@@ -1,0 +1,36 @@
+{"id": "q01", "kind": "brief", "query": "painterly fantasy character artist, open for commissions", "intent": "Character artists with a painterly fantasy style who say they are open for work."}
+{"id": "q02", "kind": "brief", "query": "dark fantasy creature designer", "intent": "Artists whose work is mainly creature or monster design with a dark fantasy mood."}
+{"id": "q03", "kind": "brief", "query": "stylized character concept art for a mobile game", "intent": "Stylized, appealing character concepts suited to mobile games, not realistic rendering."}
+{"id": "q04", "kind": "brief", "query": "sci-fi environment concept artist", "intent": "Environment concept art with science fiction settings."}
+{"id": "q05", "kind": "brief", "query": "anime style character illustrator available for freelance", "intent": "Anime or manga style character illustration, artist states availability."}
+{"id": "q06", "kind": "brief", "query": "realistic armor and weapon designs", "intent": "Realistically rendered armor, weapon or gear design work."}
+{"id": "q07", "kind": "brief", "query": "cute chibi character artist for a cozy game", "intent": "Cute, rounded or chibi characters with a cozy, friendly tone."}
+{"id": "q08", "kind": "brief", "query": "cyberpunk city concept art", "intent": "Cyberpunk urban environments."}
+{"id": "q09", "kind": "brief", "query": "monster design for a horror game", "intent": "Horror creature and monster concepts."}
+{"id": "q10", "kind": "brief", "query": "hand-painted fantasy landscapes", "intent": "Painterly fantasy landscape or environment work."}
+{"id": "q11", "kind": "brief", "query": "character portraits for a visual novel", "intent": "Character portrait or sprite style illustration suited to visual novels."}
+{"id": "q12", "kind": "brief", "query": "mech and robot concept designer", "intent": "Mecha, robot or mechanical character design."}
+{"id": "q13", "kind": "studio", "query": "senior character concept artist, stylized, production experience", "intent": "Stylized character concept artists whose portfolio shows production-style sheets or stated studio experience."}
+{"id": "q14", "kind": "studio", "query": "stylized hand-painted prop concepts", "intent": "Prop or item concept art in a stylized, hand-painted look."}
+{"id": "q15", "kind": "studio", "query": "hard surface vehicle concept artist", "intent": "Vehicle or hard-surface design concepts."}
+{"id": "q16", "kind": "studio", "query": "creature concept artist with anatomy studies and turnarounds", "intent": "Creature designers who show anatomy studies or multi-view turnarounds."}
+{"id": "q17", "kind": "studio", "query": "environment keyframe illustration with cinematic lighting", "intent": "Cinematic keyframe or mood paintings of environments."}
+{"id": "q18", "kind": "studio", "query": "character turnaround sheets and orthographics for 3D modeling", "intent": "Character sheets with front, side and back views usable by modelers."}
+{"id": "q19", "kind": "studio", "query": "UI and icon artist for a fantasy RPG", "intent": "Game icons, item art or UI art in a fantasy style."}
+{"id": "q20", "kind": "studio", "query": "costume design callouts for a historical fantasy setting", "intent": "Costume or outfit design sheets with callouts, historical or historical-fantasy flavor."}
+{"id": "q21", "kind": "studio", "query": "splash art illustrator for a card game", "intent": "Polished, dynamic full illustrations of the kind used for card or splash art."}
+{"id": "q22", "kind": "studio", "query": "pixel art character sprites and animations", "intent": "Pixel art characters or sprite sheets."}
+{"id": "q23", "kind": "studio", "query": "visual development artist, color keys and mood boards", "intent": "Visual development work: color keys, mood studies, style exploration."}
+{"id": "q24", "kind": "studio", "query": "2D concept artist for an indie roguelike, flexible on style", "intent": "Generalist 2D game concept artists showing range across characters, enemies and environments."}
+{"id": "q25", "kind": "hard", "query": "traditional watercolor character art, not digital", "intent": "Medium filter with a negation: traditional watercolor only, digital work is a miss."}
+{"id": "q26", "kind": "hard", "query": "concpet artist charcter desing", "intent": "Misspelled 'concept artist character design'. Should still return character concept artists."}
+{"id": "q27", "kind": "hard", "query": "art nouveau inspired character design", "intent": "Rare style: ornamental, flowing art nouveau influence in character work."}
+{"id": "q28", "kind": "hard", "query": "lush painted backgrounds like classic animated films", "intent": "Style described by reference: soft, detailed, painted animation-style backgrounds."}
+{"id": "q29", "kind": "hard", "query": "no anime, realistic gritty soldiers", "intent": "Negation: realistic military or soldier characters, anime-style results are a miss."}
+{"id": "q30", "kind": "hard", "query": "open for work creature artist who also does 3D sculpts", "intent": "Availability filter plus two skills: creature design and 3D sculpting."}
+{"id": "q31", "kind": "hard", "query": "isometric environment concepts for a strategy game", "intent": "Isometric or top-down environment and building concepts."}
+{"id": "q32", "kind": "hard", "query": "black and white ink illustrations of monsters", "intent": "Medium and subject: monochrome ink work, monsters or creatures."}
+{"id": "q33", "kind": "hard", "query": "biopunk body horror organic designs", "intent": "Rare genre: organic, fleshy, biopunk or body-horror design."}
+{"id": "q34", "kind": "hard", "query": "character designer for a children's educational game, friendly shapes", "intent": "Simple, friendly, child-appropriate character design. Dark or mature work is a miss."}
+{"id": "q35", "kind": "hard", "query": "someone who paints dragons", "intent": "Short colloquial query: artists with several painted dragon pieces."}
+{"id": "q36", "kind": "hard", "query": "dieselpunk airships and aviator characters", "intent": "Rare genre: dieselpunk vehicles and characters."}

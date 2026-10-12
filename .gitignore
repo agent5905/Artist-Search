@@ -227,3 +227,4 @@ node_modules/
 .wrangler/
 .dev.vars
 .pytest_tmp/
+.pytest_tmp*/

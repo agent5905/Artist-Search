@@ -1,15 +1,22 @@
 # Artist Search: Progress
 
-**Status, 2026-10-11:** Setup is done. The build is **paused on one owner decision** (item 1 below). No DeviantArt request has been made and no artist data has been collected.
+**Status, 2026-10-11:** Path B chosen. Wave 1 is building: the polite crawler, DeviantArt discovery, and the database schema. Live collection waits on DeviantArt API credentials (item 1 below).
 
 ## Waiting on the owner
 
-1. **DeviantArt's terms forbid the Analyze step as the spec describes it.** Details in [The DeviantArt finding](#the-deviantart-finding). Pick a path: A, B or C.
-2. **Credentials.**
-   - `DEVIANTART_CLIENT_ID` and `DEVIANTART_CLIENT_SECRET` are not in `.env`. They come from registering an app at deviantart.com/developers/register (needed for paths A and B).
-   - `CLOUDFLARE_API_TOKEN` is rejected by Cloudflare (HTTP 401, "Invalid API Token"). Not needed until the site deploys.
-   - `CLOUDFLARE_PAGES_PROJECT_NAME` and `APP_BASE_URL` are empty. Not needed until the site deploys.
-3. **Pushing.** Everything is committed locally. Nothing has been pushed to GitHub yet.
+1. **DeviantArt API credentials.** Register an app at deviantart.com/developers/register and add `DEVIANTART_CLIENT_ID` and `DEVIANTART_CLIENT_SECRET` to `.env`. Nothing can be collected until then.
+2. **Send the permission request.** A draft is in [docs/deviantart-permission-request.md](docs/deviantart-permission-request.md). Edit and send it through DeviantArt's Help Center.
+3. **Cloudflare token.** `CLOUDFLARE_API_TOKEN` is rejected (HTTP 401, "Invalid API Token"). Needed for the site preview and for search-time query embeddings. `CLOUDFLARE_PAGES_PROJECT_NAME` and `APP_BASE_URL` are empty.
+4. **The reference for the search and style A/B tests** (see decision 3 below). Proceeding with the stated default unless told otherwise.
+
+## Owner decisions (these amend the spec)
+
+Made 2026-10-11, after the DeviantArt terms were read.
+
+1. **Path B.** The DeviantArt API is used only to find artists in the niche and their public links. No DeviantArt image or text goes into any model or in front of any agent. Analysis runs on artists' own portfolio sites.
+2. **New hard rule: honor AI opt-outs everywhere.** A site or page is skipped when robots.txt disallows us, when it blocks known AI crawlers, or when it carries `noai`, `noimageai`, `noindex` or a text-and-data-mining reservation. Only custom-domain sites are crawled; hosted platforms and social networks are never fetched.
+3. **Reference for pieces 5 and 6 (default, pending the owner).** DeviantArt results cannot be shown to a critic. The blind A/B reference becomes a plain keyword search (text) and a generic image-embedding ranking (style) over the same index, and the critic also grades every result on its own against the artist's real work. This is a weaker bar than the spec's. It is the strongest one the terms allow.
+4. **Push `main` after every round.**
 
 ## The plan
 
@@ -19,7 +26,9 @@ Each row is one piece with its own builder and its own fresh critic. Critics get
 
 | # | Piece | What the critic inspects | Bar |
 |---|---|---|---|
-| 1 | Collect | Test output | Pass or fail: rerun creates no duplicates, rate limit holds, removed artists stay removed |
+| 1a | Discover (DeviantArt API: handles and public links only) | Test output | Pass or fail: rerun creates no duplicates, backs off on rate limits, stores no DeviantArt content, removed artists stay removed |
+| 1b | Crawl (artists' own sites) | Test output and adversarial probes | Pass or fail: robots.txt obeyed, 3 seconds per host holds, AI opt-outs honored, platforms never fetched |
+| 1c | Portfolio extraction | Extracted works next to the live site | Every work is the artist's own, with a working source link |
 | 2 | Work tags | Each tag next to the image | Any unsupported tag is a loss |
 | 3 | Work descriptions | Each description next to the image | Any unsupported claim is a loss |
 | 4 | Artist profiles | Each claim next to the works and bio | Any unsupported claim is a loss |
@@ -31,11 +40,11 @@ Each row is one piece with its own builder and its own fresh critic. Critics get
 | 10 | Schema and search functions | Test output and measured size | Pass or fail: under 400 MB, no image bytes stored |
 | 11 | Claim or remove | Test output | Pass or fail: a removed artist is gone and is skipped on every later collect |
 
-The reference for pieces 5 and 6 is DeviantArt's own search and "more like this" in the spec. Whether that reference can be used depends on the decision above.
+The reference for pieces 5 and 6 changed under path B. See owner decision 3.
 
 ### The eval set (`eval/`, frozen before the first judged round)
 
-- **`eval/queries.jsonl`, 36 queries.** 12 plain briefs in the spec's style (style + subject + availability), 12 written the way game studios phrase art roles (for example "stylized hand-painted prop concepts"), 12 hard cases (a medium filter, a negation, a misspelling, a rare style). Written before any search code exists, so they cannot be tuned to it.
+- **`eval/queries.jsonl`, 36 queries. Frozen 2026-10-11, SHA-256 `e1a7f9b59a66c62b88166aa2d8fe55bd5c3abf3703de78acfd78e165e3ff13ee`.** 12 plain briefs in the spec's style (style + subject + availability), 12 written the way game studios phrase art roles (for example "stylized hand-painted prop concepts"), 12 hard cases (a medium filter, a negation, a misspelling, a rare style). Written before any search code exists, so they cannot be tuned to it.
 - **`eval/seeds.jsonl`, 30 seed artists.** Drawn at random with a fixed seed from the first 200 collected artists, not hand-picked.
 - **Claim sample.** 50 artists per round, drawn at random with a recorded seed, for the tag and profile checks.
 - **Reference results** are captured once per query and seed and frozen with the set.
@@ -46,16 +55,16 @@ The reference for pieces 5 and 6 is DeviantArt's own search and "more like this"
 | Job | Choice | Status |
 |---|---|---|
 | Describe and tag an image | `qwen3.8` (27B, vision) in Ollama, with `gemma4:26b` as the A/B challenger | Both already installed |
-| Text embeddings | `qwen3-embedding:4b` in Ollama, 2,560 dimensions, stored half-precision | Already installed |
+| Text embeddings | Must run in two places with the same weights: locally for profiles, and on Cloudflare Workers AI for the search box. Candidates on both: `bge-m3` and `qwen3-embedding-0.6b` (1,024 dimensions). Chosen by A/B | Listed in the Workers AI catalog; local copies not downloaded yet |
 | Style embeddings | `tomg-group-umd/CSD-ViT-L` (built for style) against `google/siglip2-so400m-patch16-384`, chosen by A/B on the seeds | Both on Hugging Face, not gated. DINOv3 is gated, so skipped |
 | Runtime | PyTorch 2.14.1 with CUDA 13.0 wheels, Python 3.12 | Wheel exists for Windows; not installed yet |
 
-Size estimate for 3,000 artists and 30,000 works: about 45 MB of 768-dimension half-precision style vectors plus an index of similar size or larger, and about 15 MB of profile vectors. That fits the 400 MB budget on paper. The real size is measured every round.
+Size estimate for 3,000 artists and 30,000 works: about 45 MB of 768-dimension half-precision style vectors plus about 6 MB of profile vectors. At this scale an exact scan is fast, so no vector index is built, which removes the main size risk. That fits the 400 MB budget on paper. The real size is measured every round.
 
 ### Order of work
 
 1. Setup. **Done.**
-2. Collect a first 200 artists. **Blocked on the decision.**
+2. Discover a first 200 artists and crawl their own sites. **Code in progress; the live run waits on DeviantArt credentials.**
 3. Analyze, then store and search, with critics starting as soon as there is real output.
 4. The three pages, on a private preview.
 5. Scale to 2,000+ and add portfolio-site crawling.
@@ -114,3 +123,10 @@ Analyzing only opted-in DeviantArt works is not on the list: the label is not in
 **Verdict:** no critic round yet. There is nothing real to judge until data can be collected.
 
 **Database:** 10.3 MB of 400 MB. Artists 0, works 0.
+
+**After the owner's answers (same day)**
+- Path B and "push main each round" recorded above. `main` pushed to GitHub.
+- `eval/queries.jsonl` written and frozen before any search code exists.
+- Permission request drafted in `docs/`.
+- `scripts/ship.sh` runs every fixed check and then pushes.
+- Wave 1 builders started: crawler, DeviantArt discovery, database schema. Each gets a fresh critic when it reports.
