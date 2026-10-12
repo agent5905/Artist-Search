@@ -1014,7 +1014,8 @@ def test_an_artist_removed_before_a_run_or_purged_from_the_library_never_gets_a_
 
     library.purge(f"da:{CHARLIE}")
     assert profiles.profiles() == []
-    assert run(Fake()) == {"removed": 1}
+    assert table() == []  # the library's purge now deletes this stage's row itself
+    assert run(Fake()) == {}
     assert table() == []
     assert b"FAKE-TAGLINE" not in config.LOCAL_DB.read_bytes()  # their own words are wiped from the file, not unlinked
 

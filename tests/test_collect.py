@@ -59,8 +59,7 @@ works stored: 13
 images downloaded: 13
 images already cached: 0
 purged artists (removed): 0
-purged artists (account suspended, inactive or gone): 0
-purged artists (profile unavailable on two runs): 0
+purged artists (account gone, or all their works, on two runs): 0
 deleted cached files (no row for them): 0
 deletions that failed: 0
 rows with an unreadable artist key: 0
@@ -70,7 +69,8 @@ skipped artists (unexpected error): 0
 skipped artists (the API failed for them): 0
 skipped artists (removed): 0
 skipped artists (a removed account under a new handle): 0
-skipped artists (profile or gallery unavailable): 1
+skipped artists (account suspended, inactive or gone): 1
+skipped artists (none of the works kept for them came back): 0
 skipped artists (most recent works tagged AI-made): 1
 skipped works (malformed entry): 0
 skipped works (another author's): 0
@@ -80,6 +80,7 @@ skipped works (no tag data): 0
 skipped works (tagged AI-made): 4
 skipped works (contact details in the title): 0
 skipped works (image download failed): 0
+skipped works (image host rate limit): 0
 skipped works (image not an accepted type): 0
 skipped works (image over the size cap): 0
 """
@@ -341,8 +342,9 @@ def base():
     )
     world.work(BRAVO, 28, tags=["fakeportrait", "AI_Generated"])
     world.work(BRAVO, 29, meta={"is_mature": True})
-    # CHARLIE: stored by discovery, but the profile lookup answers 400 with no more said.
+    # CHARLIE: stored by discovery, but the profile lookup says, in its documented code, that there is no such user.
     assert store.upsert_artist(CHARLIE, f"https://www.deviantart.com/{CHARLIE}", [], 3)
+    world.profiles[CHARLIE] = refusal(404, error_code=2)
     # DELTA: three of four recent works are tagged as AI-made.
     world.artist(DELTA)
     for n, tag in ((41, "midjourney"), (42, "aiart"), (43, "StableDiffusion"), (44, "fakepainting")):
@@ -647,8 +649,9 @@ def test_of_a_whole_profile_response_only_the_public_fields_are_kept_and_the_bio
         "FAKE-TAGLINE wa.me/zzhandle",
         # What a critic got past the second version, which looked for these one spelling at a time.
         "FAKE-TAGLINE zzhandle at outlook.com",
-        "FAKE-TAGLINE zzhandle(a)mailhost",
-        "FAKE-TAGLINE skype / snapchat / signal / kik / messenger zzhandle",
+        "FAKE-TAGLINE Tel. 555 0199",
+        "FAKE-TAGLINE call 9123 4567",
+        "FAKE-TAGLINE t.me/zzhandle",
         "FAKE-TAGLINE see zzhandle.art",
     ],
 )
@@ -662,17 +665,19 @@ def test_a_tagline_with_an_address_a_service_or_a_number_in_it_is_not_kept_at_al
     ]
     stored = config.LOCAL_DB.read_bytes()
     assert b"mail" not in stored and b"zz.fa" not in stored and b"0199" not in stored and b"zzhandle" not in stored
-    assert b"outlook" not in stored and b"skype" not in stored
+    assert b"outlook" not in stored and b"4567" not in stored
 
 
 CONTACT_TITLES = [
     "FAKE-TITLE zz.fake@mail.invalid",
     "FAKE-TITLE zz.fake&amp;#64;mail.invalid",
     "FAKE-TITLE call +00 555 010 9999",
-    "FAKE-TITLE whatsapp zzhandle",
-    "FAKE-TITLE discord: zzhandle",
-    "FAKE-TITLE zzhandle(a)mailhost",
     "FAKE-TITLE zzhandle at mailhost.invalid",
+    # The critic's four of round 4: they stayed in the title and in the page address made from it.
+    "FAKE-TITLE call 9123 4567",
+    "FAKE-TITLE Tel. 555 0199",
+    "FAKE-TITLE t.me/zzhandle",
+    "FAKE-TITLE wa.me/zzhandle",
 ]
 
 
@@ -847,108 +852,67 @@ def test_a_work_that_does_not_qualify_is_not_stored_and_its_image_is_never_fetch
     assert sum(count for name, count in counts.items() if name.startswith("skipped")) == 1
 
 
-AI_SPELLINGS = [
-    # The bare tag, which the first version let through on ten works of ten.
-    *("ai", "AI", "Ai", "a.i.", "a_i", "ai_", "AIイラスト", "ＡＩ", "ai2026"),
-    # "ai" and then a word.
-    *("aiadopt", "aiadopts", "aiadoptable", "aiadoptables", "aiadoptableopen", "aiadoptablesopen", "aiadoptsopen"),
-    *("ai_adoptable", "AI-Adopt", "aiart", "AIart", "ai_art", "AI-Art", "Ai Art", "aiartwork", "aiartcommunity"),
-    *("aiartist", "aigenerated", "ai_generated", "AI-Generated", "aigeneratedart", "aigeneration", "aigen", "AI_image"),
-    *("aiimage", "aiillustration", "aigirl", "aiportrait", "aitools", "ai_tools", "aiassisted", "ai_assisted"),
-    *("aidrawing", "aidesign", "aimade", "ai_made", "aicharacter", "aiwaifu", "aimodel", "aiphoto"),
-    # "ai" as a word of its own, and the endings that say who made it.
-    *("anime_ai", "furry_ai_art", "art_ai", "digital-ai", "createdwithai", "created_with_ai", "madewithai"),
-    *("made_with_ai", "generatedwithai", "generatedbyai", "madebyai", "artbyai", "drawnbyai", "madeusingai"),
-    *("createdusingai", "withai", "byai"),
-    # The names of the tools.
-    *("artificialintelligence", "artificial_intelligence", "generativeai", "generative_ai", "genai", "gen_ai"),
-    *("genaiart", "midjourney", "MidJourney", "midjourneyv6", "midjourney_art", "madewithmidjourney", "nijijourney"),
-    *("niji", "niji5", "nijiv6", "niji_journey", "stablediffusion", "StableDiffusion", "Stable_Diffusion_XL"),
-    *("stablediffusionart", "usingstablediffusion", "sdxl", "sdxl_art", "ponysdxl", "waifudiffusion", "ponydiffusion"),
-    *("dalle", "DALL-E", "dalle2", "dalle3", "dallemini", "dreamup", "DreamUp", "novelai", "NovelAI", "novel_ai"),
-    *("comfyui", "comfy_ui", "leonardoai", "leonardo_ai", "nightcafe", "night_cafe", "pixai", "pix_ai", "civitai"),
-    *("seaart", "sea_art", "seaartai", "tensorart", "tensor_art", "txt2img", "img2img", "text2image", "texttoimage"),
-    *("controlnet", "dreambooth", "craiyon", "automatic1111", "invokeai", "bingimagecreator", "adobefirefly"),
-    *("playgroundai", "inteligenciaartificial", "diffusion", "latentdiffusion", "anything_diffusion", "diffusionmodel"),
-    # The third finding in the real cache, and the three that a tag merely containing "free" let through.
-    *("synthography", "Synthographer", "synthographic_art", "aiadoptfree", "ai_art_free", "aigeneratedfreeadopt"),
-    *("ai_adopt_free", "aifreebie", "aifreeadopt", "adopt_ai_free"),
-    *("openai", "OpenAI", "open_ai", "chatgpt", "gpt4o", "gpt5", "bing_ai", "starryai", "artbreeder", "deepdream"),
-    *("ai_collab", "aicollab"),
+AI_SPELLINGS = [  # one of collect.AI_TAGS, whole, in the ways an artist writes it
+    *("ai", "AI", "Ai", "a.i.", "a_i", "ai_", "ＡＩ"),
+    *("aiart", "AIart", "ai_art", "AI-Art", "Ai Art", "aiartwork", "aigenerated", "ai_generated", "AI-Generated"),
+    *("aigeneratedart", "aiimage", "AI_image", "aiadopt", "AI-Adopt", "aiadoptable", "ai_adoptable", "aiadoptables"),
+    *("generativeai", "generative_ai", "midjourney", "MidJourney", "stablediffusion", "StableDiffusion"),
+    *("Stable_Diffusion", "dalle", "DALL-E", "dalle2", "dalle3", "dreamup", "DreamUp", "novelai", "NovelAI"),
+    *("novel_ai", "nijijourney", "niji_journey", "synthography", "synthographyart"),
 ]
-NOT_AI_SPELLINGS = [
-    # Ordinary English and Japanese words and names that begin with "ai".
-    *("air", "airbrush", "aircraft", "airplane", "airship", "airelemental", "airi", "aim", "aiming", "aid", "aide"),
-    *("ailment", "aisle", "aioli", "aileron", "aiguillette", "aikido", "aiko", "aika", "aimi", "aiko_art", "aizawa"),
-    *("aizawashota", "aizen", "aizensousuke", "aidenpearce", "aisha", "aigis", "ainz", "aincrad", "aipom"),
-    *("aishiteru", "aidoru", "aihoshino"),
-    # The opposite claim, which twenty-five works in the first real cache carry.
+# The critic's ten come first: each of them had a human artist who objects to AI purged as an AI artist.
+PROTESTS = [
+    *("say_no_to_ai", "no_to_ai", "fuck_ai", "ai_sucks", "boycott_ai", "do_not_train_ai", "not_for_ai_training"),
+    *("ai_is_stealing", "made_by_human_not_by_ai", "ai_free_art"),
     *("noai", "NoAI", "no_ai", "no-ai", "notai", "not_ai", "nonai", "antiai", "anti_ai", "noaiart", "no_ai_art"),
-    *("notaiart", "nonaiart", "antiaiart", "noaiused", "notmadewithai", "not_made_with_ai", "notbyai"),
-    *("madewithoutai", "made_without_ai", "stopai", "stopaiart", "banai", "zeroai", "againstai", "art_not_ai"),
-    *("100_no_ai", "aifree", "ai_free", "aiisnotart", "ai_is_not_art", "aiartisnotart", "aiistheft"),
-    *("humanmade", "humanartist", "handdrawn"),
-    # Words that only end in "ai", hold it, or begin like the name of a tool.
-    *("samurai", "minimalistsamurai", "bonsai", "thai", "thaiart", "senpai", "kawaii", "dubai", "hawaii", "mai", "kai"),
-    *("firstaid", "maid", "raid", "paint", "detail", "hairstyle", "fairy", "daily", "dallas", "nijisanji", "seaartist"),
-    *("generativeart", "genial", "synthetic", "neuralinterface", "exploration", "floral", "valorantfanart", "pixar"),
-    *("leonardo", "leonardodavinci", "night", "cafe", "diffuse", "diffused", "diffuser", "fakepainting"),
-    *(
-        "openair",
-        "openairpainting",
-        "sparklingair",
-        "climbingaid",
-        "starryair",
-        "no_ai_generated_art",
-        "notaigenerated",
-    ),
+    *("notmadewithai", "not_made_with_ai", "madewithoutai", "stopai", "banai", "art_not_ai", "100_no_ai", "aifree"),
+    *("ai_free", "aiisnotart", "ai_is_not_art", "aiistheft", "humanmade", "handdrawn", "no_ai_generated_art"),
+]
+# Let through here on purpose (the lead's decision, round 4): the analysis stage reads each work's tags and title
+# with a language model and makes the real decision. The critic's five look-alikes come first.
+LEFT_FOR_ANALYSIS = [
+    *("airender", "airealism", "novelaidiffusion", "nordic_midjourney", "noir_stablediffusion"),
+    *("aiadoptableopen", "aiartcommunity", "aiillustration", "createdwithai", "madewithai", "anime_ai", "aitools"),
+    *("midjourneyv6", "stablediffusionart", "sdxl", "comfyui", "niji", "diffusion", "synthographer", "ai2026"),
+    # And what never was about AI: words and names that begin with it, end in it or hold it.
+    *("air", "airbrush", "aim", "aid", "aiko", "aizawa", "aincrad", "samurai", "bonsai", "senpai", "kawaii", "maid"),
+    *("paint", "detail", "fairy", "dallas", "generativeart", "openair", "fakepainting"),
 ]
 
 
 @pytest.mark.parametrize("tag", AI_SPELLINGS)
-def test_a_tag_that_says_ai_made_the_work_is_recognised(tag):
+def test_a_tag_that_is_one_of_the_ai_tags_marks_its_work(tag):
     assert collect._is_ai(["fakepainting", tag, "fakeportrait"]), tag
 
 
-@pytest.mark.parametrize("tag", NOT_AI_SPELLINGS)
-def test_a_tag_that_only_looks_like_one_or_says_the_opposite_is_not(tag):
+@pytest.mark.parametrize("tag", [*PROTESTS, *LEFT_FOR_ANALYSIS])
+def test_no_other_tag_marks_anything_here(tag):
+    """Round 4, after four rounds of patterns that erred both ways at once: a tag counts only when it is, whole,
+    one of a short list. A protest costs nobody anything; a look-alike is left for the analysis stage."""
     assert not collect._is_ai(["fakepainting", tag, "fakeportrait"]), tag
 
 
-def test_every_entry_of_the_ai_lists_is_used_and_every_lookalike_is_let_through():
-    for tag in (*collect.AI_NAMES, *collect.AI_STARTS, *collect.AI_EXACT, *collect.AI_ENDS):
-        assert collect._is_ai([tag]), tag
-    for tag in (*collect.AI_LOOKALIKES, *collect.AI_LOOKALIKE_STARTS):
-        assert not collect._is_ai([tag]) and tag.startswith("ai"), tag
-    for tag in collect.AI_LOOKALIKE_STARTS:
-        assert not collect._is_ai([tag + "fake"]), tag
-    for tag in collect.AI_LOOKALIKES:
-        assert collect._is_ai([tag + "fake"]) or tag.startswith("air"), (
-            tag
-        )  # exact only: "aid" is a word, "aidrawing" is not
-    for denial in collect.AI_DENIALS:
-        assert not collect._is_ai([denial + "ai"]) and not collect._is_ai([f"{denial}_ai_art"]), denial
-    assert not collect._is_ai([])
+def test_the_ai_tags_are_a_short_list_of_whole_tags():
+    assert len(collect.AI_TAGS) <= 30 and all(re.fullmatch(r"[a-z0-9]+", tag) for tag in collect.AI_TAGS)
+    assert not collect._is_ai([]) and not collect._is_ai(["fakepainting", "fakeportrait"])
+    for tag in collect.AI_TAGS:  # whole, and nothing less: no prefix, no suffix, no "contains"
+        assert collect._is_ai([tag]) and collect._is_ai([tag.upper()]), tag
+        for other in (f"fake{tag}", f"{tag}fake", f"no{tag}", f"fake_{tag}_fake"):
+            assert not collect._is_ai([other]), other
 
 
-@pytest.mark.parametrize("tag", ["ai", "aiadoptable", "createdwithai", "aitools", "sdxl", "noai", "aika"])
+@pytest.mark.parametrize("tag", ["ai", "aiadoptable", "AI_Generated", "noai", "ai_free_art", "airender"])
 def test_one_ai_tag_among_a_works_tags_costs_that_work_its_place_and_no_other(tag, capsys):
     world = solo()
     world.metadata[uuid(2)] = metadata(2, ALPHA, ["fakepainting", tag, "fakeportrait"])
     counts = counts_of(world, capsys)
-    ai_made = tag not in ("noai", "aika")
+    ai_made = tag in ("ai", "aiadoptable", "AI_Generated")
     assert kept(ALPHA) == ([4, 3, 1] if ai_made else [4, 3, 2, 1])
     assert (preview_path(2) in [request.url.path for request in world.requests("images")]) is not ai_made
     assert counts[collect.AI_TAGGED] == int(ai_made) and counts[collect.MOSTLY_AI] == 0
 
 
-@pytest.mark.parametrize(
-    "family",
-    [
-        ["ai"],
-        ["aiadopt", "aiadoptable", "aiadoptableopen", "aiadoptables", "aiadoptablesopen", "aiadopts", "aiadoptsopen"],
-    ],
-)
+@pytest.mark.parametrize("family", [["ai"], ["aiadopt", "aiadoptable", "aiadoptables"]])
 def test_an_artist_with_such_a_tag_on_ten_works_of_ten_is_skipped(family, capsys, tmp_path):
     """The two artists the critic found stored whole in the real cache, rebuilt with made-up works."""
     world = solo(10)
@@ -973,6 +937,41 @@ def test_an_artist_whose_ten_works_are_all_tagged_synthography_is_skipped_and_pu
     assert rows("profiles") == rows("works") == [] and files(tmp_path) == ["cache/pipeline.sqlite"]
 
 
+def test_an_artist_who_tags_every_work_against_ai_loses_nothing(capsys):
+    """The critic's finding, and the worst error this product can make: an artist who had been collected, each of
+    whose works carries a tag that objects to AI, was taken for an AI artist and purged. With whole tags only,
+    none of the critic's ten costs a work or an artist anything."""
+    assert PROTESTS[:10] == [
+        *("say_no_to_ai", "no_to_ai", "fuck_ai", "ai_sucks", "boycott_ai", "do_not_train_ai", "not_for_ai_training"),
+        *("ai_is_stealing", "made_by_human_not_by_ai", "ai_free_art"),
+    ]
+    world = solo(10)
+    assert run(world) == 0
+    for n in range(1, 11):
+        world.metadata[uuid(n)] = metadata(n, ALPHA, ["fakeportrait", PROTESTS[n - 1], "fakecharacter"])
+    seen = len(world.log)
+    counts = counts_of(world, capsys)
+    assert counts[collect.MOSTLY_AI] == counts[collect.AI_TAGGED] == counts[collect.PURGED] == 0
+    assert counts[collect.WORKS] == counts[collect.CACHED] == 10 and world.since(seen, "images") == []
+    assert kept(ALPHA) == list(range(10, 0, -1)) and len(cached()) == 10
+    assert json.loads(rows("works")[0]["tags"]) == ["fakeportrait", "say_no_to_ai", "fakecharacter"]  # kept as written
+
+
+def test_the_lookalikes_are_let_through_here_on_purpose(capsys):
+    world = solo(5)
+    for n in range(1, 6):
+        world.metadata[uuid(n)] = metadata(n, ALPHA, ["fakeportrait", LEFT_FOR_ANALYSIS[n - 1]])
+    counts = counts_of(world, capsys)
+    assert counts[collect.AI_TAGGED] == counts[collect.MOSTLY_AI] == 0 and kept(ALPHA) == [5, 4, 3, 2, 1]
+    assert LEFT_FOR_ANALYSIS[:5] == [
+        "airender",
+        "airealism",
+        "novelaidiffusion",
+        "nordic_midjourney",
+        "noir_stablediffusion",
+    ]
+
+
 def test_what_an_earlier_version_stored_is_cleaned_up_by_running_again(capsys, tmp_path):
     """Round 1 kept AI-tagged works. They are on disk: rows, tags and cached files. A rerun over every artist
     removes an AI-tagged work with its file, and purges an artist most of whose works are AI-made."""
@@ -981,7 +980,7 @@ def test_what_an_earlier_version_stored_is_cleaned_up_by_running_again(capsys, t
     for n in range(21, 31):
         world.work(BRAVO, n, tags=["fakeadopt", "aiadoptable"])
     for n in (2, 5):
-        world.metadata[uuid(n)] = metadata(n, ALPHA, ["fakepainting", "createdwithai" if n == 2 else "aitools"])
+        world.metadata[uuid(n)] = metadata(n, ALPHA, ["fakepainting", "ai_generated" if n == 2 else "midjourney"])
     for username, numbers in ((ALPHA, range(1, 10)), (BRAVO, range(21, 31))):  # as the first version left it
         stored = []
         for n in numbers:
@@ -1004,7 +1003,7 @@ def test_what_an_earlier_version_stored_is_cleaned_up_by_running_again(capsys, t
     ]
     assert world.requests("images") == [] and counts[collect.CACHED] == 7  # nothing is downloaded twice
     stored = config.LOCAL_DB.read_bytes()
-    assert b"createdwithai" not in stored and b"aitools" not in stored and b"aiadoptable" not in stored
+    assert b"ai_generated" not in stored and b"midjourney" not in stored and b"aiadoptable" not in stored
 
 
 @pytest.mark.parametrize(
@@ -1316,7 +1315,9 @@ def test_a_second_run_makes_no_duplicates_and_downloads_nothing_that_is_cached(c
 
     assert run(world) == 0
     counts = summary(capsys.readouterr().out)
-    assert (without_time(rows("profiles")), without_time(rows("works")), files(tmp_path), store.all_artists()) == first
+    queue = [artist for artist in first[3] if artist[0] != key(CHARLIE)]  # twice now the API has said: no such user
+    assert (without_time(rows("profiles")), without_time(rows("works")), files(tmp_path)) == first[:3]
+    assert store.all_artists() == queue and counts[collect.GONE] == 1
     assert world.since(seen, "images") == [] and len(world.since(seen)) == BASE_REQUESTS - 13
     assert counts[collect.DOWNLOADED] == 0 and counts[collect.CACHED] == 13 and counts[collect.WORKS] == 13
     assert counts[collect.ORPHANS] == 0
@@ -1600,6 +1601,25 @@ def test_removed_hashes_imported_from_the_list_of_record_purge_too(capsys):
     assert library.artist_keys() == [key(BRAVO), key(FOXTROT)] and cached() == image_files(BRAVO_KEPT)
 
 
+def test_a_removed_artists_rows_in_the_other_stages_tables_go_in_the_same_run(capsys):
+    """The critic's finding: ten of ten rows for a removed artist's works stayed in the tagging stage's and the
+    style stage's tables until those stages ran again. Here with tables this stage has never heard of."""
+    world = base()
+    assert run(world) == 0
+    raw("CREATE TABLE fake_work_tags (deviation_id TEXT, model TEXT, result TEXT)")
+    raw("CREATE TABLE fake_summaries (artist_key TEXT PRIMARY KEY, summary TEXT)")
+    for row in rows("works"):
+        raw("INSERT INTO fake_work_tags VALUES (?, 'fake-model', 'FAKE-RESULT')", row["deviation_id"])
+    for name in (ALPHA, BRAVO):
+        raw("INSERT INTO fake_summaries VALUES (?, 'FAKE-SUMMARY')", key(name))
+    store.mark_removed(ALPHA)
+    assert counts_of(world, capsys)[collect.PURGED] == 1
+    left = sorted(work_id for (work_id,) in raw("SELECT deviation_id FROM fake_work_tags"))
+    assert left == sorted(uuid(n) for n in BRAVO_KEPT) and raw("SELECT artist_key FROM fake_summaries") == [
+        (key(BRAVO),)
+    ]
+
+
 def test_cached_files_with_no_row_are_deleted_at_the_start_of_every_run(capsys, tmp_path):
     """The critic's finding: the database was lost, the images stayed, and ten files of a removed artist had no
     row for any purge to go by. Now a file no row names is deleted before the run asks for anything."""
@@ -1624,16 +1644,18 @@ def test_cached_files_with_no_row_are_deleted_at_the_start_of_every_run(capsys, 
 
 
 def test_an_account_that_changed_its_handle_leaves_nothing_behind_under_the_old_one(capsys, tmp_path):
-    """The critic's finding: collected as one handle, collected again as another, the new handle removed, and the
-    old key's profile row survived. The API's user id, kept as a hash, says the two keys are one account."""
+    """The critic's findings, two rounds of them: collected as one handle, collected again as another, the new
+    handle removed. First the old key's profile row survived. Then the old handle did, in the store's queue and
+    among the skips, and was asked about on every later run. The API's user id, kept as a hash, says the two
+    keys are one account, and the old one goes everywhere when the new one is stored."""
     world = solo(4)
     assert run(world) == 0
     assert kept(ALPHA) == [4, 3, 2, 1]
-    # The account takes a new handle. Discovery finds it under that; the old handle now answers 400.
+    # The account takes a new handle. Discovery finds it under that; of the old one the API says: no such user.
     world.artist(RENAMED, user={**author(RENAMED), "userid": f"FAKE-USERID-{ALPHA}"})
     for n in (3, 4, 5):  # two works it had before, and a new one
         world.work(RENAMED, n)
-    world.profiles[ALPHA] = 400
+    world.profiles[ALPHA] = refusal(404, error_code=2)
 
     counts = counts_of(world, capsys)
     assert counts[collect.UNAVAILABLE] == 1 and counts[collect.PROFILES] == 1
@@ -1641,11 +1663,16 @@ def test_an_account_that_changed_its_handle_leaves_nothing_behind_under_the_old_
     assert kept(RENAMED) == [5, 4, 3] and cached() == image_files([3, 4, 5])
     assert [request.url.path for request in world.requests("images")].count(preview_path(4)) == 1  # not fetched twice
     assert rows("profiles", RENAMED)[0]["user_hash"] == user_hash(ALPHA)
-    assert "zz-fake-alpha" not in json.dumps(rows("profiles") + rows("works"))  # not in any row of either table
+    assert [artist[0] for artist in store.all_artists()] == [key(RENAMED)] and rows("skipped") == []
+    assert b"zz-fake-alpha" not in config.LOCAL_DB.read_bytes()  # the old handle is nowhere in the file
 
     store.mark_removed(RENAMED)
     assert counts_of(world, capsys)[collect.PURGED] == 1
     assert library.artist_keys() == [] and files(tmp_path) == ["cache/pipeline.sqlite"]
+    seen = len(world.log)
+    assert counts_of(world, capsys)[collect.PROCESSED] == 0 and world.since(seen) == []  # nobody is asked about
+    stored = config.LOCAL_DB.read_bytes()
+    assert b"zz-fake-alpha" not in stored and b"zz-fake-renamed" not in stored and rows("skipped") == []
 
 
 def test_an_account_removed_under_one_handle_is_not_collected_under_the_next(capsys, tmp_path):
@@ -1673,31 +1700,94 @@ def test_an_account_removed_under_one_handle_is_not_collected_under_the_next(cap
     assert counts_of(world, capsys)[collect.PROCESSED] == 0 and world.since(seen) == []  # and never asked about again
 
 
-def test_what_is_kept_under_a_profile_that_is_gone_two_runs_running_is_purged(capsys, tmp_path):
-    """The critic's finding: an account took a new handle and was removed under that one before the new handle was
-    ever collected, so nothing tied the removal to the old handle, whose rows stayed. A profile that cannot be
-    had on two consecutive runs is a dead one, and what is kept under a dead profile does not stay in the index."""
-    world = base()
+def trio():
+    """ALPHA with four good works, and BRAVO and DELTA with one each: two the API goes on answering for."""
+    world = solo(4)
+    for name, n in ((BRAVO, 21), (DELTA, 41)):
+        world.artist(name)
+        world.work(name, n)
+    return world
+
+
+@pytest.mark.parametrize("code", [0, 1, 2])
+def test_an_account_the_api_calls_gone_on_two_runs_is_purged_and_asked_about_no_more(code, capsys, tmp_path):
+    """The profile endpoint's three documented codes: suspended, inactive, not found. Said once, it is noted.
+    Said again on the next run, what is kept under the handle is purged and the handle leaves the queue. It may
+    be the old handle of an account that was then removed under its new one, which nothing else would tie to it."""
+    world = trio()
     assert run(world) == 0
-    world.profiles[ALPHA] = 404
+    world.profiles[ALPHA] = refusal(404, error_code=code)
     once = counts_of(world, capsys)
-    assert once[collect.DEAD] == 0 and once[collect.UNAVAILABLE] == 2 and kept(ALPHA) == ALPHA_KEPT  # once is not dead
+    assert (
+        once[collect.UNAVAILABLE] == 1 and once[collect.GONE] == 0 and kept(ALPHA) == [4, 3, 2, 1]
+    )  # once is not gone
     twice = counts_of(world, capsys)
-    assert twice[collect.DEAD] == 1 and twice[collect.UNAVAILABLE] == 2 and collect.DEAD_AFTER == 2
-    assert rows("profiles", ALPHA) == rows("works", ALPHA) == [] and kept(BRAVO) == BRAVO_KEPT
-    assert files(tmp_path) == [*(f"cache/images/{name}" for name in image_files(BRAVO_KEPT)), "cache/pipeline.sqlite"]
-    assert key(ALPHA) in library.last_attempts()  # still noted as passed over: they do not go to the front for it
+    assert twice[collect.UNAVAILABLE] == 1 and twice[collect.GONE] == 1 and collect.DEAD_AFTER == 2
+    assert rows("profiles", ALPHA) == rows("works", ALPHA) == rows("skipped") == [] and kept(BRAVO) == [21]
+    assert files(tmp_path) == [*(f"cache/images/{name}" for name in image_files([21, 41])), "cache/pipeline.sqlite"]
+    assert [artist[0] for artist in store.all_artists()] == [key(BRAVO), key(DELTA)] and not store.is_removed(ALPHA)
+    assert b"zz-fake-alpha" not in config.LOCAL_DB.read_bytes()
+    seen = len(world.log)
     again = counts_of(world, capsys)
-    assert again[collect.DEAD] == 0 and again[collect.UNAVAILABLE] == 2  # nothing more to purge, for them or CHARLIE
+    assert again[collect.PROCESSED] == 2 and again[collect.GONE] == 0
+    assert not [
+        request for request in world.since(seen) if world.concerns(request, ALPHA)
+    ]  # and is asked about no more
 
 
-def test_an_artist_whose_gallery_cannot_be_had_is_noted_as_passed_over(capsys):
-    world = solo(2)
-    world.detours.append(lambda request: refusal(404) if request.url.path == GALLERY_PATH else None)
-    assert counts_of(world, capsys)[collect.UNAVAILABLE] == 1
-    assert list(library.last_attempts()) == [key(ALPHA)] and library.artist_keys() == []
-    # It is the profile that makes an account dead, and that is there.
-    assert counts_of(world, capsys)[collect.DEAD] == 0
+def test_an_account_is_not_called_gone_in_a_run_where_the_api_answered_for_nobody_else(capsys):
+    """A run counts only when the API answered for more artists than it called gone."""
+    world = solo(4)
+    assert run(world) == 0
+    world.profiles[ALPHA] = refusal(404, error_code=2)
+    for _ in range(3):
+        counts = counts_of(world, capsys)
+        assert counts[collect.UNAVAILABLE] == 1 and counts[collect.GONE] == 0 and kept(ALPHA) == [4, 3, 2, 1]
+    assert [row["unavailable"] for row in rows("skipped")] == [0]
+    world.artist(BRAVO)  # one it answers for, and one it calls gone: still not more
+    for _ in range(3):
+        counts = counts_of(world, capsys)
+        assert counts[collect.UNAVAILABLE] == 1 and counts[collect.GONE] == 0 and kept(ALPHA) == [4, 3, 2, 1]
+    assert [row["unavailable"] for row in rows("skipped")] == [0]
+
+
+def test_an_answer_that_says_nothing_between_two_that_say_gone_counts_neither_way(capsys):
+    world = trio()
+    assert run(world) == 0
+    world.profiles[ALPHA] = refusal(404, error_code=2)
+    assert counts_of(world, capsys)[collect.GONE] == 0
+    world.profiles[ALPHA] = 403
+    assert run(world) == 0
+    captured = capsys.readouterr()
+    assert captured.err == "skipped an artist: profile lookup answered HTTP 403\n"
+    assert summary(captured.out)[collect.GONE] == 0 and kept(ALPHA) == [4, 3, 2, 1]
+    world.profiles[ALPHA] = refusal(404, error_code=2)
+    assert counts_of(world, capsys)[collect.GONE] == 1 and rows("works", ALPHA) == []
+
+
+def test_a_profile_that_answers_200_is_a_profile_whatever_else_it_says(capsys):
+    world = solo(2, error_code=2)
+    assert counts_of(world, capsys)[collect.PROFILES] == 1 and kept(ALPHA) == [2, 1]
+
+
+def test_an_artist_whose_gallery_the_api_refuses_is_passed_over_and_keeps_what_they_had(capsys):
+    """Whatever the refusal says: one of the profile endpoint's codes means nothing on another endpoint."""
+    world = trio()
+    assert run(world) == 0
+    world.detours.append(
+        lambda request: (
+            refusal(404, error_code=2)
+            if request.url.path == GALLERY_PATH and request.url.params["username"] == ALPHA
+            else None
+        )
+    )
+    for _ in range(3):
+        assert run(world) == 0
+        captured = capsys.readouterr()
+        assert captured.err == "skipped an artist: gallery lookup answered HTTP 404\n"
+        counts = summary(captured.out)
+        assert counts[collect.API_FAILED] == 1 and counts[collect.GONE] == counts[collect.UNAVAILABLE] == 0
+        assert kept(ALPHA) == [4, 3, 2, 1] and key(ALPHA) in library.last_attempts()
 
 
 def test_a_removed_artist_who_was_only_ever_passed_over_is_forgotten_too(capsys):
@@ -1710,15 +1800,16 @@ def test_a_removed_artist_who_was_only_ever_passed_over_is_forgotten_too(capsys)
     assert key(CHARLIE) not in library.last_attempts() and b"zz-fake-charlie" not in config.LOCAL_DB.read_bytes()
 
 
-def test_a_profile_that_was_unavailable_once_and_came_back_is_not_a_dead_one(capsys):
-    world = base()
+def test_an_account_the_api_called_gone_once_and_then_answered_for_is_not_purged(capsys):
+    world = trio()
     assert run(world) == 0
-    there, world.profiles[ALPHA] = world.profiles[ALPHA], 404
-    assert counts_of(world, capsys)[collect.DEAD] == 0
+    there, world.profiles[ALPHA] = world.profiles[ALPHA], refusal(404, error_code=2)
+    assert counts_of(world, capsys)[collect.UNAVAILABLE] == 1
     world.profiles[ALPHA] = there
-    assert counts_of(world, capsys)[collect.PROFILES] == 3
-    world.profiles[ALPHA] = 404
-    assert counts_of(world, capsys)[collect.DEAD] == 0 and kept(ALPHA) == ALPHA_KEPT  # the count started again
+    assert counts_of(world, capsys)[collect.PROFILES] == 3 and rows("skipped") == []
+    world.profiles[ALPHA] = refusal(404, error_code=2)
+    counts = counts_of(world, capsys)
+    assert counts[collect.GONE] == 0 and kept(ALPHA) == [4, 3, 2, 1]  # the count started again
 
 
 def test_a_row_with_a_key_nobody_can_read_is_counted_and_keeps_nobody_from_being_purged(capsys):
@@ -1727,44 +1818,34 @@ def test_a_row_with_a_key_nobody_can_read_is_counted_and_keeps_nobody_from_being
     assert run(world) == 0
     raw("UPDATE works SET artist_key = '!! FAKE: not a key !!' WHERE deviation_id = ?", uuid(21))  # sorts first
     raw("INSERT INTO skipped VALUES ('!! FAKE: nor is this !!', '2026-10-12T00:00:00+00:00', 0)")
+    raw(
+        "INSERT INTO works (deviation_id, artist_key, page_url, tags, thumb_url, fetched_at) "
+        "VALUES (?, '!! FAKE: a third !!', 'FAKE', '[]', 'FAKE', 'FAKE')",
+        uuid(99),
+    )
     store.mark_removed(ALPHA)
     counts = counts_of(world, capsys)
-    # Two such rows at the start of the run and one at its end, once BRAVO's work is stored afresh: counted as two.
-    assert counts[collect.BAD_KEY] == 2 and counts[collect.PURGED] == 1 and counts[collect.PROCESSED] == 4
+    # Three such rows at the start of the run and one at its end: BRAVO's work is stored afresh, and the note about
+    # a handle nobody asks about is swept up. The same rows at both ends are counted once: three, not four.
+    assert counts[collect.BAD_KEY] == 3 and counts[collect.PURGED] == 1 and counts[collect.PROCESSED] == 4
     assert rows("profiles", ALPHA) == rows("works", ALPHA) == [] and cached() == image_files(BRAVO_KEPT)
-
-
-@pytest.mark.parametrize("code", [0, 1, 2])
-def test_an_account_the_api_says_is_suspended_inactive_or_gone_is_purged(code, capsys, tmp_path):
-    """The profile endpoint's three documented error codes. Each says the account is no longer public."""
-    world = base()
-    assert run(world) == 0
-    world.profiles[ALPHA] = refusal(error_code=code)
-    counts = counts_of(world, capsys)
-    assert counts[collect.GONE] == 1 and counts[collect.UNAVAILABLE] == 1 and counts[collect.PROCESSED] == 5
-    assert rows("profiles", ALPHA) == rows("works", ALPHA) == [] and cached() == image_files(BRAVO_KEPT)
-
-
-def test_an_account_the_api_says_is_gone_on_the_second_run_is_purged_once_and_counted_once(capsys):
-    world = base()
-    assert run(world) == 0
-    world.profiles[ALPHA] = 404
-    assert counts_of(world, capsys)[collect.UNAVAILABLE] == 2
-    world.profiles[ALPHA] = refusal(error_code=2)
-    counts = counts_of(world, capsys)
-    assert counts[collect.GONE] == 1 and counts[collect.DEAD] == 0 and counts[collect.UNAVAILABLE] == 1
-    assert rows("profiles", ALPHA) == rows("works", ALPHA) == []
 
 
 @pytest.mark.parametrize(
     "more", [{}, {"error_code": 3}, {"error_code": "2"}, {"error_code": True}, {"error_code": None}]
 )
-def test_any_other_refusal_is_not_taken_for_the_account_being_gone(more, capsys):
-    world = base()
+def test_any_other_refusal_is_the_api_failing_and_never_the_account_being_gone(more, capsys):
+    world = trio()
     assert run(world) == 0
     world.profiles[ALPHA] = refusal(**more)
-    counts = counts_of(world, capsys)
-    assert counts[collect.GONE] == 0 and counts[collect.UNAVAILABLE] == 2 and kept(ALPHA) == ALPHA_KEPT
+    for _ in range(3):
+        assert run(world) == 0
+        captured = capsys.readouterr()
+        assert captured.err == "skipped an artist: profile lookup answered HTTP 400\n"
+        counts = summary(captured.out)
+        assert counts[collect.API_FAILED] == 1 and counts[collect.GONE] == counts[collect.UNAVAILABLE] == 0
+        assert kept(ALPHA) == [4, 3, 2, 1]
+    assert [row["unavailable"] for row in rows("skipped")] == [0]
 
 
 def test_one_file_that_cannot_be_deleted_does_not_keep_another_removed_artist_on_disk(monkeypatch, capsys, tmp_path):
@@ -1908,21 +1989,82 @@ def test_repeated_429s_stop_the_run_cleanly_with_what_was_finished_kept(capsys):
     assert world.waits[-5:] == [2.0, 4.0, 8.0, 16.0, 32.0]
 
 
-def test_a_429_from_the_image_host_stops_the_run_cleanly(capsys):
+def limited(*numbers):
+    """A detour: the image host answers 429 for these works' previews, or for every image when none is named."""
+
+    def detour(request):
+        if request.url.host == CDN_HOST and (not numbers or request.url.path in map(preview_path, numbers)):
+            return httpx.Response(429, text="FAKE-SLOW-DOWN")
+
+    return detour
+
+
+def test_an_image_the_host_refuses_for_the_rate_limit_is_asked_for_again_and_then_that_work_alone_is_left_out(capsys):
+    """The critic's finding: one work's image always answered 429, and four runs in a row stopped at the same first
+    artist with nobody behind them asked, the images before it downloaded again each time. Now it is asked for
+    again after 2, 4 and 8 seconds, then that work is left out, and everybody gets their turn."""
+    world = trio()
+    world.detours.append(limited(3))
+    for nth in range(4):
+        seen = len(world.log)
+        counts = counts_of(world, capsys)
+        asked = [request.url.path for request in world.since(seen, "images")]
+        others = [preview_path(n) for n in (4, 2, 1, 21, 41)] if nth == 0 else []  # downloaded once, and never again
+        assert sorted(asked) == sorted([preview_path(3)] * (1 + collect.SERVER_RETRIES) + others)
+        times = [at for at, request in world.log[seen:] if request.url.path == preview_path(3)]
+        assert [later - earlier for earlier, later in itertools.pairwise(times)] == [2.0, 4.0, 8.0]
+        assert counts[collect.IMAGE_LIMITED] == 1 and counts[collect.PROFILES] == 3 and counts[collect.ORPHANS] == 0
+        assert kept(ALPHA) == [4, 2, 1] and kept(BRAVO) == [21] and cached() == image_files([1, 2, 4, 21, 41])
+    world.detours.clear()
+    assert counts_of(world, capsys)[collect.DOWNLOADED] == 1 and kept(ALPHA) == [4, 3, 2, 1]
+
+
+def test_an_image_host_that_keeps_refusing_stops_the_run_with_the_artist_noted_as_passed_over(capsys):
+    """Three works in a row refused, retries and all: by then it is us the host is refusing, not these images.
+    The run stops, and the artist is noted first, so that the next run begins with somebody else."""
     world = base()
-    world.detours.append(
-        lambda request: httpx.Response(429, text="FAKE-SLOW-DOWN") if request.url.path == preview_path(10) else None
-    )
+    world.detours.append(limited())
     assert run(world) == 1
     captured = capsys.readouterr()
     assert captured.err == "stopped: rate limited by the image host\n"
     counts = summary(captured.out)
-    assert counts[collect.DOWNLOADED] == 2 and counts[collect.ORPHANS] == 2  # works 12 and 11: no row came for them
-    assert len(world.requests("images")) == 3 and world.asked_about(BRAVO) == []
-    assert library.artist_keys() == [] and cached() == []  # nothing half-stored is left lying about
+    assert counts[collect.IMAGE_LIMITED] == collect.MAX_REFUSALS == 3 and counts[collect.PROCESSED] == 1
+    assert len(world.requests("images")) == 3 * (1 + collect.SERVER_RETRIES) and world.asked_about(BRAVO) == []
+    assert list(library.last_attempts()) == [key(ALPHA)] and library.artist_keys() == [] and cached() == []
     world.detours.clear()
-    assert run(world) == 0  # and the next run does the whole job
-    assert kept(ALPHA) == ALPHA_KEPT and cached() == image_files(ALPHA_KEPT + BRAVO_KEPT)
+    seen = len(world.log)
+    assert run(world, max_artists=1) == 0
+    lookups = [request.url.path for request in world.since(seen, "api") if request.url.path.startswith(PROFILE_PATH)]
+    assert lookups == [PROFILE_PATH + BRAVO]  # not ALPHA again
+    assert run(world) == 0 and kept(ALPHA) == ALPHA_KEPT and cached() == image_files(ALPHA_KEPT + BRAVO_KEPT)
+
+
+def test_refusals_with_any_other_answer_between_them_do_not_stop_the_run(capsys):
+    """Refused, refused, served; refused, refused, not found; refused: five refusals, and never three running."""
+    world = base()
+    world.detours.append(limited(12, 11, 9, 8, 6))
+    del world.images[preview_path(7)]
+    counts = counts_of(world, capsys)
+    assert counts[collect.IMAGE_LIMITED] == 5 and counts[collect.IMAGE_FAILED] == 1 and counts[collect.PROFILES] == 3
+    assert kept(ALPHA) == [10, 5, 4, 3, 2, 1] and kept(BRAVO) == BRAVO_KEPT
+
+
+def test_an_image_served_from_the_apis_own_host_waits_the_apis_interval():
+    """It is one more request to that host, and requests to that host are a second apart."""
+    world = solo(3)
+    for entry in world.galleries[ALPHA]:
+        entry["preview"]["src"] = entry["preview"]["src"].replace(CDN, f"https://{API_HOST}")
+
+    def served_by_the_api_host(request):
+        if request.url.path in world.images:
+            return httpx.Response(200, headers={"content-type": "image/jpeg"}, content=world.images[request.url.path])
+
+    world.detours.append(served_by_the_api_host)
+    assert run(world) == 0
+    images = [request for request in world.requests("api") if request.url.path in world.images]
+    assert kept(ALPHA) == [3, 2, 1] and len(images) == 3 and world.requests("images") == []
+    assert min(world.gaps("api")) >= discover.MIN_INTERVAL == 1.0
+    assert not any("authorization" in request.headers for request in images)  # and the token does not go with it
 
 
 def test_an_expired_token_is_renewed_once_and_the_request_repeated():
@@ -2047,8 +2189,10 @@ FAILURES = {  # what the API answers for BRAVO: (endpoint, status, requests made
     "a gallery that answers 500": (GALLERY_PATH, 500, 4, "gallery lookup answered HTTP 500"),
     "a gallery that answers 503": (GALLERY_PATH, 503, 4, "gallery lookup answered HTTP 503"),
     "metadata that answers 500": (METADATA_PATH, 500, 4, "metadata lookup answered HTTP 500"),
-    "metadata that answers 400": (METADATA_PATH, 400, 1, "metadata lookup was refused"),
-    "metadata that answers 404": (METADATA_PATH, 404, 1, "metadata lookup was refused"),
+    "metadata that answers 400": (METADATA_PATH, 400, 1, "metadata lookup answered HTTP 400"),
+    "metadata that answers 404": (METADATA_PATH, 404, 1, "metadata lookup answered HTTP 404"),
+    "a profile that answers 403": (PROFILE_PATH, 403, 1, "profile lookup answered HTTP 403"),
+    "a gallery that answers 404": (GALLERY_PATH, 404, 1, "gallery lookup answered HTTP 404"),
 }
 
 
@@ -2145,23 +2289,139 @@ def test_an_artist_passed_over_waits_at_the_back_of_the_next_run_not_at_the_fron
     assert turns(1) == [BRAVO]
 
 
-@pytest.mark.parametrize("status", [400, 403, 404, 410])
-def test_an_artist_whose_profile_or_gallery_is_unavailable_is_passed_over(status, capsys):
-    """A 4XX that does not carry one of the three documented codes says nothing about the account: it may be an
-    outage or a refusal. The artist is passed over and what was collected about them earlier is left alone."""
+OUTAGES = {  # what every profile lookup answers while the API is down, or is refusing us
+    "403 with a page of HTML": lambda: httpx.Response(403, text="<html>FAKE-BLOCKED</html>"),
+    "403 with an error and no code": lambda: refusal(403),
+    "404 with a code that is not one of the three": lambda: refusal(404, error_code=3),
+    "400 with the code as a string": lambda: refusal(400, error_code="2"),
+    "410 with nothing": lambda: httpx.Response(410),
+}
+
+
+@pytest.mark.parametrize("outage", OUTAGES)
+def test_an_outage_that_refuses_every_profile_stops_the_run_and_purges_nobody(outage, capsys, tmp_path):
+    """The critic's finding, and a dangerous one: with the token still issued and every profile lookup answering
+    403, the first run processed everybody and exited 0 in silence, and the second purged the whole library as
+    "dead". An answer that is not one of the API's three documented codes says nothing about an account: it is
+    the API failing, a few of those in a row stop the run, and nobody is ever purged for it."""
     world = base()
     assert run(world) == 0
-    world.profiles[ALPHA] = httpx.Response(status, text="<html>FAKE</html>")
+    before = (rows("profiles"), rows("works"), files(tmp_path), store.all_artists())
+    capsys.readouterr()
+    world.detours.append(lambda request: OUTAGES[outage]() if request.url.path.startswith(PROFILE_PATH) else None)
+    for _ in range(3):
+        assert run(world) == 1
+        captured = capsys.readouterr()
+        assert re.fullmatch(
+            r"(skipped an artist: profile lookup answered HTTP 4\d\d\n){5}"
+            r"stopped: 5 artists in a row failed: the API seems to be down\n",
+            captured.err,
+        ), captured.err
+        counts = summary(captured.out)
+        assert counts[collect.API_FAILED] == counts[collect.PROCESSED] == 5
+        assert counts[collect.GONE] == counts[collect.PURGED] == counts[collect.UNAVAILABLE] == 0
+        assert (rows("profiles"), rows("works"), files(tmp_path), store.all_artists()) == before
+    # CHARLIE's, from the run that went well. The outage moved nobody's count.
+    assert {row["artist_key"]: row["unavailable"] for row in rows("skipped")} == {
+        key(name): int(name == CHARLIE) for name in (ALPHA, BRAVO, CHARLIE, DELTA, FOXTROT)
+    }
+    world.detours.clear()
+    assert run(world) == 0 and kept(ALPHA) == ALPHA_KEPT and kept(BRAVO) == BRAVO_KEPT
+
+
+def test_an_outage_that_calls_every_account_gone_purges_nobody_either(capsys, tmp_path):
+    """Further than the finding: even the documented "no such user" is not believed when the API says it of
+    everybody. It counts only in a run where the API answered for more artists than it called gone."""
+    world = base()
+    assert run(world) == 0
+    before = (rows("profiles"), rows("works"), files(tmp_path), store.all_artists())
     world.detours.append(
-        lambda request: (
-            httpx.Response(status, json={"error": "FAKE", "error_code": 2})
-            if request.url.path == GALLERY_PATH and request.url.params["username"] == BRAVO
-            else None
-        )
+        lambda request: refusal(404, error_code=2) if request.url.path.startswith(PROFILE_PATH) else None
     )
+    for _ in range(3):
+        counts = counts_of(world, capsys)
+        assert counts[collect.UNAVAILABLE] == 5 and counts[collect.GONE] == 0
+        assert (rows("profiles"), rows("works"), files(tmp_path), store.all_artists()) == before
+    assert sum(row["unavailable"] for row in rows("skipped")) == 1  # CHARLIE's, from the run that went well
+
+
+def test_a_few_artists_all_of_whom_the_api_fails_for_is_not_a_run_that_went_well(capsys):
+    """Fewer than MAX_FAILURES artists cannot make a row of that many, and the run must not exit 0 for that."""
+    world, names = many(3)
+    world.detours.append(lambda request: refusal(403) if request.url.path.startswith(PROFILE_PATH) else None)
+    assert run(world) == 1
+    captured = capsys.readouterr()
+    assert captured.err == (
+        "skipped an artist: profile lookup answered HTTP 403\n" * 3
+        + "incomplete: the API failed for every artist that was tried.\n"
+    )
+    assert summary(captured.out)[collect.API_FAILED] == 3 and list(library.last_attempts()) == list(map(key, names))
+
+
+EMPTY_ANSWERS = {  # an API that answers every lookup with a 200, and with nothing in it
+    "an empty gallery": (GALLERY_PATH, {"has_more": False, "next_offset": None, "results": []}),
+    "a gallery with no results at all": (GALLERY_PATH, {}),
+    "no metadata": (METADATA_PATH, {"metadata": []}),
+}
+
+
+@pytest.mark.parametrize("answer", EMPTY_ANSWERS)
+def test_an_outage_that_answers_with_empty_lists_drops_nobodys_works(answer, capsys, tmp_path):
+    """Further than the finding again. An artist's works are replaced whole, so a 200 with nothing in it would
+    have emptied the library in a single run. A turn that would leave an artist with none of the works kept for
+    them is not acted on at once: it counts like an account called gone, and only in a run that went well."""
+    path, body = EMPTY_ANSWERS[answer]
+    world = base()
+    assert run(world) == 0
+    before = (rows("works"), files(tmp_path), store.all_artists())
+    world.detours.append(lambda request: httpx.Response(200, json=body) if request.url.path == path else None)
+    for _ in range(3):
+        counts = counts_of(world, capsys)
+        assert counts[collect.EMPTIED] == 2 and counts[collect.GONE] == counts[collect.WORKS] == 0
+        assert (rows("works"), files(tmp_path), store.all_artists()) == before
+    assert {row["artist_key"]: row["unavailable"] for row in rows("skipped")} == {
+        key(ALPHA): 0,  # noted as passed over, so that they wait at the back of the next run
+        key(BRAVO): 0,
+        key(CHARLIE): 1,  # from the run that went well
+    }
+    world.detours.clear()
+    assert run(world) == 0 and kept(ALPHA) == ALPHA_KEPT and kept(BRAVO) == BRAVO_KEPT
+    assert without_time(rows("works")) == without_time(before[0])  # stored afresh, and the same works
+
+
+def test_an_artist_who_took_every_work_down_is_purged_on_the_second_run_that_shows_it(capsys, tmp_path):
+    world = trio()
+    assert run(world) == 0
+    world.galleries[ALPHA] = []
+    once = counts_of(world, capsys)
+    assert once[collect.EMPTIED] == 1 and once[collect.GONE] == 0 and kept(ALPHA) == [4, 3, 2, 1]  # once is not gone
+    twice = counts_of(world, capsys)
+    assert twice[collect.EMPTIED] == 1 and twice[collect.GONE] == 1
+    assert rows("profiles", ALPHA) == rows("works", ALPHA) == rows("skipped") == []
+    assert files(tmp_path) == [*(f"cache/images/{name}" for name in image_files([21, 41])), "cache/pipeline.sqlite"]
+    assert [artist[0] for artist in store.all_artists()] == [key(BRAVO), key(DELTA)] and not store.is_removed(ALPHA)
+
+
+def test_an_artist_whose_works_were_missing_once_and_came_back_keeps_them(capsys):
+    world = trio()
+    assert run(world) == 0
+    there, world.galleries[ALPHA] = world.galleries[ALPHA], []
+    assert counts_of(world, capsys)[collect.EMPTIED] == 1
+    world.galleries[ALPHA] = there
     counts = counts_of(world, capsys)
-    assert counts[collect.UNAVAILABLE] == 3 and counts[collect.PROCESSED] == 5 and counts[collect.GONE] == 0
-    assert kept(ALPHA) == ALPHA_KEPT and kept(BRAVO) == BRAVO_KEPT and cached() == image_files(ALPHA_KEPT + BRAVO_KEPT)
+    assert counts[collect.CACHED] == 6 and counts[collect.DOWNLOADED] == 0 and rows("skipped") == []
+    world.galleries[ALPHA] = []
+    counts = counts_of(world, capsys)
+    assert counts[collect.GONE] == 0 and kept(ALPHA) == [4, 3, 2, 1]  # the count started again
+
+
+def test_an_artist_with_no_works_kept_is_stored_as_before_when_none_qualify(capsys):
+    """Nothing is at stake for them: the profile is stored, with no works."""
+    world = solo(0)
+    for _ in range(2):
+        counts = counts_of(world, capsys)
+        assert counts[collect.PROFILES] == 1 and counts[collect.EMPTIED] == 0 and rows("works") == []
+    assert len(rows("profiles")) == 1 and not library.has_works(key(ALPHA))
 
 
 MALFORMED_BODIES = {
@@ -2376,7 +2636,7 @@ def test_stdout_is_counts_and_nothing_else(capsys):
     world = base()
     assert run(world) == 0
     out = capsys.readouterr().out
-    assert summary(out) and len(out.splitlines()) == len(collect._COUNTS) == 29
+    assert summary(out) and len(out.splitlines()) == len(collect._COUNTS) == 30
     assert not re.search(r"FAKE|zz-fake|https?:|deviantart|wixmp|[0-9A-F]{8}-", out, re.IGNORECASE)
     for word in ("artists processed", "profiles stored", "works stored", "images downloaded", "skipped"):
         assert word in out
