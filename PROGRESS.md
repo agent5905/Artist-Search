@@ -1,6 +1,6 @@
 # Artist Search: Progress
 
-**Status, 2026-10-13:** The first two blind A/B tests on real artwork are done, both for style similarity. A style-specific model beat a general one 7 to 4, and a two-way scoring rule then beat the original rule 8 to 3. 1,470 works from 148 artists are collected and have style vectors. Collect failed its first critic (AI-tagged art got through) and is in round 2; tagging is being built.
+**Status, 2026-10-13 (later):** The first full collection finished cleanly: 442 artists, 4,381 works, each with a locally cached image. Three blind A/B tests on real artwork are done (two on style, one on tagging). The seed-artist eval set is frozen. Tagging and collect are in their next rounds; the database's critic is queued.
 
 ## Waiting on the owner
 
@@ -49,7 +49,7 @@ The reference for pieces 5 and 6 changed under path B. See owner decision 3.
 ### The eval set (`eval/`, frozen before the first judged round)
 
 - **`eval/queries.jsonl`, 36 queries. Frozen 2026-10-11, SHA-256 `e1a7f9b59a66c62b88166aa2d8fe55bd5c3abf3703de78acfd78e165e3ff13ee`.** 12 plain briefs in the spec's style (style + subject + availability), 12 written the way game studios phrase art roles (for example "stylized hand-painted prop concepts"), 12 hard cases (a medium filter, a negation, a misspelling, a rare style). Written before any search code exists, so they cannot be tuned to it.
-- **`eval/seeds.jsonl`, 30 seed artists.** Drawn at random with a fixed seed from the first 200 collected artists, not hand-picked.
+- **`eval/seeds.jsonl`, 30 seed artists. Frozen 2026-10-13, SHA-256 `a0943b593a284174d262105af5da111acd2fd78008642152c68b0567fbc953e3`.** Drawn at random with a fixed seed (20261013) from the 437 collected artists with at least 6 works, not hand-picked. Stored as hashes of the artist key, so no name sits in the repo's history and a removed artist leaves nothing behind there.
 - **Claim sample.** 50 artists per round, drawn at random with a recorded seed, for the tag and profile checks.
 - **Reference results** are captured once per query and seed and frozen with the set.
 - The SHA-256 of each eval file is recorded here when it is frozen. A changed hash without an owner note is a failed round.
@@ -305,3 +305,44 @@ The strict own-site rule costs about 2%. Most artists simply have no site of the
 **Discovery.** A clean third run stored 378 candidates; the store holds 472 artists across runs. 15% list their own bare domain, 39% no website, 45% a platform, 2% another domain that is not a bare front page.
 
 **Pipeline counts:** artists discovered 472, artists collected 148, works 1,470, images cached 1,470, style vectors 1,470 per model. **Database:** 12.6 MB of 400 MB, artists 0, works 0.
+
+### Round 6: first full collection; blind tagging test; collect's second critic (2026-10-13)
+
+**First full collection (collect round 2 code), exit 0 after about 2 hours 50 minutes.**
+
+| Count | Value |
+|---|---|
+| Artists processed | 472 |
+| Artists stored with a profile and works | 442 |
+| Works stored, each with a cached image | 4,381 |
+| Artists skipped as mostly AI-tagged | 30 |
+| Works skipped as AI-tagged | 741 |
+| Works skipped as mature or unrated | 174 |
+| Works skipped as not a public image | 118 |
+| Malformed entries | 6 |
+| Download failures, refused rows, unexpected errors | 0 |
+
+- About 1 artist in 16 is skipped as mostly AI-tagged, and 14% of otherwise eligible works carry an AI tag. For 2,500 indexed artists, plan on roughly 2,700 candidates before the stricter AI check in the analysis stage removes more.
+- The run that stopped earlier was not a duplicate work, as the lead had guessed. The builder traced it: its own unfinished change to the profiles table reached the live database through another stage's process while the old collector was writing. Fixed: opening the store never changes a table, and inserts name their columns. Lesson recorded for the lead: no schema change to the shared local store while a run is in progress.
+
+**Piece 2 and 3, tags and descriptions: first blind test.** 30 random works; for each, the image and both local vision models' results, labeled A and B in an order shuffled per work. Bar: any unsupported claim is a loss.
+
+| | qwen3.8 | gemma4:26b |
+|---|---|---|
+| Works won | **17** | 11, with 2 ties |
+| Works with at least one unsupported claim | 15 of 30 | 15 of 30 |
+| Unsupported claims in total | 21 | 17 |
+| Important things left out | 7 | 34 |
+| Seconds per image | 2.28 | 1.63 |
+
+- **Verdict: both fail the bar.** Half the works carry an unsupported claim under each model. qwen3.8 says far more and gets slightly more wrong; gemma leaves out most of what matters. qwen3.8 is the base from here.
+- **Biggest gap:** genres the image gives no sign of ("anime style" on western-style dragon heads; "fantasy" on a plain forest landscape and an age-of-sail ship). Then guessed details in descriptions (a sword that is not there), subjects over-tagged ("prop or weapon" for something a character holds), and illustrated cards with a game-style overlay flagged "not artwork".
+- **Round 2, a different approach rather than a reworded prompt:** a verification pass. Each proposed genre and subject is asked about directly and kept only if confirmed, in two variants: the model checking itself, and the more cautious second model checking it.
+
+**Piece 1c, collect: second critic, fail, 5 of 10 (was 4 of 9).**
+- **Passed:** no duplicates; counts-only output; documented requests; opening the store never changes a table; all 66 rule breaks the critic tried on the built code were caught by tests.
+- **The gap that came back a third time: AI-tagged art.** Round 1 knew 11 tag prefixes. Round 2 was wider and still missed "synthography" (11 stored works, one artist's whole set) and read any tag containing "free" as a protest. A list of spellings cannot be closed, so the decision moves to the analysis stage, where a local language model reads each work's own tags and title and answers one question: do these declare the work AI-made?
+- **The failure that matters most at scale:** one artist whose profile returns a server error stopped the whole run, and every later run at the same artist. Round 3 retries, then skips that artist and moves them to the back.
+- **Narrow, found with made-up data, real cache clean:** a dropped title surviving inside the page address; messaging links kept as a website (now an allow-list of portfolio hosts instead of a deny-list); an artist removed and then renamed being collected again (the removal list now remembers the account's hashed user id).
+
+**Pipeline counts:** artists discovered 472, artists collected 442, works 4,381, images cached 4,381, tagged 500 per model, style vectors being computed for all. **Database:** 12.6 MB of 400 MB, artists 0, works 0.
