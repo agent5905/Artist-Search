@@ -60,11 +60,13 @@ def data_api(method: str, path: str, key: Key, **kwargs: Any) -> httpx.Response:
 def upsert(table: str, rows: list[dict[str, Any]], on_conflict: str, returning: str = "*") -> list[dict[str, Any]]:
     """Insert rows with the service key, updating the ones that already exist on the on_conflict columns.
 
-    Every row needs the same keys. Returns the rows written, limited to the `returning` columns
-    (pass "id,slug" to avoid downloading embeddings). The database leaves two kinds of row out,
-    and so they are missing from the result: an artist who was removed (or who links to a removed
-    site or profile), and a work that already holds exactly these values, which is not rewritten.
-    After loading works, call refresh_style_centroids() and then vacuum_analyze().
+    Every row needs the same keys. Artists conflict on "slug", works on "artist_id,key" (the key is
+    the deviation page for a DeviantArt work and the image for a work on the artist's own site).
+    Returns the rows written, limited to the `returning` columns (pass "slug" to avoid
+    downloading embeddings). The database leaves two kinds of row out, and so they are missing from
+    the result: an artist who was removed (or who links to a removed site or profile), and a row
+    that already holds exactly these values, which is not rewritten. So read the ids to attach works
+    with from rpc("artist_ids", {}, "secret"), not from here. Call after_load() when done.
     """
     if not rows:
         return []
@@ -105,18 +107,21 @@ def migrate() -> None:
     raise RuntimeError("the Data API did not pick up the schema within 30 seconds")
 
 
-def refresh_style_centroids() -> int:
-    """Rebuild what similar_artists reads (artist_styles) from the works. Returns how many artists changed.
+def after_load() -> None:
+    """Run after every load: rebuild what the public functions read, then vacuum.
 
-    similar_artists cannot see an artist until this has run. It goes through the Management API,
-    which has no 8 s limit: a first fill for 3,000 artists writes about 46 MB and takes 8 to 13 s.
+    Until it has run, similar_artists cannot see a new artist, and a misspelled search word is only
+    put right to words that were already known. The rebuilds go through the Management API, which
+    has no 8 s limit: a first fill of the style table for 3,000 artists writes about 46 MB.
     """
-    return sql("select public.refresh_style_centroids() as changed")[0]["changed"]
+    sql("select public.refresh_style_centroids()")
+    sql("select public.refresh_search_words()")
+    vacuum_analyze()
 
 
 def vacuum_analyze() -> None:
-    """Clear dead row versions and refresh the planner's statistics. Run it after a load."""
-    for table in ("artists", "works", "artist_styles"):
+    """Clear dead row versions and refresh the planner's statistics."""
+    for table in ("artists", "works", "artist_styles", "search_words"):
         sql(f"vacuum (analyze) public.{table}")  # one call each: vacuum cannot share a transaction
 
 
