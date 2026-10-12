@@ -1,6 +1,7 @@
 """Blind A/B contact sheets for the style critic.
 
     uv run python eval/style_sheets.py --a csd --b siglip2 --seeds 12 --name round1
+    uv run python eval/style_sheets.py --a csd:best --b csd:mutual --seeds 12 --name round2
 
 For each randomly drawn seed artist it writes three images under cache/review/<name>/ (git-ignored, local only):
 seed_NN.jpg (the seed's works), seed_NN_A.jpg and seed_NN_B.jpg (the artists each model ranks nearest, one row
@@ -76,7 +77,8 @@ def main() -> int:
         models = [args.a, args.b]
         rng.shuffle(models)
         for label, model in zip("AB", models, strict=True):
-            nearest = [key for key, _ in style.neighbors(artist, model, top=NEIGHBORS)]
+            name, _, rule = model.partition(":")  # "csd" or "csd:mutual"
+            nearest = [key for key, _ in style.neighbors(artist, name, top=NEIGHBORS, rule=rule or "best")]
             sheet([works(conn, key, PER_ARTIST) for key in nearest], out / f"seed_{n:02d}_{label}.jpg")
         answer.append({"n": n, "artist": artist, "A": models[0], "B": models[1]})
     (keys / f"{args.name}.json").write_text(json.dumps({"seeds": answer}, indent=1), encoding="utf-8")

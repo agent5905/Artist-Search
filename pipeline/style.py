@@ -10,7 +10,7 @@ Every other command loads weights from local files only, with the hub's offline 
 
     uv run python -m pipeline.style --download --model csd        once per model
     uv run python -m pipeline.style --model csd --max-works 500
-    uv run python -m pipeline.style --neighbors da:somebody --model csd --top 10
+    uv run python -m pipeline.style --neighbors da:somebody --model csd --top 10 --rule mutual
 
 Stdout is counts and throughput only, except `--neighbors`: one JSON object per line.
 """
@@ -34,6 +34,7 @@ from pipeline import library
 DIMENSIONS = 768  # sql/001_schema.sql: works.style_embedding is halfvec(768)
 BATCH = 16
 WRITE_EVERY = 256  # works a transaction. The file is shared, and a commit can take seconds when the disk is busy
+RULES = ("best", "mutual")  # how neighbors() scores a candidate
 
 # model -> (repository on huggingface.co, pinned commit, the files needed). Nothing else is ever fetched.
 WEIGHTS = {
@@ -227,14 +228,22 @@ def artist_vectors(artist_key: str, model: str, db: pathlib.Path | str | None = 
 
 
 def neighbors(
-    artist_key: str, model: str, top: int = 10, db: pathlib.Path | str | None = None
+    artist_key: str, model: str, top: int = 10, rule: str = "best", db: pathlib.Path | str | None = None
 ) -> list[tuple[str, float]]:
     """The artists most like this one, best first, as (artist key, score).
 
-    The score is the one similar_artists gives in sql/002_functions.sql: the mean, over the seed's works, of
-    the best cosine match among the candidate's works. Ties go to the lower key. Never the seed, and never an
-    artist without vectors. Empty when the seed has no vectors.
+    rule "best" is the score similar_artists gives in sql/002_functions.sql: the mean, over the seed's works,
+    of the best cosine match among the candidate's works. One work of a candidate can be the best match for
+    all of them, so it favors an artist with a bit of everything.
+    rule "mutual" is the average of that and the same the other way round: the mean, over the candidate's
+    works, of the best match among the seed's. A candidate's works that match nothing of the seed's count
+    against them.
+
+    Ties go to the lower key. Never the seed, and never an artist without vectors. Empty when the seed has no
+    vectors. ValueError for any other rule.
     """
+    if rule not in RULES:
+        raise ValueError(f"rule must be one of {RULES}")
     # ponytail: reads every vector on each call (46 MB at 30,000 works) and scores every artist. The database
     # scores only the 100 nearest by centroid and reads 10 works an artist, which is all collect keeps
     # (collect.MAX_WORKS). Past a few hundred artists the two can differ at the tail of a long list.
@@ -245,7 +254,13 @@ def neighbors(
     seed = stacks.pop(artist_key, None)
     if seed is None:
         return []
-    scores = [(key, float((seed @ theirs.T).max(axis=1).mean())) for key, theirs in stacks.items()]
+    scores = []
+    for key, theirs in stacks.items():
+        cosines = seed @ theirs.T  # one row a work of the seed's, one column a work of the candidate's
+        score = cosines.max(axis=1).mean()
+        if rule == "mutual":
+            score = (score + cosines.max(axis=0).mean()) / 2
+        scores.append((key, float(score)))
     return sorted(scores, key=lambda pair: (-pair[1], pair[0]))[:top]
 
 
@@ -255,12 +270,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--max-works", type=int, default=500, help="embed at most this many works in this run")
     parser.add_argument("--neighbors", metavar="ARTIST_KEY", help="print the artists nearest to this one")
     parser.add_argument("--top", type=int, default=10, help="how many neighbors to print")
+    parser.add_argument("--rule", choices=RULES, default="best", help="how --neighbors scores (see neighbors)")
     parser.add_argument("--download", action="store_true", help="fetch the model's weights from huggingface.co")
     args = parser.parse_args(argv)
     if args.download:
         download(args.model)
     elif args.neighbors:
-        nearest = neighbors(args.neighbors, args.model, args.top)
+        nearest = neighbors(args.neighbors, args.model, args.top, args.rule)
         for key, score in nearest:
             print(json.dumps({"artist": key, "score": round(score, 4)}))
         if not nearest:

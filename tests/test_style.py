@@ -277,6 +277,58 @@ def test_neighbors_is_the_mean_over_the_seeds_works_of_the_best_match_among_the_
     assert capsys.readouterr().out == ""
 
 
+def test_the_mutual_rule_puts_a_consistent_artist_above_one_with_a_bit_of_everything(model, capsys):
+    model.table = {
+        1: [1, 0, 0],  # ALPHA, the seed
+        2: [0, 1, 0],  # ALPHA
+        3: [1, 0, 0],  # BRAVO, a mixed portfolio: ALPHA's first work exactly,
+        4: [0, 1, 0],  # ALPHA's second exactly,
+        5: [0, 0, 1],  # and two works like nothing of ALPHA's
+        6: [0, 0, 0, 1],
+        7: [4, 3, 0],  # CHARLIE, consistent: cosine 0.8 and 0.6 with ALPHA's two
+        8: [3, 4, 0],  # CHARLIE: 0.6 and 0.8
+        9: [0, 1, 1],  # DELTA, one work: cosine 0 and 0.7071 with ALPHA's two
+    }
+    for artist, shades in ((ALPHA, (1, 2)), (BRAVO, (3, 4, 5, 6)), (CHARLIE, (7, 8)), (DELTA, (9,))):
+        collect(artist, *shades)
+    style.run("csd", 500)
+    capsys.readouterr()
+
+    def nearest(seed, rule):
+        return [(key, pytest.approx(score, abs=1e-3)) for key, score in style.neighbors(seed, "csd", rule=rule)]
+
+    half = 2**-0.5
+    # "best", from ALPHA: both its works find themselves in BRAVO (1.0); in CHARLIE each finds 0.8;
+    # in DELTA they find 0 and 0.7071.
+    assert nearest(ALPHA, "best") == [(BRAVO, 1.0), (CHARLIE, 0.8), (DELTA, half / 2)]
+    assert style.neighbors(ALPHA, "csd") == style.neighbors(ALPHA, "csd", rule="best")  # and it is the default
+    # "mutual" adds the way back. BRAVO's four works find 1, 1, 0 and 0 in ALPHA: (1.0 + 0.5) / 2 = 0.75.
+    # CHARLIE's two each find 0.8: (0.8 + 0.8) / 2 = 0.8. DELTA's one finds 0.7071: (0.3536 + 0.7071) / 2.
+    assert nearest(ALPHA, "mutual") == [(CHARLIE, 0.8), (BRAVO, 0.75), (DELTA, 3 * half / 4)]
+    # It is the same score from either end, which "best" is not. From BRAVO, "best": its four works find
+    # 1, 1, 0 and 0 in ALPHA (0.5), 0.8, 0.8, 0 and 0 in CHARLIE (0.4), and 0, 0.7071, 0.7071 and 0 in DELTA.
+    assert nearest(BRAVO, "best") == [(ALPHA, 0.5), (CHARLIE, 0.4), (DELTA, half / 2)]
+    assert nearest(BRAVO, "mutual") == [(ALPHA, 0.75), (CHARLIE, 0.6), (DELTA, 3 * half / 4)]
+    # From CHARLIE: its works find 0.8 and 0.8 in BRAVO, and BRAVO's find 0.8, 0.8, 0 and 0 in it: (0.8 + 0.4) / 2.
+    # In DELTA they find 0.4243 and 0.5657, and DELTA's one finds 0.5657 in it: (0.4950 + 0.5657) / 2.
+    assert nearest(CHARLIE, "mutual") == [(ALPHA, 0.8), (BRAVO, 0.6), (DELTA, 3 * half / 4)]
+    for seed in (ALPHA, BRAVO, CHARLIE, DELTA):
+        assert seed not in [key for key, _ in style.neighbors(seed, "csd", rule="mutual")]
+    assert style.neighbors("da:nobody", "csd", rule="mutual") == []
+    with pytest.raises(ValueError):
+        style.neighbors(ALPHA, "csd", rule="closest")
+
+    def printed(*extra):
+        assert style.main(["--neighbors", ALPHA, "--model", "csd", "--top", "2", *extra]) == 0
+        rows = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+        return [(row["artist"], pytest.approx(row["score"], abs=1e-3)) for row in rows]
+
+    assert printed() == printed("--rule", "best") == [(BRAVO, 1.0), (CHARLIE, 0.8)]
+    assert printed("--rule", "mutual") == [(CHARLIE, 0.8), (BRAVO, 0.75)]
+    with pytest.raises(SystemExit):
+        style.main(["--neighbors", ALPHA, "--model", "csd", "--rule", "closest"])
+
+
 # 5. Stdout carries counts and throughput only.
 
 
