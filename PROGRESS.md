@@ -1,6 +1,6 @@
 # Artist Search: Progress
 
-**Status, 2026-10-12 (evening):** The owner has decided to run the full AI pipeline on DeviantArt works (decision 7 below). DeviantArt is the primary source again, as the spec first described, and the 2,000 target is reachable. Next on the critical path: collect works and profiles for the 396 candidates already found, then analyze them locally.
+**Status, 2026-10-12 (night):** Real artwork is on disk for the first time: 5 artists, 50 works, 50 cached images, collected through the API. The analysis pieces have started on them (tags and descriptions, style vectors). Discovery is rerunning live so every niche candidate is stored. Collect is with its first critic.
 
 ## Waiting on the owner
 
@@ -223,3 +223,47 @@ Fresh critics, same bars. Both pieces failed again, on narrower gaps.
 **Yield.** 60 of 396 candidates (15%) list a bare custom domain. Still to apply, unmeasured: the link back to DeviantArt, AI opt-outs, the shared-domain rule, and whether the site serves its own images (most custom-domain portfolios are built on Squarespace, Wix or similar, whose image hosts are refused pending the owner). Deeper paging and more tags can raise the candidate count many times over, since the API allows 1,000 pages per tag and this run used 40. Even so, if the remaining filters keep one site in five, 2,000 artists would need on the order of 65,000 candidates.
 
 **Pipeline counts:** artists discovered 60, sites crawled 0, works 0. **Database:** 11.7 MB of 400 MB, artists 0, works 0.
+
+### Round 4: discovery, crawler, database; first collected works (2026-10-12)
+
+| Piece | Tests | Critic | Bar items passed | Biggest gap |
+|---|---|---|---|---|
+| 1a Discover | 429 pass | **Fail** | 6 of 9 (the same six, for the third time) | Site names with non-ASCII letters (a German sharp s, a Greek final sigma, Thai, Hindi) are read differently by the removal check than by the link check, so a removed site written that way is not recognised |
+| 1b Crawl | 2,519 pass | Deferred | | Built with proof of ownership by link-back. Its critic waits until portfolio-site crawling is scheduled, since nothing depends on it now |
+| 10 and 11 Database | 108 pass on the live project | Queued | | Round 4 built: verified removal, schema for DeviantArt works, misspelling fallback |
+| 1c Collect (new) | 350 pass | With its first critic | | |
+
+**Discovery, the remaining gap is narrow.** Everything that governs what a live run fetches and stores has passed three independent critics. The failures are confined to internationalized domain names in the removal and shared-domain checks. The critic also showed a removal can spread: removing one artist bars every domain their profile lists and everyone else who lists it, so an account could name a victim's site and then remove itself. Round 5 fixes both. The second by changing the rule to match the owner's verified-removal decision: a removal proven through a DeviantArt profile bars that handle, and a removal proven through a site bars that site and everyone who lists it. One no longer implies the other.
+
+**Second live discovery run (stopped early, restarted).** It stopped on a local database lock after 245 of 405 candidates, most likely because another stage was writing to the same file. The partial counts answer the yield question:
+
+| Website field of 245 stored artists | Artists | Share |
+|---|---|---|
+| Their own bare domain | 37 | 15% |
+| None given | 96 | 39% |
+| A listed platform or DeviantArt itself | 106 | 43% |
+| Another domain, not a bare front page | 6 | 2% |
+
+The strict own-site rule costs about 2%. Most artists simply have no site of their own, which is why the own-site route could not reach 2,000 and why the owner's decision 7 was needed.
+
+**Collect, first live run (5 artists).**
+
+| Count | Value |
+|---|---|
+| Artists processed | 5 |
+| Works stored | 50, each with a title, a publish time and 2 to 18 of the artist's own tags |
+| Images cached locally | 50, all JPEG, 32 to 196 KB, long side 894 to 1,414 px |
+| Works skipped as mature or unrated | 4 |
+| Works skipped as AI-tagged | 0 |
+| Run time | 2 min 9 s, about 25 s per artist |
+
+- Live responses matched the documentation; no code change was needed.
+- Thumbnail URLs are signed and carry no expiry, so they can be embedded on the site.
+- None of the 5 profiles had bio text. If that holds at scale, written profiles rest on tagline, specialty and the works themselves.
+- At 25 seconds per artist, 2,500 artists is about 17 hours of collection. Fine as an overnight run; worth speeding up before scale.
+
+**Database, round 4 (builder's measurements, not yet judged).** 158 MB of 400 MB with 3,000 analyzed artists and 30,000 works; 248 MB right after every row is rewritten, before cleanup. Warm calls 0.11 to 0.4 s as the public. The first search with an embedding right after a full rewrite took 3.27 s against a 3 s limit: the one known weak spot.
+
+**Environment.** PyTorch 2.14.1 with CUDA runs on the RTX 5090. The Cloudflare token now verifies, and both shortlisted text-embedding models exist on Workers AI.
+
+**Pipeline counts:** artists discovered 245 and rising, artists collected 5, works 50, images cached 50. **Database:** 12.6 MB of 400 MB, artists 0, works 0.
