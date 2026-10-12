@@ -1,13 +1,11 @@
 # Artist Search: Progress
 
-**Status, 2026-10-12 (afternoon):** The owner chose a hybrid corpus and verified removal (decisions 5 and 6 below). The plan now reaches 2,000+ artists from the DeviantArt API without putting any of their content through a model. Crawler and discovery are in round 4; the database gets the removal change and the hybrid schema in its round 4.
+**Status, 2026-10-12 (evening):** The owner has decided to run the full AI pipeline on DeviantArt works (decision 7 below). DeviantArt is the primary source again, as the spec first described, and the 2,000 target is reachable. Next on the critical path: collect works and profiles for the 396 candidates already found, then analyze them locally.
 
 ## Waiting on the owner
 
 1. **Cloudflare token.** `CLOUDFLARE_API_TOKEN` is still rejected (HTTP 401). Create a narrow token (Pages edit, Workers Scripts edit, Workers AI read) and put it in `.env`. Needed for the site preview and the search box, not before.
-2. **Image hosts run by site builders** (Wix, Squarespace, Shopify, WordPress.com). Refused by default. Under the hybrid plan this only limits how many artists get AI enrichment, not the size of the index.
-3. **Judging DeviantArt-sourced results.** A critic is a model, so it may not look at DeviantArt content. For search quality on those artists the owner will be the blind A/B judge, on a local page built for it. Critics still judge everything testable with synthetic data, and the enriched subset.
-4. **Optional: the DeviantArt permission request** in `docs/`. If granted, AI enrichment extends to every artist.
+2. **Optional: tell DeviantArt.** The draft in `docs/` can still be sent as a courtesy question. It is no longer blocking anything.
 
 ## Owner decisions (these amend the spec)
 
@@ -19,6 +17,8 @@ Made 2026-10-11, after the DeviantArt terms were read.
 4. **Push `main` after every round.**
 5. **Hybrid corpus (2026-10-12).** The owner requires at least 2,000 artists. Every artist comes from the DeviantArt API and is indexed without AI: the artist's own tags, titles, tagline and stated specialty, searched by keyword, with "similar" artists found by tag overlap and thumbnails embedded from DeviantArt with attribution and a link back. AI analysis (vision tags, style vectors, written profiles) runs only for artists whose own site passes the ownership and opt-out checks. No DeviantArt content goes into a model, an agent's context, or a log an agent reads: pipeline output stays counts only, and builders and critics work with synthetic data. This replaces spec section 4.2 for most artists.
 6. **Verified removal (2026-10-12).** An artist who proves control of their site or DeviantArt profile, by adding a short code that is then checked, is removed at once and never re-added. A request without proof is logged for the owner and changes nothing until the owner acts. This replaces "any request hides at once", which failed its critic twice on abuse.
+7. **Full AI pipeline on DeviantArt works (2026-10-12).** The lead read Terms of Service section 24 as barring any use of labeled content as input to a trained model, which covers the Analyze step, and stopped to ask. The owner reads the section as aimed at training and image generation, neither of which this project does, and accepts the risk of going ahead. So: DeviantArt works are tagged, described and embedded by local models, profiles are written from them, and critics may view them. This supersedes decisions 1 and 5 and the "no DeviantArt content near a model" part of decision 2. Still in force: no training, no generation, no rehosting, local image cache only, verified removal, rate limits, and AI opt-outs honored on artists' own sites.
+8. **A/B references (2026-10-12, default).** With critics able to view DeviantArt content, pieces 5 and 6 return to the spec's bars: DeviantArt's own search and "more like this". The reference is captured from the public website, not through the API, because the API License bars using the API for benchmarking. This supersedes decision 3.
 
 ## The plan
 
