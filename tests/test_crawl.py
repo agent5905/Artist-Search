@@ -4,8 +4,10 @@ Spec section 2 (hard rules 4 and 5) and owner decision 2 (honor AI opt-outs ever
 """
 
 import gzip
+import inspect
 import itertools
 import random
+import re
 import socket
 import sys
 import threading
@@ -32,6 +34,7 @@ from pipeline.crawl import (  # noqa: E402
     PLATFORM_DOMAINS,
     PLATFORM_NAMES,
     SITE_REQUEST_BUDGET,
+    VERIFY_REQUEST_BUDGET,
     FetchResult,
     PoliteFetcher,
     Site,
@@ -43,6 +46,10 @@ ROBOTS = f"{SITE}/robots.txt"
 TDM = f"{SITE}/.well-known/tdmrep.json"
 MIN = config.MIN_SECONDS_PER_HOST
 NOAI = '<meta name="robots" content="noai">'
+PROFILE = "https://www.deviantart.com/JaneDoe"  # the account that claims janedoe.art
+LINK_BACK = f'<a href="{PROFILE}">my DeviantArt</a>'  # what a front page must hold to prove that claim
+FRONT = f"{SITE}/"
+PROOF = [ROBOTS, TDM, FRONT]  # all that proving a site may cost
 PSL = tldextract.TLDExtract(suffix_list_urls=(), cache_dir=None, include_psl_private_domains=True)
 
 
@@ -52,6 +59,7 @@ def fresh_site_state():
     crawl._LAST.clear()
     crawl._DELAY.clear()
     crawl._SPENT.clear()
+    crawl._OWNERS.clear()
 
 
 class Clock:
@@ -119,15 +127,30 @@ class Web:
     def gaps(self):
         return [later - earlier for earlier, later in itertools.pairwise(self.times)]
 
+    def open(self, root=FRONT, profile=PROFILE, fetcher=None):
+        """The one public way in: ask for the site to be opened on the strength of its front page."""
+        return (fetcher or self.fetcher).open_site(root, profile)
+
+    def site(self, root=SITE, fetcher=None):
+        """A handle on a site whose front page has already proved the claim.
+
+        Most tests here are about what happens after that proof, so they start from it. The proof itself is
+        tested through open_site alone, in section 5.
+        """
+        host = httpx.URL(root).raw_host.decode("ascii")
+        crawl._OWNERS.setdefault(PSL.extract_str(host).top_domain_under_public_suffix, "janedoe")
+        return Site(fetcher or self.fetcher, root, PROFILE)
+
     def fetch(self, url, fetcher=None, **kwargs):
-        """The only public way to a URL: open the site it would belong to by its front page, then ask that handle."""
+        """Fetch a URL of a proven site. A URL whose site could never be opened gets the refusal open_site gives."""
         try:
-            host = httpx.URL(url).host
+            host = httpx.URL(url).raw_host.decode("ascii")
             root = f"https://{PSL.extract_str(host).top_domain_under_public_suffix or host}/"
         except Exception:
             root = url
-        site = (fetcher or self.fetcher).open_site(root)
-        return site.fetch(url, **kwargs) if isinstance(site, Site) else site
+        if not is_own_site(root):
+            return self.open(root, fetcher=fetcher)
+        return self.site(root, fetcher).fetch(url, **kwargs)
 
     def get(self, path, **kwargs):
         return self.fetch(SITE + path, **kwargs)
@@ -147,7 +170,7 @@ def raw_reply(body, headers=None):
     return lambda request: httpx.Response(200, headers=headers, content=iter([body]))
 
 
-def html(body="<html><head><title>Jane Doe</title></head><body>art</body></html>", headers=None):
+def html(body=f"<html><head><title>Jane Doe</title></head><body>art {LINK_BACK}</body></html>", headers=None):
     return reply(200, body, {"content-type": "text/html; charset=utf-8", **(headers or {})})
 
 
@@ -329,12 +352,9 @@ def test_missing_robots_means_allowed(status):
 @pytest.mark.parametrize(
     "robots",
     [
-        reply(500),
-        reply(502),
-        reply(503),
-        reply(429),
-        reply(401),
-        reply(403),
+        *(reply(status) for status in (400, 401, 402, 403, 405, 406, 408, 409, 418, 421, 422, 426, 429, 451)),
+        *(reply(status) for status in (500, 501, 502, 503, 504, 507, 520)),
+        *(reply(status) for status in (300, 301, 302, 303, 304, 307, 308)),  # a redirect that names no Location
         httpx.ConnectError("no route"),
         httpx.ReadTimeout("slow"),
         OSError("socket closed"),
@@ -626,6 +646,48 @@ def test_a_429_or_503_closes_the_site_for_the_rest_of_the_run(answer, where):
     assert web.fetch("https://other-artist.com/a").ok
 
 
+def test_http_and_https_of_one_site_share_one_clock():
+    web = Web({"http://janedoe.art/old": redirect(f"{SITE}/new"), f"{SITE}/new": html()})
+    assert web.fetch("http://janedoe.art/old").ok
+    assert web.urls == [*files("http://janedoe.art"), "http://janedoe.art/old", ROBOTS, TDM, f"{SITE}/new"]
+    assert web.gaps == [MIN] * 5  # the https robots.txt waits its turn after the http redirect
+
+
+def test_a_crawl_delay_learned_over_http_holds_for_https():
+    web = Web({"http://janedoe.art/robots.txt": reply(200, "User-agent: *\nCrawl-delay: 9"), f"{SITE}/a": html()})
+    web.routes["http://janedoe.art/a"] = html()
+    web.get("/a")
+    web.fetch("http://janedoe.art/a")
+    web.get("/a")
+    web.get("/a")
+    assert (
+        web.urls == [ROBOTS, TDM, f"{SITE}/a", *files("http://janedoe.art"), "http://janedoe.art/a"] + [f"{SITE}/a"] * 2
+    )
+    assert web.gaps == [MIN, MIN, MIN, 9.0, 9.0, 9.0, 9.0]
+
+
+def test_no_caller_and_no_environment_variable_can_lower_the_delay():
+    assert MIN == 3.0
+    constructor = inspect.signature(PoliteFetcher).parameters
+    assert list(constructor) == ["transport", "clock", "sleep", "resolver"]  # nothing here sets a delay
+    assert all(parameter.kind is parameter.KEYWORD_ONLY for parameter in constructor.values())
+    assert list(inspect.signature(PoliteFetcher.open_site).parameters) == ["self", "root_url", "profile_url"]
+    assert list(inspect.signature(Site.fetch).parameters) == ["self", "url", "image"]
+    assert list(inspect.signature(Site).parameters) == ["fetcher", "root", "profile", "front_page"]
+    source = Path(crawl.__file__).read_text(encoding="utf-8")
+    assert not re.search(r"\bos\b|\bgetenv\b|\benviron\b", source)  # nothing is read from the environment
+
+
+@pytest.mark.parametrize("name", ["CRAWL_DELAY", "MIN_DELAY", "MIN_SECONDS_PER_HOST", "ARTIST_SEARCH_MIN_DELAY"])
+def test_an_environment_variable_changes_nothing(monkeypatch, name):
+    monkeypatch.setenv(name, "0")
+    monkeypatch.setenv(f"POLITE_{name}", "0")
+    web = Web({f"{SITE}/a": html()})
+    web.get("/a")
+    web.get("/a")
+    assert web.gaps == [MIN, MIN, MIN]
+
+
 # --- 4. AI opt-outs ------------------------------------------------------------------------------------------------
 
 
@@ -635,7 +697,8 @@ def test_the_ai_crawler_list_is_the_agreed_one():
         "Bytespider Applebot-Extended Meta-ExternalAgent Amazonbot cohere-ai Diffbot omgili ImagesiftBot "
         "FacebookBot Omgilibot Claude-SearchBot Claude-User Perplexity-User img2dataset YouBot Timpibot AI2Bot "
         "PetalBot DuckAssistBot meta-externalfetcher Google-CloudVertexBot cohere-training-data-crawler "
-        "Webzio-Extended MistralAI-User Ai2Bot-Dolma".split()
+        "Webzio-Extended MistralAI-User Ai2Bot-Dolma GoogleOther TikTokSpider PanguBot".split()
+        + ["Kangaroo Bot"]
     )
 
 
@@ -659,7 +722,11 @@ OPT_OUT_HEADERS = [
     [("x-robots-tag", "all,noai")],
     [("x-robots-tag", "ArtistSearchBot: noindex")],
     [("x-robots-tag", "GPTBot: noindex")],
-    [("x-robots-tag", "nofollow"), ("x-robots-tag", "noai")],  # two header lines
+    [("x-robots-tag", "nofollow"), ("x-robots-tag", "noai")],  # two header lines: every one of them is read
+    [("x-robots-tag", "noai"), ("x-robots-tag", "nofollow")],
+    [("x-robots-tag", "index"), ("x-robots-tag", "noimageai"), ("x-robots-tag", "follow")],
+    [("tdm-reservation", "1"), ("tdm-reservation", "0")],
+    [("content-signal", "ai-train=no"), ("content-signal", "search=yes")],
     [("tdm-reservation", "1")],
     [("TDM-Reservation", " 1 ")],
     [("content-signal", "ai-train=no")],
@@ -953,8 +1020,12 @@ FETCHABLE = [  # not front pages, so not "own sites" to discover, but pages and 
 @pytest.mark.parametrize("url", OWN_SITES, ids=short)
 def test_the_front_page_of_a_bare_custom_domain_is_an_own_site(url):
     assert is_own_site(url)
-    web = Web({str(httpx.URL(url)): html()})
-    assert web.fetch(url).ok
+    parsed = httpx.URL(url)
+    home = str(parsed.copy_with(raw_path=parsed.raw_path, fragment=None))  # as it is requested: "/" and no fragment
+    web = Web({home: html()})
+    site = web.open(url)
+    assert isinstance(site, Site) and site.front_page.url == home
+    assert web.urls == [f"{home}robots.txt", f"{home}.well-known/tdmrep.json", home]
 
 
 @pytest.mark.parametrize("url", NOT_OWN_SITES + FETCHABLE, ids=short)
@@ -1159,6 +1230,14 @@ BAD_URLS = [
     "https://janedoe.art/public/..%5cprivate/a",
     "https://janedoe.art/public/..;/private/a",
     "https://janedoe.art/public/%2e%2e",
+    "https://janedoe.art//private/a",  # an empty segment: a server that merges slashes serves /private/a
+    "https://janedoe.art/public//a",
+    "https://janedoe.art/%2Fprivate/a",  # an encoded slash
+    "https://janedoe.art/public%2fa",
+    "https://janedoe.art/%252Fprivate/a",
+    "https://janedoe.art/%5Cprivate/a",  # a backslash, encoded or not
+    "https://janedoe.art/%5cprivate/a",
+    "https://janedoe.art/public\\a",
     # Not a URL at all.
     "https://jane doe.art/",
     "https://ｄｅｖｉａｎｔａｒｔ.com/",
@@ -1184,13 +1263,6 @@ def test_there_is_no_public_way_to_fetch_without_opening_a_site():
     assert [name for name in vars(Site) if not name.startswith("_")] == ["fetch"]
 
 
-def test_opening_a_site_makes_no_request():
-    web = Web()
-    site = web.fetcher.open_site(f"{SITE}/")
-    assert isinstance(site, Site) and site.root == f"{SITE}/"
-    assert web.requests == [] and web.lookups == []
-
-
 @pytest.mark.parametrize(
     ("root", "skip"),
     [
@@ -1208,18 +1280,308 @@ def test_opening_a_site_makes_no_request():
     ],
 )
 def test_open_site_says_why_a_url_is_not_an_own_site(root, skip):
-    assert Web().fetcher.open_site(root) == FetchResult(root, skip=skip)
+    assert Web().open(root) == FetchResult(root, skip=skip)
 
 
 @pytest.mark.parametrize("root", NOT_OWN_SITES + FETCHABLE + PLATFORM_URLS + BAD_URLS, ids=short)
 def test_a_site_opens_only_from_the_front_page_of_an_own_site(root):
     web = Web({root: html()})
-    refused = web.fetcher.open_site(root)
+    refused = web.open(root)
     assert isinstance(refused, FetchResult) and refused.skip in ("not_own_site", "platform", "bad_url")
-    forged = Site(web.fetcher, root)  # a handle made by hand opens nothing more
+    forged = Site(web.fetcher, root, PROFILE)  # a handle made by hand opens nothing more
     assert forged.fetch(root).skip == refused.skip
     assert forged.fetch(f"{SITE}/").skip == refused.skip
     assert web.requests == [] and web.lookups == []
+
+
+def front(*links):
+    """A front page that holds this markup among the rest."""
+    return html("<html><head><title>Jane Doe</title></head><body><h1>Jane Doe</h1>" + "".join(links) + "</body></html>")
+
+
+LINKS_BACK = [
+    '<a href="https://www.deviantart.com/janedoe">DeviantArt</a>',
+    '<a href="https://deviantart.com/janedoe">DeviantArt</a>',
+    '<a href="http://www.deviantart.com/janedoe">DeviantArt</a>',
+    '<a href="https://www.deviantart.com/JaneDoe">DeviantArt</a>',
+    '<a href="HTTPS://WWW.DEVIANTART.COM/JANEDOE">DeviantArt</a>',
+    '<a href="https://www.deviantart.com/janedoe/">DeviantArt</a>',
+    '<a href="https://www.deviantart.com/janedoe/gallery">my gallery</a>',
+    '<a href="https://www.deviantart.com/janedoe/art/Dragon-Rider-912345678">a piece of mine</a>',
+    '<a href="https://www.deviantart.com/janedoe?utm_source=site#about">DeviantArt</a>',
+    '<a href="https://janedoe.deviantart.com">DeviantArt</a>',  # the old form
+    '<a href="http://JaneDoe.DeviantArt.com/gallery/">DeviantArt</a>',
+    '<a href="//www.deviantart.com/janedoe">DeviantArt</a>',
+    '<a href="  https://www.deviantart.com/janedoe\n">DeviantArt</a>',
+    '<a rel="nofollow noopener" target="_blank" href="https://www.deviantart.com/janedoe">me</a>',  # still a link
+    "<a href='https://www.deviantart.com/janedoe'>DeviantArt</a>",
+    "<A HREF=https://www.deviantart.com/janedoe>DeviantArt</A>",
+    '<a class="social" href="https&#58;//www.deviantart.com/janedoe">DeviantArt</a>',
+    '<link rel="me" href="https://www.deviantart.com/janedoe">',
+    '<area shape="rect" coords="0,0,9,9" href="https://www.deviantart.com/janedoe">',
+    '<!-- socials --><script>var x = "<a href=nothing>";</script><a href="https://www.deviantart.com/janedoe">me</a>',
+    '<a href="https://www.deviantart.com/someone-else">a friend</a><a href="https://www.deviantart.com/janedoe">me</a>',
+    "<p>filler</p>" * 100_000 + '<a href="https://www.deviantart.com/janedoe">DeviantArt</a>',
+]
+NEAR_MISSES = [
+    "",  # no link at all
+    "<p>Find me at https://www.deviantart.com/janedoe</p>",  # the handle only in text
+    "<p>deviantart.com/janedoe</p>",
+    '<!-- <a href="https://www.deviantart.com/janedoe">an old link</a> -->',  # only inside a comment
+    '<!-- never closed <a href="https://www.deviantart.com/janedoe">x</a>',
+    "<script>document.write('<a href=\"https://www.deviantart.com/janedoe\">x</a>')</script>",  # only inside a script
+    '<script type="application/ld+json">{"sameAs": ["https://www.deviantart.com/janedoe"]}</script>',
+    '<style>a[href="https://www.deviantart.com/janedoe"] { color: red }</style>',
+    '<textarea><a href="https://www.deviantart.com/janedoe">x</a></textarea>',
+    '<iframe><a href="https://www.deviantart.com/janedoe">x</a></iframe>',
+    '<img alt=\'<a href="https://www.deviantart.com/janedoe">\' src="a.png">',  # only inside an attribute
+    '<div data-href="https://www.deviantart.com/janedoe">x</div>',
+    '<a name="https://www.deviantart.com/janedoe">x</a>',
+    '<a title="https://www.deviantart.com/janedoe" href="/links">x</a>',
+    '<img src="https://www.deviantart.com/janedoe">',
+    '<div href="https://www.deviantart.com/janedoe">x</div>',  # an href on something that is not a link
+    '<base href="https://www.deviantart.com/janedoe">',
+    '<a href="https://www.deviantart.com/janedoe2">x</a>',  # another handle that shares a prefix
+    '<a href="https://www.deviantart.com/janedoeart">x</a>',
+    '<a href="https://www.deviantart.com/jane">x</a>',
+    '<a href="https://www.deviantart.com/janedoe-fan">x</a>',
+    '<a href="https://www.deviantart.com/someone-else/art/Portrait-of-janedoe-912345678">x</a>',  # another's deviation
+    '<a href="https://www.deviantart.com/someone-else/janedoe">x</a>',
+    '<a href="https://www.deviantart.com/tag/janedoe">x</a>',
+    '<a href="https://www.deviantart.com/users/outgoing?https://www.deviantart.com/janedoe">x</a>',
+    '<a href="https://www.deviantart.com/">x</a>',
+    '<a href="https://www.deviantart.com//janedoe">x</a>',
+    '<a href="https://janedoe2.deviantart.com/">x</a>',
+    '<a href="https://www.janedoe.deviantart.com/">x</a>',
+    '<a href="https://janedoe.deviantart.com.evil.example/">x</a>',
+    '<a href="https://deviantart.com.evil.example/janedoe">x</a>',
+    '<a href="https://notdeviantart.com/janedoe">x</a>',
+    '<a href="https://www.deviantart.net/janedoe">x</a>',
+    '<a href="https://sta.sh/janedoe">x</a>',
+    '<a href="https://www.artstation.com/janedoe">x</a>',
+    '<a href="ftp://www.deviantart.com/janedoe">x</a>',
+    '<a href="https://www.deviantart.com:8443/janedoe">x</a>',
+    '<a href="https://janedoe@www.deviantart.com/">x</a>',
+    '<a href="/janedoe">x</a>',  # this site's /janedoe, not DeviantArt's
+    '<a href="janedoe.deviantart.com">x</a>',
+    '<a href="mailto:janedoe@deviantart.com">x</a>',
+    "<a href=\"javascript:location='https://www.deviantart.com/janedoe'\">x</a>",
+]
+
+
+@pytest.mark.parametrize("link", LINKS_BACK, ids=short)
+def test_a_front_page_that_links_back_to_the_profile_opens_the_site(link):
+    web = Web({FRONT: front(link), f"{SITE}/gallery": html("<p>the gallery</p>")})
+    site = web.open()
+    assert isinstance(site, Site) and (site.root, site.profile) == (FRONT, PROFILE)
+    assert site.front_page.ok and link.encode() in site.front_page.content  # the proof, kept so it need not be re-asked
+    assert web.urls == PROOF
+    assert site.fetch(f"{SITE}/gallery").content == b"<p>the gallery</p>"
+    assert web.urls == [*PROOF, f"{SITE}/gallery"]
+
+
+@pytest.mark.parametrize("link", NEAR_MISSES, ids=short)
+def test_a_front_page_without_that_link_closes_the_site_for_the_run(link):
+    web = Web({FRONT: front(link), f"{SITE}/gallery": html()})
+    assert web.open() == FetchResult(FRONT, skip="not_own_site")
+    assert web.urls == PROOF
+    web.routes[FRONT] = front(LINK_BACK)  # whatever the page says later, the run is over for this site
+    for fetcher in (web.fetcher, web.new_fetcher()):
+        assert fetcher.open_site(FRONT, PROFILE).skip == "not_own_site"
+        assert fetcher.open_site("http://www.janedoe.art", PROFILE).skip == "not_own_site"  # any front page of the site
+        assert Site(fetcher, FRONT, PROFILE).fetch(f"{SITE}/gallery").skip == "not_own_site"
+        assert Site(fetcher, FRONT, PROFILE).fetch(FRONT, image=True).skip == "not_own_site"
+    assert web.urls == PROOF and len(web.requests) == VERIFY_REQUEST_BUDGET == 3
+
+
+UNPROVEN = [  # (what the site answers, the skip, what was asked of it)
+    ({ROBOTS: reply(200, "User-agent: *\nDisallow: /")}, "robots", [ROBOTS]),
+    ({ROBOTS: reply(500)}, "robots", [ROBOTS]),
+    ({ROBOTS: reply(200, "User-agent: GPTBot\nDisallow: /")}, "ai_opt_out", [ROBOTS]),
+    ({TDM: reply(200, '[{"location": "/", "tdm-reservation": 1}]')}, "ai_opt_out", [ROBOTS, TDM]),
+    ({FRONT: front(LINK_BACK, NOAI)}, "ai_opt_out", PROOF),
+    ({FRONT: html(headers={"x-robots-tag": "noindex"})}, "ai_opt_out", PROOF),
+    ({FRONT: reply(404)}, "error", PROOF),
+    ({FRONT: reply(500)}, "error", PROOF),
+    ({FRONT: reply(401)}, "auth", PROOF),
+    ({FRONT: httpx.ConnectError("refused")}, "error", PROOF),
+    ({FRONT: RuntimeError("a bug somewhere")}, "error", PROOF),
+    ({FRONT: reply(200, LINK_BACK.encode() + bytes(PAGE_MAX_BYTES))}, "too_large", PROOF),
+    # A front page that moves is not followed: proving a site is three requests, never a crawl.
+    ({FRONT: redirect("https://www.janedoe.art/")}, "not_own_site", PROOF),
+    ({FRONT: redirect("/home")}, "not_own_site", PROOF),
+    ({FRONT: redirect("https://someone-else.com/")}, "not_own_site", PROOF),
+    (
+        {FRONT: redirect("/home"), ROBOTS: reply(200, "User-agent: *\nDisallow: /.well-known/")},
+        "not_own_site",
+        [ROBOTS, FRONT],
+    ),
+    # Nor is the allowance stretched by policy files that move.
+    (
+        {ROBOTS: redirect("https://www.janedoe.art/robots.txt"), "https://www.janedoe.art/robots.txt": reply(200, "")},
+        "not_own_site",
+        [ROBOTS, "https://www.janedoe.art/robots.txt", TDM],
+    ),
+    (
+        {TDM: redirect("https://www.janedoe.art/.well-known/tdmrep.json")},
+        "not_own_site",
+        [ROBOTS, TDM, "https://www.janedoe.art/.well-known/tdmrep.json"],
+    ),
+]
+
+
+@pytest.mark.parametrize(("answers", "skip", "asked"), UNPROVEN, ids=short)
+def test_a_site_that_cannot_be_proven_is_closed_for_the_run(answers, skip, asked):
+    web = Web({FRONT: front(LINK_BACK), "https://www.janedoe.art/": front(LINK_BACK), f"{SITE}/home": front(LINK_BACK)})
+    web.routes.update(answers)
+    refused = web.open()
+    assert isinstance(refused, FetchResult) and refused.skip == skip and refused.content == b""
+    assert web.urls == asked and len(asked) <= VERIFY_REQUEST_BUDGET
+    web.routes.update({ROBOTS: reply(404), TDM: reply(404), FRONT: front(LINK_BACK)})  # too late
+    for fetcher in (web.fetcher, web.new_fetcher()):
+        assert fetcher.open_site(FRONT, PROFILE).skip == "not_own_site"
+        assert fetcher.open_site("https://www.janedoe.art/", PROFILE).skip == "not_own_site"
+        assert Site(fetcher, FRONT, PROFILE).fetch(f"{SITE}/home").skip == "not_own_site"
+    assert web.urls == asked
+
+
+def test_a_name_at_a_private_address_is_not_asked_for_proof():
+    web = Web({FRONT: front(LINK_BACK)})
+    web.dns["janedoe.art"] = ["192.168.1.1"]
+    assert web.open().skip == "bad_url"
+    assert web.requests == []
+    web.dns.clear()
+    assert web.open().skip == "not_own_site"  # closed all the same
+    assert web.requests == []
+
+
+BAD_PROFILES = [
+    "",
+    "janedoe",
+    "https://www.deviantart.com/",
+    "https://www.deviantart.com",
+    "https://www.artstation.com/janedoe",
+    "https://deviantart.com.evil.example/janedoe",
+    "https://www.deviantart.com.evil.example/janedoe",
+    "ftp://www.deviantart.com/janedoe",
+    "https://www.deviantart.com:8443/janedoe",
+    "https://janedoe:pw@www.deviantart.com/janedoe",
+    "https://www.deviantart.com/jane doe",
+    "https://www.deviantart.com/jane.doe",
+    "https://www.deviantart.com/%2e%2e/janedoe",
+    "https://www.deviantart.com/\ud83d",
+    None,
+    42,
+]
+
+
+@pytest.mark.parametrize("profile", BAD_PROFILES, ids=short)
+def test_a_claim_needs_a_deviantart_profile(profile):
+    web = Web({FRONT: front(LINK_BACK, '<a href="https://www.artstation.com/janedoe">ArtStation</a>')})
+    assert web.open(profile=profile) == FetchResult(FRONT, skip="bad_url")
+    assert Site(web.fetcher, FRONT, profile).fetch(FRONT).skip == "not_own_site"
+    assert web.requests == [] and web.lookups == []
+    assert isinstance(web.open(), Site)  # and a claim that was never looked into closes nothing
+
+
+@pytest.mark.parametrize(
+    ("root", "home"),
+    [
+        ("http://janedoe.art/", "http://janedoe.art/"),
+        ("https://www.janedoe.art", "https://www.janedoe.art/"),
+        ("HTTPS://JANEDOE.ART/#", "https://janedoe.art/"),
+    ],
+)
+def test_a_site_is_proven_from_whichever_front_page_was_given(root, home):
+    web = Web({home: front(LINK_BACK), f"{home}gallery": html()})
+    site = web.open(root)
+    assert isinstance(site, Site) and site.front_page.ok
+    assert web.urls == [f"{home}robots.txt", f"{home}.well-known/tdmrep.json", home]
+    assert site.fetch(f"{home}gallery").ok
+    assert site.fetch(f"{SITE}/a").skip == "error"  # any host or scheme of the proven site, each under its own rules
+
+
+def test_a_proven_site_is_proven_for_every_fetcher_and_is_not_asked_twice():
+    web = Web({FRONT: front(LINK_BACK), f"{SITE}/a": html(), "https://www.janedoe.art/a": html()})
+    first = web.open()
+    again = web.open()
+    elsewhere = web.open(
+        "https://www.janedoe.art/", "https://deviantart.com/JANEDOE/gallery", fetcher=web.new_fetcher()
+    )
+    assert all(isinstance(site, Site) for site in (first, again, elsewhere))
+    assert first.front_page.ok and again.front_page is None and elsewhere.front_page is None
+    assert web.urls == PROOF
+    assert again.fetch(f"{SITE}/a").ok and elsewhere.fetch("https://www.janedoe.art/a").ok
+    assert len(crawl._SPENT) == 1 and crawl._SPENT["janedoe.art"] == len(web.requests)  # the proof counts in the budget
+
+
+def test_a_second_account_claiming_a_proven_site_closes_it():
+    web = Web(
+        {FRONT: front(LINK_BACK, '<a href="https://www.deviantart.com/a-friend">a friend</a>'), f"{SITE}/a": html()}
+    )
+    site = web.open()
+    assert site.fetch(f"{SITE}/a").ok
+    asked = list(web.urls)
+    assert web.open(profile="https://www.deviantart.com/someone-else") == FetchResult(FRONT, skip="not_own_site")
+    assert site.fetch(f"{SITE}/a").skip == "not_own_site"  # one site, two claimants: nobody's own site
+    assert web.open().skip == "not_own_site"
+    assert web.open(profile="https://www.deviantart.com/a-friend").skip == "not_own_site"
+    assert web.urls == asked
+
+
+def test_only_the_account_that_was_proven_can_fetch():
+    web = Web({FRONT: front(LINK_BACK), f"{SITE}/a": html()})
+    assert isinstance(web.open(), Site)
+    forged = Site(web.fetcher, FRONT, "https://www.deviantart.com/someone-else")
+    assert forged.fetch(f"{SITE}/a").skip == "not_own_site"
+    assert (
+        Site(web.fetcher, "https://other-artist.com/", PROFILE).fetch("https://other-artist.com/").skip
+        == "not_own_site"
+    )
+    assert web.urls == PROOF
+
+
+def test_an_unproven_site_is_never_asked_a_fourth_request():
+    web = Web({FRONT: front(), f"{SITE}/a": html()})
+    assert web.open().skip == "not_own_site"
+    crawl._OWNERS.pop("janedoe.art")  # even if the record of the failed claim were lost
+    assert Site(web.fetcher, FRONT, PROFILE).fetch(f"{SITE}/a").skip == "not_own_site"
+    assert web.open().skip == "not_own_site" and web.open().skip == "not_own_site"
+    assert len(web.requests) == VERIFY_REQUEST_BUDGET
+
+
+UNLISTED_PLATFORMS = """
+    thumbtack.com bark.com taskrabbit.com freelancehunt.com fl.ru mihuashi.com truthsocial.com mas.to foriio.com
+    xfolio.jp linktree.com rentry.co trello.com hubstaff.com flexjobs.com weworkremotely.com remoteok.com
+    codementor.io gigster.com arc.dev polywork.com read.cv peerlist.io layers.to glass.photo vero.co minds.com
+    gab.com gettr.com mewe.com odysee.com rumble.com bitchute.com taringa.net hive.blog steemit.com dev.to
+    hashnode.com producthunt.com meetup.com eventbrite.com craigslist.org gumtree.com kijiji.ca yelp.com
+    nextdoor.com houzz.com angi.com
+""".split()
+
+
+@pytest.mark.parametrize("www", ["", "www."])
+@pytest.mark.parametrize("domain", UNLISTED_PLATFORMS)
+def test_an_unlisted_platform_home_page_gets_three_requests_and_never_another(domain, www):
+    home = f"https://{www}{domain}/"
+    assert is_own_site(home)  # no list names it, and its shape is that of an artist's front page
+    members = "".join(
+        f'<a href="/pro/{n}">a member</a><a href="https://www.deviantart.com/member{n}">their DeviantArt</a>'
+        for n in range(40)
+    )
+    web = Web({home: html(f"<html><body><a href='/login'>Log in</a>{members}</body></html>"), f"{home}pro/1": html()})
+    assert web.open(home) == FetchResult(home, skip="not_own_site")
+    assert web.urls == [f"{home}robots.txt", f"{home}.well-known/tdmrep.json", home]
+    other_form = f"https://{'' if www else 'www.'}{domain}/"
+    for fetcher in (web.fetcher, web.new_fetcher()):
+        for root in (home, other_form, home.replace("https:", "http:")):
+            assert fetcher.open_site(root, PROFILE).skip == "not_own_site"
+            assert (
+                fetcher.open_site(root, "https://www.deviantart.com/member1").skip == "not_own_site"
+            )  # closed is closed
+            assert Site(fetcher, root, PROFILE).fetch(f"{home}pro/1").skip == "not_own_site"
+            assert Site(fetcher, root, "https://www.deviantart.com/member1").fetch(home).skip == "not_own_site"
+    assert len(web.requests) == VERIFY_REQUEST_BUDGET
 
 
 OFF_THE_SITE = PLATFORM_URLS + [
@@ -1248,7 +1610,7 @@ OFF_THE_SITE = PLATFORM_URLS + [
 @pytest.mark.parametrize("url", OFF_THE_SITE, ids=short)
 def test_a_site_handle_fetches_nothing_that_is_not_on_its_site(url):
     web = Web({url: html()})
-    site = web.fetcher.open_site(SITE)
+    site = web.site()
     assert site.fetch(url) == FetchResult(url, skip="offsite")
     assert site.fetch(url, image=True).skip == "offsite"
     assert web.requests == [] and web.lookups == []
@@ -1257,7 +1619,7 @@ def test_a_site_handle_fetches_nothing_that_is_not_on_its_site(url):
 @pytest.mark.parametrize("url", BAD_URLS, ids=short)
 def test_a_site_handle_fetches_no_bad_url(url):
     web = Web()
-    assert web.fetcher.open_site(SITE).fetch(url).skip in ("bad_url", "offsite")
+    assert web.site().fetch(url).skip in ("bad_url", "offsite")
     assert web.requests == [] and web.lookups == []
 
 
@@ -1289,11 +1651,12 @@ PRIVATE_ADDRESSES = [
 ]
 
 
+@pytest.mark.parametrize("scheme", ["https", "http"])
 @pytest.mark.parametrize("addresses", PRIVATE_ADDRESSES, ids=short)
-def test_a_name_that_resolves_to_a_private_address_is_never_connected_to(addresses):
-    web = Web({f"{SITE}/admin": html("the router's admin page")})
+def test_a_name_that_resolves_to_a_private_address_is_never_connected_to(addresses, scheme):
+    web = Web({f"{scheme}://janedoe.art/admin": html("the router's admin page")})
     web.dns["janedoe.art"] = addresses
-    result = web.get("/admin")
+    result = web.fetch(f"{scheme}://janedoe.art/admin")
     assert (result.skip, result.content) == ("bad_url", b"")
     assert web.requests == [] and web.lookups == ["janedoe.art"]
 
@@ -1386,7 +1749,8 @@ def test_without_an_injected_resolver_the_systems_answer_is_checked(monkeypatch)
     clock = Clock()
     transport = httpx.MockTransport(lambda request: requests.append(request) or httpx.Response(200))
     fetcher = PoliteFetcher(transport=transport, clock=clock, sleep=clock.sleep)
-    assert fetcher.open_site(SITE).fetch(f"{SITE}/admin").skip == "bad_url"
+    crawl._OWNERS["janedoe.art"] = "janedoe"  # a site already proven
+    assert Site(fetcher, SITE, PROFILE).fetch(f"{SITE}/admin").skip == "bad_url"
     assert asked == ["janedoe.art"] and requests == []
 
 
@@ -1697,10 +2061,12 @@ NONSENSE = [None, 42, b"https://janedoe.art/", ["https://janedoe.art/"], object(
 @pytest.mark.parametrize("url", NONSENSE, ids=["none", "int", "bytes", "list", "object", "unprintable"])
 def test_nonsense_input_comes_back_as_a_skip(url):
     web = Web()
-    assert web.fetcher.open_site(url).skip == "bad_url"
-    assert web.fetcher.open_site(SITE).fetch(url).skip == "bad_url"
-    assert web.fetcher.open_site(SITE).fetch(url, image=True).url == ""
-    assert Site(web.fetcher, url).fetch(SITE).skip == "bad_url"
+    assert web.open(root=url).skip == "bad_url"
+    assert web.open(profile=url).skip == "bad_url"
+    assert web.site().fetch(url).skip == "bad_url"
+    assert web.site().fetch(url, image=True).url == ""
+    assert Site(web.fetcher, url, PROFILE).fetch(SITE).skip == "bad_url"
+    assert Site(web.fetcher, SITE, url).fetch(SITE).skip == "not_own_site"
     assert web.requests == [] and web.lookups == []
     assert is_own_site(url) is False
 
@@ -1717,9 +2083,9 @@ def test_the_result_carries_content_or_a_reason():
     good = web.get("/old", image=True)
     assert good == FetchResult(f"{SITE}/a.png", png, "image/png", 200, None)
     assert good.ok
-    bad = web.fetcher.open_site("https://www.deviantart.com/")
+    bad = web.open("https://www.deviantart.com/")
     assert bad == FetchResult("https://www.deviantart.com/", b"", "", 0, "platform")
-    away = web.fetcher.open_site(SITE).fetch("https://someone-else.com/a.png", image=True)
+    away = web.site().fetch("https://someone-else.com/a.png", image=True)
     assert away == FetchResult("https://someone-else.com/a.png", b"", "", 0, "offsite")
     assert not bad.ok
     with pytest.raises(AttributeError):

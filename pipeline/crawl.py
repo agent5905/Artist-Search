@@ -3,11 +3,14 @@
 Hard rules 4 and 5 and owner decision 2 live here, in one place. Later stages get pages and images in two steps,
 and there is no other way in:
 
-    site = fetcher.open_site("https://janedoe.art/")   # a Site, or a FetchResult saying why it is not an own site
+    site = fetcher.open_site("https://janedoe.art/", "https://www.deviantart.com/janedoe")
     page = site.fetch("https://janedoe.art/gallery")   # a FetchResult: the content, or the reason it was skipped
 
-Neither step raises. Nothing is requested that is not on a site opened from an own-site front page, and no site is
-asked for more than SITE_REQUEST_BUDGET requests in one process.
+open_site returns a Site only once the front page has been seen to link back to that DeviantArt profile, and a
+FetchResult saying why not otherwise. Proving it costs at most VERIFY_REQUEST_BUDGET requests (robots.txt,
+tdmrep.json, the front page). A site that fails is closed for the rest of the run, for every fetcher. Neither step
+raises, nothing is requested that is not on a proven site, and no site is asked for more than SITE_REQUEST_BUDGET
+requests in one process.
 """
 
 import fnmatch
@@ -20,7 +23,7 @@ import socket
 import threading
 import time
 import zlib
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass
 from html import unescape
 from http.cookiejar import DefaultCookiePolicy
@@ -42,6 +45,7 @@ MAX_SECONDS_PER_RESPONSE = 120.0  # the read timeout is per chunk, so a slow dri
 MAX_CRAWL_DELAY = 60.0  # a host that asks for more patience than this is treated as closed to us
 MAX_REDIRECTS = 5
 SITE_REQUEST_BUDGET = 60  # requests of one site per process, everything counted. A mistaken site stays a small one
+VERIFY_REQUEST_BUDGET = 3  # all a site is asked until its front page proves whose it is: robots.txt, tdmrep.json, it
 STALLED_CLOCK_SECONDS = 0.1  # real time. A clock that reads the same for this long has stopped, not just ticked late
 META_TAG_MAX = 100_000  # characters. A <meta> tag that does not end within this is treated as an opt-out
 GZIP_MEMBERS_MAX = 64  # no real page has more than one; each further one costs a copy of what is left
@@ -97,9 +101,22 @@ AI_CRAWLER_TOKENS = (
     "Webzio-Extended",
     "MistralAI-User",
     "Ai2Bot-Dolma",
+    "GoogleOther",
+    "TikTokSpider",
+    "PanguBot",
+    "Kangaroo Bot",
 )
 OPT_OUT_DIRECTIVES = frozenset({"noai", "noimageai", "noindex", "none"})
-_US = config.ROBOTS_TOKEN.lower()
+
+
+def _agent(value: str) -> str:
+    """The product token of a robots.txt User-agent value, in lower case: "ArtistSearchBot 0.1" is "artistsearchbot"."""
+    token = re.match(r"[\w-]+|\*", value.strip().lower())
+    return token.group() if token else ""
+
+
+_US = _agent(config.ROBOTS_TOKEN)
+_AI_AGENTS = tuple(_agent(token) for token in AI_CRAWLER_TOKENS)
 # Headers and <meta> names whose directives bind us: the general ones, ours, and any AI crawler's.
 _ROBOTS_NAMES = frozenset({"robots", "x-robots-tag", _US, *(token.lower() for token in AI_CRAWLER_TOKENS)})
 # Content-Signal: ai-train=no / ai-input=no, and Content-Usage: train-ai=n, in robots.txt or in a header.
@@ -174,6 +191,13 @@ _DEFAULT_PORT = {"http": 80, "https": 443}
 _NAT64 = ipaddress.ip_network("64:ff9b::/96")
 
 _META_OPEN = re.compile(r"<meta(?=[\s/>])", re.IGNORECASE)
+_TAG = re.compile(r"<!--|<([a-zA-Z][^\s/>]*)")  # a comment, or the opening of a tag with its name
+# Elements whose content is text, not markup: nothing inside them is a link.
+_RAW_TEXT = {
+    name: re.compile(rf"</{name}(?=[\s/>])", re.IGNORECASE)
+    for name in ("script", "style", "textarea", "title", "xmp", "iframe", "noembed", "noframes", "plaintext")
+}
+_HANDLE = re.compile(r"[a-z0-9-]+")
 # One step inside a tag: its closing ">", or the next attribute with its quoted or bare value.
 _ATTRIBUTE = re.compile(r"""[\s/]*(?:(>)|([^\s/>][^\s/>=]*)(?:\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]*)))?)""")
 
@@ -184,6 +208,8 @@ _LOCK = threading.RLock()  # re-entrant, so a fetch made from inside a callback 
 _LAST: dict[str, float] = {}  # site -> the clock reading when its last request ended
 _DELAY: dict[str, float] = {}  # site -> seconds between requests, once a Crawl-delay has raised it
 _SPENT: dict[str, int] = {}  # site -> requests made of it so far, out of SITE_REQUEST_BUDGET
+# site -> the DeviantArt handle its front page links back to, or None once a claim on it has failed: closed for the run
+_OWNERS: dict[str, str | None] = {}
 
 
 @dataclass(frozen=True)
@@ -210,16 +236,22 @@ def _site(url: httpx.URL) -> str:
     return _PSL.extract_str(_host(url)).top_domain_under_public_suffix
 
 
-def _dot_segments(url: httpx.URL) -> bool:
-    """True when the path still holds a `.` or `..` segment that some server would resolve.
+def _unsafe_path(url: httpx.URL) -> bool:
+    """True when a server might serve this path as a different one, so that robots.txt cannot be held against it.
 
-    httpx resolves the plain ones. What is left is encoded (%2e%2e, %252e, %2f..%2f), behind a backslash, or
-    carries a path parameter (..;), and robots.txt cannot be matched against a path the server will rewrite.
+    That is a `.` or `..` segment that httpx did not resolve (encoded as %2e, or carrying a path parameter: ..;),
+    an empty segment (//private), an encoded slash (%2F) or a backslash, however deep the encoding goes.
     """
-    path = url.path
+    sent = url.raw_path.partition(b"?")[0].decode("ascii")
+    path = sent
     while "%" in path and unquote(path) != path:
         path = unquote(path)
-    return any(segment.partition(";")[0] in (".", "..") for segment in path.replace("\\", "/").split("/"))
+    return (
+        "\\" in path
+        or "//" in path
+        or path.count("/") != sent.count("/")
+        or any(segment.partition(";")[0] in (".", "..") for segment in path.split("/"))
+    )
 
 
 def _refusal(url: httpx.URL) -> Skip | None:
@@ -231,7 +263,7 @@ def _refusal(url: httpx.URL) -> Skip | None:
         or url.port not in (None, _DEFAULT_PORT[url.scheme])
         or url.userinfo  # credentials in a URL would be sent as an Authorization header
         or not _HOSTNAME.fullmatch(host)
-        or _dot_segments(url)
+        or _unsafe_path(url)
     ):
         return "bad_url"
     labels = host.split(".")
@@ -372,8 +404,7 @@ class _Robots:
             if key == "user-agent":
                 if in_rules:
                     agents, in_rules = [], False
-                token = re.match(r"[\w-]+|\*", value.lower())  # the product token: "ArtistSearchBot 0.1" is us
-                agents.append(token.group() if token else "")
+                agents.append(_agent(value))
                 self.groups.setdefault(agents[-1], [])
             elif key in ("allow", "disallow", "crawl-delay"):
                 in_rules = True
@@ -396,8 +427,8 @@ class _Robots:
         """True when the site reserves itself from AI use, or shuts an AI crawler out of the site or this path."""
         if self.reserved:
             return True
-        for token in AI_CRAWLER_TOKENS:
-            rules = self.groups.get(token.lower(), [])
+        for agent in _AI_AGENTS:
+            rules = self.groups.get(agent, [])
             if any(not allow and _matches(pattern, "/") for allow, pattern in rules) or not _allowed(rules, path):
                 return True
         return False
@@ -429,26 +460,88 @@ def _reserves(name: str, value: str) -> bool:
     return name in _ROBOTS_NAMES and not OPT_OUT_DIRECTIVES.isdisjoint(re.split(r"[^a-z]+", value))
 
 
+def _attributes(text: str, position: int) -> tuple[dict[str, str] | None, int]:
+    """The attributes of the tag whose name ends at `position`, and where the tag ends. None for a tag with no end.
+
+    Tags are read here, attribute by attribute, and not by html.parser: on a malformed page it is quadratic
+    (2 MB of "<!--" takes minutes).
+    """
+    attributes: dict[str, str] = {}
+    limit = position + META_TAG_MAX
+    while True:
+        step = _ATTRIBUTE.match(text, position, limit)
+        if not step:
+            return None, position
+        position = step.end()
+        if step.group(1):
+            return attributes, position
+        value = step.group(3) or step.group(4) or (step.group(5) or "").rstrip("/")
+        attributes.setdefault(step.group(2).lower(), unescape(value))  # the first of a repeated attribute wins
+
+
 def _meta_reserves(text: str) -> bool:
     """True when a <meta> tag in the text opts out, or cannot be read to its end.
 
-    Tags are read here, attribute by attribute, and not by html.parser: on a malformed page it is quadratic
-    (2 MB of "<!--" takes minutes). Ceiling: a commented-out meta still counts, which fails closed.
+    Ceiling: a commented-out meta still counts, which fails closed.
     """
     for opening in _META_OPEN.finditer(text):
-        attributes: dict[str, str] = {}
-        position, limit = opening.end(), opening.end() + META_TAG_MAX
-        while True:
-            step = _ATTRIBUTE.match(text, position, limit)
-            if not step:
-                return True  # no end in sight: a tag we cannot read counts as an opt-out
-            if step.group(1):
-                break
-            value = step.group(3) or step.group(4) or (step.group(5) or "").rstrip("/")
-            attributes.setdefault(step.group(2).lower(), unescape(value))  # the first of a repeated attribute wins
-            position = step.end()
+        attributes, _ = _attributes(text, opening.end())
+        if attributes is None:
+            return True  # no end in sight: a tag we cannot read counts as an opt-out
         if _reserves(attributes.get("name") or attributes.get("http-equiv") or "", attributes.get("content", "")):
             return True
+    return False
+
+
+def _hrefs(text: str) -> Iterator[str]:
+    """The href of every <a>, <area> and <link> that is markup: none from a comment, a script or an attribute."""
+    position = 0
+    while found := _TAG.search(text, position):
+        name = (found.group(1) or "").lower()
+        if not name:  # a comment runs to its "-->", or to the end of the page
+            position = text.find("-->", found.end() - 2) + 3
+            if position < 3:
+                return
+            continue
+        attributes, position = _attributes(text, found.end())
+        if attributes is None:
+            return  # a tag with no end: nothing after it can be trusted to be markup
+        if name in _RAW_TEXT:
+            closing = _RAW_TEXT[name].search(text, position)
+            if not closing:
+                return
+            position = closing.end()
+        elif name in ("a", "area", "link"):
+            yield attributes.get("href", "")
+
+
+def _deviantart_handle(url: httpx.URL) -> str | None:
+    """The DeviantArt account a URL points at, in lower case, or None.
+
+    Two forms, and nothing else: deviantart.com/<handle> (with or without www., a trailing slash or anything
+    deeper under the handle) and the old <handle>.deviantart.com.
+    """
+    host = _host(url)
+    if url.scheme not in _DEFAULT_PORT or url.userinfo or url.port not in (None, _DEFAULT_PORT[url.scheme]):
+        return None
+    if host in ("deviantart.com", "www.deviantart.com"):
+        handle = (url.path.split("/") + [""])[1].lower()
+    else:
+        handle, _, parent = host.partition(".")
+        if parent != "deviantart.com" or handle == "www":
+            return None
+    return handle if _HANDLE.fullmatch(handle) else None
+
+
+def _links_back(page: FetchResult, handle: str) -> bool:
+    """True when the page holds a link to that DeviantArt profile: the proof that the site is the account's own."""
+    base = httpx.URL(page.url)
+    for href in _hrefs(page.content.decode("utf-8", "replace")):  # the markup that matters here is ASCII
+        try:
+            if _deviantart_handle(base.join(href.strip())) == handle:
+                return True
+        except httpx.InvalidURL:
+            continue
     return False
 
 
@@ -467,12 +560,27 @@ def _shown(url: object) -> str:
     return url if isinstance(url, str) else ""
 
 
+def _request_url(url: str) -> httpx.URL:
+    """The URL as it will be requested: no fragment, and "/" spelled out where the path was left empty."""
+    parsed = httpx.URL(url)
+    return parsed.copy_with(raw_path=parsed.raw_path, fragment=None)
+
+
+def _profile_handle(profile_url: str) -> str | None:
+    """The handle of a DeviantArt profile URL, or None when it is not one."""
+    try:
+        return _deviantart_handle(httpx.URL(profile_url))
+    except Exception:
+        return None
+
+
 class PoliteFetcher:
     """GETs public pages and images from artists' own sites, and nothing else.
 
-    Nothing is fetched except through a site opened with open_site, so every request is anchored to a front page
-    that passed is_own_site. The per-site clocks and budgets are shared by every fetcher in the process. The
-    robots.txt cache belongs to one fetcher, so use one for a whole run.
+    Nothing is fetched except through a site opened with open_site, and a site opens only when its front page
+    links back to the DeviantArt profile that claims it. Which sites are proven or closed, their clocks and their
+    budgets are shared by every fetcher in the process. The robots.txt cache belongs to one fetcher, so use one
+    for a whole run.
     """
 
     def __init__(
@@ -501,19 +609,52 @@ class PoliteFetcher:
         # ponytail: robots.txt is cached for the life of the fetcher. RFC 9309 says 24 hours at most; a run is shorter.
         self._origins: dict[str, _Robots | Skip] = {}  # scheme://host -> its rules, or why it is closed to us
 
-    def open_site(self, root_url: str) -> "Site | FetchResult":
-        """A handle on an artist's own site, or the skip that says why `root_url` is not one. Makes no request."""
-        reason = _own_site_refusal(root_url)
-        return FetchResult(_shown(root_url), skip=reason) if reason else Site(self, root_url)
+    def open_site(self, root_url: str, profile_url: str) -> "Site | FetchResult":
+        """Prove that `root_url` is the own site of the DeviantArt account at `profile_url`, and hand back a Site.
 
-    def _fetch(self, root: str, url: str, image: bool) -> FetchResult:
-        """What Site.fetch runs. The root is judged again here, so a handle made by hand opens nothing more."""
+        The proof is a link back to that profile on the site's front page. It is looked for once per site and
+        process, and costs at most VERIFY_REQUEST_BUDGET requests: robots.txt, tdmrep.json and the front page,
+        with no redirect followed from that page. Anything short of proof comes back as a skip and closes the
+        site for the rest of the run, for every fetcher. So does a second account claiming a proven site.
+        """
+        with _LOCK:
+            reason = _own_site_refusal(root_url)
+            handle = _profile_handle(profile_url)
+            if reason or not handle:
+                return FetchResult(_shown(root_url), skip=reason or "bad_url")
+            root = _request_url(root_url)
+            site, front_page = _site(root), None
+            if site not in _OWNERS:
+                _OWNERS[site] = None  # closed, unless the front page says otherwise
+                try:
+                    front_page = self._get(root, PAGE_MAX_BYTES, redirects=0)
+                    if front_page.ok and _links_back(front_page, handle):
+                        _OWNERS[site] = handle
+                except Exception:  # a skip never raises, so an unexpected failure is logged and skipped
+                    log.exception("could not open %s", root)
+                    return FetchResult(str(root), skip="error")
+                if front_page.skip:
+                    unproven = front_page.skip == "budget" or 300 <= front_page.status < 400
+                    reason = "not_own_site" if unproven else front_page.skip
+                    return FetchResult(front_page.url, status=front_page.status, skip=reason)
+            if _OWNERS[site] != handle:
+                _OWNERS[site] = None
+                return FetchResult(str(root), skip="not_own_site")
+            return Site(self, root_url, profile_url, front_page)
+
+    def _fetch(self, root: str, profile: str, url: str, image: bool) -> FetchResult:
+        """What Site.fetch runs. The claim is judged again here, so a handle made by hand opens nothing more."""
         with _LOCK:
             try:
                 reason = _own_site_refusal(root)
-                parsed = httpx.URL(url)
-                if not reason and _site(parsed) != _site(httpx.URL(root)):
-                    reason = "offsite"
+                handle = _profile_handle(profile)
+                parsed = _request_url(url)
+                if not reason:
+                    site = _site(httpx.URL(root))
+                    if not handle or _OWNERS.get(site) != handle:
+                        reason = "not_own_site"
+                    elif _site(parsed) != site:
+                        reason = "offsite"
             except Exception:
                 reason = "bad_url"
             if reason:
@@ -524,27 +665,29 @@ class PoliteFetcher:
                 log.exception("could not fetch %s", parsed)
                 return FetchResult(str(parsed), skip="error")
 
-    def _get(self, url: httpx.URL, cap: int, policy_path: str = "") -> FetchResult:
-        """Follow one URL through its redirects.
+    def _get(self, url: httpx.URL, cap: int, policy_path: str = "", redirects: int = MAX_REDIRECTS) -> FetchResult:
+        """Follow one URL through at most `redirects` redirects.
 
         `policy_path` is set when the URL is robots.txt or tdmrep.json itself. No rule can forbid reading those,
         their own headers do not close the host, and they may only redirect to the same path on the same site.
         """
-        site = _site(url)
-        for _ in range(MAX_REDIRECTS + 1):
+        site, status = _site(url), 0
+        for _ in range(redirects + 1):
             try:
                 reason, address = self._admit(url, site, policy_path)
-                if not reason and _SPENT.get(site, 0) >= SITE_REQUEST_BUDGET:
+                budget = SITE_REQUEST_BUDGET if _OWNERS.get(site) else VERIFY_REQUEST_BUDGET
+                if not reason and _SPENT.get(site, 0) >= budget:
                     reason = "budget"
                 if reason:
                     return FetchResult(str(url), skip=reason)
                 response, body = self._send(url, address, cap)
+                status = response.status_code
                 if response.has_redirect_location:
                     url = url.join(response.headers["location"])
                     continue
             except (httpx.HTTPError, httpx.InvalidURL, OSError):
                 return FetchResult(str(url), skip="error")
-            if response.status_code in (401, 403):
+            if status in (401, 403):
                 reason = "auth"
             elif not response.is_success:
                 reason = "error"
@@ -553,9 +696,9 @@ class PoliteFetcher:
             elif not policy_path and _opted_out(response.headers, body):
                 reason = "ai_opt_out"
             else:
-                return FetchResult(str(url), body, response.headers.get("content-type", ""), response.status_code)
-            return FetchResult(str(url), status=response.status_code, skip=reason)
-        return FetchResult(str(url), skip="error")  # too many redirects
+                return FetchResult(str(url), body, response.headers.get("content-type", ""), status)
+            return FetchResult(str(url), status=status, skip=reason)
+        return FetchResult(str(url), status=status, skip="error")  # one redirect too many: `url` is where it pointed
 
     def _admit(self, url: httpx.URL, site: str, policy_path: str) -> tuple[Skip | None, str]:
         """Every check a URL must pass before it is requested, run again for each redirect hop.
@@ -668,15 +811,17 @@ class PoliteFetcher:
 
 
 class Site:
-    """One artist's own site, as opened by PoliteFetcher.open_site. It is the only way to fetch anything."""
+    """One artist's own site, proven and opened by PoliteFetcher.open_site. It is the only way to fetch anything."""
 
-    def __init__(self, fetcher: PoliteFetcher, root: str) -> None:
+    def __init__(self, fetcher: PoliteFetcher, root: str, profile: str, front_page: FetchResult | None = None) -> None:
         self._fetcher = fetcher
         self.root = root
+        self.profile = profile
+        self.front_page = front_page  # the page that proved the claim, when this handle is the one that fetched it
 
     def fetch(self, url: str, *, image: bool = False) -> FetchResult:
         """GET one public page of this site, or one image when `image` is set (only the size cap differs).
 
         Never raises. A URL that is not on this site comes back as `offsite`, unrequested.
         """
-        return self._fetcher._fetch(self.root, url, image)
+        return self._fetcher._fetch(self.root, self.profile, url, image)
