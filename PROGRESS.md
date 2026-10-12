@@ -1,17 +1,13 @@
 # Artist Search: Progress
 
-**Status, 2026-10-12 (later):** First real data is in: a live discovery run found 60 artists with their own site out of 396 niche candidates. Round 3 critics passed most of the crawler and discovery bars; both are in round 4 on the remaining gaps. The database is in round 3. No artist site has been crawled yet.
-
-**The number that matters most right now:** 15% of niche candidates list a bare custom domain. Three more filters apply before an artist is indexed (the site must link back to their DeviantArt profile, must carry no AI opt-out, and must serve its own images), and none of those is measured yet. Reaching 2,000 artists on path B looks unlikely without a decision from the owner. See "Yield" in round 3 below.
+**Status, 2026-10-12 (afternoon):** The owner chose a hybrid corpus and verified removal (decisions 5 and 6 below). The plan now reaches 2,000+ artists from the DeviantArt API without putting any of their content through a model. Crawler and discovery are in round 4; the database gets the removal change and the hybrid schema in its round 4.
 
 ## Waiting on the owner
 
-0. **Corpus size.** The first live numbers suggest path B will fall well short of 2,000 artists. The levers are the owner's: send the DeviantArt permission request (the draft is in `docs/`), allow images from site-builder hosts (item 2), approve another source, or accept a smaller index for this version.
-1. **How a removal request is verified.** The removal flow has failed its critic twice on abuse. Options: (1) verified instant removal, where an artist proves control of their site and is removed at once, and unproven requests are logged for the owner; (2) the owner reviews every request; (3) keep instant hiding for anyone, capped at 20 a day, and accept that a prankster can hide artists and delay real requests. Recommended: 1. That part of the database is on hold.
-2. **Image hosts run by site builders.** Custom-domain Wix, Squarespace, Shopify and WordPress.com sites serve images from the platform's own servers. Refused by default until the owner says otherwise. Likely the largest single cut to how many artists qualify.
-3. **Cloudflare token.** `CLOUDFLARE_API_TOKEN` is still rejected (HTTP 401). Suggested: a new, narrow token (Pages edit, Workers Scripts edit, Workers AI read). Needed for the site preview and the search box.
-4. **The reference for the search and style A/B tests** (decision 3 below). Proceeding with the stated default.
-5. **Optional: the DeviantArt permission request** in `docs/`. Only needed if DeviantArt artwork itself should be analyzed later.
+1. **Cloudflare token.** `CLOUDFLARE_API_TOKEN` is still rejected (HTTP 401). Create a narrow token (Pages edit, Workers Scripts edit, Workers AI read) and put it in `.env`. Needed for the site preview and the search box, not before.
+2. **Image hosts run by site builders** (Wix, Squarespace, Shopify, WordPress.com). Refused by default. Under the hybrid plan this only limits how many artists get AI enrichment, not the size of the index.
+3. **Judging DeviantArt-sourced results.** A critic is a model, so it may not look at DeviantArt content. For search quality on those artists the owner will be the blind A/B judge, on a local page built for it. Critics still judge everything testable with synthetic data, and the enriched subset.
+4. **Optional: the DeviantArt permission request** in `docs/`. If granted, AI enrichment extends to every artist.
 
 ## Owner decisions (these amend the spec)
 
@@ -21,6 +17,8 @@ Made 2026-10-11, after the DeviantArt terms were read.
 2. **New hard rule: honor AI opt-outs everywhere.** A site or page is skipped when robots.txt disallows us, when it blocks known AI crawlers, or when it carries `noai`, `noimageai`, `noindex` or a text-and-data-mining reservation. Only custom-domain sites are crawled; hosted platforms and social networks are never fetched.
 3. **Reference for pieces 5 and 6 (default, pending the owner).** DeviantArt results cannot be shown to a critic. The blind A/B reference becomes a plain keyword search (text) and a generic image-embedding ranking (style) over the same index, and the critic also grades every result on its own against the artist's real work. This is a weaker bar than the spec's. It is the strongest one the terms allow.
 4. **Push `main` after every round.**
+5. **Hybrid corpus (2026-10-12).** The owner requires at least 2,000 artists. Every artist comes from the DeviantArt API and is indexed without AI: the artist's own tags, titles, tagline and stated specialty, searched by keyword, with "similar" artists found by tag overlap and thumbnails embedded from DeviantArt with attribution and a link back. AI analysis (vision tags, style vectors, written profiles) runs only for artists whose own site passes the ownership and opt-out checks. No DeviantArt content goes into a model, an agent's context, or a log an agent reads: pipeline output stays counts only, and builders and critics work with synthetic data. This replaces spec section 4.2 for most artists.
+6. **Verified removal (2026-10-12).** An artist who proves control of their site or DeviantArt profile, by adding a short code that is then checked, is removed at once and never re-added. A request without proof is logged for the owner and changes nothing until the owner acts. This replaces "any request hides at once", which failed its critic twice on abuse.
 
 ## The plan
 
