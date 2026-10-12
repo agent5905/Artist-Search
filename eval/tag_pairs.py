@@ -1,6 +1,7 @@
 """Blind A/B pairs for the tagging critic.
 
     uv run python eval/tag_pairs.py --a qwen3.8:latest --b gemma4:26b --works 30 --name round1
+    uv run python eval/tag_pairs.py --a qwen3.8:latest+qwen3.8:latest --b qwen3.8:latest+gemma4:26b --name round2
 
 Writes cache/review/<name>/items.jsonl (git-ignored, local only): one line per work with the cached image path
 and the two models' results as "A" and "B", shuffled per work with the model names removed. The answer key goes
@@ -30,8 +31,13 @@ def main() -> int:
     keys = config.CACHE_DIR / "review" / "keys"
     out.mkdir(parents=True, exist_ok=True)
     keys.mkdir(parents=True, exist_ok=True)
-    first = tagging.sample(args.works, args.seed, model=args.a)
-    second = {row["deviation_id"]: row for row in tagging.sample(args.works, args.seed, model=args.b)}
+
+    def sample(spec: str) -> list[dict]:
+        model, _, verifier = spec.partition("+")  # "qwen3.8:latest" or "qwen3.8:latest+gemma4:26b"
+        return tagging.sample(args.works, args.seed, model=model, verifier=verifier or None)
+
+    first = sample(args.a)
+    second = {row["deviation_id"]: row for row in sample(args.b)}
     rng = random.Random(args.seed)
     items, answer = [], []
     for n, row in enumerate(first, start=1):
