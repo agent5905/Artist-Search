@@ -1,0 +1,339 @@
+"""Tests for pipeline.style.
+
+Every handle, address and image below is invented here: flat 8x8 squares made in memory. The model is a
+stand-in that turns a square's red value into a vector, so nothing touches the GPU and nothing is downloaded.
+The cache directory and the database are moved into pytest's temporary directory.
+"""
+
+import io
+import json
+import os
+import re
+import socket
+import sqlite3
+import subprocess
+import sys
+from contextlib import closing
+
+import numpy as np
+import pytest
+from PIL import Image
+
+from pipeline import config, library, style
+
+ALPHA, BRAVO, CHARLIE, DELTA, ECHO, FOXTROT, GOLF = (
+    f"da:zz-fake-{name}" for name in ("alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf")
+)
+# Begins the way a PNG does, so the library keeps it, and is not an image.
+BROKEN = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR" + b"FAKE-BYTES-THAT-ARE-NOT-AN-IMAGE"
+
+
+def work_id(n):
+    return f"00000000-0000-4000-A000-{n:012d}"
+
+
+def square(shade):
+    buffer = io.BytesIO()
+    Image.new("RGB", (8, 8), (shade, 0, 0)).save(buffer, "PNG")
+    return buffer.getvalue()
+
+
+def collect(artist, *squares, broken=(), bare=()):
+    """Collect one invented artist. Each number is a work of theirs.
+
+    Its cached image is a flat square whose red value is that number, bytes that are not an image (`broken`),
+    or nothing at all (`bare`).
+    """
+    for n in squares:
+        library.save_image(work_id(n), "image/png", square(n))
+    for n in broken:
+        library.save_image(work_id(n), "image/png", BROKEN)
+    works = [
+        {
+            "work_id": work_id(n),
+            "page_url": f"https://www.deviantart.com/zz-fake/art/FAKE-TITLE-{n}",
+            "title": "FAKE-TITLE",
+            "tags": [],
+            "thumb_url": "https://images-wixmp-zzfake.wixmp.com/f/FAKE-THUMB.jpg",
+            "published": "1",
+        }
+        for n in (*squares, *broken, *bare)
+    ]
+    library.store_artist(artist, user_id=None, tagline=None, specialty=None, level=None, website=None, works=works)
+
+
+class FakeModel:
+    """Stands in for style.load_model. A square's red value picks its vector; it notes what it is asked for."""
+
+    def __init__(self):
+        self.table = {}  # red value -> the first few numbers of its vector; the rest are zero
+        self.loads = 0
+        self.batches = []  # the red values of each batch it was given
+        self.meanwhile = None  # something to happen while a batch is in the model
+
+    def __call__(self, model):
+        self.loads += 1
+        return self.embed
+
+    def embed(self, images):
+        self.batches.append([image.getpixel((0, 0))[0] for image in images])
+        if self.meanwhile:
+            self.meanwhile()
+        # Like a GPU, it answers differently when the batch is short: the stage must always send a full one.
+        return np.array([self.vector(shade) for shade in self.batches[-1]]) + (style.BATCH - len(images))
+
+    def vector(self, shade):
+        if shade in self.table:
+            return np.pad(np.array(self.table[shade], dtype=float), (0, 768 - len(self.table[shade])))
+        return np.random.default_rng(shade).normal(size=768) * 3  # not unit length: the stage has to make it so
+
+
+def unsynced(*args, connect=sqlite3.connect, **kwargs):
+    """sqlite3.connect that does not wait for the disk after each commit, as in test_library.py."""
+    conn = connect(*args, **kwargs)
+    conn.execute("PRAGMA synchronous = OFF")
+    return conn
+
+
+@pytest.fixture(autouse=True)
+def cache(tmp_path, monkeypatch):
+    monkeypatch.setattr(config, "CACHE_DIR", tmp_path / "cache")
+    monkeypatch.setattr(config, "LOCAL_DB", tmp_path / "cache" / "pipeline.sqlite")
+    monkeypatch.setattr(sqlite3, "connect", unsynced)  # a busy disk makes each commit take seconds
+
+
+@pytest.fixture
+def model(monkeypatch):
+    fake = FakeModel()
+    monkeypatch.setattr(style, "load_model", fake)
+    return fake
+
+
+@pytest.fixture
+def no_network(monkeypatch):
+    """Every way to open a connection is refused, and each attempt is written down."""
+    attempts = []
+
+    def refuse(*args, **kwargs):
+        attempts.append(args)
+        raise OSError("the network is off in this test")
+
+    for name in ("connect", "connect_ex"):
+        monkeypatch.setattr(socket.socket, name, refuse)
+    for name in ("getaddrinfo", "create_connection"):
+        monkeypatch.setattr(socket, name, refuse)
+    return attempts
+
+
+def stored():
+    with closing(sqlite3.connect(config.LOCAL_DB)) as conn:
+        return conn.execute("SELECT deviation_id, model, vector FROM style_vectors ORDER BY 1, 2").fetchall()
+
+
+def unit(values):
+    return np.asarray(values) / np.linalg.norm(values)
+
+
+# 1. Hard rules 2 and 9: the stage works with the network unavailable, and never reaches for it.
+
+
+def test_a_run_opens_no_connection(model, no_network):
+    collect(ALPHA, 1, 2)
+    collect(BRAVO, 3)
+    assert style.main(["--model", "csd"]) == 0
+    assert style.main(["--neighbors", ALPHA, "--model", "csd"]) == 0
+    assert len(stored()) == 3
+    assert no_network == []
+    with pytest.raises(OSError):  # and the guard is not a dud
+        socket.socket().connect(("127.0.0.1", 9))
+    assert len(no_network) == 1
+
+
+def test_the_real_loaders_set_the_offline_switches_and_never_reach_for_the_network(tmp_path):
+    """The real load_model, in its own process, with the network refused and no weights on the machine.
+
+    Each model must stop with the note about fetching its weights, without one attempt to connect.
+    """
+    probe = """
+import os, socket
+def refuse(*args, **kwargs):
+    print("CONNECTION ATTEMPT", flush=True)
+    raise OSError("the network is off in this test")
+socket.socket.connect = socket.socket.connect_ex = socket.getaddrinfo = socket.create_connection = refuse
+from pipeline import style
+for model in sorted(style.WEIGHTS):
+    try:
+        style.load_model(model)
+        print(model, "LOADED")
+    except SystemExit as stop:
+        print(model, "stopped:", stop)
+print("switches", os.environ["HF_HUB_OFFLINE"], os.environ["TRANSFORMERS_OFFLINE"])
+"""
+    empty = str(tmp_path / "no-weights-here")
+    env = {**os.environ, "HF_HOME": empty, "HF_HUB_CACHE": empty, "HF_HUB_OFFLINE": "0", "TRANSFORMERS_OFFLINE": "0"}
+    result = subprocess.run(
+        [sys.executable, "-c", probe], cwd=config.ROOT, env=env, capture_output=True, text=True, timeout=300
+    )
+    fetch = "No local weights. Fetch them once: python -m pipeline.style --download --model"
+    assert result.stdout.splitlines() == [
+        f"csd stopped: {fetch} csd",
+        f"siglip2 stopped: {fetch} siglip2",
+        "switches 1 1",
+    ]
+
+
+# 2. Vectors are unit length, 768 numbers, finite, and the same image gives the same vector again.
+
+
+def test_vectors_are_unit_length_768_finite_float16_and_the_same_on_a_rerun(model, monkeypatch):
+    monkeypatch.setattr(style, "BATCH", 2)
+    collect(ALPHA, 1, 2, 3, 4, 5)
+    style.run("csd", 500)
+    first = stored()
+    assert len(first) == 5 and all(len(blob) == 768 * 2 for _, _, blob in first)
+    for n in range(1, 6):
+        vector = style.vector(work_id(n), "csd")
+        assert vector.dtype == np.float16 and vector.shape == (768,)
+        assert np.isfinite(vector).all()
+        assert abs(np.linalg.norm(vector.astype(np.float64)) - 1) < 1e-3
+        assert np.allclose(vector, unit(model.vector(n)), atol=1e-3)  # this work's own vector, made unit length
+    assert len({blob for _, _, blob in first}) == 5
+
+    def forget():
+        with closing(sqlite3.connect(config.LOCAL_DB)) as conn, conn:
+            conn.execute("DELETE FROM style_vectors")
+
+    forget()  # from nothing again: written after the first four works and at the end
+    monkeypatch.setattr(style, "WRITE_EVERY", 4)
+    assert style.run("csd", 500)["embedded"] == 5
+    assert stored() == first
+    forget()  # and again, one work a run: each image has other company in its batch, or none
+    for _ in range(5):
+        style.run("csd", 1)
+    assert stored() == first
+    assert {len(batch) for batch in model.batches} == {2}  # the model was only ever given full batches
+
+
+# 3. A rerun creates no duplicates and computes nothing.
+
+
+def test_a_rerun_adds_nothing_and_computes_nothing(model):
+    collect(ALPHA, 1, 2, 3, 4, 5)
+    assert style.run("csd", 2)["embedded"] == 2
+    assert style.run("csd", 500)["embedded"] == 3  # the rest, and not the first two again
+    assert [sorted(set(batch)) for batch in model.batches] == [[1, 2], [3, 4, 5]] and model.loads == 2
+    first = stored()
+    assert [(work, name) for work, name, _ in first] == [(work_id(n), "csd") for n in range(1, 6)]
+
+    assert style.run("csd", 500) == {"embedded": 0, "failed": 0}
+    assert (len(model.batches), model.loads) == (2, 2)  # nothing computed: the model was not even loaded
+    assert stored() == first
+
+    assert style.run("siglip2", 500)["embedded"] == 5  # the other model keeps its own vectors for the same works
+    assert len(stored()) == 10 and [row for row in stored() if row[1] == "csd"] == first
+
+
+# 4. The ranking is the database's rule, worked by hand.
+
+
+def test_neighbors_is_the_mean_over_the_seeds_works_of_the_best_match_among_the_candidates(model, capsys):
+    model.table = {
+        1: [1, 0, 0],  # ALPHA
+        2: [0, 1, 0],  # ALPHA
+        3: [2, 0, 0],  # BRAVO: ALPHA's first work exactly, twice as long (length must not count)
+        4: [1, 1, 0],  # BRAVO: halfway between ALPHA's two
+        5: [3, 4, 0],  # CHARLIE: cosine 0.6 with ALPHA's first, 0.8 with its second
+        6: [0, 0, 1],  # DELTA: at right angles to all of the above
+        7: [0, 0, 5],  # GOLF: the same direction as DELTA
+    }
+    for artist, shades in ((ALPHA, (1, 2)), (BRAVO, (3, 4)), (CHARLIE, (5,)), (DELTA, (6,)), (GOLF, (7,))):
+        collect(artist, *shades)
+    collect(ECHO, broken=[8])  # collected, but no vector could be made
+    collect(FOXTROT, bare=[9])  # collected, but no image
+    style.run("csd", 500)
+    capsys.readouterr()
+
+    def nearest(seed, top=10):
+        return [(key, pytest.approx(score, abs=1e-3)) for key, score in style.neighbors(seed, "csd", top)]
+
+    half = 2**-0.5
+    # ALPHA's first work finds itself in BRAVO (1.0), its second finds BRAVO's halfway work (0.7071).
+    # In CHARLIE they find 0.6 and 0.8. DELTA and GOLF tie at nothing, and the lower key goes first.
+    assert nearest(ALPHA) == [(BRAVO, (1 + half) / 2), (CHARLIE, 0.7), (DELTA, 0.0), (GOLF, 0.0)]
+    assert nearest(ALPHA, top=2) == [(BRAVO, (1 + half) / 2), (CHARLIE, 0.7)]
+    # The mean runs over the SEED's works: CHARLIE's one work finds 0.8 in ALPHA, though ALPHA found 0.7 in it.
+    assert nearest(CHARLIE) == [(BRAVO, 7 * half / 5), (ALPHA, 0.8), (DELTA, 0.0), (GOLF, 0.0)]
+    assert nearest(BRAVO)[:2] == [(ALPHA, (1 + half) / 2), (CHARLIE, (0.6 + 7 * half / 5) / 2)]
+    assert nearest(DELTA)[0] == (GOLF, 1.0)
+    for seed in (ALPHA, BRAVO, CHARLIE, DELTA, GOLF):  # never the seed, never an artist without vectors
+        assert not {seed, ECHO, FOXTROT} & {key for key, _ in style.neighbors(seed, "csd")}
+    assert style.neighbors(ECHO, "csd") == style.neighbors(FOXTROT, "csd") == style.neighbors("da:nobody", "csd") == []
+    assert style.neighbors(ALPHA, "siglip2") == []  # another model's vectors are another matter
+
+    assert style.main(["--neighbors", ALPHA, "--model", "csd", "--top", "2"]) == 0
+    printed = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert printed == [{"artist": BRAVO, "score": 0.8536}, {"artist": CHARLIE, "score": 0.7}]
+    assert style.main(["--neighbors", ECHO, "--model", "csd"]) == 1
+    assert capsys.readouterr().out == ""
+
+
+# 5. Stdout carries counts and throughput only.
+
+
+def test_stdout_is_counts_and_throughput_only(model, capsys):
+    collect(ALPHA, 1, 2)
+    collect(BRAVO, broken=[3])
+    assert style.main(["--model", "csd", "--max-works", "500"]) == 0
+    lines = capsys.readouterr().out.splitlines()
+    assert lines[:2] == ["embedded: 2", "failed: 1"]
+    assert all(re.fullmatch(r"(embedded|failed|images_per_second|peak_gpu_mb): \d+(\.\d+)?", line) for line in lines)
+    assert style.main(["--model", "csd"]) == 0
+    assert capsys.readouterr().out.splitlines() == ["embedded: 0", "failed: 0"]
+
+
+# An image that will not open is recorded as failed and skipped, and the run carries on.
+
+
+def test_a_bad_image_is_recorded_as_failed_and_the_rest_each_get_their_own_vector(model):
+    model.table = {5: [0, 0, 0]}  # a vector with no direction: nothing to make unit length
+    collect(ALPHA, 1, 3, 5, 6, broken=[2], bare=[4])  # 4 has no cached image: not this stage's business
+    (library.image_dir() / f"{work_id(6)}.png").unlink()  # named on its row, gone from the disk
+    counts = style.run("csd", 500)
+    assert (counts["embedded"], counts["failed"]) == (2, 3)
+    assert [(work, blob is None) for work, _, blob in stored()] == [
+        (work_id(1), False),
+        (work_id(2), True),
+        (work_id(3), False),
+        (work_id(5), True),
+        (work_id(6), True),
+    ]
+    for n in (1, 3):  # the gap in the batch did not shift anyone's vector onto a neighbor
+        assert np.allclose(style.vector(work_id(n), "csd"), unit(model.vector(n)), atol=1e-3)
+    assert all(style.vector(work_id(n), "csd") is None for n in (2, 4, 5, 6))
+    assert list(style.artist_vectors(ALPHA, "csd")) == [work_id(1), work_id(3)]
+    assert style.artist_vectors(BRAVO, "csd") == {}
+
+    assert style.run("csd", 500) == {"embedded": 0, "failed": 0}  # a failed work is not tried again
+    assert len(model.batches) == 1
+
+
+# Hard rule 7: what was computed from a removed artist's work is not kept.
+
+
+def test_a_removed_artists_vectors_are_never_read_again_and_are_deleted_by_the_next_run(model):
+    collect(ALPHA, 1)
+    collect(BRAVO, 2)
+    style.run("csd", 500)
+    assert style.neighbors(BRAVO, "csd")[0][0] == ALPHA
+
+    library.purge(ALPHA)
+    assert style.vector(work_id(1), "csd") is None
+    assert style.artist_vectors(ALPHA, "csd") == {}
+    assert style.neighbors(BRAVO, "csd") == []
+    style.run("csd", 500)
+    assert [work for work, _, _ in stored()] == [work_id(2)]
+
+    collect(CHARLIE, 3)
+    model.meanwhile = lambda: library.purge(CHARLIE)  # removed while their work is in the model
+    style.run("csd", 500)
+    assert model.batches[-1][0] == 3 and [work for work, _, _ in stored()] == [work_id(2)]
