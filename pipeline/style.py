@@ -10,7 +10,7 @@ Every other command loads weights from local files only, with the hub's offline 
 
     uv run python -m pipeline.style --download --model csd        once per model
     uv run python -m pipeline.style --model csd --max-works 500
-    uv run python -m pipeline.style --neighbors da:somebody --model csd --top 10 --rule mutual
+    uv run python -m pipeline.style --neighbors da:somebody --model csd --top 10 --rule local
 
 Stdout is counts and throughput only, except `--neighbors`: one JSON object per line.
 """
@@ -34,7 +34,8 @@ from pipeline import library
 DIMENSIONS = 768  # sql/001_schema.sql: works.style_embedding is halfvec(768)
 BATCH = 16
 WRITE_EVERY = 256  # works a transaction. The file is shared, and a commit can take seconds when the disk is busy
-RULES = ("best", "mutual")  # how neighbors() scores a candidate
+RULES = ("best", "mutual", "local")  # how neighbors() scores a candidate
+NEAREST = 10  # rule "local": how many of an artist's nearest artists their usual closeness is taken over
 
 # model -> (repository on huggingface.co, pinned commit, the files needed). Nothing else is ever fetched.
 WEIGHTS = {
@@ -228,7 +229,7 @@ def artist_vectors(artist_key: str, model: str, db: pathlib.Path | str | None = 
 
 
 def neighbors(
-    artist_key: str, model: str, top: int = 10, rule: str = "best", db: pathlib.Path | str | None = None
+    artist_key: str, model: str, top: int = 10, rule: str = "mutual", db: pathlib.Path | str | None = None
 ) -> list[tuple[str, float]]:
     """The artists most like this one, best first, as (artist key, score).
 
@@ -238,30 +239,43 @@ def neighbors(
     rule "mutual" is the average of that and the same the other way round: the mean, over the candidate's
     works, of the best match among the seed's. A candidate's works that match nothing of the seed's count
     against them.
+    rule "local" corrects "mutual" for artists who are fairly near everyone, and so turn up for every seed:
+    twice the pair's mutual score, less each one's usual closeness, which is the mean of their mutual scores
+    with their NEAREST nearest artists (all the others, when there are fewer). It can be negative.
 
     Ties go to the lower key. Never the seed, and never an artist without vectors. Empty when the seed has no
     vectors. ValueError for any other rule.
     """
     if rule not in RULES:
         raise ValueError(f"rule must be one of {RULES}")
-    # ponytail: reads every vector on each call (46 MB at 30,000 works) and scores every artist. The database
-    # scores only the 100 nearest by centroid and reads 10 works an artist, which is all collect keeps
-    # (collect.MAX_WORKS). Past a few hundred artists the two can differ at the tail of a long list.
-    stacks = {}
-    for key, works in _vectors(model, db).items():
-        stack = np.stack(list(works.values())).astype(np.float32)
-        stacks[key] = stack / np.linalg.norm(stack, axis=1, keepdims=True)
-    seed = stacks.pop(artist_key, None)
-    if seed is None:
+    vectors = _vectors(model, db)
+    if artist_key not in vectors or len(vectors) < 2:
         return []
-    scores = []
-    for key, theirs in stacks.items():
-        cosines = seed @ theirs.T  # one row a work of the seed's, one column a work of the candidate's
-        score = cosines.max(axis=1).mean()
-        if rule == "mutual":
-            score = (score + cosines.max(axis=0).mean()) / 2
-        scores.append((key, float(score)))
-    return sorted(scores, key=lambda pair: (-pair[1], pair[0]))[:top]
+    # ponytail: every call reads every vector and scores every pair of artists, whatever the rule: 0.2 s at
+    # 4,400 works, growing with the square (about 10 s at 30,000). Only "local" needs every pair. When a call
+    # gets slow, score the seed's pairs alone for the other rules, or keep each artist's usual closeness in a
+    # table. The database scores only the 100 nearest by centroid, on 10 works an artist, which is all collect
+    # keeps: past a few hundred artists the two can differ at the tail of a long list.
+    keys = list(vectors)
+    counts = np.array([len(vectors[key]) for key in keys])
+    starts = np.cumsum(counts) - counts  # where each artist's works begin in the stack
+    works = np.stack([vector for key in keys for vector in vectors[key].values()]).astype(np.float32)
+    works /= np.linalg.norm(works, axis=1, keepdims=True)
+    # best[w, a]: the best cosine match for work w among artist a's works. Made 2,048 works at a time, so
+    # the works-by-works table of cosines is never whole in memory.
+    best = np.concatenate(
+        [np.maximum.reduceat(works[at : at + 2048] @ works.T, starts, axis=1) for at in range(0, len(works), 2048)]
+    )
+    scores = np.add.reduceat(best, starts, axis=0) / counts[:, None]  # scores[a, b]: "best", seed a, candidate b
+    if rule != "best":
+        scores = (scores + scores.T) / 2
+    if rule == "local":
+        np.fill_diagonal(scores, -np.inf)  # an artist is not one of their own nearest
+        usual = np.sort(scores, axis=1)[:, -min(NEAREST, len(keys) - 1) :].mean(axis=1)
+        scores = 2 * scores - usual[:, None] - usual
+    row = scores[keys.index(artist_key)]
+    found = [(key, float(score)) for key, score in zip(keys, row, strict=True) if key != artist_key]
+    return sorted(found, key=lambda pair: (-pair[1], pair[0]))[:top]
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -270,7 +284,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--max-works", type=int, default=500, help="embed at most this many works in this run")
     parser.add_argument("--neighbors", metavar="ARTIST_KEY", help="print the artists nearest to this one")
     parser.add_argument("--top", type=int, default=10, help="how many neighbors to print")
-    parser.add_argument("--rule", choices=RULES, default="best", help="how --neighbors scores (see neighbors)")
+    parser.add_argument("--rule", choices=RULES, default="mutual", help="how --neighbors scores (see neighbors)")
     parser.add_argument("--download", action="store_true", help="fetch the model's weights from huggingface.co")
     args = parser.parse_args(argv)
     if args.download:

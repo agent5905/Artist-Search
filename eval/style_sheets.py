@@ -2,6 +2,9 @@
 
     uv run python eval/style_sheets.py --a csd --b siglip2 --seeds 12 --name round1
     uv run python eval/style_sheets.py --a csd:best --b csd:mutual --seeds 12 --name round2
+    uv run python eval/style_sheets.py --a csd:mutual --b csd:local --frozen --seeds 12 --name round3
+
+--frozen takes the first N seed artists from eval/seeds.jsonl (stored as hashes) instead of drawing new ones.
 
 For each randomly drawn seed artist it writes three images under cache/review/<name>/ (git-ignored, local only):
 seed_NN.jpg (the seed's works), seed_NN_A.jpg and seed_NN_B.jpg (the artists each model ranks nearest, one row
@@ -10,6 +13,7 @@ which the critic is not given.
 """
 
 import argparse
+import hashlib
 import json
 import pathlib
 import random
@@ -55,6 +59,7 @@ def main() -> int:
     parser.add_argument("--seeds", type=int, default=12)
     parser.add_argument("--rng", type=int, default=20261012)
     parser.add_argument("--name", required=True, help="folder name under cache/review/")
+    parser.add_argument("--frozen", action="store_true", help="use the frozen seed artists in eval/seeds.jsonl")
     args = parser.parse_args()
 
     out = config.CACHE_DIR / "review" / args.name
@@ -72,7 +77,14 @@ def main() -> int:
         )
     ]
     answer = []
-    for n, artist in enumerate(rng.sample(eligible, args.seeds), start=1):
+    if args.frozen:
+        by_hash = {hashlib.sha256(key.encode()).hexdigest(): key for key in eligible}
+        lines = (pathlib.Path(__file__).parent / "seeds.jsonl").read_text(encoding="utf-8").splitlines()
+        frozen = [by_hash.get(json.loads(line)["artist_sha256"]) for line in lines]
+        seeds = [key for key in frozen if key][: args.seeds]  # a removed or uncollected seed is skipped
+    else:
+        seeds = rng.sample(eligible, args.seeds)
+    for n, artist in enumerate(seeds, start=1):
         sheet([works(conn, artist, 6)], out / f"seed_{n:02d}.jpg")
         models = [args.a, args.b]
         rng.shuffle(models)

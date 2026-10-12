@@ -254,7 +254,7 @@ def test_neighbors_is_the_mean_over_the_seeds_works_of_the_best_match_among_the_
     capsys.readouterr()
 
     def nearest(seed, top=10):
-        return [(key, pytest.approx(score, abs=1e-3)) for key, score in style.neighbors(seed, "csd", top)]
+        return [(key, pytest.approx(score, abs=1e-3)) for key, score in style.neighbors(seed, "csd", top, "best")]
 
     half = 2**-0.5
     # ALPHA's first work finds itself in BRAVO (1.0), its second finds BRAVO's halfway work (0.7071).
@@ -270,7 +270,7 @@ def test_neighbors_is_the_mean_over_the_seeds_works_of_the_best_match_among_the_
     assert style.neighbors(ECHO, "csd") == style.neighbors(FOXTROT, "csd") == style.neighbors("da:nobody", "csd") == []
     assert style.neighbors(ALPHA, "siglip2") == []  # another model's vectors are another matter
 
-    assert style.main(["--neighbors", ALPHA, "--model", "csd", "--top", "2"]) == 0
+    assert style.main(["--neighbors", ALPHA, "--model", "csd", "--top", "2", "--rule", "best"]) == 0
     printed = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
     assert printed == [{"artist": BRAVO, "score": 0.8536}, {"artist": CHARLIE, "score": 0.7}]
     assert style.main(["--neighbors", ECHO, "--model", "csd"]) == 1
@@ -301,10 +301,10 @@ def test_the_mutual_rule_puts_a_consistent_artist_above_one_with_a_bit_of_everyt
     # "best", from ALPHA: both its works find themselves in BRAVO (1.0); in CHARLIE each finds 0.8;
     # in DELTA they find 0 and 0.7071.
     assert nearest(ALPHA, "best") == [(BRAVO, 1.0), (CHARLIE, 0.8), (DELTA, half / 2)]
-    assert style.neighbors(ALPHA, "csd") == style.neighbors(ALPHA, "csd", rule="best")  # and it is the default
     # "mutual" adds the way back. BRAVO's four works find 1, 1, 0 and 0 in ALPHA: (1.0 + 0.5) / 2 = 0.75.
     # CHARLIE's two each find 0.8: (0.8 + 0.8) / 2 = 0.8. DELTA's one finds 0.7071: (0.3536 + 0.7071) / 2.
     assert nearest(ALPHA, "mutual") == [(CHARLIE, 0.8), (BRAVO, 0.75), (DELTA, 3 * half / 4)]
+    assert style.neighbors(ALPHA, "csd") == style.neighbors(ALPHA, "csd", rule="mutual")  # and it is the default
     # It is the same score from either end, which "best" is not. From BRAVO, "best": its four works find
     # 1, 1, 0 and 0 in ALPHA (0.5), 0.8, 0.8, 0 and 0 in CHARLIE (0.4), and 0, 0.7071, 0.7071 and 0 in DELTA.
     assert nearest(BRAVO, "best") == [(ALPHA, 0.5), (CHARLIE, 0.4), (DELTA, half / 2)]
@@ -323,10 +323,63 @@ def test_the_mutual_rule_puts_a_consistent_artist_above_one_with_a_bit_of_everyt
         rows = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
         return [(row["artist"], pytest.approx(row["score"], abs=1e-3)) for row in rows]
 
-    assert printed() == printed("--rule", "best") == [(BRAVO, 1.0), (CHARLIE, 0.8)]
-    assert printed("--rule", "mutual") == [(CHARLIE, 0.8), (BRAVO, 0.75)]
+    assert printed("--rule", "best") == [(BRAVO, 1.0), (CHARLIE, 0.8)]
+    assert printed() == printed("--rule", "mutual") == [(CHARLIE, 0.8), (BRAVO, 0.75)]
     with pytest.raises(SystemExit):
         style.main(["--neighbors", ALPHA, "--model", "csd", "--rule", "closest"])
+
+
+def test_the_local_rule_puts_a_specific_match_above_an_artist_who_is_near_everyone(model, monkeypatch, capsys):
+    model.table = {
+        1: [1, 0, 0, 0, 0],  # ALPHA, the seed
+        2: [4, 0, 0, 3, 0],  # BRAVO, the specific match: cosine 0.8 with ALPHA's work, 0.5333 with CHARLIE's,
+        3: [0, 0, 0, 0, 1],  # and a second work like nothing else here
+        4: [2, 1, 2, 0, 0],  # CHARLIE, near everyone: 0.6667 with ALPHA, 0.3333 with DELTA, 0.6667 with ECHO
+        5: [0, 1, 0, 0, 0],  # DELTA
+        6: [0, 0, 1, 0, 0],  # ECHO
+    }
+    for artist, shades in ((ALPHA, (1,)), (BRAVO, (2, 3)), (CHARLIE, (4,)), (DELTA, (5,)), (ECHO, (6,))):
+        collect(artist, *shades)
+    style.run("csd", 500)
+    capsys.readouterr()
+
+    def nearest(seed, rule):
+        return [(key, pytest.approx(score, abs=1e-3)) for key, score in style.neighbors(seed, "csd", rule=rule)]
+
+    # The mutual scores. ALPHA and BRAVO: ALPHA's work finds 0.8, BRAVO's two find 0.8 and 0: (0.8 + 0.4) / 2.
+    # BRAVO and CHARLIE: (0.5333 + 0.2667) / 2. Every other pair is one work against one work: their cosine.
+    #              ALPHA   BRAVO   CHARLIE  DELTA   ECHO
+    #   ALPHA        -      0.6    0.6667    0       0
+    #   BRAVO       0.6      -     0.4       0       0
+    #   CHARLIE    0.6667   0.4      -      0.3333  0.6667
+    #   DELTA       0       0      0.3333    -       0
+    #   ECHO        0       0      0.6667    0       -
+    assert nearest(ALPHA, "mutual") == [(CHARLIE, 2 / 3), (BRAVO, 0.6), (DELTA, 0.0), (ECHO, 0.0)]
+    # "local" starts from those and not from "best", which has 0.8 for ALPHA and BRAVO: every figure below
+    # would then be another.
+    assert nearest(ALPHA, "best")[0] == (BRAVO, 0.8)
+
+    # Fewer other artists than NEAREST (10), so usual closeness is the mean over all four others:
+    # ALPHA (0.6667 + 0.6) / 4 = 0.3167, BRAVO (0.6 + 0.4) / 4 = 0.25, CHARLIE (0.6667 + 0.4 + 0.3333 + 0.6667) / 4
+    # = 0.5167, DELTA 0.3333 / 4 = 0.0833, ECHO 0.6667 / 4 = 0.1667.
+    # From ALPHA: BRAVO 2 x 0.6 - 0.3167 - 0.25 = 0.6333, CHARLIE 2 x 0.6667 - 0.3167 - 0.5167 = 0.5,
+    # DELTA 0 - 0.3167 - 0.0833 = -0.4, ECHO 0 - 0.3167 - 0.1667 = -0.4833.
+    assert nearest(ALPHA, "local") == [(BRAVO, 19 / 30), (CHARLIE, 0.5), (DELTA, -0.4), (ECHO, -29 / 60)]
+
+    # Over the two nearest only: ALPHA (0.6667 + 0.6) / 2 = 0.6333, BRAVO (0.6 + 0.4) / 2 = 0.5,
+    # CHARLIE (0.6667 + 0.6667) / 2 = 0.6667, DELTA (0.3333 + 0) / 2 = 0.1667, ECHO (0.6667 + 0) / 2 = 0.3333.
+    monkeypatch.setattr(style, "NEAREST", 2)
+    # From ALPHA: BRAVO 1.2 - 0.6333 - 0.5 = 0.0667, CHARLIE 1.3333 - 0.6333 - 0.6667 = 0.0333,
+    # DELTA 0 - 0.6333 - 0.1667 = -0.8, ECHO 0 - 0.6333 - 0.3333 = -0.9667.
+    assert nearest(ALPHA, "local") == [(BRAVO, 1 / 15), (CHARLIE, 1 / 30), (DELTA, -0.8), (ECHO, -29 / 30)]
+    # From CHARLIE: ECHO 1.3333 - 0.6667 - 0.3333 = 0.3333, ALPHA 0.0333 (the same from either end),
+    # DELTA 0.6667 - 0.6667 - 0.1667 = -0.1667, BRAVO 0.8 - 0.6667 - 0.5 = -0.3667.
+    assert nearest(CHARLIE, "local") == [(ECHO, 1 / 3), (ALPHA, 1 / 30), (DELTA, -1 / 6), (BRAVO, -11 / 30)]
+    assert style.neighbors("da:nobody", "csd", rule="local") == []
+
+    assert style.main(["--neighbors", ALPHA, "--model", "csd", "--rule", "local", "--top", "2"]) == 0
+    rows = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert [row["artist"] for row in rows] == [BRAVO, CHARLIE]
 
 
 # 5. Stdout carries counts and throughput only.
