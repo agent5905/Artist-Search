@@ -4,8 +4,9 @@
 
 ## Waiting on the owner
 
-1. **Cloudflare token.** `CLOUDFLARE_API_TOKEN` is still rejected (HTTP 401). Create a narrow token (Pages edit, Workers Scripts edit, Workers AI read) and put it in `.env`. Needed for the site preview and the search box, not before.
-2. **Optional: tell DeviantArt.** The draft in `docs/` can still be sent as a courtesy question. It is no longer blocking anything.
+Nothing is blocking. One optional item: the draft note to DeviantArt in `docs/` can still be sent as a courtesy question.
+
+The first public deployment will be asked for separately when the site reaches its preview stage.
 
 ## Owner decisions (these amend the spec)
 
@@ -19,6 +20,7 @@ Made 2026-10-11, after the DeviantArt terms were read.
 6. **Verified removal (2026-10-12).** An artist who proves control of their site or DeviantArt profile, by adding a short code that is then checked, is removed at once and never re-added. A request without proof is logged for the owner and changes nothing until the owner acts. This replaces "any request hides at once", which failed its critic twice on abuse.
 7. **Full AI pipeline on DeviantArt works (2026-10-12).** The lead read Terms of Service section 24 as barring any use of labeled content as input to a trained model, which covers the Analyze step, and stopped to ask. The owner reads the section as aimed at training and image generation, neither of which this project does, and accepts the risk of going ahead. So: DeviantArt works are tagged, described and embedded by local models, profiles are written from them, and critics may view them. This supersedes decisions 1 and 5 and the "no DeviantArt content near a model" part of decision 2. Still in force: no training, no generation, no rehosting, local image cache only, verified removal, rate limits, and AI opt-outs honored on artists' own sites.
 8. **A/B references (2026-10-12, default).** With critics able to view DeviantArt content, pieces 5 and 6 return to the spec's bars: DeviantArt's own search and "more like this". The reference is captured from the public website, not through the API, because the API License bars using the API for benchmarking. This supersedes decision 3.
+9. **Cloudflare (2026-10-12).** The owner replaced the API token; it verifies, and Pages, Workers and Workers AI are reachable. The Pages project name `artist-search` is approved. Approving the name is not approval to deploy.
 
 ## The plan
 

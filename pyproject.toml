@@ -5,7 +5,11 @@ description = "A search engine for finding game concept and character artists."
 requires-python = ">=3.12"
 dependencies = [
     "httpx>=0.28.1",
+    "pillow>=12.3.0",
     "tldextract>=5.4.0",
+    "torch>=2.14.1",
+    "torchvision>=0.29.1",
+    "transformers>=5.19.0",
 ]
 
 [dependency-groups]
@@ -24,3 +28,13 @@ files = ["scripts", "pipeline"]
 testpaths = ["tests"]
 # The system temp dir is not writable from every shell on this machine.
 addopts = "--basetemp=.pytest_tmp"
+
+# GPU build of PyTorch for the local analysis stage (RTX 5090, CUDA 13).
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu130" }
+torchvision = { index = "pytorch-cu130" }
