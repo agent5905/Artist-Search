@@ -1,6 +1,6 @@
 # Artist Search: Progress
 
-**Status, 2026-10-12 (night):** Real artwork is on disk for the first time: 5 artists, 50 works, 50 cached images, collected through the API. The analysis pieces have started on them (tags and descriptions, style vectors). Discovery is rerunning live so every niche candidate is stored. Collect is with its first critic.
+**Status, 2026-10-13:** The first two blind A/B tests on real artwork are done, both for style similarity. A style-specific model beat a general one 7 to 4, and a two-way scoring rule then beat the original rule 8 to 3. 1,470 works from 148 artists are collected and have style vectors. Collect failed its first critic (AI-tagged art got through) and is in round 2; tagging is being built.
 
 ## Waiting on the owner
 
@@ -267,3 +267,41 @@ The strict own-site rule costs about 2%. Most artists simply have no site of the
 **Environment.** PyTorch 2.14.1 with CUDA runs on the RTX 5090. The Cloudflare token now verifies, and both shortlisted text-embedding models exist on Workers AI.
 
 **Pipeline counts:** artists discovered 245 and rising, artists collected 5, works 50, images cached 50. **Database:** 12.6 MB of 400 MB, artists 0, works 0.
+
+### Round 5: first blind A/B tests; collect's first critic (2026-10-12 to 13)
+
+**Piece 6, style similarity: two blind tests on real artwork.** For each of 12 seed artists drawn at random, the critic saw three contact sheets: the seed's works, and two competing sets of the four nearest artists, labeled A and B in an order shuffled per seed. The critic judged style only (rendering, line, palette, finish), not subject. The answer key was kept where the critic was not told to look. The sheet maker is `eval/style_sheets.py`; the sheets themselves stay in the git-ignored cache.
+
+| Test | Contender | Seeds won | Rows judged a real style match (of 48) |
+|---|---|---|---|
+| 1. Which model | CSD (trained for style) | **7** | **23** |
+| | SigLIP2 (general image model) | 4, with 1 tie | 19 |
+| 2. Which scoring rule, both on CSD | Two-way ("mutual") | **8** | **29** |
+| | One-way ("best"), the original | 3, with 1 tie | 21 |
+
+- **Test 1 verdict:** the losing sets "matched genre, not finish": photoreal matte painting offered for a loose painterly seed, glossy saturated card art for a muted one. The critic also named what hurt both: artists with mixed portfolios, and a small pool.
+- **What changed between the tests:** the original rule scored a candidate by how well the seed's works found a match among the candidate's. An artist with a bit of everything could rank first on one or two works. The new rule also asks how well the candidate's works match the seed's.
+- **Test 2 verdict:** the two-way rule won clearly, and its most common remaining failures are a mixed-portfolio artist still taking a top-three slot, and the best match being present but not ranked first. The same few artists recur across unrelated seeds.
+- **Adopted:** CSD with the two-way rule. The database's similar-style function will follow.
+- **Still short of the bar:** 29 of 48 rows is 60%. Next: correct for artists that show up everywhere, and rerun on a larger pool. Then the spec's bar, against DeviantArt's own "more like this".
+
+**Unsuitable content.** The first critic flagged about ten cases at thumbnail size (sexualised character sheets, pin-ups, one moderately gory image) and one artist whose four images were blurred placeholders. DeviantArt's "not mature" flag is not strict enough for a studio-facing site. The tagging stage's "explicit" flag will exclude such works, and will flag blurred placeholders.
+
+**Piece 1c, collect: first critic, fail, 4 of 9 bar items.**
+
+| Passed | Failed |
+|---|---|
+| No duplicates across three runs | AI-tagged works stored: 22 in the real cache, two artists with 10 of 10 |
+| 1.00 s minimum between API requests; at most 2 image downloads a second | Obscured emails and phone numbers got through text scrubbing (made-up data; the real cache was clean) |
+| Output is counts only | A tiny image written as text was stored in a text field (made-up data) |
+| Requests match the documentation | A removed artist's images could survive a lost database, a renamed account, or a removal landing mid-run |
+
+- **Biggest gap:** the AI-art filter knew 11 tag prefixes and missed plain spellings. Round 2 widens it and the rerun purges what got in.
+- **Change of approach on free text:** scrubbing pieces out of text does not work. The bio field is removed (empty in all 41 real profiles), and a tagline is dropped whole if it contains an `@`, a messaging link or a phone-length run of digits.
+- **A correction to the lead's own bar:** the critic was told that no country, age or location may appear even inside a stored field. That is stricter than spec rule 6, which allows an artist's public bio and bars emails and phone numbers. The next round words the bar as rule 6 does.
+
+**Collection so far.** A full run stopped a third of the way through on a database constraint error (cause being found by the builder). Before stopping: 151 artists processed, 143 profiles, 1,420 works with images; 146 works and 7 whole artists skipped as AI-tagged, 82 works as mature or unrated. AI-tagged art is common in this niche, which raises how many candidates 2,000 artists will need.
+
+**Discovery.** A clean third run stored 378 candidates; the store holds 472 artists across runs. 15% list their own bare domain, 39% no website, 45% a platform, 2% another domain that is not a bare front page.
+
+**Pipeline counts:** artists discovered 472, artists collected 148, works 1,470, images cached 1,470, style vectors 1,470 per model. **Database:** 12.6 MB of 400 MB, artists 0, works 0.
