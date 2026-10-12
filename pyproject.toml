@@ -1,0 +1,23 @@
+[project]
+name = "artist-search"
+version = "0.1.0"
+description = "A search engine for finding game concept and character artists."
+requires-python = ">=3.12"
+dependencies = []
+
+[dependency-groups]
+dev = ["mypy>=2.4", "pytest>=9.1", "ruff>=0.17"]
+
+[tool.ruff]
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP"]
+
+[tool.mypy]
+files = ["scripts"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# The system temp dir is not writable from every shell on this machine.
+addopts = "--basetemp=.pytest_tmp"

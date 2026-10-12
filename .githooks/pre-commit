@@ -1,0 +1,3 @@
+#!/bin/sh
+# Hard rule 8: secret scan before every commit. Enable with: git config core.hooksPath .githooks
+exec python scripts/secret_scan.py

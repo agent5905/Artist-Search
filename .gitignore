@@ -218,3 +218,12 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# --- Artist Search ---
+# Local image cache for analysis. Hard rule 2: images never leave this machine.
+/cache/
+# Site tooling
+node_modules/
+.wrangler/
+.dev.vars
+.pytest_tmp/

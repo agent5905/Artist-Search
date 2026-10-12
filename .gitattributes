@@ -1,0 +1,2 @@
+# LF everywhere: the pre-commit hook's shebang breaks with CRLF.
+* text=auto eol=lf
