@@ -1,9 +1,12 @@
 # Artist Search: Progress
 
-**Status, 2026-10-12:** Round 2 is in for the crawler and the database: both failed again, on narrower gaps, and are in round 3 with a changed approach. Discovery's round 2 is with its critic. The first live discovery run is still held until discovery passes.
+**Status, 2026-10-12 (later):** First real data is in: a live discovery run found 60 artists with their own site out of 396 niche candidates. Round 3 critics passed most of the crawler and discovery bars; both are in round 4 on the remaining gaps. The database is in round 3. No artist site has been crawled yet.
+
+**The number that matters most right now:** 15% of niche candidates list a bare custom domain. Three more filters apply before an artist is indexed (the site must link back to their DeviantArt profile, must carry no AI opt-out, and must serve its own images), and none of those is measured yet. Reaching 2,000 artists on path B looks unlikely without a decision from the owner. See "Yield" in round 3 below.
 
 ## Waiting on the owner
 
+0. **Corpus size.** The first live numbers suggest path B will fall well short of 2,000 artists. The levers are the owner's: send the DeviantArt permission request (the draft is in `docs/`), allow images from site-builder hosts (item 2), approve another source, or accept a smaller index for this version.
 1. **How a removal request is verified.** The removal flow has failed its critic twice on abuse. Options: (1) verified instant removal, where an artist proves control of their site and is removed at once, and unproven requests are logged for the owner; (2) the owner reviews every request; (3) keep instant hiding for anyone, capped at 20 a day, and accept that a prankster can hide artists and delay real requests. Recommended: 1. That part of the database is on hold.
 2. **Image hosts run by site builders.** Custom-domain Wix, Squarespace, Shopify and WordPress.com sites serve images from the platform's own servers. Refused by default until the owner says otherwise. Likely the largest single cut to how many artists qualify.
 3. **Cloudflare token.** `CLOUDFLARE_API_TOKEN` is still rejected (HTTP 401). Suggested: a new, narrow token (Pages edit, Workers Scripts edit, Workers AI read). Needed for the site preview and the search box.
@@ -190,3 +193,33 @@ Fresh critics, same bars. Both pieces failed again, on narrower gaps.
 - Database: the public key cannot touch a table, no hidden artist in 494 search combinations, 102 to 105 MB at full scale.
 
 **Database:** 11.7 MB of 400 MB. Artists 0, works 0.
+
+### Round 3: crawler and discovery; first live run (2026-10-12)
+
+| Piece | Tests | Critic | Bar items passed | Biggest gap |
+|---|---|---|---|---|
+| 1b Crawl | 2,229 pass | **Fail** | 6 of 8 (was 4, was 2) | A platform's bare home page still passes as an own site: 281 of 308 real platforms tried, 58 pages of one fetched before the budget stopped it |
+| 1a Discover | 352 pass | **Fail** | 6 of 9 (same six as round 2, confirmed by a second critic) | A domain four artists listed was still handed to the crawler, because profile-shaped links were dropped before they could be counted |
+| 10 and 11 Database | | Round 3 with its builder | | |
+
+**Crawler, third change of approach on "platforms are never requested".** A list (round 1), a shape test (round 2) and anchoring fetches to an own-site root with a 60-request budget (round 3) each failed, because none can tell a platform's home page from an artist's site. Round 4 requires proof: only the front page may be fetched until it is seen to link back to the same artist's DeviantArt profile. This also stops an account from listing someone else's site as its own. Cost: artists whose sites do not link back are left out, and one front-page fetch of an unknown site is unavoidable.
+
+**Discovery, what passed twice:** no DeviantArt content stored, printed or logged (a 300,000-string fuzz in round 2, 49 hostile fields and zero log records in round 3); no private data; no duplicates; 1.0 s minimum gap in real time; mature works never counted; endpoints match the documentation.
+
+**First live discovery run.** Run from the exact code the critic judged, because the six bar items that govern what a run fetches and stores had passed twice and the removal list was empty. Output is counts only.
+
+| Count | Value |
+|---|---|
+| Browse pages fetched (6 tags, 40 pages each) | 240 |
+| Deviations counted | 9,836 |
+| Authors seen | 7,791 |
+| Candidates (3 or more works under the niche tags) | 396 |
+| Profiles looked up | 396 |
+| No own-site link (no website, a platform link, or a link with a path or subdomain) | 336 |
+| **Artists stored (handle and own-site front page)** | **60** |
+| Rate-limit responses | 0 |
+| Run time | 12.5 minutes |
+
+**Yield.** 60 of 396 candidates (15%) list a bare custom domain. Still to apply, unmeasured: the link back to DeviantArt, AI opt-outs, the shared-domain rule, and whether the site serves its own images (most custom-domain portfolios are built on Squarespace, Wix or similar, whose image hosts are refused pending the owner). Deeper paging and more tags can raise the candidate count many times over, since the API allows 1,000 pages per tag and this run used 40. Even so, if the remaining filters keep one site in five, 2,000 artists would need on the order of 65,000 candidates.
+
+**Pipeline counts:** artists discovered 60, sites crawled 0, works 0. **Database:** 11.7 MB of 400 MB, artists 0, works 0.
