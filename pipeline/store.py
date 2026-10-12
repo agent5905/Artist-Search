@@ -227,7 +227,7 @@ def _open(db: pathlib.Path | str | None) -> Iterator[sqlite3.Connection]:
     """One transaction on the store: committed on success, rolled back on error, always closed."""
     path = pathlib.Path(db or config.LOCAL_DB)
     path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(path)
+    conn = sqlite3.connect(path, timeout=60)  # several stages write to this file; wait for a lock, do not fail
     try:
         conn.execute("PRAGMA secure_delete = ON")  # a removed artist's row is zeroed in the file, not just unlinked
         conn.executescript(_SCHEMA)
