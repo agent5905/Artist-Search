@@ -5,6 +5,7 @@ nothing here calls it: all traffic goes to an httpx.MockTransport. Nothing reall
 replace time.sleep, which is the one thing the code waits with, and the fake clock moves only when it is called.
 """
 
+import hashlib
 import inspect
 import itertools
 import json
@@ -50,12 +51,25 @@ WEBSITES = {
     KILO: "https://zz-fake-kilo.art/folio?mail=fake.kilo@mail.invalid#FAKE-FRAGMENT",
 }
 
+
+def expected_row(name, links, hits):
+    return (f"da:{name.lower()}", name, f"https://www.deviantart.com/{name}", links, hits)
+
+
 # What the base world must leave in the store: key, handle, profile URL, links, hits. Nothing else.
+# Every author with three clean works and a readable profile is stored (owner decision 7). A link is kept only
+# when the website field is the front page of a domain of their own.
 EXPECTED = [
-    ("da:zz-fake-alpha", ALPHA, f"https://www.deviantart.com/{ALPHA}", ["https://zz-fake-alpha.art/"], 4),
-    ("da:zz-fake-bravo", BRAVO, f"https://www.deviantart.com/{BRAVO}", ["http://www.zz-fake-bravo.com/"], 3),
-    ("da:zz-fake-delta", DELTA, f"https://www.deviantart.com/{DELTA}", ["https://zz-fake-delta.co.uk/"], 3),
+    expected_row(ALPHA, ["https://zz-fake-alpha.art/"], 4),
+    expected_row(BRAVO, ["http://www.zz-fake-bravo.com/"], 3),
+    expected_row(DELTA, ["https://zz-fake-delta.co.uk/"], 3),
+    expected_row(FOXTROT, [], 3),  # no website
+    expected_row(GOLF, [], 3),  # DeviantArt itself
+    expected_row(INDIA, [], 3),
+    expected_row(JULIET, [], 3),  # a hosted gallery
+    expected_row(KILO, [], 3),  # a path on their own domain: dropped, not trimmed
 ]
+OWN_SITES = [(key, links[0]) for key, _, _, links, _ in EXPECTED if links]  # what the crawl stage is offered
 EXPECTED_STDOUT = """\
 pages fetched: 7
 deviations counted: 94
@@ -63,10 +77,15 @@ mature skipped: 7
 authors seen: 71
 candidates (>= 3 hits): 9
 skipped (removed): 0
-profiles fetched: 8
 profiles unavailable: 1
-no external link: 5
-artists stored: 3
+not reached (--max-artists): 0
+profiles fetched: 8
+artists stored: 8
+of those, with an own-site link: 3
+of those, no website given: 1
+of those, website on a listed platform or DeviantArt: 3
+of those, website on another domain, not a bare front page: 1
+of those, website names no public host: 0
 """
 BASE_REQUESTS = 17  # 1 token + 7 browse pages + 9 profile lookups
 # The base world's requests in order: 0 token, 1-7 browse, then lookups 8 HOTEL (400), 9 ALPHA, 10 BRAVO, 11 DELTA...
@@ -261,6 +280,12 @@ def run(fake, db, max_artists=200):
         return discover.discover(CLIENT_ID, CLIENT_SECRET, max_artists=max_artists, db=db, transport=fake.transport)
 
 
+def summary(out):
+    """The printed counts as a dict. It also checks that every line is a label and a number, and nothing more."""
+    assert all(re.fullmatch(r"[A-Za-z ,()>=0-9-]+: \d+", line) for line in out.splitlines()), out
+    return {label: int(count) for label, count in (line.rsplit(": ", 1) for line in out.splitlines())}
+
+
 def all_rows(db):
     if not db.exists():
         return []
@@ -340,6 +365,28 @@ def test_base_run_stores_exactly_the_expected_rows(db):
     assert len(fake.log) == BASE_REQUESTS
 
 
+def test_every_candidate_whose_profile_can_be_read_is_stored_with_or_without_a_site(db):
+    """Owner decision 7: an own site is optional. Three clean works under the niche tags are what it takes."""
+    assert run(world(), db) == 0
+    assert [name for _, name, _, links, _ in stored(db) if links] == [ALPHA, BRAVO, DELTA]
+    assert [name for _, name, _, links, _ in stored(db) if not links] == [FOXTROT, GOLF, INDIA, JULIET, KILO]
+    assert store.all_artists(db) == [(key, name, url) for key, name, url, _, _ in EXPECTED]  # for the collect stage
+    assert store.own_site_candidates(db) == OWN_SITES  # for the crawl stage: only those with a site of their own
+    for never in (HOTEL, CHARLIE, ECHO):  # no profile to read; two works; two clean works
+        assert f"da:{never}" not in [key for key, *_ in stored(db)]
+
+
+def test_a_removed_artist_is_in_neither_list_handed_to_the_later_stages(db):
+    assert run(world(), db) == 0
+    store.mark_removed(f"da:{FOXTROT}", db)  # stored with no link
+    store.mark_removed("site:zz-fake-alpha.art", db)  # stored with a link
+    left = [key for key, *_ in without("da:zz-fake-foxtrot", "da:zz-fake-alpha")]
+    assert [key for key, _, _ in store.all_artists(db)] == left
+    assert store.own_site_candidates(db) == OWN_SITES[1:]
+    assert run(world(), db) == 0  # and a rerun brings neither back
+    assert [key for key, _, _ in store.all_artists(db)] == left
+
+
 def test_store_holds_no_deviantart_content(db):
     fake = world()
     assert run(fake, db) == 0
@@ -356,7 +403,7 @@ def test_store_holds_no_deviantart_content(db):
     for text in ("FAKE", "fake-cdn", "fake-bio-link", "/art/", "artstation", "mail.invalid", "@", "?", "#", "folio"):
         assert text not in "\n".join(str(row) for row in all_rows(db))
     assert "FAKE" not in disk and "fake-cdn" not in disk and "mail.invalid" not in disk and "artstation" not in disk
-    assert "kilo" not in disk.lower()  # a link with a path was dropped whole: not even its domain was kept
+    assert "zz-fake-kilo.art" not in disk and "folio" not in disk  # a link with a path is dropped whole
     for text in allowed:  # and the scan can see what is stored
         assert text in disk
 
@@ -372,7 +419,14 @@ def test_store_holds_no_private_data_even_when_the_api_returns_it(db):
     with closing(sqlite3.connect(db)) as conn:
         tables = {name for (name,) in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
         columns = [row[1] for row in conn.execute("PRAGMA table_info(artists)")]
-    assert tables == {"artists", "removed"}
+    assert tables == {"artists", "removed", "listed"}
+    with closing(sqlite3.connect(db)) as conn:  # the two other tables hold sha256 digests and nothing else
+        hashes = [
+            value
+            for row in conn.execute("SELECT key_hash, '' FROM removed UNION SELECT * FROM listed")
+            for value in row
+        ]
+    assert len(hashes) == 8 and all(re.fullmatch(r"[0-9a-f]{64}", value) for value in hashes)  # 4 artists, 4 domains
     assert columns == ["key", "da_username", "da_profile_url", "links", "niche_hits", "discovered_at"]
 
 
@@ -456,8 +510,11 @@ def test_no_spelling_of_a_platform_host_reaches_the_store(db, capsys):
     fake, names = small_world(NOT_THEIR_OWN_SITE)
     assert run(fake, db) == 0
     assert fake.looked_up() == names  # every profile was read
-    assert all_rows(db) == []  # and nothing was kept
-    assert f"no external link: {len(names)}\n" in capsys.readouterr().out
+    assert [links for *_, links, _ in stored(db)] == [[]] * len(names)  # each is stored, and none with a link
+    counts = summary(capsys.readouterr().out)
+    # All of them count as a platform but one: the backslash spelling also names a domain that is not one.
+    assert (counts[discover.ON_PLATFORM], counts[discover.OTHER_SHAPE]) == (len(names) - 1, 1)
+    assert counts[discover.NO_WEBSITE] == counts[discover.NO_HOST] == 0
     assert "FAKE" not in everything_on_disk(db)
 
 
@@ -503,8 +560,8 @@ def test_profile_shaped_links_are_dropped_whole_and_never_trimmed_to_the_root(db
     fake, names = small_world(PROFILE_SHAPED)
     assert run(fake, db) == 0
     assert fake.looked_up() == names  # every profile was read
-    assert all_rows(db) == []  # and nothing was kept, not even the bare domain
-    assert f"no external link: {len(names)}\n" in capsys.readouterr().out
+    assert [links for *_, links, _ in stored(db)] == [[]] * len(names)  # stored with no link: not the bare domain
+    assert summary(capsys.readouterr().out)[discover.OTHER_SHAPE] == len(names)
     disk = everything_on_disk(db)
     assert "zz-fake-site" not in disk and "mail.invalid" not in disk
 
@@ -608,6 +665,72 @@ def test_whatever_the_website_field_holds_a_kept_link_is_a_canonical_front_page(
     assert kept > 100  # the fuzz does reach the kept branch
 
 
+@pytest.mark.parametrize(
+    ("website", "count"),
+    [
+        ("", discover.NO_WEBSITE),
+        ("   ", discover.NO_WEBSITE),
+        (None, discover.NO_WEBSITE),
+        (12345, discover.NO_WEBSITE),
+        ("https://www.deviantart.com/zz-fake/gallery", discover.ON_PLATFORM),
+        ("https://www.deviantart.com./zz-fake/art/FAKE-TITLE-99", discover.ON_PLATFORM),
+        ("https://www.artstation.com/zz-fake", discover.ON_PLATFORM),  # a listed name, in any label
+        ("zz-fake.tumblr.com", discover.ON_PLATFORM),
+        ("https://www.pinterest.de/zz-fake", discover.ON_PLATFORM),
+        ("https://zz-fake.github.io", discover.ON_PLATFORM),
+        ("https://x.com/zz-fake", discover.ON_PLATFORM),  # a listed domain
+        ("fav.me/dfake", discover.ON_PLATFORM),
+        ("https://zz-fake.cargo.site", discover.ON_PLATFORM),
+        ("https://zz-fake-site.art/folio", discover.OTHER_SHAPE),  # a path
+        ("https://shop.zz-fake-site.art", discover.OTHER_SHAPE),  # a subdomain
+        ("https://zz-fake-site.art/?u=zz-fake", discover.OTHER_SHAPE),  # a query
+        ("https://zz-fake-site.art/#/zz-fake", discover.OTHER_SHAPE),  # a fragment
+        ("https://zz-fake-site.co.uk:8443", discover.OTHER_SHAPE),
+        ("<https://zz-fake-site.art>", discover.OTHER_SHAPE),
+        ("zz-fake-site.art (commissions open)", discover.OTHER_SHAPE),
+        ("FAKE-TAGLINE free text", discover.NO_HOST),
+        ("https://localhost/x", discover.NO_HOST),
+        ("https://127.0.0.1", discover.NO_HOST),
+        ("https://zz-fake-site.example", discover.NO_HOST),  # no registrable domain, and on no list
+        ("https://zz-fake-site.test/folio", discover.NO_HOST),
+    ],
+)
+def test_a_profile_with_no_link_to_keep_is_counted_under_exactly_one_reason(website, count):
+    assert discover._external_links(website) == []
+    assert discover._why_no_link(website, store.hosts_in(website)) == count
+
+
+def test_the_summary_splits_the_profiles_with_no_link_and_prints_counts_only(db, capfd):
+    websites = [
+        "",
+        "https://www.artstation.com/zz-fake-one",
+        "https://www.deviantart.com/zz-fake-two/gallery",
+        "https://zz-fake-three.art/folio",
+        "https://zz-fake-user.zz-fake-four.art",
+        "https://zz-fake-five.art/?page=2",
+        "FAKE-TAGLINE free text",
+        "https://zz-fake-kept.art",
+    ]
+    fake, names = small_world(websites)
+    assert run(fake, db) == 0
+    out, err = capfd.readouterr()
+    counts = summary(out.replace("\r\n", "\n"))
+    assert err == ""
+    assert counts[discover.NO_WEBSITE] == 1
+    assert counts[discover.ON_PLATFORM] == 2
+    assert counts[discover.OTHER_SHAPE] == 3
+    assert counts[discover.NO_HOST] == 1
+    assert counts[discover.OWN_SITE] == 1
+    assert counts["artists stored"] == counts["profiles fetched"] == counts["candidates (>= 3 hits)"] == len(names)
+    reasons = (discover.OWN_SITE, discover.NO_WEBSITE, discover.ON_PLATFORM, discover.OTHER_SHAPE, discover.NO_HOST)
+    assert sum(counts[label] for label in reasons) == counts["artists stored"]  # each stored artist under one
+    printed = out.lower()
+    for told in ("zz-fake", "artstation", "folio", "free text", ".art", "http", "tagline"):
+        assert told not in printed  # a count says how many, never who or where
+    assert [bool(links) for *_, links, _ in stored(db)] == [False] * 7 + [True]  # all stored, one with a link
+    assert "fake-three" not in everything_on_disk(db) and "fake-four" not in everything_on_disk(db)
+
+
 # --- 3: rerunning creates no duplicates ---
 
 
@@ -621,27 +744,86 @@ def test_rerun_creates_no_duplicates(db):
     assert run(world(), db) == 0
     assert all_rows(db) == first
     with closing(sqlite3.connect(db)) as conn:
-        assert conn.execute("SELECT count(*), count(DISTINCT lower(da_username)) FROM artists").fetchone() == (3, 3)
+        assert conn.execute("SELECT count(*), count(DISTINCT lower(da_username)) FROM artists").fetchone() == (8, 8)
 
 
-def test_max_artists_caps_what_one_run_stores(db):
+def test_max_artists_caps_what_one_run_stores(db, capsys):
     fake = world()
     assert run(fake, db, max_artists=1) == 0
     assert stored(db) == EXPECTED[:1]
     assert fake.looked_up() == [HOTEL, ALPHA]  # and the lookups stop there
+    counts = summary(capsys.readouterr().out)
+    assert counts[discover.NOT_REACHED] == 7  # 9 candidates: one unavailable, one stored, seven not reached
+    capped = world()
+    assert run(capped, db, max_artists=4) == 0  # a cap on what is stored, with or without a site
+    assert stored(db) == EXPECTED[:4]
+    assert summary(capsys.readouterr().out)[discover.NOT_REACHED] == 4
 
 
 # --- 4: removed artists are skipped and never re-added (hard rule 7) ---
 
 
-def test_removed_artist_is_skipped_without_even_a_profile_lookup(db, capsys):
-    store.mark_removed("da:ZZ-FAKE-ALPHA", db)  # another case than the API uses
+def test_a_removed_artist_whose_site_is_known_is_skipped_without_a_lookup(db, capsys):
+    assert run(world(), db) == 0  # ALPHA is stored, so their site is known
+    capsys.readouterr()
+    assert store.mark_removed("da:ZZ-FAKE-ALPHA", db) == 1  # another case than the API uses
     for _ in range(2):
         fake = world()
         assert run(fake, db) == 0
         assert ALPHA not in fake.looked_up()
         assert stored(db) == without("da:zz-fake-alpha")
         assert "skipped (removed): 1\n" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("how", ["mark_removed", "import_removed"])
+def test_a_removed_handle_never_seen_here_is_looked_up_once_solely_to_bar_its_site(db, capsys, how):
+    """Without that one lookup, a second account that lists the removed artist's site is stored on the next run."""
+    if how == "mark_removed":
+        assert store.mark_removed("da:ZZ-FAKE-ALPHA", db) == 0  # nothing is known about them here
+    else:  # the removal arrives from the list of record, into a fresh cache
+        assert store.import_removed([hashlib.sha256(b"da:zz-fake-alpha").hexdigest()], db) == 0
+    first = world()
+    assert run(first, db) == 0
+    assert first.looked_up().count(ALPHA) == 1  # read once
+    assert stored(db) == without("da:zz-fake-alpha")  # and nothing of it kept
+    assert "skipped (removed): 1\n" in capsys.readouterr().out
+    assert store.is_removed("site:zz-fake-alpha.art", db)  # their site is on the list now
+    assert "alpha" not in everything_on_disk(db).lower()  # as a hash: no handle, no site, nothing else
+    # The next run: a second account lists that site, and the removed artist shows a new one.
+    second = world({ALPHA: "https://zz-fake-alpha-new.art", BRAVO: "https://www.zz-fake-alpha.art/"})
+    assert run(second, db) == 0
+    assert ALPHA not in second.looked_up()  # never read again
+    assert stored(db) == without("da:zz-fake-alpha", "da:zz-fake-bravo")  # the second account is not stored
+    assert store.is_removed(f"da:{BRAVO}", db)
+    assert "alpha" not in everything_on_disk(db).lower() and "bravo" not in everything_on_disk(db).lower()
+
+
+def test_a_handle_removed_after_being_seen_with_no_site_is_still_looked_up_once(db):
+    """FOXTROT's profile was read before the removal and named no site, so nothing of theirs could be barred."""
+    assert run(world(), db) == 0
+    assert store.mark_removed(f"da:{FOXTROT}", db) == 1  # the row they had, which named no site
+    moved = {FOXTROT: "https://zz-fake-foxtrot.art/folio"}  # by now they have a site
+    after = world(moved)
+    assert run(after, db) == 0
+    assert after.looked_up().count(FOXTROT) == 1
+    assert store.is_removed("site:zz-fake-foxtrot.art", db)
+    again = world(moved | {BRAVO: "https://zz-fake-foxtrot.art"})  # and a second account turns up on it
+    assert run(again, db) == 0
+    assert FOXTROT not in again.looked_up()
+    assert stored(db) == without("da:zz-fake-foxtrot", "da:zz-fake-bravo")
+    assert "foxtrot" not in everything_on_disk(db).lower()
+
+
+@pytest.mark.parametrize("handle", [HOTEL, FOXTROT, JULIET, KILO])  # no profile, no website, a platform, a path
+def test_the_one_lookup_of_a_removed_handle_is_never_repeated_whatever_it_finds(db, handle):
+    store.mark_removed(f"da:{handle}", db)
+    first, second = world(), world()
+    assert run(first, db) == 0 and run(second, db) == 0
+    assert first.looked_up().count(handle) == 1
+    assert handle not in second.looked_up()
+    assert stored(db) == without(f"da:{handle}")  # everybody else is stored, as ever
+    assert not store.is_removed("site:www.artstation.com", db)  # a platform never goes on the list
+    assert store.is_removed("site:zz-fake-kilo.art", db) is (handle == KILO)  # a site of their own does, in any shape
 
 
 def test_artist_removed_after_discovery_is_gone_and_never_readded(db):
@@ -711,6 +893,17 @@ def test_site_removed_before_discovery_bars_the_artist_too(db):
     assert stored(db) == without("da:zz-fake-delta")
 
 
+def test_the_store_has_the_last_word_and_an_artist_it_refuses_is_not_counted_as_stored(db, capsys, monkeypatch):
+    """Two checks stand between a removed site and the store. This is the second one, with the first one blind."""
+    store.mark_removed("site:zz-fake-delta.co.uk", db)
+    monkeypatch.setattr(store, "record_listing", lambda username, hosts, db=None: False)
+    assert run(world(), db) == 0
+    counts = summary(capsys.readouterr().out)
+    assert stored(db) == without("da:zz-fake-delta")
+    assert (counts["skipped (removed)"], counts["artists stored"]) == (1, len(EXPECTED) - 1)
+    assert store.is_removed(f"da:{DELTA}", db)
+
+
 @pytest.mark.parametrize(
     "website",
     [
@@ -738,19 +931,20 @@ def test_removing_one_handle_removes_every_account_that_lists_the_same_site(db):
     """A renamed or second account: two handles, one site. Removing one by handle removes both, and the site."""
     studio = "https://zz-fake-studio.art/"
     assert run(world({ALPHA: studio, BRAVO: "http://www.zz-fake-studio.art"}), db) == 0
-    assert [key for key, *_ in stored(db)] == ["da:zz-fake-alpha", "da:zz-fake-bravo", "da:zz-fake-delta"]
+    assert [key for key, *_ in stored(db)] == [key for key, *_ in EXPECTED]
     assert store.mark_removed(f"da:{ALPHA}", db) == 2
-    assert stored(db) == [EXPECTED[2]]
+    assert stored(db) == without("da:zz-fake-alpha", "da:zz-fake-bravo")
     assert store.is_removed(f"da:{BRAVO}", db) and store.is_removed("site:zz-fake-studio.art", db)
     # A later run: both come back under new sites, and a third handle now lists the removed site.
     later = world({ALPHA: "https://zz-fake-alpha-new.art", BRAVO: "https://zz-fake-bravo-new.art", DELTA: studio})
     assert run(later, db) == 0
     assert later.looked_up() == [HOTEL, DELTA, FOXTROT, GOLF, INDIA, JULIET, KILO]  # the two were not even looked up
-    assert stored(db) == []  # and the third handle went the same way, with the row it had
+    gone = ("da:zz-fake-alpha", "da:zz-fake-bravo", "da:zz-fake-delta")
+    assert stored(db) == without(*gone)  # and the third handle went the same way, with the row it had
     assert store.is_removed(f"da:{DELTA}", db)
     last = world({DELTA: "https://zz-fake-delta-new.art"})
     assert run(last, db) == 0
-    assert stored(db) == []
+    assert stored(db) == without(*gone)
     assert "studio" not in everything_on_disk(db).lower() and "delta" not in everything_on_disk(db).lower()
 
 
@@ -761,10 +955,183 @@ def test_the_removal_list_of_record_keeps_a_removed_artist_out_of_a_fresh_cache(
         of_record = [key_hash for (key_hash,) in conn.execute("SELECT key_hash FROM removed")]
     db.unlink()  # the local store is a cache: gone
     assert store.import_removed(of_record, db) == 0
+    for expected_lookups in (1, 0):  # a fresh cache does not know their site was barred: one lookup, then none
+        fake = world()
+        assert run(fake, db) == 0
+        assert fake.looked_up().count(ALPHA) == expected_lookups
+        assert stored(db) == without("da:zz-fake-alpha")
+    second_account = world({BRAVO: "https://zz-fake-alpha.art"})
+    assert run(second_account, db) == 0
+    assert stored(db) == without("da:zz-fake-alpha", "da:zz-fake-bravo")
+
+
+def odd_spellings(host):
+    """Ways a profile's website field can name a host that no two URL parsers read alike."""
+    joiner, soft_hyphen, fullwidth_zz = chr(0x200D), chr(0xAD), chr(0xFF5A) * 2
+    return [
+        f"https://{host}\\x",  # a backslash
+        f"<https://{host}>",
+        f"({host})",
+        f'"https://{host}"',
+        f"[url=https://{host}]my site[/url]",
+        f"{host} (commissions open)",
+        f"my site: {host}!",
+        f"my site...{host}",  # an ellipsis run into the name
+        f"*.{host}",
+        f"https://xn--zz-fake-{chr(0xE9)}.art and {host}",  # beside a name that is not valid: still found
+        f"portfolio at {host}, prints at zz-fake-prints.art",
+        f"https://{host}\n(second line)",
+        f"{host};{host}",
+        f"https://{host}/" + "x" * 400,  # over the length the own-site rule reads
+        "x" * 400 + f" https://{host}",
+        f"  {host.upper()}  ",
+        f"https://{host}./",
+        f"https://www.{host}",
+        f"https://shop.{host}/folio",
+        f"http://{host}:8080/x?y=1#z",
+        f"https://{host}/#/zz-fake-user",
+        f"https://fake-user:fake-pass@{host}/",
+        f"fake.person@{host}",
+        f"//{host}",
+        f"https:///{host}",
+        f"https://{host.replace('.', '%2E')}/",  # a percent-encoded dot
+        f"https://{host.replace('.', chr(0x3002))}",  # an ideographic full stop
+        f"https://{host}{chr(0xFF0E)}",  # a fullwidth one, trailing
+        f"https://{host.replace('.', chr(0x3002))}/folio",  # the same three inside the name of a link with a path,
+        f"https://{host.replace('.', chr(0xFF0E))}/folio",  # which only the scan of the raw field can recognise
+        host.replace(".", chr(0xFF61)) + " (commissions open)",
+        host.replace("zz", fullwidth_zz),  # fullwidth letters
+        host[:3] + joiner + host[3:],  # an invisible character inside the name
+        host[:3] + soft_hyphen + host[3:],
+        f"https://zz-fake-redirect.art/?to=https://{host}/",
+        f"https://zz-fake-redirect.art/out?url=https%3A%2F%2F{host}%2F",
+        f"https://{host.replace('.', '%252E')}/",  # encoded twice
+        host.replace(".", "&#46;"),  # an HTML entity for the dot
+        host.replace(".", "[.]"),  # the dot spelled out, the way people hide an address from robots
+        "hxxps://" + host.replace(".", "(.)") + "/folio",
+        host.replace(".", " [dot] "),
+        host.replace(".", " DOT "),
+    ]
+
+
+def test_a_removed_site_is_recognised_however_the_website_field_spells_it(db, capsys):
+    store.mark_removed("site:zz-fake-d.art", db)
+    spellings = odd_spellings("zz-fake-d.art")
+    fake, names = small_world(spellings)
+    assert run(fake, db) == 0
+    assert fake.looked_up() == names
+    not_barred = [spelling for name, spelling in zip(names, spellings, strict=True) if not store.is_removed(name, db)]
+    assert not_barred == []
+    assert all_rows(db) == []
+    assert f"skipped (removed): {len(names)}\n" in capsys.readouterr().out
+    # The next run: each of them shows a clean site of their own. None is read again, none is stored.
+    later, _ = small_world([f"https://zz-fake-new-{n:02d}.art" for n in range(len(names))])
+    assert run(later, db) == 0
+    assert later.looked_up() == [] and all_rows(db) == []
+    assert "zz-fake-d" not in everything_on_disk(db).lower()
+
+
+def test_a_removed_site_with_a_name_outside_ascii_is_recognised_too(db):
+    name = "zz-f" + chr(0xE4) + "ke-d.art"  # a-umlaut: xn--zz-fke-d-... once encoded
+    assert store.mark_removed(f"site:{name}", db) == 0
+    spellings = [f"<https://{name}/folio>", f"{name.upper()} (commissions open)", f"https://www.{name}/?page=2"]
+    fake, names = small_world(spellings)
+    assert run(fake, db) == 0
+    assert [name for name in names if not store.is_removed(name, db)] == []
+    assert all_rows(db) == []
+
+
+def test_only_the_website_field_is_read_for_hosts_never_the_bio_or_the_rest_of_the_profile(db, capsys):
+    """Every made-up bio names zz-fake-bio-link.art and every profile carries an email at mail.invalid. Reading
+    hosts out of DeviantArt text is not allowed, so a removal of that site must touch nobody."""
+    store.mark_removed("site:zz-fake-bio-link.art", db)
     fake = world()
     assert run(fake, db) == 0
-    assert ALPHA not in fake.looked_up()
-    assert stored(db) == without("da:zz-fake-alpha")
+    assert "zz-fake-bio-link.art" in "".join(fake.served)  # the API did send it, in the bio
+    assert stored(db) == EXPECTED
+    assert capsys.readouterr().out == EXPECTED_STDOUT  # nobody skipped as removed
+    assert store.own_site_candidates(db) == OWN_SITES
+
+
+def test_hostnames_are_found_in_running_text_and_nothing_else_is():
+    assert store.hosts_in("see WWW.ZZ-Fake-Site.Art/folio or shop.zz-fake-site.co.uk!") == {
+        "www.zz-fake-site.art",
+        "shop.zz-fake-site.co.uk",
+    }
+    for nothing in (
+        "",
+        "FAKE-TAGLINE free text",
+        "zz-fake-site",
+        "1.2.3.4",
+        "-x.art",
+        "x.-art",
+        None,
+        12,
+        ["zz-fake.art"],
+    ):
+        assert store.hosts_in(nothing) == set()
+    assert store.hosts_in("x" * 20_000 + " zz-fake-site.art") == set()  # only the first 10,000 characters are read
+    assert store.hosts_in(chr(0xD800) + " zz-fake-site.art " + chr(0xDFFF)) == {"zz-fake-site.art"}  # no error
+
+
+# --- 9: the seeding list never offers the crawl stage a domain that several profiles list ---
+
+FRONT, PATH, SUBDOMAIN = "https://zz-fake-plat.art/", "https://zz-fake-plat.art/u2", "https://u3.zz-fake-plat.art"
+ALPHA_SEED = ("da:zz-fake-alpha", FRONT)
+
+
+def test_the_seeding_list_is_the_stored_artists_with_a_domain_nobody_else_lists(db):
+    assert run(world(), db) == 0
+    assert store.own_site_candidates(db) == OWN_SITES
+
+
+def test_a_domain_listed_by_three_profiles_in_one_run_is_not_a_candidate(db):
+    """The front page is a bare domain and is stored. The other two listings have a profile's shape and are
+    dropped, but they are counted: three profiles naming one domain make it a platform, whatever any list says."""
+    assert run(world({ALPHA: FRONT, BRAVO: PATH, DELTA: SUBDOMAIN}), db) == 0
+    links = {name: links for _, name, _, links, _ in stored(db)}
+    assert (links[ALPHA], links[BRAVO], links[DELTA]) == ([FRONT], [], [])  # all three stored, one link kept
+    assert store.own_site_candidates(db) == []
+    kept = "\n".join(map(str, all_rows(db)))
+    assert "u2" not in kept and "u3" not in kept and kept.count("zz-fake-plat") == 1  # the other two are hashes
+
+
+def test_the_five_profile_case_leaves_only_the_artist_with_a_domain_to_themselves(db):
+    websites = [
+        "https://zz-fake-plat.art/",
+        "https://zz-fake-plat.art/zz-fake-second",
+        "https://zz-fake-third.zz-fake-plat.art",
+        "https://www.zz-fake-plat.art/?u=zz-fake-fourth",
+        "https://zz-fake-solo.art",
+    ]
+    fake, names = small_world(websites)
+    assert run(fake, db) == 0
+    assert store.own_site_candidates(db) == [(f"da:{names[4]}", "https://zz-fake-solo.art/")]
+
+
+@pytest.mark.parametrize("second_listing", [PATH, SUBDOMAIN, "https://www.zz-fake-plat.art/?u=u4", f"<{FRONT}>"])
+def test_a_domain_stops_being_a_candidate_when_a_later_run_finds_a_second_listing(db, second_listing):
+    assert run(world({ALPHA: FRONT, BRAVO: "", DELTA: ""}), db) == 0
+    assert store.own_site_candidates(db) == [ALPHA_SEED]  # one artist, one domain: a candidate
+    assert run(world({ALPHA: FRONT, BRAVO: second_listing, DELTA: ""}), db) == 0
+    assert store.own_site_candidates(db) == []
+
+
+def test_a_domain_listed_in_an_earlier_run_is_not_a_candidate_when_its_front_page_turns_up(db):
+    assert run(world({ALPHA: "", BRAVO: PATH, DELTA: SUBDOMAIN}), db) == 0
+    assert not any(links for *_, links, _ in stored(db))  # nobody has a link,
+    assert "plat" not in everything_on_disk(db).lower()  # and of the two listings nothing is kept but hashes
+    assert run(world({ALPHA: FRONT, BRAVO: "", DELTA: ""}), db) == 0
+    assert stored(db)[0][3] == [FRONT]
+    assert store.own_site_candidates(db) == []
+
+
+def test_the_same_artist_listing_their_domain_twice_is_still_one_listing(db):
+    for website in (FRONT, "https://www.zz-fake-plat.art"):  # two runs, two spellings of one front page
+        assert run(world({ALPHA: website, BRAVO: "", DELTA: ""}), db) == 0
+    assert store.own_site_candidates(db) == [("da:zz-fake-alpha", "https://www.zz-fake-plat.art/")]
+    assert run(world({ALPHA: f"{FRONT}folio", BRAVO: "", DELTA: ""}), db) == 0  # now a path: no link is kept
+    assert stored(db)[0][3] == [] and store.own_site_candidates(db) == []
 
 
 # --- 5: rate limits, backoff, token refresh, redirects, user agent ---
@@ -980,6 +1347,29 @@ def test_profile_lookups_refused_with_401_stop_the_run_at_the_first_one(db, caps
     assert all_rows(db) == []
 
 
+@pytest.mark.parametrize("status", [400, 403, 404, 410, 418, 451])
+def test_a_profile_answered_with_any_4xx_is_skipped_and_the_run_goes_on(db, capsys, status):
+    """The docs declare a profile's errors as 4XX. One suspended account must not stop every run at the same place."""
+    fake = world()
+    fake.before = lambda index, request: status if request.url.path == PROFILE_PATH + ALPHA else None
+    assert run(fake, db) == 0
+    out, err = capsys.readouterr()
+    assert err == ""
+    assert "profiles unavailable: 2\n" in out  # HOTEL, which has no profile, and ALPHA
+    assert stored(db) == without("da:zz-fake-alpha")
+    assert len(fake.log) == BASE_REQUESTS  # every other candidate was still looked up
+
+
+@pytest.mark.parametrize("status", [204, 302, 500, 503])
+def test_any_other_answer_to_a_profile_lookup_stops_the_run(db, capsys, status):
+    fake = world()
+    fake.before = lambda index, request: status if request.url.path == PROFILE_PATH + ALPHA else None
+    assert run(fake, db) == 1
+    assert capsys.readouterr().err == f"stopped: profile lookup failed with HTTP {status}\n"
+    assert fake.looked_up() == [HOTEL, ALPHA]
+    assert all_rows(db) == []
+
+
 def test_wrong_credentials_stop_the_run_without_printing_them(db, capsys):
     fake = world()
     status = discover.discover("FAKE-WRONG-ID", "FAKE-WRONG-SECRET", max_artists=5, db=db, transport=fake.transport)
@@ -1040,7 +1430,11 @@ def test_malformed_entries_are_skipped_and_the_run_goes_on(db, capsys):
     fake = FakeDA({"gameart": junk * 3 + good + listy}, profiles)
     assert run(fake, db) == 0
     assert fake.looked_up() == ["zz-fake-good", "zz-fake-listy"]  # zz-fake-junk never became a candidate
-    assert [(name, hits) for _, name, _, _, hits in stored(db)] == [("zz-fake-good", 3)]
+    # The profile that came back as a list names no website, so that artist is stored with no link.
+    assert [(name, links, hits) for _, name, _, links, hits in stored(db)] == [
+        ("zz-fake-good", ["https://zz-fake-good.art/"], 3),
+        ("zz-fake-listy", [], 3),
+    ]
     assert capsys.readouterr().err == ""
 
 

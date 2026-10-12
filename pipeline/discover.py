@@ -1,11 +1,15 @@
-"""Find niche artists through DeviantArt's official API. Handles and the front page of their own domain only.
+"""Find niche artists through DeviantArt's official API: every author with enough work under the niche tags.
 
     uv run python -m pipeline.discover --max-artists 200
 
-Owner decision 1 (PROGRESS.md): DeviantArt's terms forbid feeding its content to an AI model, and the
-agents that run this are models. So nothing from a response is printed, logged or stored except the
-handle, the profile URL built from it, the address of the artist's own domain, and a hit count. Output is
-counts only.
+An author with MIN_HITS or more non-mature works under the niche tags is stored, whether or not their profile
+names a site of their own (owner decision 7 in PROGRESS.md: DeviantArt is the primary source, an own site is
+optional). Later stages collect and analyze the works. This stage has no use for any of that content, so
+nothing from a response is printed, logged or stored except the handle, the profile URL built from it, the
+front page of the artist's own domain when the profile names one, and a hit count. Output is counts only.
+One more thing is kept, as hashes that name nobody: which registrable domain each profile's website field
+mentions, so that a domain several profiles list is never taken for one artist's own site, and so that a
+removal reaches every account that lists the removed site.
 
 Endpoints (deviantart.readme.io, read 2026-10-11). Each is documented as accepting a client_credentials token:
     POST /oauth2/token                          grant_type=client_credentials
@@ -41,6 +45,15 @@ MAX_OFFSET = 50000  # the documented maximum for browse/tags
 PAGES_PER_TAG = 40
 MIN_INTERVAL = 1.0  # seconds between any two requests
 MAX_429 = 6  # HTTP 429s in a row on one request before the run stops. The wait doubles each time: 1 to 32 seconds.
+# The summary adds up: candidates = skipped (removed) + profiles unavailable + not reached + artists stored.
+NOT_REACHED = "not reached (--max-artists)"
+# Every stored artist falls under exactly one of these five: they have an own-site link, or this is why not.
+# Only the count is kept. An own site is optional (owner decision 7): an artist is stored either way.
+OWN_SITE = "of those, with an own-site link"
+NO_WEBSITE = "of those, no website given"
+ON_PLATFORM = "of those, website on a listed platform or DeviantArt"
+OTHER_SHAPE = "of those, website on another domain, not a bare front page"  # a path, subdomain, query or fragment
+NO_HOST = "of those, website names no public host"  # free text, a local name, no registrable domain
 _COUNTS = (
     "pages fetched",
     "deviations counted",
@@ -48,10 +61,15 @@ _COUNTS = (
     "authors seen",
     f"candidates (>= {MIN_HITS} hits)",
     "skipped (removed)",
-    "profiles fetched",
     "profiles unavailable",
-    "no external link",
+    NOT_REACHED,
+    "profiles fetched",
     "artists stored",
+    OWN_SITE,
+    NO_WEBSITE,
+    ON_PLATFORM,
+    OTHER_SHAPE,
+    NO_HOST,
 )
 
 
@@ -128,6 +146,22 @@ def _external_links(website: object) -> list[str]:
     return [f"{url.scheme}://{url.raw_host.decode('ascii')}/"]
 
 
+def _why_no_link(website: object, hosts: set[str]) -> str:
+    """Which count a stored artist with no own-site link falls under, given the hosts their website field names.
+
+    For the printed summary only. Nothing about the profile or the link is kept: the answer is one of four labels.
+    """
+    if not isinstance(website, str) or not website.strip():
+        return NO_WEBSITE
+    if any(store.registrable_domain(host) for host in hosts):  # a domain that could be their own, in another shape
+        return OTHER_SHAPE
+    for labels in (host.split(".") for host in hosts):  # the two lists the crawl stage refuses: names, then domains
+        on_a_listed_domain = any(".".join(labels[start:]) in crawl.PLATFORM_DOMAINS for start in range(len(labels)))
+        if on_a_listed_domain or not crawl.PLATFORM_NAMES.isdisjoint(labels):
+            return ON_PLATFORM
+    return NO_HOST
+
+
 @contextlib.contextmanager
 def _http_logs_off() -> Iterator[None]:
     """httpx logs every request URL at INFO, and a profile lookup's URL holds a handle. Not during a run."""
@@ -183,36 +217,47 @@ def _run(api: _Api, counts: dict[str, int], max_artists: int, db: pathlib.Path |
 
     candidates = sorted((key for key, n in hits.items() if n >= MIN_HITS), key=lambda key: (-hits[key], key))
     counts[f"candidates (>= {MIN_HITS} hits)"] = len(candidates)
-    for key in candidates:
+    for position, key in enumerate(candidates):
         if counts["artists stored"] >= max_artists:
+            counts[NOT_REACHED] = len(candidates) - position
             break
         username = names[key]
-        if store.is_removed(store.artist_key(username), db):  # hard rule 7: not even a profile lookup
+        # Hard rule 7. A removed artist is skipped without a lookup, with one exception: while their site is not
+        # known here, their profile is read once, solely so the site it names goes on the removal list as a hash
+        # and a second account cannot bring them back. Nothing else from that profile is used or kept.
+        if store.is_removed(store.artist_key(username), db) and not store.site_unresolved(username, db):
             counts["skipped (removed)"] += 1
             continue
         response = api.get(f"/user/profile/{username}")
-        if response.status_code in (400, 404):  # suspended, inactive or gone
-            counts["profiles unavailable"] += 1
-            continue
-        if response.status_code != 200:
-            raise Stop(f"profile lookup failed with HTTP {response.status_code}")
-        counts["profiles fetched"] += 1
+        status = response.status_code
+        # The docs give 4XX for a profile that cannot be shown (suspended, inactive, gone). One such account
+        # must not end the run. 401 means our token, and 429 never gets here.
+        unavailable = 400 <= status < 500 and status not in (401, 429)
+        if status != 200 and not unavailable:
+            raise Stop(f"profile lookup failed with HTTP {status}")
+        if status == 200:
+            counts["profiles fetched"] += 1
         # ponytail: the website field is the only link the profile response documents. Links typed into the bio
         # are not read, because that means parsing DeviantArt text. Revisit if too few artists have a website.
-        body = response.json()
+        body = response.json() if status == 200 else None
         website = body.get("website") if isinstance(body, dict) else None
-        url = _website(website)
-        # Hard rule 7 comes before the own-site filter: a removed site bars whoever lists it, in a link of any shape.
-        if url is not None and store.bar_if_site_removed(username, url.raw_host.decode("ascii"), db):
+        # The removal list is asked about every host the field names, however it is written, before the own-site
+        # rule gets to drop the link. The same hosts are recorded as hashes for the shared-domain rule.
+        hosts = store.hosts_in(website)
+        if store.record_listing(username, hosts, db):
             counts["skipped (removed)"] += 1
             continue
+        if unavailable:
+            counts["profiles unavailable"] += 1
+            continue
+        # Every candidate whose profile can be read is stored. A link is kept only if it is their own site's
+        # front page; without one the artist is stored all the same, with no link.
         links = _external_links(website)
-        if not links:
-            counts["no external link"] += 1  # nothing to crawl, so nothing worth keeping
-        elif store.upsert_artist(username, PROFILE_URL.format(username), links, hits[key], db):
-            counts["artists stored"] += 1
-        else:
+        if not store.upsert_artist(username, PROFILE_URL.format(username), links, hits[key], db):
             counts["skipped (removed)"] += 1
+            continue
+        counts["artists stored"] += 1
+        counts[OWN_SITE if links else _why_no_link(website, hosts)] += 1
 
 
 def discover(
