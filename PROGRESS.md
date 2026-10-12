@@ -1,12 +1,12 @@
 # Artist Search: Progress
 
-**Status, 2026-10-11 (late):** Round 1 is in. Two of three pieces failed their critics and are in round 2; the third critic is still probing. DeviantArt credentials work. The first live discovery run is held until the discovery fix passes a fresh critic.
+**Status, 2026-10-12:** Round 2 is in for the crawler and the database: both failed again, on narrower gaps, and are in round 3 with a changed approach. Discovery's round 2 is with its critic. The first live discovery run is still held until discovery passes.
 
 ## Waiting on the owner
 
-1. **Cloudflare token.** `CLOUDFLARE_API_TOKEN` is still rejected (HTTP 401, "Invalid API Token"). The token's record shows it active, so the string in `.env` is most likely not its current secret. Suggested: create a new, narrow token (Pages edit, Workers Scripts edit, Workers AI read). Needed for the site preview and the search box, not before.
-2. **Image hosts run by site builders.** Custom-domain Wix, Squarespace, Shopify and WordPress.com sites serve their images from the platform's own servers. Fetching those may fall under the platform's terms, so the default is to refuse them until the owner says otherwise. Cost: those artists yield pages but no images, so they drop out of the index.
-3. **Removal policy (default in place).** A removal request hides the artist at once, up to 20 artists a day; past that, requests are logged and wait for review. Nothing is deleted until the owner reviews it. There is no proof of identity yet.
+1. **How a removal request is verified.** The removal flow has failed its critic twice on abuse. Options: (1) verified instant removal, where an artist proves control of their site and is removed at once, and unproven requests are logged for the owner; (2) the owner reviews every request; (3) keep instant hiding for anyone, capped at 20 a day, and accept that a prankster can hide artists and delay real requests. Recommended: 1. That part of the database is on hold.
+2. **Image hosts run by site builders.** Custom-domain Wix, Squarespace, Shopify and WordPress.com sites serve images from the platform's own servers. Refused by default until the owner says otherwise. Likely the largest single cut to how many artists qualify.
+3. **Cloudflare token.** `CLOUDFLARE_API_TOKEN` is still rejected (HTTP 401). Suggested: a new, narrow token (Pages edit, Workers Scripts edit, Workers AI read). Needed for the site preview and the search box.
 4. **The reference for the search and style A/B tests** (decision 3 below). Proceeding with the stated default.
 5. **Optional: the DeviantArt permission request** in `docs/`. Only needed if DeviantArt artwork itself should be analyzed later.
 
@@ -158,3 +158,35 @@ Three builders worked in parallel. Each piece then went to a fresh critic that s
 **DeviantArt:** credentials verified (token issued, validity check passed). No content has been requested.
 
 **Database:** 27.9 MB of 400 MB (empty tables; the extra is index space left by the full-scale test, which is reused). Artists 0, works 0.
+
+### Round 2: crawler and database (2026-10-12)
+
+Fresh critics, same bars. Both pieces failed again, on narrower gaps.
+
+| Piece | Tests | Critic | Bar items passed | Biggest gap |
+|---|---|---|---|---|
+| 1b Crawl | 1,277 pass (was 446) | **Fail** | 4 of 8 (was 2 of 8) | A platform still counts as an "own site" when the profile sits after a `#`, and any platform missing from the list can be fetched directly |
+| 10 and 11 Database | 63 pass (was 15) | **Fail** | 5 of 11 (was 8 of 11, against easier probes) | With the daily cap used up, a real artist's removal request returns "ok" but hides nothing and is not logged |
+| 1a Discover | 269 pass (was 64) | With its critic | | |
+
+**Gaps that survived two rounds, and the change of approach** (spec section 5: write down what was tried, then try something different)
+
+- **Crawler, "platforms are never requested".**
+  - Round 1 tried a hand-written list of platforms. The critic fetched 115 platforms that were not on it.
+  - Round 2 tried a shape test (bare custom domain, no path, no subdomain) plus a longer list. The critic got through with a `#` route and with country variants of listed names.
+  - Round 3 stops relying on lists: no request can be made unless it is anchored to a site that passed the own-site test, each site has a request budget, and the seeding step drops any domain that more than one artist lists.
+- **Database, "the removal flow cannot be abused".**
+  - Round 1 tried instant hiding for anyone. One visitor hid 40 artists in 3.8 seconds.
+  - Round 2 tried a cap of 20 a day. A visitor can use it up, and real requests are then silently dropped.
+  - A cap is the wrong tool: it either lets a prankster hide artists or lets them block real requests. The fix needs proof of who is asking, which changes the bar, so it is with the owner (item 1 above).
+- **Database, "similar style answers in time".** Round 2 passed when quiet but failed for about 25 seconds after every data reload. Round 3 ranks artists by one stored style vector first, then re-ranks a shortlist, so it no longer scans every work.
+
+**Other findings now with the builders**
+- Database: titles, descriptions and profiles accepted a 200 KB embedded image (hard rule 1). A purged artist got back in 5 ways out of 355 tried. A filter list of 100,000 values caused an error and slowed other visitors.
+- Crawler: one robots.txt precedence case with non-ASCII paths; the address check and the connection resolved a name separately; the crawler kept requesting a site after it answered "slow down".
+
+**What held under heavier attack**
+- Crawler: the 3-second gap across 27 mixed requests, 38,028 opted-out markup variants with none missed, 71 URL tricks and 47 redirect targets with no off-site request.
+- Database: the public key cannot touch a table, no hidden artist in 494 search combinations, 102 to 105 MB at full scale.
+
+**Database:** 11.7 MB of 400 MB. Artists 0, works 0.
