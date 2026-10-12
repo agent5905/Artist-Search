@@ -23,6 +23,7 @@ def test_key_pattern_is_blocked():
 def test_images_and_env_file_are_blocked():
     assert problems("web/public/art.PNG", "", [])
     assert problems(".env", "", [])
+    assert problems(".env.cloudflare_info", "", [])
     assert problems(".env.example", "GH_TOKEN=", []) == []
 
 

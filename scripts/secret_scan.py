@@ -21,6 +21,7 @@ PATTERNS = [
         r"github_pat_[A-Za-z0-9_]{40,}",
         r"sb_secret_[A-Za-z0-9_-]{20,}",
         r"sbp_[a-f0-9]{40}",
+        r"cf[au]t_[A-Za-z0-9_-]{30,}",
         r"eyJ[A-Za-z0-9_-]{20,}\.eyJ[A-Za-z0-9_-]{20,}\.",
         r"AKIA[0-9A-Z]{16}",
         r"-----BEGIN [A-Z ]*PRIVATE KEY-----",
@@ -48,8 +49,9 @@ def problems(name: str, text: str, secrets: list[str]) -> list[str]:
     found = []
     if pathlib.PurePosixPath(name).suffix.lower() in IMAGE_EXTS:
         found.append("image file (hard rule 1: never store artwork in the repo)")
-    if pathlib.PurePosixPath(name).name == ".env":
-        found.append(".env must never be committed")
+    base = pathlib.PurePosixPath(name).name
+    if base.startswith(".env") and base != ".env.example":
+        found.append("env files must never be committed")
     if any(s in text for s in secrets):
         found.append("contains a value from .env")
     found += [f"matches key pattern {p.pattern[:24]}" for p in PATTERNS if p.search(text)]

@@ -1,13 +1,14 @@
 # Artist Search: Progress
 
-**Status, 2026-10-11:** Path B chosen. Wave 1 is building: the polite crawler, DeviantArt discovery, and the database schema. Live collection waits on DeviantArt API credentials (item 1 below).
+**Status, 2026-10-11 (late):** Round 1 is in. Two of three pieces failed their critics and are in round 2; the third critic is still probing. DeviantArt credentials work. The first live discovery run is held until the discovery fix passes a fresh critic.
 
 ## Waiting on the owner
 
-1. **DeviantArt API credentials.** Register an app at deviantart.com/developers/register and add `DEVIANTART_CLIENT_ID` and `DEVIANTART_CLIENT_SECRET` to `.env`. Nothing can be collected until then.
-2. **Send the permission request.** A draft is in [docs/deviantart-permission-request.md](docs/deviantart-permission-request.md). Edit and send it through DeviantArt's Help Center.
-3. **Cloudflare token.** `CLOUDFLARE_API_TOKEN` is rejected (HTTP 401, "Invalid API Token"). Needed for the site preview and for search-time query embeddings. `CLOUDFLARE_PAGES_PROJECT_NAME` and `APP_BASE_URL` are empty.
-4. **The reference for the search and style A/B tests** (see decision 3 below). Proceeding with the stated default unless told otherwise.
+1. **Cloudflare token.** `CLOUDFLARE_API_TOKEN` is still rejected (HTTP 401, "Invalid API Token"). The token's record shows it active, so the string in `.env` is most likely not its current secret. Suggested: create a new, narrow token (Pages edit, Workers Scripts edit, Workers AI read). Needed for the site preview and the search box, not before.
+2. **Image hosts run by site builders.** Custom-domain Wix, Squarespace, Shopify and WordPress.com sites serve their images from the platform's own servers. Fetching those may fall under the platform's terms, so the default is to refuse them until the owner says otherwise. Cost: those artists yield pages but no images, so they drop out of the index.
+3. **Removal policy (default in place).** A removal request hides the artist at once, up to 20 artists a day; past that, requests are logged and wait for review. Nothing is deleted until the owner reviews it. There is no proof of identity yet.
+4. **The reference for the search and style A/B tests** (decision 3 below). Proceeding with the stated default.
+5. **Optional: the DeviantArt permission request** in `docs/`. Only needed if DeviantArt artwork itself should be analyzed later.
 
 ## Owner decisions (these amend the spec)
 
@@ -130,3 +131,30 @@ Analyzing only opted-in DeviantArt works is not on the list: the label is not in
 - Permission request drafted in `docs/`.
 - `scripts/ship.sh` runs every fixed check and then pushes.
 - Wave 1 builders started: crawler, DeviantArt discovery, database schema. Each gets a fresh critic when it reports.
+
+### Round 1: crawler, discovery, database (2026-10-11)
+
+Three builders worked in parallel. Each piece then went to a fresh critic that saw only the goal, the bar, the hard rules and the real code.
+
+| Piece | Builder's tests | Critic | Biggest gap the critic named |
+|---|---|---|---|
+| 1a Discover | 64 pass | **Fail** (4 of 8 bar items) | Hosts were compared as raw text. A DeviantArt URL with a trailing dot was stored as an "external link", which put a deviation title on disk |
+| 10 and 11 Database | 15 pass on the live project | **Fail** (3 of 11 bar items) | Any anonymous visitor could hide the whole index (40 artists in 3.8 seconds), and the purge then deleted and blocked them for good |
+| 1b Crawl | 446 pass | Still probing | |
+
+**What the critics found that the builders' own tests missed**
+- Discover: a site removal did not bar the artist's handle, so the artist came back on the next run with a new website. An email address inside a website URL was stored. The 1-second wait between requests had no test: removing it passed all 64.
+- Database: a purged artist got back in through a trailing space, a non-breaking space, or a trailing dot in the URL, or by having no handle and no site at all. `artists.links` accepted a 220 KB `data:` image and served it publicly, which breaks hard rule 1. A 20,000-word query returned HTTP 500.
+- Both builders ran their own mutation checks first (31 and 4 deliberate rule breaks, all caught). The critics still found real failures, which is the case for a separate critic.
+
+**What held under attack**
+- Discover: no duplicates across case variants, backoff and token refresh, mature works never counted, credentials never in a URL or in output.
+- Database: the public key cannot read or write any table; hidden artists never appeared in about 200 calls; search and similar-style functions survived hostile input.
+
+**Measured at full scale** (3,000 synthetic artists, 30,000 works, loaded into the real tables and then deleted): 92 to 99 MB of the 400 MB budget. Search 20 to 50 ms, similar-style 0.44 to 0.49 s against a 3 s public limit.
+
+**Now:** both failed pieces are in round 2 with the critic's gap as the task. The removal flow changes to owner-reviewed purges, a reject path, and a daily cap on automatic hiding.
+
+**DeviantArt:** credentials verified (token issued, validity check passed). No content has been requested.
+
+**Database:** 27.9 MB of 400 MB (empty tables; the extra is index space left by the full-scale test, which is reused). Artists 0, works 0.

@@ -228,3 +228,6 @@ node_modules/
 .dev.vars
 .pytest_tmp/
 .pytest_tmp*/
+# Any other env-style file the owner drops in (tokens, account info)
+.env.*
+!.env.example
