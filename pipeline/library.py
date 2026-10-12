@@ -1,19 +1,22 @@
 """What the collect stage keeps: each artist's public profile fields, their recent works, one cached image a work.
 
-Two tables in the local SQLite file, beside the store's (pipeline/store.py), and image files in image_dir().
+Three tables in the local SQLite file, beside the store's (pipeline/store.py), and image files in image_dir().
 Every value is checked here, on the way in, whoever calls. Nothing is cut out of a value to make it fit: a value
 that might hold what must not be kept is dropped whole.
   - hard rule 1: the tables are STRICT and hold text only: short texts, addresses and a file name. A text or an
     address with "data:" in it in any spelling, or a text with a long encoded-looking run, is not kept.
   - hard rule 2: image bytes are written by save_image() and nowhere else, as files under config.CACHE_DIR.
-  - hard rule 6: there is no free-text bio. A text with an "@", a link, a messaging service or seven digits in
-    it is not kept. The API's user id is kept only as a hash, to know an account that changed its handle.
+  - hard rule 6: there is no free-text bio. A text with an "@", a mail or messaging service, anything shaped
+    like a domain or seven digits in it is not kept. A work whose title holds contact details is not kept at
+    all, because its page address is made from its title. A website is kept only when it is the artist's own
+    site or a profile on one of PROFILE_DOMAINS. The API's user id is kept only as a hash.
   - hard rule 7: purge() deletes everything kept about one artist, files included, and drop_orphans() deletes
     every cached file that no row accounts for.
 Every function that reads or writes the tables takes an optional `db` path; the default is config.LOCAL_DB. A
 work whose image_file is NULL has no cached image: the analysis stage must leave it alone.
 """
 
+import base64
 import contextlib
 import hashlib
 import html
@@ -29,9 +32,9 @@ from urllib.parse import unquote
 
 import httpx
 
-from pipeline import config, store
+from pipeline import config, crawl, store
 
-_TIMESTAMP = "[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T*"  # for GLOB: what a fetched_at begins with
+_TIMESTAMP = "[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T*"  # for GLOB: what a timestamp begins with
 # The CHECKs are there so that a row of the wrong shape is refused, never stored. The first version had none and
 # wrote its rows by position. When this table changed under a collector of that version that was still
 # running, it stored seven artists' websites as fetched_at and stopped on the eighth, who had no website.
@@ -42,7 +45,7 @@ _PROFILES = f"""(
     level TEXT,
     website TEXT CHECK (website LIKE 'http%://%'),                    -- scheme://host/path, nothing else
     fetched_at TEXT NOT NULL CHECK (fetched_at GLOB '{_TIMESTAMP}'),  -- ISO-8601 UTC
-    -- sha256 hex of the API's user id: the same account under another handle
+    -- sha256 hex of 'uid:<the API's user id>': the same account under another handle
     user_hash TEXT CHECK (length(user_hash) = 64 AND user_hash NOT GLOB '*[^0-9a-f]*')
 ) STRICT"""
 _SCHEMA = f"""
@@ -59,10 +62,17 @@ CREATE TABLE IF NOT EXISTS works (
     fetched_at TEXT NOT NULL         -- ISO-8601 UTC
 ) STRICT;
 CREATE INDEX IF NOT EXISTS works_by_artist ON works (artist_key);
+-- Artists the collector passed over the last time their turn came, so that the next run takes them last and
+-- not first. A new table, made when there is none: nothing here changes a table that exists (see _open).
+CREATE TABLE IF NOT EXISTS skipped (
+    artist_key TEXT PRIMARY KEY,
+    skipped_at TEXT NOT NULL CHECK (skipped_at GLOB '{_TIMESTAMP}'),  -- ISO-8601 UTC
+    unavailable INTEGER NOT NULL     -- runs in a row in which their profile could not be had
+) STRICT;
 """
 # A profiles table from an earlier version of this module (see _upgrade). It is rebuilt with the artists it
 # lists and when each was fetched, and nothing else: what it held was kept under looser rules, some of it in the
-# wrong column, and the next run fills in what still qualifies. Titles the rules of today could refuse go too.
+# wrong column, and the next run fills in what still qualifies.
 _UPGRADE = f"""
 BEGIN;
 CREATE TABLE profiles_upgraded {_PROFILES};
@@ -71,8 +81,7 @@ INSERT INTO profiles_upgraded (artist_key, fetched_at)
     FROM profiles;
 DROP TABLE profiles;
 ALTER TABLE profiles_upgraded RENAME TO profiles;
-UPDATE works SET title = NULL
-    WHERE title LIKE '%@%' OR title LIKE '%data:%' OR title GLOB '*[0-9]*[0-9]*[0-9]*[0-9]*[0-9]*[0-9]*[0-9]*';
+UPDATE works SET title = NULL WHERE title LIKE '%@%' OR title LIKE '%data:%';
 COMMIT;
 """
 
@@ -88,20 +97,23 @@ IMAGE_TYPES = {
 }
 PAGE_DOMAINS = ("deviantart.com",)  # where a work's page lives
 IMAGE_DOMAINS = ("wixmp.com", "deviantart.net", "deviantart.com")  # where DeviantArt serves its images from
-# Never kept as an artist's website: an address there is a way to message a person, not a portfolio.
-MESSAGING_DOMAINS = (
-    *("wa.me", "whatsapp.com", "t.me", "telegram.me", "telegram.org", "telegram.dog", "m.me", "messenger.com"),
-    *("discord.gg", "discord.com", "discordapp.com", "signal.me", "signal.group", "line.me", "lin.ee", "viber.com"),
-    *("vb.me", "skype.com", "wechat.com", "qq.com", "kakao.com", "kik.me", "kik.com", "vk.me", "icq.im", "icq.com"),
-    *("zalo.me", "threema.id", "matrix.to", "snapchat.com"),
+# The only places an artist's website may be, besides a site of their own: portfolio and social profiles.
+# A list of what is kept, because a list of what is refused (messaging services) can never be finished.
+PROFILE_DOMAINS = (
+    *("artstation.com", "behance.net", "instagram.com", "x.com", "twitter.com", "tumblr.com", "patreon.com"),
+    *("ko-fi.com", "linktr.ee", "carrd.co", "youtube.com", "twitch.tv", "bsky.app"),
 )
 
 _UUID = re.compile(r"[0-9A-F]{8}(?:-[0-9A-F]{4}){3}-[0-9A-F]{12}")
 _TAG_NAME = re.compile(r"[\w-]{1,60}")
-_PAGE_PATH = re.compile(r"/[A-Za-z0-9_-]{1,40}/art/[A-Za-z0-9_.%-]{1,300}")  # /<handle>/art/<title>-<number>
-_IMAGE_QUERY = re.compile(
-    r"(?:token=[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+)?"
-)  # none, or DeviantArt's signature
+_PAGE_PATH = re.compile(r"/[A-Za-z0-9_-]{1,40}/art/[A-Za-z0-9_.%-]{1,200}")  # /<handle>/art/<title>-<number>
+# DeviantArt's signature on an image address: token=<header>.<claims>.<signature>, the header a few dozen characters.
+_IMAGE_TOKEN = re.compile(r"token=(?P<header>[A-Za-z0-9_-]{1,100})\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+")
+MAX_TOKEN = 1000  # characters; the longest real one seen is 639
+# On a profile host, a path that is a way to write to a person, or to be sent somewhere else.
+_NOT_A_PROFILE = re.compile(
+    r"/(?:messages?|messaging|direct|dm|inbox|chat|intent|compose|share|send|redirect)(?:/|$)", re.I
+)
 _MARKUP = re.compile(r"<[^<>]*>")
 # Characters that show nothing and are not in Unicode's "other" categories, which _settle removes wholesale:
 # the grapheme joiner, the Hangul and Khmer fillers, the Mongolian and the general variation selectors, blank braille.
@@ -109,16 +121,30 @@ _INVISIBLE = re.compile(
     "[\u034f\u115f\u1160\u17b4\u17b5\u180b-\u180f\u2800\u3164\ufe00-\ufe0f\uffa0\U000e0100-\U000e01ef]"
 )
 _ENCODED = re.compile(r"[A-Za-z0-9+/=_-]{100,}")  # no word is this long; a base64 file is
+# Mail and messaging services by name. A name counts when no letter stands before it: not the mail in "platemail".
+# The second list are also ordinary words, so they count only whole: "signal" and not "signals".
+# ponytail: "The Messenger" and "Signal Lost" are refused with the rest, a tagline dropped or a work not kept
+# (5 of the first 4,381 works). Telling the word from the service needs a reader, not a pattern.
+_SERVICES = (
+    r"(?<![A-Za-z])(?:e-?mail|gmail|googlemail|hotmail|protonmail|icloud|yandex|fastmail|tutanota|whats\s*app"
+    r"|snapchat|skype|wechat|weixin|viber|kakaotalk|facetime|imessage|threema)"
+)
+_SERVICE_WORDS = (
+    r"(?<![A-Za-z])(?:mail|outlook|yahoo|ymail|proton|aol|gmx|telegram|discord|signal|kik|messenger|kakao|icq|qq|zalo)"
+    r"(?![A-Za-z])"
+)
+# "name (at) host", "host [dot] com", and "name(a)host". The last only between two words: "Sheet (A)" is a title.
+_WRITTEN_AROUND = r"[\[({]\s*(?:at|dot)\s*[\])}]|(?<=\w)[\[({]a[\])}](?=\w)"
 _CONTACT = re.compile(
-    r"://|www\.|\b(?:mailto|tel|sms|callto|skype|facetime)\s*:"
-    r"|\b(?:wa|t|m|line|vb|kik|vk|zalo|signal)\.me\b|whats\s*app|telegram|discord|viber|wechat|weixin|kakao"
-    r"|(?<![A-Za-z])(?:e-?mail|gmail|hotmail|protonmail|icloud)"  # not the mail in "platemail" or "ringmail"
-    r"|[\[({]\s*(?:at|dot)\s*[\])}]",
-    re.IGNORECASE,
+    rf"\b(?:mailto|tel|sms|callto|skype|facetime)\s*:|{_SERVICES}|{_SERVICE_WORDS}|{_WRITTEN_AROUND}", re.IGNORECASE
 )
 # "name at host dot com", and "name_at_host_dot_com" in a tag: the two words, each between things that are not letters.
 _AT = re.compile(r"(?<![A-Za-z])at(?![A-Za-z])", re.IGNORECASE)
 _DOT = re.compile(r"(?<![A-Za-z])dot(?![A-Za-z])", re.IGNORECASE)
+
+
+class ContactInTitle(ValueError):
+    """A work's title holds contact details. The work is not kept: its page address is made from its title."""
 
 
 def image_dir() -> pathlib.Path:
@@ -144,27 +170,53 @@ def _settle(text: str, percent: bool = False) -> str | None:
     return None
 
 
-def _suspect(probe: str | None) -> bool:
-    """True when a settled text could hold an address, a number to call, or an embedded file. It is then dropped."""
-    if probe is None:
-        return True
-    squashed = "".join(probe.split()).lower()
+def _digits(text: str) -> int:
+    return sum(map(str.isdigit, text))
+
+
+def _embedded(text: str) -> bool:
+    """True when a settled text could hold a file: "data:" in any spacing or case, or a long encoded-looking run."""
+    return "data:" in "".join(text.split()).lower() or bool(_ENCODED.search(text))
+
+
+def _contact(text: str) -> bool:
+    """True when a settled free text could hold a way to reach a person: an "@", a mail or messaging service,
+    seven digits, an address written around its "@" and its dots, or anything at all that is shaped like a domain."""
     return (
-        "@" in squashed
-        or "data:" in squashed
-        or sum(map(str.isdigit, probe)) >= 7
-        or bool(_ENCODED.search(probe) or _CONTACT.search(probe) or (_AT.search(probe) and _DOT.search(probe)))
+        "@" in text
+        or _digits(text) >= 7
+        or bool(_CONTACT.search(text) or (_AT.search(text) and _DOT.search(text)) or store.hosts_in(text))
     )
 
 
 def _text(value: object, limit: int) -> str | None:
-    """A short public text cut to `limit`, or None for anything else, a suspect text included."""
+    """A short public text cut to `limit`, or None for anything else: not a text, or one that would not settle or
+    could hold contact details or a file, as it is written or once its percent-encoding is undone."""
     if not isinstance(value, str) or len(value) > 10_000:
         return None
-    shown = _settle(value)
-    if not shown or _suspect(shown) or _suspect(_settle(value, percent=True)):
+    shown, probe = _settle(value), _settle(value, percent=True)
+    if not shown or probe is None or any(_contact(text) or _embedded(text) for text in (shown, probe)):
         return None
     return shown[:limit].strip() or None
+
+
+def _title(value: object) -> str | None:
+    """A work's title cut to 200 characters. None for no title, or one that could hold a file.
+
+    ContactInTitle when it holds an "@", a mail or messaging service, nine digits (seven and eight are dates and
+    serial numbers), an address written around its "@", or "at" with "dot" or with something shaped like a
+    domain; and when it will not settle, which is somebody hiding something.
+    """
+    if not isinstance(value, str) or len(value) > 10_000:
+        return None
+    shown, probe = _settle(value), _settle(value, percent=True)
+    if shown is None or probe is None:
+        raise ContactInTitle("a title that will not settle")
+    for text in (shown, probe):
+        spelled_out = _AT.search(text) and (_DOT.search(text) or store.hosts_in(text))
+        if "@" in text or _digits(text) >= 9 or _CONTACT.search(text) or spelled_out:
+            raise ContactInTitle("contact details in a title")  # never echoes the title
+    return None if _embedded(shown) or _embedded(probe) else shown[:200].strip() or None
 
 
 def _choice(value: object) -> str | None:
@@ -175,7 +227,9 @@ def _choice(value: object) -> str | None:
 
 def _tags(value: object) -> list[str]:
     """The artist's own tags: plain tag names of 60 characters at most, and 60 of them at most."""
-    names = (_text(tag, 61) for tag in (value if isinstance(value, list) else []))
+    tags = value if isinstance(value, list) else []
+    # A tag is a name, so one that is long as it is written is not read: reading 100 of them took seconds.
+    names = (_text(tag, 61) for tag in tags if isinstance(tag, str) and len(tag) <= 300)
     return [name for name in names if name and _TAG_NAME.fullmatch(name)][:60]
 
 
@@ -184,24 +238,33 @@ def _on(host: str, domains: tuple[str, ...]) -> bool:
 
 
 def _website(value: object) -> str | None:
-    """A profile's website field as scheme://host/path, or None. No query and no fragment, never a messaging
-    service, and never an address with an "@", seven digits or "data:" in it, however it is encoded."""
+    """A profile's website field as scheme://host/path, or None.
+
+    Kept only when it is the front page of a site of the artist's own (crawl.is_own_site is the rule), or a
+    profile on one of PROFILE_DOMAINS: a user's subdomain there, or a path of one or two parts that is not a
+    way to message somebody. Never with a query or a fragment, and never with an "@", seven digits, "data:" or
+    an encoded-looking run in it, however it is encoded.
+    """
     if not isinstance(value, str) or len(value) > 300:
         return None
     shown, probe = _settle(value), _settle(value, percent=True)
-    if not shown or " " in shown or probe is None:
-        return None
-    squashed = "".join(probe.split()).lower()
-    if "@" in squashed or "data:" in squashed or sum(map(str.isdigit, probe)) >= 7 or _ENCODED.search(probe):
+    if not shown or " " in shown or probe is None or "@" in probe or _digits(probe) >= 7 or _embedded(probe):
         return None
     try:
         url = httpx.URL(shown if "://" in shown else f"https://{shown}")
         host = store.canonical_host(url.raw_host.decode("ascii"))
     except (httpx.InvalidURL, UnicodeError):
         return None
-    if url.scheme not in ("http", "https") or host is None or _on(host, MESSAGING_DOMAINS):
+    if url.scheme not in ("http", "https") or host is None:
         return None
-    return f"{url.scheme}://{host}{url.raw_path.decode('ascii').partition('?')[0]}"
+    path = url.raw_path.decode("ascii").partition("?")[0]
+    address = f"{url.scheme}://{host}{path}"
+    if not _on(host, PROFILE_DOMAINS):
+        return address if crawl.is_own_site(address) else None
+    parts = [part for part in path.split("/") if part]
+    users_own_subdomain = host.removeprefix("www.") not in PROFILE_DOMAINS  # zzfake.tumblr.com, not tumblr.com
+    profile = len(parts) <= 2 and (parts or users_own_subdomain) and not _NOT_A_PROFILE.search(path)
+    return address if profile else None
 
 
 def _address(value: object, domains: tuple[str, ...]) -> httpx.URL:
@@ -223,7 +286,8 @@ def _address(value: object, domains: tuple[str, ...]) -> httpx.URL:
 
 
 def page_address(value: object) -> str:
-    """The address of a work's own page: https://www.deviantart.com/<handle>/art/<title>, and nothing after it."""
+    """The address of a work's own page: https://www.deviantart.com/<handle>/art/<title>, and nothing after it.
+    The title part is 200 characters at most, of the letters, digits and four marks DeviantArt makes it from."""
     url = _address(value, PAGE_DOMAINS)
     if not _PAGE_PATH.fullmatch(url.raw_path.decode("ascii")):  # raw_path is the path and the query: so, no query
         raise ValueError("not a work's page")
@@ -231,11 +295,25 @@ def page_address(value: object) -> str:
 
 
 def image_address(value: object) -> str:
-    """The address of an image on one of DeviantArt's image hosts, with no query but DeviantArt's own signature."""
+    """The address of an image on one of DeviantArt's image hosts, with no query but DeviantArt's own signature:
+    a token of MAX_TOKEN characters at most, whose first part is a small JSON header that names an algorithm."""
     url = _address(value, IMAGE_DOMAINS)
-    if not _IMAGE_QUERY.fullmatch(url.query.decode("ascii")):
+    query = url.query.decode("ascii")
+    if query and not _signature(query):
         raise ValueError("not an image address")
     return str(url)
+
+
+def _signature(query: str) -> bool:
+    """True when a query is DeviantArt's signature and nothing else (see image_address)."""
+    token = _IMAGE_TOKEN.fullmatch(query)
+    if token is None or len(query) > len("token=") + MAX_TOKEN:
+        return False
+    try:
+        header = json.loads(base64.urlsafe_b64decode(token["header"] + "=" * (-len(token["header"]) % 4)))
+    except ValueError:  # not base64, not UTF-8 or not JSON
+        return False
+    return isinstance(header, dict) and isinstance(header.get("alg"), str)
 
 
 def deviation_id(value: object) -> str:
@@ -258,10 +336,10 @@ def checked_work(
 ) -> tuple[str, str, str | None, str, str, str | None]:
     """One work's values as they are stored: id, page, title, tags as JSON, thumbnail, time published.
 
-    ValueError for an id that is not a UUID or an address that is not acceptable. A title or a tag that is not
-    acceptable is left out, and the work is still good.
+    ValueError for an id that is not a UUID or an address that is not acceptable, and its subclass ContactInTitle
+    for a title that holds contact details. A tag that is not acceptable is left out, and the work is still good.
     """
-    title_kept, tags_kept = _text(title, 200), json.dumps(_tags(tags))
+    title_kept, tags_kept = _title(title), json.dumps(_tags(tags))
     return (
         deviation_id(work_id),
         page_address(page_url),
@@ -277,6 +355,17 @@ def _key(artist_key: object) -> str:
     if not isinstance(artist_key, str) or store.artist_key(artist_key.removeprefix("da:")) != artist_key:
         raise ValueError("not an artist key")
     return artist_key
+
+
+def account(user_id: object, spelling: str = "uid") -> str | None:
+    """The hash an account is known by: sha256 of 'uid:<the API's user id>'. None when there is no id.
+
+    ponytail: profiles written before this spelling hashed 'da-user:<id>'. Both are recognised where an account
+    is looked for; drop the old one when no row is left that a run has not rewritten.
+    """
+    if not isinstance(user_id, str) or not user_id:
+        return None
+    return hashlib.sha256(f"{spelling}:{user_id}".encode()).hexdigest()
 
 
 @contextlib.contextmanager
@@ -355,6 +444,7 @@ def store_artist(
     each row names the work's cached image when there is one. The artist's other works go, with their files.
     So does whatever is kept under another key for the same `user_id`: that is this account under the handle
     it had before, and a removal by the new handle must not leave the old one's rows behind (hard rule 7).
+    The artist is no longer one that was passed over (see note_skip).
 
     Returns two counts of what went wrong without stopping the rest: works whose row the database refused (a
     constraint; the work is then not kept), and works that had to go but have a file that could not be deleted
@@ -364,9 +454,7 @@ def store_artist(
     when the database refuses the profile row itself.
     """
     key = _key(artist_key)
-    user_hash = (
-        hashlib.sha256(f"da-user:{user_id}".encode()).hexdigest() if isinstance(user_id, str) and user_id else None
-    )
+    user_hash = account(user_id)
     profile = (key, _text(tagline, 200), _choice(specialty), _choice(level), _website(website), store._now(), user_hash)
     rows = [checked_work(**work) for work in works]
     with _open(db) as conn:
@@ -378,6 +466,7 @@ def store_artist(
             "VALUES (?, ?, ?, ?, ?, ?, ?)",
             profile,
         )
+        conn.execute("DELETE FROM skipped WHERE artist_key = ?", (key,))
         stored = set()
         for work_id, *rest in rows:
             try:
@@ -390,8 +479,8 @@ def store_artist(
             except sqlite3.IntegrityError:  # SQLite undoes that one statement; the transaction and the artist go on
                 pass
         stuck = _drop_works(conn, key, stored)
-        same_account = "SELECT artist_key FROM profiles WHERE user_hash = ? AND artist_key != ?"
-        for (other,) in conn.execute(same_account, (user_hash, key)).fetchall():
+        same_account = "SELECT artist_key FROM profiles WHERE user_hash IN (?, ?) AND artist_key != ?"
+        for (other,) in conn.execute(same_account, (user_hash, account(user_id, "da-user"), key)).fetchall():
             stuck += _forget(conn, other)
     return len({row[0] for row in rows} - stored), stuck
 
@@ -422,8 +511,12 @@ def save_image(work_id: str, content_type: str, data: bytes) -> str:
     return name
 
 
-def purge(artist_key: str, db: pathlib.Path | str | None = None) -> None:
+def purge(artist_key: str, db: pathlib.Path | str | None = None, *, keep_skip: bool = False) -> None:
     """Hard rule 7: delete the artist's profile, their works and every cached image of those works. Safe to repeat.
+
+    The note that they were passed over goes too, unless `keep_skip`: the collector keeps it for an artist it
+    purges for a reason of its own (their works are AI-made, their account is gone), so that it does not ask
+    about them first on every run. For a removed artist nothing is kept.
 
     One file that cannot be deleted does not stop the rest. OSError once everything else is gone: that work's
     row stays, so artist_keys() still lists the artist and the purge can be run again.
@@ -431,8 +524,55 @@ def purge(artist_key: str, db: pathlib.Path | str | None = None) -> None:
     key = _key(artist_key)
     with _open(db) as conn:
         stuck = _forget(conn, key)
+        if not keep_skip:
+            conn.execute("DELETE FROM skipped WHERE artist_key = ?", (key,))
     if stuck:
         raise OSError("a cached file could not be deleted")
+
+
+def note_skip(artist_key: str, unavailable: bool = False, db: pathlib.Path | str | None = None) -> int:
+    """Note, with the time, that the collector passed this artist over, so that the next run takes them last.
+
+    `unavailable` says their profile could not be had. Returns for how many runs in a row that has now been so;
+    any other skip sets it back to 0, and so does storing the artist.
+    """
+    key = _key(artist_key)
+    with _open(db) as conn:
+        conn.execute(
+            "INSERT INTO skipped (artist_key, skipped_at, unavailable) VALUES (?, ?, ?) ON CONFLICT(artist_key) "
+            "DO UPDATE SET skipped_at = excluded.skipped_at, unavailable = excluded.unavailable * (unavailable + 1)",
+            (key, store._now(), int(unavailable)),
+        )
+        return int(conn.execute("SELECT unavailable FROM skipped WHERE artist_key = ?", (key,)).fetchone()[0])
+
+
+def last_attempts(db: pathlib.Path | str | None = None) -> dict[str, str]:
+    """For every artist the collector has stored or passed over: when it last did, as an ISO-8601 time."""
+    query = "SELECT artist_key, max(at) FROM (SELECT artist_key, fetched_at AS at FROM profiles UNION ALL "
+    with _open(db) as conn:
+        return dict(conn.execute(query + "SELECT artist_key, skipped_at FROM skipped) GROUP BY artist_key"))
+
+
+def account_hash(artist_key: str, db: pathlib.Path | str | None = None) -> str | None:
+    """The hash the artist's account is known by, when their profile is stored. It is what goes on the store's
+    removal list when they are removed, so that the same account under a new handle is known for what it is."""
+    key = _key(artist_key)
+    with _open(db) as conn:
+        try:
+            row = conn.execute("SELECT user_hash FROM profiles WHERE artist_key = ?", (key,)).fetchone()
+        except sqlite3.OperationalError:  # a table from the first version, which kept no hash
+            return None
+    # Only a hash is handed on: a table an earlier version left may hold something else in this column.
+    return row[0] if row and row[0] and re.fullmatch(r"[0-9a-f]{64}", row[0]) else None
+
+
+def account_removed(user_id: object, db: pathlib.Path | str | None = None) -> bool:
+    """True when the account with this API user id is on the store's removal list, under whatever handle it was
+    removed (hard rule 7). Read through the store's own check, so there is one removal list and one way to ask it."""
+    if account(user_id) is None:
+        return False
+    with _open(db) as conn:
+        return store._removed(conn, [f"uid:{user_id}", f"da-user:{user_id}"])
 
 
 def drop_orphans(db: pathlib.Path | str | None = None) -> tuple[int, int]:

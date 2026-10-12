@@ -11,6 +11,10 @@ A run starts and ends by deleting what must not be there: everything kept about 
 since, and every cached file no row accounts for. Running it again over every artist also brings what an
 earlier version stored up to the rules of this one: each artist's profile and works are replaced whole.
 
+No single artist ends a run. Whatever goes wrong with one is counted, the artist is noted as passed over so that
+the next run takes them last, and the run goes on. It stops only for the rate limit, for our own token, and
+when MAX_FAILURES artists in a row have failed, which means the API is down.
+
 Endpoints (deviantart.readme.io, read 2026-10-12). Each is documented under the security scheme
 "oauth2AuthorizationCodeOrClientCredentials" with scope "browse", so a client_credentials token is accepted:
     GET /api/v1/oauth2/user/profile/{username}   no parameters: "expand" would add age, sex and location
@@ -38,7 +42,9 @@ MAX_WORKS = 10  # works kept per artist
 # among their 24 newest gets fewer. Follow next_offset if too many artists come up short.
 GALLERY_LIMIT = 24
 IMAGE_INTERVAL = 0.5  # seconds waited before every image download: two a second at most
-MAX_FAILURES = 3  # artists failing unexpectedly one after another before the run gives up
+SERVER_RETRIES = 3  # times a 5XX answer is asked for again, 2, 4 and 8 seconds later. The API docs suggest three.
+MAX_FAILURES = 5  # artists failing one after another before the run gives up: by then it is the API, not them
+DEAD_AFTER = 2  # runs in a row an artist's profile must be unavailable before what was kept about them is purged
 NOT_IMAGE_KEYS = frozenset(("videos", "flash", "text_content", "excerpt"))  # what a film or a text carries
 
 # Which tags say a work is AI-made. A tag is read in lower case with everything but letters and digits taken
@@ -47,16 +53,15 @@ NOT_IMAGE_KEYS = frozenset(("videos", "flash", "text_content", "excerpt"))  # wh
 #   - begins with "ai" and is not one of the ordinary words and names in AI_LOOKALIKES ("aiadoptable", "aitools"),
 #   - ends in one of AI_ENDS ("createdwithai"), begins with one of AI_STARTS, is one of AI_EXACT, or has one of
 #     AI_NAMES anywhere in it ("madewithmidjourney"),
-# unless it says the opposite ("noai", "not_ai_art", "aifree"). When in doubt a tag counts.
-# ponytail: tags are the only signal, because DeviantArt's own "created using AI tools" label is not in the
-# API. An AI phrase that begins like an ordinary word is missed ("airender" reads as air...), and so is a tag
-# in another script. Add to the lists as real tags turn up; a model reading the image is the real upgrade.
+# unless it says the opposite: a denial before it ("noai", "not_ai_art") or one of AI_PROTESTS, whole ("aifree").
+# ponytail: this is a first sieve and no more. A list of spellings cannot be closed, so the analysis stage reads
+# each work's tags with a language model and decides there. Nothing here is meant to grow.
 AI_NAMES = (
     *("midjourney", "nijijourney", "diffusion", "novelai", "comfyui", "leonardoai", "nightcafe", "civitai"),
     *("tensorart", "txt2im", "img2im", "text2im", "texttoim", "sdxl", "artificialintelligence", "generativeai"),
     *("inteligenciaartificial", "intelligenceartificielle", "dreambooth", "controlnet", "craiyon", "automatic1111"),
     *("invokeai", "bingimagecreator", "adobefirefly", "playgroundai", "chatgpt", "gpt4", "gpt5", "artbreeder"),
-    *("deepdream", "runwayml"),
+    *("deepdream", "runwayml", "synthograph"),
 )
 AI_STARTS = ("dalle", "dreamup", "genai", "pixai", "seaartai", "nijiv", "niji4", "niji5", "niji6", "niji7")
 # Exact, because "nijisanji", "seaartist", "openair" and "sparklingair" are something else.
@@ -65,7 +70,10 @@ AI_EXACT = frozenset(
 )
 AI_ENDS = ("withai", "byai", "usingai")
 AI_DENIALS = ("not", "no", "non", "anti", "never", "without", "zero", "stop", "ban", "against")
-_AI_PROTEST = re.compile(r"isnot|isnt|notart|theft|steal|stole|sucks|free")  # inside a tag that begins with "ai"
+# The whole tag, and nothing less: "aiadoptfree" is an AI adoptable that costs nothing, not a protest.
+AI_PROTESTS = frozenset(
+    ("aifree", "aiisnotart", "aiisntart", "aiartisnotart", "aiartisntart", "aiistheft", "aiartistheft")
+)
 # Ordinary English and Japanese words and names that begin with "ai". A tag that is one of them is not about AI;
 # nor is one that begins with one of the longer ones, where no AI phrase could begin the same way.
 AI_LOOKALIKES = frozenset(
@@ -87,12 +95,16 @@ DOWNLOADED = "images downloaded"
 CACHED = "images already cached"
 PURGED = "purged artists (removed)"
 GONE = "purged artists (account suspended, inactive or gone)"
+DEAD = "purged artists (profile unavailable on two runs)"
 ORPHANS = "deleted cached files (no row for them)"
 UNDELETED = "deletions that failed"
+BAD_KEY = "rows with an unreadable artist key"
 NOT_STORED = "skipped artists (the database refused the profile)"
 ROW_REFUSED = "skipped works (the database refused the row)"
 FAILED = "skipped artists (unexpected error)"
+API_FAILED = "skipped artists (the API failed for them)"
 REMOVED = "skipped artists (removed)"
+RENAMED = "skipped artists (a removed account under a new handle)"
 UNAVAILABLE = "skipped artists (profile or gallery unavailable)"
 MOSTLY_AI = "skipped artists (most recent works tagged AI-made)"
 MALFORMED = "skipped works (malformed entry)"
@@ -101,35 +113,20 @@ NOT_IMAGE = "skipped works (not a public image)"
 MATURE = "skipped works (mature or unrated)"
 NO_METADATA = "skipped works (no tag data)"
 AI_TAGGED = "skipped works (tagged AI-made)"
+TITLE = "skipped works (contact details in the title)"
 IMAGE_FAILED = "skipped works (image download failed)"
 IMAGE_WRONG_TYPE = "skipped works (image not an accepted type)"
 IMAGE_TOO_LARGE = "skipped works (image over the size cap)"
 _COUNTS = (
-    PROCESSED,
-    PROFILES,
-    WORKS,
-    DOWNLOADED,
-    CACHED,
-    PURGED,
-    GONE,
-    ORPHANS,
-    UNDELETED,
-    NOT_STORED,
-    ROW_REFUSED,
-    FAILED,
-    REMOVED,
-    UNAVAILABLE,
-    MOSTLY_AI,
-    MALFORMED,
-    NOT_OWN,
-    NOT_IMAGE,
-    MATURE,
-    NO_METADATA,
-    AI_TAGGED,
-    IMAGE_FAILED,
-    IMAGE_WRONG_TYPE,
-    IMAGE_TOO_LARGE,
+    *(PROCESSED, PROFILES, WORKS, DOWNLOADED, CACHED, PURGED, GONE, DEAD, ORPHANS, UNDELETED, BAD_KEY),
+    *(NOT_STORED, ROW_REFUSED, FAILED, API_FAILED, REMOVED, RENAMED, UNAVAILABLE, MOSTLY_AI),
+    *(MALFORMED, NOT_OWN, NOT_IMAGE, MATURE, NO_METADATA, AI_TAGGED, TITLE),
+    *(IMAGE_FAILED, IMAGE_WRONG_TYPE, IMAGE_TOO_LARGE),
 )
+
+
+class _ApiFailed(Exception):
+    """The API would not answer for this artist. The message is safe to print: a name of ours and a status."""
 
 
 def _ai_word(word: str) -> bool:
@@ -143,10 +140,10 @@ def _says_ai(tag: str) -> bool:
     """True when one of an artist's own tags marks the work as AI-made. See the comment above AI_NAMES."""
     words = re.findall(r"[a-z0-9]+", unicodedata.normalize("NFKC", tag).lower())
     word = "".join(words)
-    # The opposite claim is not a claim: "noai", "no_ai_art", "notmadewithai", "aifree", "aiisnotart".
-    if any(word.startswith(no) and _ai_word(word[len(no) :]) for no in AI_DENIALS):
+    # The opposite claim is not a claim: "noai", "no_ai_art", "notmadewithai", and the protests, whole.
+    if word in AI_PROTESTS or any(word.startswith(no) and _ai_word(word[len(no) :]) for no in AI_DENIALS):
         return False
-    if word.startswith("ai") and (_AI_PROTEST.search(word) or words[0] in AI_LOOKALIKES):
+    if word.startswith("ai") and words[0] in AI_LOOKALIKES:
         return False
     # "ai" as a word of its own counts wherever it stands, unless the word before it denies it ("art_not_ai").
     alone = any(w == "ai" and (at == 0 or words[at - 1] not in AI_DENIALS) for at, w in enumerate(words))
@@ -180,13 +177,32 @@ def _why_not(entry: dict[str, Any], username: str) -> str | None:
     return None
 
 
+def _get(api: discover._Api, path: str, **params: str | int) -> httpx.Response:
+    """api.get(), with a 5XX answer asked for again up to SERVER_RETRIES times, each after twice as long a wait.
+
+    The docs say a 500 is worth retrying up to three times. What comes back after that is the caller's to judge.
+    """
+    for wait in (*(2.0**attempt for attempt in range(1, SERVER_RETRIES + 1)), None):
+        response = api.get(path, **params)
+        if response.status_code < 500 or wait is None:
+            break
+        time.sleep(wait)  # on top of the second discover._Api leaves before every request
+    return response
+
+
 def _body(response: httpx.Response, what: str) -> dict[str, Any] | None:
-    """The JSON object of a 200. None for a 4XX, which the docs give for a suspended, inactive or missing user."""
+    """The JSON object of a 200. None for a 4XX, which the docs give for a suspended, inactive or missing user.
+
+    discover.Stop for a 401, which is our token refused even after it was renewed: nobody's turn can succeed.
+    _ApiFailed for anything else, a 5XX that outlasted its retries included: that ends this artist's turn only.
+    """
     status = response.status_code
-    if 400 <= status < 500 and status not in (401, 429):  # 401 means our token, and 429 never gets here
+    if status == 401:
+        raise discover.Stop(f"{what} failed with HTTP 401")
+    if 400 <= status < 500:  # 429 never gets here: discover._Api waits it out, or stops the run
         return None
     if status != 200:
-        raise discover.Stop(f"{what} failed with HTTP {status}")
+        raise _ApiFailed(f"{what} answered HTTP {status}")
     body = response.json()
     return body if isinstance(body, dict) else {}
 
@@ -230,23 +246,42 @@ def _fetch_image(http: httpx.Client, url: str) -> tuple[str, bytes] | str:
     return content_type, bytes(data)
 
 
-def _purge(key: str, counts: dict[str, int], db: pathlib.Path | str | None) -> bool:
+def _purge(key: str, counts: dict[str, int], db: pathlib.Path | str | None, keep_skip: bool = False) -> bool:
     """library.purge() that does not end the run: a file that cannot be deleted is counted, and the run goes on to
     the next artist, whose data must not stay on disk because of it. False when something could not be deleted."""
     try:
-        library.purge(key, db)
+        library.purge(key, db, keep_skip=keep_skip)
     except OSError:
         counts[UNDELETED] += 1
         return False
     return True
 
 
+def _remove(key: str, counts: dict[str, int], db: pathlib.Path | str | None, user_id: object = None) -> bool:
+    """Purge an artist who is on the removal list, and first put their account on that list as well.
+
+    The account is the hash of the API's user id, which does not change when a handle does. Without it the
+    purge would delete the one thing that says who they were, and the same account under a new handle would be
+    collected again (hard rule 7: not re-added later). It is taken from the profile that was stored, and from
+    `user_id` when the removal lands in the artist's own turn, which may be their first.
+    """
+    accounts = {account for account in (library.account_hash(key, db), library.account(user_id)) if account}
+    if accounts:
+        store.import_removed(accounts, db)
+    return _purge(key, counts, db)
+
+
 def _sweep(counts: dict[str, int], db: pathlib.Path | str | None) -> None:
     """Hard rule 7, at both ends of every run: everything kept about an artist who is now on the removal list
     goes, and so does every cached file no row accounts for."""
-    for key in library.artist_keys(db):
-        if store.is_removed(key, db) and _purge(key, counts, db):
-            counts[PURGED] += 1
+    unreadable = 0
+    for key in sorted({*library.artist_keys(db), *library.last_attempts(db)}):
+        try:
+            if store.is_removed(key, db) and _remove(key, counts, db):
+                counts[PURGED] += 1
+        except ValueError:  # a key nobody can read is counted, and the artists after it are purged all the same
+            unreadable += 1
+    counts[BAD_KEY] = max(counts[BAD_KEY], unreadable)  # the same rows at both ends of a run, counted once
     deleted, failed = library.drop_orphans(db)
     counts[ORPHANS] += deleted
     counts[UNDELETED] += failed
@@ -256,21 +291,33 @@ def _collect_artist(
     api: discover._Api, http: httpx.Client, username: str, counts: dict[str, int], db: pathlib.Path | str | None
 ) -> None:
     key = store.artist_key(username)
-    response = api.get(f"/user/profile/{username}")
+    response = _get(api, f"/user/profile/{username}")
     profile = _body(response, "profile lookup")
     if profile is None:
+        # Gone for certain when the API says so in as many words. Otherwise a profile that cannot be had on
+        # DEAD_AFTER runs running is a dead one, and what was kept under it does not stay in the index: it may be
+        # an account that took a new handle and was then removed under that one.
         gone = _gone(response)
-        if gone:
-            _purge(key, counts, db)
+        dead = library.note_skip(key, unavailable=True, db=db) >= DEAD_AFTER and key in library.artist_keys(db)
+        if gone or dead:
+            _purge(key, counts, db, keep_skip=True)
         counts[GONE if gone else UNAVAILABLE] += 1
+        counts[DEAD] += dead and not gone
         return
-    # Hard rule 7, now that the profile is read: an artist whose website is a removed site is removed with it.
-    if store.record_listing(username, store.hosts_in(profile.get("website")), db):
-        _purge(key, counts, db)
-        counts[REMOVED] += 1
+    user = profile.get("user")
+    user_id = user.get("userid") if isinstance(user, dict) else None
+    # Hard rule 7. An account removed under one handle is the same account under the next: the new handle is
+    # barred through the store, and nothing is collected. So is an artist whose website is a removed site.
+    renamed = library.account_removed(user_id, db)
+    if renamed:
+        store.mark_removed(username, db)
+    if renamed or store.record_listing(username, store.hosts_in(profile.get("website")), db):
+        _remove(key, counts, db, user_id)
+        counts[RENAMED if renamed else REMOVED] += 1
         return
-    page = _body(api.get("/gallery/all", username=username, limit=GALLERY_LIMIT), "gallery lookup")
+    page = _body(_get(api, "/gallery/all", username=username, limit=GALLERY_LIMIT), "gallery lookup")
     if page is None:
+        library.note_skip(key, db=db)
         counts[UNAVAILABLE] += 1
         return
 
@@ -289,11 +336,11 @@ def _collect_artist(
 
     metadata: dict[str, dict[str, Any]] = {}  # deviation id -> its metadata, which is where the tags are
     if candidates:
-        response = api.get("/deviation/metadata", **{f"deviationids[{n}]": id_ for n, id_ in enumerate(candidates)})
-        if response.status_code != 200:  # the only documented error is asking for too many, which is ours to fix
-            raise discover.Stop(f"metadata lookup failed with HTTP {response.status_code}")
-        body = response.json()
-        for item in (body.get("metadata") if isinstance(body, dict) else None) or []:
+        asked = {f"deviationids[{n}]": id_ for n, id_ in enumerate(candidates)}
+        body = _body(_get(api, "/deviation/metadata", **asked), "metadata lookup")
+        if body is None:  # the one documented refusal is asking for too many: ours to fix. Their turn is over.
+            raise _ApiFailed("metadata lookup was refused")
+        for item in body.get("metadata") or []:
             if isinstance(item, dict) and isinstance(item.get("deviationid"), str):
                 metadata[item["deviationid"].upper()] = item
 
@@ -320,6 +367,7 @@ def _collect_artist(
             clean.append((work_id, entry, tags))
     if ai_made > len(clean):  # most of the works that could be judged: this is not an artist to list
         _purge(key, counts, db)
+        library.note_skip(key, db=db)
         counts[MOSTLY_AI] += 1
         return
 
@@ -340,6 +388,9 @@ def _collect_artist(
         try:
             preview = library.image_address(_src(entry["preview"]))  # never the full original
             library.checked_work(**work)
+        except library.ContactInTitle:  # hard rule 6: the title is in the page address too, so the work is not kept
+            counts[TITLE] += 1
+            continue
         except ValueError:
             counts[MALFORMED] += 1
             continue
@@ -360,15 +411,14 @@ def _collect_artist(
             counts[DOWNLOADED] += 1
         kept.append(work)
     if store.is_removed(key, db):  # and once more before anything is written. What was downloaded is swept up.
-        _purge(key, counts, db)
+        _remove(key, counts, db, user_id)
         counts[REMOVED] += 1
         return
-    user = profile.get("user")
     try:
         # One transaction for the whole artist: the profile, these works, and nothing else of theirs left behind.
         refused, stuck = library.store_artist(
             key,
-            user_id=user.get("userid") if isinstance(user, dict) else None,
+            user_id=user_id,
             tagline=profile.get("tagline"),
             specialty=profile.get("artist_specialty"),
             level=profile.get("artist_level"),
@@ -379,6 +429,7 @@ def _collect_artist(
     except sqlite3.IntegrityError:
         # A constraint refused the profile row. Nothing of this artist was written and what was downloaded is
         # swept up at the end. One artist the database will not take must not end the run for the rest.
+        library.note_skip(key, db=db)
         counts[NOT_STORED] += 1
         return
     counts[ROW_REFUSED] += refused
@@ -397,29 +448,35 @@ def _where(exc: Exception) -> str:
 def _run(
     api: discover._Api, http: httpx.Client, counts: dict[str, int], max_artists: int, db: pathlib.Path | str | None
 ) -> None:
-    collected = set(library.artist_keys(db))
-    # Artists with nothing collected come first, so a run that was cut short picks up where it stopped.
-    # ponytail: an artist skipped as unavailable or AI-made has no profile row, so every run asks about them again.
-    artists = sorted(store.all_artists(db), key=lambda artist: artist[0] in collected)
+    tried = library.last_attempts(db)
+    # Whoever has never had a turn comes first, then whoever had theirs longest ago. A run that was cut short
+    # picks up where it stopped, and an artist the last run had to pass over waits at the back of this one
+    # instead of standing at the front of every run and in the way of everybody behind them.
+    artists = sorted(store.all_artists(db), key=lambda artist: tried.get(artist[0], ""))
     failed_in_a_row = 0
     for _, username, _ in artists[: max(max_artists, 0)]:
+        key = None
         try:
-            if store.is_removed(store.artist_key(username), db):  # asked again right before each artist is fetched
+            key = store.artist_key(username)
+            if store.is_removed(key, db):  # asked again right before each artist is fetched
                 counts[REMOVED] += 1
                 continue
             counts[PROCESSED] += 1
             _collect_artist(api, http, username, counts, db)
             failed_in_a_row = 0
-        except (discover.Stop, httpx.HTTPError):
-            raise  # the API or the network has failed, not this artist: the next one would fail the same way
+        except discover.Stop:
+            raise  # the rate limit, or our own token: the next artist would fare no better
         except Exception as exc:
-            # No single artist ends the run for the rest: whatever went wrong with this one is counted, and the
-            # run goes on. What they had downloaded is swept up at the end.
-            counts[FAILED] += 1
+            # No single artist ends the run for the rest. This one is counted and noted as passed over, and what
+            # they had downloaded is swept up at the end.
+            api_failed = isinstance(exc, _ApiFailed)
+            counts[API_FAILED if api_failed else FAILED] += 1
+            print(f"skipped an artist: {exc if api_failed else _where(exc)}", file=sys.stderr)
+            if key:
+                library.note_skip(key, db=db)
             failed_in_a_row += 1
-            print(f"skipped an artist: {_where(exc)}", file=sys.stderr)
-            if failed_in_a_row == MAX_FAILURES:  # by now it is not the artists
-                raise discover.Stop(f"{MAX_FAILURES} artists in a row failed") from None
+            if failed_in_a_row == MAX_FAILURES:
+                raise discover.Stop(f"{MAX_FAILURES} artists in a row failed: the API seems to be down") from None
 
 
 def collect(

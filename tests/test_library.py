@@ -4,13 +4,14 @@ Every handle, address, text and byte below is invented for these tests. Nothing 
 here fetches anything. The cache directory and the database are moved into pytest's temporary directory.
 """
 
+import base64
 import hashlib
 import inspect
 import json
 import sqlite3
 import subprocess
 import time
-from contextlib import closing
+from contextlib import closing, suppress
 
 import pytest
 
@@ -21,7 +22,16 @@ REAL_CACHE_DIR = config.CACHE_DIR  # as the project sets it, before the fixture 
 ALPHA, BRAVO = "da:zz-fake-alpha", "da:zz-fake-bravo"
 ID1, ID2, ID3, ID4 = (f"00000000-0000-4000-A000-{n:012d}" for n in (1, 2, 3, 4))
 PAGE = "https://www.deviantart.com/zz-fake-alpha/art/FAKE-TITLE-1-1001"
-SIGNED = "token=FAKE-CDN-TOKEN-1.FAKE-PAYLOAD.FAKE-SIGNATURE"  # the shape of DeviantArt's signature on an image address
+
+
+def encoded(value):
+    """What a signature's parts are made of: URL-safe base64 with the padding left off."""
+    data = value if isinstance(value, bytes) else json.dumps(value, separators=(",", ":")).encode()
+    return base64.urlsafe_b64encode(data).decode().rstrip("=")
+
+
+HEADER = encoded({"typ": "JWT", "alg": "HS256"})  # the header every real signature seen so far begins with
+SIGNED = f"token={HEADER}.FAKE-CLAIMS-1.FAKE-SIGNATURE"  # DeviantArt's signature on an image address
 THUMB = f"https://images-wixmp-zzcdn.wixmp.com/f/FAKE-THUMB-1.jpg?{SIGNED}"
 JPEG = b"\xff\xd8\xff" + b"FAKE-IMAGE-BYTES-1" * 50
 PNG = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR" + b"FAKE-IMAGE-BYTES-2" * 50
@@ -98,9 +108,10 @@ def test_the_tables_hold_what_was_asked_for_and_nothing_else():
     with closing(sqlite3.connect(config.LOCAL_DB)) as conn:
         columns = {
             table: [(name, kind) for _, name, kind, *_ in conn.execute(f"PRAGMA table_info({table})")]
-            for table in ("profiles", "works")
+            for table in ("profiles", "works", "skipped")
         }
-        strict = conn.execute("SELECT strict FROM pragma_table_list WHERE name IN ('profiles', 'works')").fetchall()
+        ours = "('profiles', 'works', 'skipped')"
+        strict = conn.execute(f"SELECT strict FROM pragma_table_list WHERE name IN {ours}").fetchall()
     assert columns["profiles"] == [
         ("artist_key", "TEXT"),
         ("tagline", "TEXT"),
@@ -121,7 +132,8 @@ def test_the_tables_hold_what_was_asked_for_and_nothing_else():
         ("image_file", "TEXT"),
         ("fetched_at", "TEXT"),
     ]
-    assert strict == [(1,), (1,)]
+    assert columns["skipped"] == [("artist_key", "TEXT"), ("skipped_at", "TEXT"), ("unavailable", "INTEGER")]
+    assert strict == [(1,), (1,), (1,)]
     assert "bio" not in inspect.signature(library.store_artist).parameters
 
 
@@ -215,6 +227,8 @@ def test_opening_the_file_never_changes_a_table_that_exists():
     library.cached_image(ID1)
     library.drop_orphans()
     library.purge(BRAVO)
+    assert library.last_attempts() == {ALPHA: WHEN}
+    assert library.account_hash(ALPHA) is None and library.account_removed("FAKE-USERID") is False
     assert raw("SELECT sql FROM sqlite_master WHERE name IN ('profiles', 'works') ORDER BY name") == made
     raw(BY_POSITION, *first_version_row(BRAVO, None))  # the old collector's next row still lands where it belongs
     assert raw("SELECT artist_key, bio, website, fetched_at FROM profiles ORDER BY 1") == [
@@ -241,19 +255,12 @@ def test_storing_an_artist_rebuilds_a_table_from_an_earlier_version(earlier):
     when = WHEN if earlier == FIRST_VERSION else "1970-01-01T00:00:00+00:00"  # the incident's rows had lost theirs
     assert rows("profiles")[:2] == [{"artist_key": key, **blank, "fetched_at": when} for key in (ALPHA, BRAVO)]
     assert rows("profiles")[2]["tagline"] == "FAKE-TAGLINE-NEW" and len(rows("profiles")[2]["user_hash"]) == 64
-    assert [row["title"] for row in rows("works")] == ["FAKE-TITLE-PLAIN 2026", None, None, None]
+    assert [row["title"] for row in rows("works")] == ["FAKE-TITLE-PLAIN 2026", None, "FAKE-TITLE 555 0199", None]
     assert [row["image_file"] for row in rows("works")] == [f"{work_id}.jpg" for work_id in (ID1, ID2, ID3, ID4)]
     stored = database_bytes()
-    for gone in (
-        b"FAKE-BIO-TEXT",
-        b"wa.me",
-        b"15550109999",
-        b"555 0199",
-        b"zz.fake@mail",
-        b"data:image",
-        b"zz-fake-bravo.art",
-    ):
+    for gone in (b"FAKE-BIO-TEXT", b"FAKE-TAGLINE call", b"wa.me", b"15550109999", b"zz.fake@mail", b"data:image"):
         assert gone not in stored, gone
+    assert b"zz-fake-bravo.art" not in stored
     assert keep(ALPHA, [fields()], tagline="FAKE-TAGLINE-ALPHA") == (0, 0)  # and it is rebuilt once, not every time
     assert rows("profiles")[2]["tagline"] == "FAKE-TAGLINE-NEW" and len(rows("works")) == 1
 
@@ -464,16 +471,17 @@ KEPT = [
     ("FAKE before &lt;img src=data:image/png;base64,RkFLRQ==&gt; after", "FAKE before after"),
     ('FAKE <a href="mailto:zz.fake@mail.invalid">write</a> now', "FAKE write now"),
     ("FAKE 12 x 34 px, 26", "FAKE 12 x 34 px, 26"),  # six digits
-    ("FAKE dot and a hat", "FAKE dot and a hat"),
+    ("FAKE a hat and a dot", "FAKE a hat and a dot"),
     ("FAKE platemail, ringmail and a female knight", "FAKE platemail, ringmail and a female knight"),
     ("FAKE atlas of dotted lines", "FAKE atlas of dotted lines"),
     ("FAKE at the dotted line", "FAKE at the dotted line"),  # "at" is a word here, "dot" is not
     ("FAKE atlas with a dot", "FAKE atlas with a dot"),  # and here it is the other way round
+    ("FAKE concept artist. Illustrator, e.g. of U.S. armour", "FAKE concept artist. Illustrator, e.g. of U.S. armour"),
+    ("FAKE signals, lines and messengers", "FAKE signals, lines and messengers"),  # not the services of those names
     ("FAKE " + "FAKEBASE" * 12 + "FAK", "FAKE " + "FAKEBASE" * 12 + "FAK"),  # a run of 99: one short of looking encoded
     ("フェイク" * 40, ("フェイク" * 40)),  # 160 letters with no space: words, not a file
 ]
-DROPPED = [
-    # An embedded file, in any spelling.
+EMBEDDINGS = [  # an embedded file, in any spelling
     f"FAKE before {EMBEDDED} after",
     f'FAKE before <img src="{EMBEDDED}"> after',  # over 10,000 characters: not read at all
     CHUNKED,
@@ -488,7 +496,10 @@ DROPPED = [
     "FAKE metadata: the word is not worth the doubt",
     "FAKE before " + "FAKEBASE" * 12 + "FAKE after",  # a run of 100 that looks encoded, with not a digit in it
     "FAKE before " + "A" * 5000 + " after",
-    # An email address, in every disguise a critic got past the first version.
+    # As written it holds the file. Once its percent-encoding is undone it is one piece of markup, and holds nothing.
+    "FAKE <data:image/gif;base64,R0lGODlhAQABAAAAACw=%3E",
+]
+ADDRESSES = [  # an email address, in every disguise a critic got past an earlier version
     "FAKE write to zz.fake+tag@mail.invalid now",
     "FAKE write to zz.fake&#64;mail.invalid now",
     "FAKE write to zz.fake&amp;#64;mail.invalid now",
@@ -498,8 +509,8 @@ DROPPED = [
     "FAKE write to zz.fake%40mail.invalid now",
     "FAKE write to zz.fake%2540mail.invalid now",
     # An "@" under six layers of entity and percent-encoding, one more than are undone. As written it holds
-    # nothing suspect; it is dropped because it would not settle.
-    "FAKE write to zz.fake&commat" + "&percnt" * 5 + "%3B" + "3B" * 5 + "mail.invalid now",
+    # nothing suspect; it is refused because it would not settle.
+    "FAKE write to zz_fake&commat" + "&percnt" * 5 + "%3B" + "3B" * 5 + "mailhost now",
     f"FAKE write to zz.fa{ZWSP}ke@ma{SHY}il.invalid now",
     "FAKE write to <b>zz.fake</b>@mail.invalid now",
     "FAKE write to zz.fake@<wbr>mail.invalid now",
@@ -507,53 +518,67 @@ DROPPED = [
     "FAKE write to zz.fake@フェイク.invalid now",
     "FAKE write to zz.fake (at) mail (dot) invalid now",
     "FAKE write to zz.fake[at]mail[dot]invalid now",
-    "FAKE write to zz.fake at mail dot invalid now",
+    "FAKE zz.fake {at} mail {dot} invalid",
+    "FAKE zz_fake ( AT ) mailhost",
+    "FAKE zz_fake(a)mailhost",  # the three a critic got past the second version
+    "FAKE zz_fake[A]mailhost",
+    "FAKE zz_fake at outlook.com",
+    "FAKE zz_fake at mailhost.invalid",
     "FAKE @zzfake",
-    # A number to call. Seven digits is where a phone number starts.
-    "FAKE call +00 (555) 010-9999 now",
-    "FAKE call 555 0199 now",
+    "FAKE write to zz_fake%40zzhost now",  # an "@" only once its percent-encoding is undone, and nothing else to see
+    "FAKE write to zz.fake at zzhost dot invalid now",
+    "FAKE zzfake_at_zzhost_dot_invalid",  # nothing here is shaped like a domain: it is the two words that tell
+    "FAKE zzfake-at-zzhost-dot-invalid",
+]
+SERVICES = [  # a mail or messaging service by name, or a way to call or write: refused in a tagline and in a title
+    *(f"FAKE {name} zzfake" for name in ("gmail", "Hotmail", "ProtonMail", "iCloud", "WhatsApp", "Whats App")),
+    *(f"FAKE {name} zzfake" for name in ("Snapchat", "skype", "WeChat", "weixin", "Viber", "KakaoTalk", "FaceTime")),
+    "FAKE e-mail zzfake",
+    "FAKE my Email is zzfake",
+    "FAKE zzfake gmail com",
+    # The critic's finding: these are ordinary words too, and with nothing after them but a name they got through.
+    *(
+        f"FAKE {name} zzfake"
+        for name in ("signal", "Kik", "messenger", "telegram", "Discord", "mail", "Outlook", "yahoo")
+    ),
+    *(f"FAKE my {name} is zzfake" for name in ("proton", "AOL", "gmx", "ymail", "kakao", "ICQ", "QQ", "Zalo")),
+    "FAKE skype / snapchat / signal / kik / messenger zzfake",
+    "FAKE discord: zzfake",
+    "FAKE Signal/zzfake",
+    "FAKE kik #zzfake",
+    "FAKE tel: 555",
+    *(f"FAKE {scheme}: zzfake" for scheme in ("sms", "callto", "TEL", "mailto")),
+]
+FREE_TEXT_ONLY = [  # refused in a tagline; in a title these are ordinary words, numbers and names
+    "FAKE call 555 0199 now",  # seven digits is where a phone number starts
     "FAKE call 5550-1999 now",
     "FAKE call ５５５ ０１９９ now",  # fullwidth digits
     f"FAKE call 555{ZWSP}0{SHY}199 now",
     "FAKE call 555<b></b>0199 now",
     "FAKE call 5&#53;5 0199 now",
     "FAKE call ٥٥٥ ٠١٩٩ now",  # Arabic-Indic digits
-    "FAKE years 2019-2023",  # eight digits: not worth the doubt
+    "FAKE years 2019-2023",  # eight digits: not worth the doubt in a tagline
     "FAKE 10%25 20%25 off",  # eight digits as written, four once decoded: it is what is written that would be kept
-    # A link, or a messaging service.
+    "FAKE zz-fake-alpha.art",  # anything shaped like a domain
     "FAKE see https://zz-fake-alpha.art",
     "FAKE see www.zz-fake-alpha.art",
     "FAKE wa.me/zzfake",
     "FAKE t.me/zzfake",
-    "FAKE WhatsApp zzfake",
-    "FAKE Whats App zzfake",
-    "FAKE telegram zzfake",
-    "FAKE Discord zzfake#0001",
-    "FAKE tel: 555",
-    "FAKE skype:zzfake",
-    "FAKE mailto:zzfake",
-    *(f"FAKE {scheme}: zzfake" for scheme in ("sms", "callto", "facetime", "TEL")),
     *(f"FAKE {name}.me/zzfake" for name in ("m", "line", "vb", "kik", "vk", "zalo", "signal", "WA", "T")),
-    *(f"FAKE {service} zzfake" for service in ("Viber", "WeChat", "weixin", "KakaoTalk", "whatsapp", "TELEGRAM")),
-    "FAKE zz.fake {at} mail {dot} invalid",
-    "FAKE zz.fake ( AT ) mail",
-    "FAKE mail [ dot ] invalid",
-    "FAKE zzfake_at_mail_dot_invalid",
-    "FAKE zzfake.AT.mail.DOT.invalid",
-    "FAKE zzfake gmail com",
-    "FAKE e-mail zzfake",
-    "FAKE my Email is zzfake",
-    "FAKE zzfake on ProtonMail",
-    # Not a text, or nothing left of it, or something that will not settle.
+    "FAKE Mr.Fox and Vol.II",
+    "FAKE dot and a hat",  # the store reads "FAKE dot and" as a name with its dot spelled out; in doubt it goes
+]
+NOT_TEXTS = ["   ", "<br>", f"{ZWSP}{SHY}{FILLER}", "FAKE word " * 1001, None, 12345, ["FAKE"], b"FAKE"]
+NUMBERS_TO_CALL = [  # nine digits or more: no date and no serial number is that long
+    "FAKE call +00 (555) 010-9999 now",
+    "FAKE 555 010 999",
+    "FAKE ５５５０１０９９９",
+    f"FAKE 555{ZWSP}010<b></b>9&#57;9",
+    "FAKE 555%30%31%30999",
+    "FAKE 10%25 20%25 30%25 off",  # twelve digits as written, six once decoded: it is what is written that is kept
+]
+TITLE_CONTACTS = [
     "FAKE &" + "amp;" * 7 + "lt;b&gt;",  # seven layers deep: whatever is under them is not looked for
-    "FAKE word " * 1001,  # over 10,000 characters
-    "   ",
-    "<br>",
-    f"{ZWSP}{SHY}{FILLER}",
-    None,
-    12345,
-    ["FAKE"],
-    b"FAKE",
 ]
 
 
@@ -565,40 +590,90 @@ def test_a_plain_text_is_kept_as_plain_words(given, kept):
         assert (profile(specialty=given)["specialty"], profile(level=given)["level"]) == (kept, kept)
 
 
-@pytest.mark.parametrize("given", DROPPED, ids=short)
-def test_a_text_that_may_hold_an_address_a_number_or_a_file_is_dropped_whole(given):
+@pytest.mark.parametrize(
+    "given",
+    [*EMBEDDINGS, *ADDRESSES, *SERVICES, *NUMBERS_TO_CALL, *TITLE_CONTACTS, *FREE_TEXT_ONLY, *NOT_TEXTS],
+    ids=short,
+)
+def test_a_text_that_may_hold_contact_details_or_a_file_is_dropped_whole(given):
     """Hard rules 1 and 6. Nothing is cut out of a suspect text and the rest kept: the field stays empty."""
     stored = profile(tagline=given, specialty=given, level=given)
     assert (stored["tagline"], stored["specialty"], stored["level"]) == (None, None, None)
-    assert work(title=given)["title"] is None
     assert work(tags=["fakeone", given, "faketwo"])["tags"] == '["fakeone", "faketwo"]'
     stored = database_bytes()
     assert b"mail" not in stored and b"0199" not in stored and b"base64" not in stored and b"zzfake" not in stored
+    assert b"zz_fake" not in stored and b"zz-fake-alpha.art" not in stored
+
+
+@pytest.mark.parametrize("title", [*ADDRESSES, *SERVICES, *NUMBERS_TO_CALL, *TITLE_CONTACTS], ids=short)
+def test_a_work_whose_title_holds_contact_details_is_not_kept_at_all(title):
+    """Hard rule 6, the critic's finding: with only the title dropped, the page address still carried it, because
+    DeviantArt makes that address from the title. So the whole work is refused, and nothing of it is stored."""
+    with pytest.raises(library.ContactInTitle):
+        library.checked_work(**fields(title=title))
+    with pytest.raises(ValueError):
+        keep(ALPHA, [fields(ID1), fields(ID2, title=title)], tagline="FAKE-TAGLINE")
+    assert rows("works") == rows("profiles") == []
+
+
+TITLES_KEPT = [
+    "FAKE study 2019-2023",  # eight digits: a date
+    "FAKE commission 20231105",
+    "FAKE piece No. 1234567",  # seven digits: a serial number
+    "FAKE Chainmail, Signals and Messengers",  # not the services: a letter before the name, or after it
+    "FAKE Hotel: the lobby",  # nor "tel:"
+    "FAKE Mr.Fox Vol.II",  # shaped like two domains, and neither is one
+    "FAKE Sheet (A)",
+    "FAKE at the gates",
+    "FAKE dot study",
+    "FAKE call 555 0199 now",
+]
+
+
+@pytest.mark.parametrize("title", TITLES_KEPT)
+def test_a_title_with_a_date_a_serial_number_or_an_ordinary_word_is_kept(title):
+    """Seven and eight digits were being dropped as phone numbers: 15 real titles of the first 762."""
+    assert work(title=title)["title"] == title
+
+
+@pytest.mark.parametrize("title", [*(text for text in EMBEDDINGS if text is not CHUNKED), *NOT_TEXTS], ids=short)
+def test_a_title_that_could_hold_a_file_is_left_out_and_the_work_is_kept(title):
+    """No address is made from such a title that could carry the file: a page's title part is short and plain."""
+    assert work(title=title)["title"] is None
+    assert b"base64" not in database_bytes()
 
 
 def test_an_embedded_image_of_any_size_never_reaches_a_text_column():
     """The round-2 database finding, on this store: 200 KB of image in every text field, and none of it is kept."""
     for picture in (EMBEDDED, CHUNKED):
         profile(tagline=picture, specialty=picture, level=picture, website=picture, user_id=picture)
-        work(title=picture, tags=[picture, "faketag"])
+        work(title=EMBEDDED, tags=[picture, "faketag"])
         stored = rows("profiles")[0]
         assert [stored[name] for name in ("tagline", "specialty", "level", "website")] == [None] * 4
         assert (rows("works")[0]["title"], rows("works")[0]["tags"]) == (None, '["faketag"]')
         assert b"FAKEBASE64" not in database_bytes() and b"base64" not in database_bytes()
+    with pytest.raises(library.ContactInTitle):  # a title of chunks is all digits to the title rule: the work goes
+        work(title=CHUNKED)
     assert config.LOCAL_DB.stat().st_size < 100_000  # the empty tables and their indexes are about half of that
 
 
 @pytest.mark.parametrize(
     "hostile",
-    ["data:" * 1999, "<" * 9999, "<a" * 4999, "at " * 3333, "@a" * 4999, "1." * 4999, "&amp;" * 1999, "%25" * 3333],
+    ["data:" * 1999, "<" * 9999, "<a" * 4999, "at " * 3333, "a." * 4999, "1." * 4999, "&amp;" * 1999, "%25" * 3333],
     ids=short,
 )
 def test_checking_a_text_written_to_be_slow_is_still_quick(hostile):
     """A text over 10,000 characters is not read at all, and one just under it takes a few milliseconds."""
     started = time.perf_counter()
     profile(tagline=hostile, specialty=hostile, level=hostile, website=hostile)
-    work(title=hostile, tags=[hostile] * 100)
+    with suppress(library.ContactInTitle):
+        work(title=hostile, tags=[hostile] * 100)
     assert time.perf_counter() - started < 5
+
+
+def test_a_tag_that_is_long_as_it_is_written_is_not_read():
+    """A hundred tags of 10,000 characters took seconds to check. A tag is a name: 300 characters as written."""
+    assert work(tags=["&#102;" * 50, "&#102;" * 51])["tags"] == json.dumps(["f" * 50])
 
 
 def test_every_text_is_cut_to_its_limit():
@@ -615,61 +690,84 @@ def test_the_word_none_for_a_specialty_or_a_level_is_stored_as_nothing():
 
 
 WEBSITES = [
+    # A site of the artist's own: its front page, and nothing under it.
     ("https://zz-fake-alpha.art", "https://zz-fake-alpha.art/"),
     ("  ZZ-Fake-Alpha.ART.  ", "https://zz-fake-alpha.art/"),
-    ("http://www.zz-fake-alpha.com/folio/", "http://www.zz-fake-alpha.com/folio/"),
-    ("https://www.artstation.com/zz-fake-alpha?FAKE-QUERY=1#FAKE-FRAGMENT", "https://www.artstation.com/zz-fake-alpha"),
-    ("https://zz-fake-alpha.art/folio-123456", "https://zz-fake-alpha.art/folio-123456"),  # six digits
+    ("http://www.zz-fake-alpha.com", "http://www.zz-fake-alpha.com/"),
+    ("https://zz-fake-alpha.art/?FAKE-QUERY=1#FAKE-FRAGMENT", "https://zz-fake-alpha.art/"),
+    ("http://www.zz-fake-alpha.com/zzfake/", None),
+    ("https://zz-fake-alpha.art/zzfake-123456", None),
+    ("https://zzfake.zz-fake-alpha.art/", None),
+    # A profile on one of the hosts listed: a user's subdomain, or a path of one or two parts.
+    ("https://www.artstation.com/zzfolio?FAKE-QUERY=1#FAKE-FRAGMENT", "https://www.artstation.com/zzfolio"),
+    ("https://zzfolio.artstation.com", "https://zzfolio.artstation.com/"),
+    ("instagram.com/zz_folio/", "https://instagram.com/zz_folio/"),
+    ("https://www.patreon.com/c/zzfolio", "https://www.patreon.com/c/zzfolio"),
+    ("https://bsky.app/profile/zzfolio.bsky.social", "https://bsky.app/profile/zzfolio.bsky.social"),
+    ("https://www.artstation.com/zzfolio-123456", "https://www.artstation.com/zzfolio-123456"),  # six digits
+    ("https://www.artstation.com/" + "FOLIOBASE" * 10, "https://www.artstation.com/" + "FOLIOBASE" * 10),
+    ("https://www.artstation.com/", None),  # the platform itself is nobody's profile
+    ("https://www.artstation.com/zzfake/albums/zzfake", None),
+    # A way to message a person: every one of these was kept by the list of services to refuse.
+    ("https://wa.link/zzfake", None),
+    ("https://ig.me/m/zzfake", None),
+    ("https://dsc.gg/zzfake", None),
+    ("https://discord.me/zzfake", None),
+    ("https://telegram.im/zzfake", None),
+    ("https://www.facebook.com/messages/t/zzfake", None),
+    ("https://www.facebook.com/zzfake", None),
+    ("https://wa.me/15550109999", None),
+    ("wa.me/zzfake", None),
+    ("https://api.whatsapp.com/send", None),
+    ("https://t.me/+15550109999", None),
+    ("https://T.ME./zzfake", None),
+    ("https://discord.gg/zzfake", None),
+    ("https://line.me/ti/p/zzfake", None),
+    ("https://vgen.co/zzfake", None),  # and anything else that is not on the list
+    ("https://zzfake.wixsite.com/folio", None),
+    # On a listed host, a path that is a way to write to somebody.
+    ("https://www.instagram.com/direct/zzfake", None),
+    ("https://x.com/messages/zzfake", None),
+    ("https://twitter.com/intent/zzfake", None),
+    ("https://www.patreon.com/messages/zzfake", None),
+    ("https://www.tumblr.com/message/zzfake", None),
+    ("https://www.twitch.tv/zzfake/chat", None),
+    ("https://www.youtube.com/redirect", None),
     # An "@", however it is written.
     ("zz.fake@mail.invalid", None),
     ("mailto:zz.fake@mail.invalid", None),
     ("https://zz.fake@mail.invalid", None),
     ("https://FAKE-USER:FAKE-PASSWORD@zz-fake-alpha.art/", None),
-    ("https://zz-fake-alpha.art/write-to/zz.fake@mail.invalid", None),
-    ("https://zz-fake-alpha.art/write-to/zz.fake%40mail.invalid", None),
-    ("https://zz-fake-alpha.art/write-to/zz.fake%2540mail.invalid", None),
-    ("https://zz-fake-alpha.art/write-to/zz.fake&#64;mail.invalid", None),
-    ("https://zz-fake-alpha.art/write-to/zz.fake＠mail.invalid", None),
+    ("https://www.youtube.com/@zzfake", None),
+    ("https://www.artstation.com/zz.fake%40mail.invalid", None),
+    ("https://www.artstation.com/zz.fake%2540mail.invalid", None),
+    ("https://www.artstation.com/zz.fake&#64;mail.invalid", None),
+    ("https://www.artstation.com/zz.fake＠mail.invalid", None),
     ("https://zz-fake-alpha.art/?mail=zz.fake@mail.invalid", None),
-    # A messaging service, with a number or without.
-    ("https://wa.me/15550109999", None),
-    ("https://wa.me/zzfake", None),
-    ("wa.me/zzfake", None),
-    ("https://api.whatsapp.com/send", None),
-    ("https://t.me/+15550109999", None),
-    ("https://t.me/zzfake", None),
-    ("https://T.ME./zzfake", None),
-    ("https://telegram.me/zzfake", None),
-    ("https://discord.gg/zzfake", None),
-    ("https://m.me/zzfake", None),
-    ("https://line.me/ti/p/zzfake", None),
-    ("https://signal.me/#p/zzfake", None),
     # Seven digits or more, anywhere in it.
-    ("https://zz-fake-alpha.art/5550199", None),
-    ("https://zz-fake-alpha.art/555/01/99", None),
-    ("https://zz-fake-alpha.art/555%30199", None),
-    ("https://zz-fake-alpha.art/５５５０１９９", None),
+    ("https://www.artstation.com/5550199", None),
+    ("https://www.artstation.com/555/0199", None),
+    ("https://www.artstation.com/555%30199", None),
+    ("https://www.artstation.com/５５５０１９９", None),
     ("https://zz-fake-5550199.art/", None),
     # An embedded file.
-    ("https://zz-fake-alpha.art/data:image/png;base64,RkFLRQ==", None),
-    ("https://zz-fake-alpha.art/DATA:image/png;base64,RkFLRQ==", None),
-    ("https://zz-fake-alpha.art/data%3Aimage/png;base64,RkFLRQ==", None),
-    ("https://zz-fake-alpha.art/%64ata:image/png;base64,RkFLRQ==", None),
-    ("https://zz-fake-alpha.art/data%253Aimage/png;base64,RkFLRQ==", None),
-    ("https://zz-fake-alpha.art/?x=data:image/png;base64,RkFLRQ==", None),
-    ("https://zz-fake-alpha.art/" + "FAKEBASE" * 13, None),  # a run of over 100 that looks encoded, with no digit
-    ("https://zz-fake-alpha.art/" + "FAKEBASE" * 11, "https://zz-fake-alpha.art/" + "FAKEBASE" * 11),
+    ("https://www.artstation.com/data:image/png;base64,RkFLRQ==", None),
+    ("https://www.artstation.com/DATA:image/png;base64,RkFLRQ==", None),
+    ("https://www.artstation.com/data%3Aimage/png;base64,RkFLRQ==", None),
+    ("https://www.artstation.com/%64ata:image/png;base64,RkFLRQ==", None),
+    ("https://www.artstation.com/data%253Aimage/png;base64,RkFLRQ==", None),
+    ("https://www.artstation.com/" + "FAKEBASE" * 13, None),  # a run of over 100 that looks encoded, with no digit
     (EMBEDDED, None),
     # Not an address.
     ("FAKE words that are not an address", None),
     ("see zz-fake-alpha.art for more", None),
-    ("https://zz-fake-alpha.art/ and FAKE words after it", None),
-    ("https://zz-fake-alpha.art/folio<br>FAKE words", None),
+    ("https://www.artstation.com/zzfake and FAKE words after it", None),
+    ("https://www.artstation.com/zzfake<br>FAKE words", None),
     ("javascript:alert(1)", None),
     ("ftp://zz-fake-alpha.art/", None),
     ("https://127.0.0.1/", None),
     ("https://localhost/", None),
-    ("https://zz-fake-alpha.art/" + "a" * 300, None),
+    ("https://www.artstation.com/" + "a" * 300, None),
     ("", None),
     (None, None),
     (12345, None),
@@ -677,26 +775,37 @@ WEBSITES = [
 
 
 @pytest.mark.parametrize(("given", "kept"), WEBSITES, ids=short)
-def test_a_website_is_kept_only_as_scheme_host_and_path_and_only_when_it_is_a_site(given, kept):
+def test_a_website_is_kept_only_when_it_is_the_artists_own_site_or_a_profile_on_a_listed_host(given, kept):
+    """Hard rule 6, the lead's change of approach: a list of what is kept, since a list of messaging services to
+    refuse can never be finished."""
     assert profile(website=given)["website"] == kept
     stored = database_bytes()
-    assert (
-        b"mail.invalid" not in stored and b"zzfake" not in stored and b"0199" not in stored and b"data:" not in stored
-    )
+    assert b"mail.invalid" not in stored and b"zzfake" not in stored and b"0199" not in stored
+    assert b"data:" not in stored and b"FAKEBASE" not in stored
 
 
-@pytest.mark.parametrize("domain", library.MESSAGING_DOMAINS)
-def test_no_address_on_a_messaging_service_is_kept_as_a_website(domain):
+def test_a_website_is_300_characters_at_most():
+    long = "https://" + "zzfolio." * 26 + "tumblr.com/" + "fake." * 14 + "fake"
+    assert len(long) == 301 and profile(website=long)["website"] is None
+    assert profile(website=long[:300])["website"] == long[:300]
+
+
+@pytest.mark.parametrize("domain", library.PROFILE_DOMAINS)
+def test_each_listed_host_keeps_a_profile_and_nothing_that_is_not_one(domain):
+    for address in (f"https://{domain}/zzfolio", f"http://www.{domain}/zzfolio/", f"https://zzfolio.{domain}/"):
+        assert profile(website=address)["website"] == address
+    assert profile(website=f"{domain.upper()}/zzfolio")["website"] == f"https://{domain}/zzfolio"
     for address in (
-        f"https://{domain}/zzfake",
-        f"http://www.{domain}/zzfake",
-        f"{domain.upper()}/zzfake",
-        f"zzfake.{domain}",
+        f"https://{domain}/",
+        f"https://www.{domain}",
+        f"https://{domain}/messages/zzfake",
+        f"https://{domain}/zzfake/direct",
+        f"https://{domain}/zzfake/zzfake/zzfake",
+        f"https://zz-fake-{domain}/zzfake",  # a name that only ends like it
+        f"https://{domain}.zz-fake-evil.invalid/zzfake",
     ):
         assert profile(website=address)["website"] is None, address
-    assert (
-        profile(website=f"https://zz-fake-{domain}/")["website"] == f"https://zz-fake-{domain}/"
-    )  # only the service itself
+    assert b"zzfake" not in database_bytes()
 
 
 def test_tags_are_kept_as_a_json_list_of_plain_tag_names():
@@ -775,7 +884,9 @@ def test_an_address_that_is_not_https_on_deviantart_is_refused_and_nothing_is_st
         "https://www.deviantart.com/zz-fake-alpha/art/FAKE-1?FAKE-QUERY=1",
         f"https://www.deviantart.com/zz-fake-alpha/art/FAKE-1?{SIGNED}",
         "https://www.deviantart.com/zz-fake-alpha/art/FAKE-1;base64,RkFLRQ==",
-        "https://www.deviantart.com/zz-fake-alpha/art/" + "FAKEBASE64" * 31,
+        # The critic's probe: an encoded file as the title part. It may be 200 characters and no more.
+        "https://www.deviantart.com/zz-fake-alpha/art/" + encoded(GIF),
+        "https://www.deviantart.com/zz-fake-alpha/art/" + "F" * 201,
         THUMB,
     ],
     ids=short,
@@ -787,14 +898,51 @@ def test_a_works_page_is_handle_art_title_on_deviantart_and_nothing_else(address
         work(page_url=address)
 
 
+# The critic's probe for the thumbnail: 1.7 KB of encoded image riding in the token of a signature.
+SMUGGLED = encoded(b"GIF89a" + b"FAKE-IMAGE-BYTES" * 80)
+NOT_SIGNATURES = [
+    "FAKE-QUERY=1",
+    "token=FAKE",
+    "token=FAKE.FAKE.FAKE=",
+    f"{SIGNED}&x=FAKEBASE64",
+    f"x=FAKEBASE64&{SIGNED}",
+    f"token={HEADER}.{SMUGGLED}.FAKE-SIGNATURE",  # over 1,000 characters
+    f"token={HEADER}.FAKE-CLAIMS.{'F' * 990}",
+    f"token={SMUGGLED[:96]}.FAKE-CLAIMS.FAKE-SIGNATURE",  # a first part that is no header: not JSON
+    "token=FAKE-HEADER.FAKE-CLAIMS.FAKE-SIGNATURE",
+    f"token={encoded(['alg', 'HS256'])}.FAKE-CLAIMS.FAKE-SIGNATURE",  # JSON, but no header
+    f"token={encoded({'typ': 'JWT'})}.FAKE-CLAIMS.FAKE-SIGNATURE",  # a header that names no algorithm
+    f"token={encoded({'alg': 256})}.FAKE-CLAIMS.FAKE-SIGNATURE",
+    f"token={encoded({'alg': 'HS256', 'x': 'F' * 80})}.FAKE-CLAIMS.FAKE-SIGNATURE",  # a header of over 100 characters
+    f"token={HEADER}..FAKE-SIGNATURE",
+    f"token={HEADER}.FAKE-CLAIMS",
+]
+
+
+@pytest.mark.parametrize("query", NOT_SIGNATURES, ids=short)
+def test_an_image_address_carries_no_query_but_deviantarts_own_signature(query):
+    """A token of 1,000 characters at most, whose first part is a small JSON header naming an algorithm."""
+    address = f"https://images-wixmp-zzcdn.wixmp.com/f/FAKE-THUMB-1.jpg?{query}"
+    with pytest.raises(ValueError):
+        library.image_address(address)
+    with pytest.raises(ValueError):
+        work(thumb_url=address)
+    assert rows("works") == []
+
+
+def test_a_signature_of_the_real_shape_is_accepted_up_to_the_cap():
+    longest = f"token={HEADER}.{'F' * (library.MAX_TOKEN - len(HEADER) - 3)}.F"
+    assert len(longest) == len("token=") + library.MAX_TOKEN == 1006
+    for query in (SIGNED, longest, f"token={encoded({'alg': 'none'})}.FAKE-CLAIMS.FAKE-SIGNATURE"):
+        address = f"https://images-wixmp-zzcdn.wixmp.com/f/FAKE-THUMB-1.jpg?{query}"
+        assert library.image_address(address) == address
+    with pytest.raises(ValueError):
+        library.image_address(f"https://images-wixmp-zzcdn.wixmp.com/f/FAKE-THUMB-1.jpg?{longest}F")
+
+
 @pytest.mark.parametrize(
     "address",
     [
-        "https://images-wixmp-zzcdn.wixmp.com/f/FAKE-THUMB-1.jpg?FAKE-QUERY=1",
-        "https://images-wixmp-zzcdn.wixmp.com/f/FAKE-THUMB-1.jpg?token=FAKE",
-        "https://images-wixmp-zzcdn.wixmp.com/f/FAKE-THUMB-1.jpg?token=FAKE.FAKE.FAKE=",
-        f"https://images-wixmp-zzcdn.wixmp.com/f/FAKE-THUMB-1.jpg?{SIGNED}&x=FAKEBASE64",
-        f"https://images-wixmp-zzcdn.wixmp.com/f/FAKE-THUMB-1.jpg?x=FAKEBASE64&{SIGNED}",
         f"https://images-wixmp-zzcdn.wixmp.com/f/FAKE-THUMB-1.jpg?{SIGNED}#FAKE-FRAGMENT",
         f"https://images-wixmp-zzcdn.wixmp.com/f/data:image/png;base64,RkFLRQ==?{SIGNED}",
         "https://images-wixmp-zzcdn.wixmp.com/f/" + "a" * 2000,
@@ -802,7 +950,7 @@ def test_a_works_page_is_handle_art_title_on_deviantart_and_nothing_else(address
     ],
     ids=short,
 )
-def test_an_image_address_carries_no_query_but_deviantarts_own_signature(address):
+def test_an_image_address_is_on_one_of_deviantarts_image_hosts_with_nothing_hidden_in_it(address):
     with pytest.raises(ValueError):
         library.image_address(address)
     with pytest.raises(ValueError):
@@ -810,6 +958,8 @@ def test_an_image_address_carries_no_query_but_deviantarts_own_signature(address
 
 
 def test_the_addresses_deviantart_really_gives_are_accepted():
+    longest_title = "https://www.deviantart.com/zz-fake-alpha/art/" + "F" * 200
+    assert library.page_address(longest_title) == longest_title
     assert library.page_address(PAGE) == PAGE
     assert library.page_address("HTTPS://WWW.DeviantArt.com/zz-fake-alpha/art/FAKE-1") == (
         "https://www.deviantart.com/zz-fake-alpha/art/FAKE-1"
@@ -1089,14 +1239,113 @@ def test_an_account_that_changed_its_handle_does_not_leave_its_old_key_behind(tm
 def test_the_user_id_is_kept_only_as_a_hash_and_only_a_real_one_links_two_keys():
     keep(ALPHA, [fields(ID1)], user_id="FAKE-USERID-1")
     keep(BRAVO, [fields(ID3)], user_id="FAKE-USERID-2")
-    assert [row["user_hash"] for row in rows("profiles")] == [
-        hashlib.sha256(f"da-user:{user_id}".encode()).hexdigest() for user_id in ("FAKE-USERID-1", "FAKE-USERID-2")
-    ]
+    assert [row["user_hash"] for row in rows("profiles")] == [account("FAKE-USERID-1"), account("FAKE-USERID-2")]
     assert b"FAKE-USERID" not in database_bytes()
     for missing in (None, "", 7, ["FAKE-USERID-1"], {"FAKE": 1}):  # no id is no link: nobody is purged for it
         keep(ALPHA, [fields(ID1)], user_id=missing)
         keep(BRAVO, [fields(ID3)], user_id=missing)
         assert [row["user_hash"] for row in rows("profiles")] == [None, None] and len(rows("works")) == 2
+
+
+def account(user_id, spelling="uid"):
+    """The hash an account is known by here and on the store's removal list: sha256 of 'uid:<the API's user id>'."""
+    return hashlib.sha256(f"{spelling}:{user_id}".encode()).hexdigest()
+
+
+def test_a_profile_from_before_the_hash_was_respelled_still_links_the_account():
+    """The second version hashed 'da-user:<id>'. A row it wrote is still known for the account it is."""
+    two_artists()
+    raw(
+        "UPDATE profiles SET user_hash = ? WHERE artist_key = ?", account("FAKE-USERID-zz-fake-alpha", "da-user"), ALPHA
+    )
+    keep("da:zz-fake-renamed", user_id="FAKE-USERID-zz-fake-alpha")
+    assert [row["artist_key"] for row in rows("profiles")] == [BRAVO, "da:zz-fake-renamed"]
+    assert [row["artist_key"] for row in rows("works")] == [BRAVO]
+
+
+def test_a_removed_account_is_known_by_its_hash_on_the_stores_removal_list():
+    """Hard rule 7 across a rename that comes after the removal. The purge deletes the profile and the hash with
+    it, so the collector first hands the hash to the store's removal list; from then on the account is known
+    there under any handle. Nothing but the hash is kept: it names nobody."""
+    two_artists()
+    assert library.account_hash(ALPHA) == account("FAKE-USERID-zz-fake-alpha")
+    assert library.account_hash("da:zz-fake-nobody") is None
+    assert library.account_removed("FAKE-USERID-zz-fake-alpha") is False
+    store.import_removed([library.account_hash(ALPHA)])
+    library.purge(ALPHA)
+    assert library.account_removed("FAKE-USERID-zz-fake-alpha") is True
+    assert library.account_removed("FAKE-USERID-zz-fake-bravo") is False
+    assert [library.account_removed(missing) for missing in (None, "", 7, ["FAKE-USERID-zz-fake-alpha"])] == [False] * 4
+    assert b"FAKE-USERID" not in database_bytes() and b"zz-fake-alpha" not in database_bytes()
+    store.import_removed([account("FAKE-USERID-OLD", "da-user")])  # an account removed while the second version ran
+    assert library.account_removed("FAKE-USERID-OLD") is True
+
+
+def test_only_a_hash_is_ever_handed_to_the_removal_list():
+    """A table an earlier version left can hold something else where the hash belongs. That is not passed on."""
+    earlier_database(AFTER_THE_INCIDENT)
+    raw(BY_POSITION, *first_version_row(ALPHA, "https://zz-fake-alpha.art/"))  # a time lands in the hash column
+    assert raw("SELECT user_hash FROM profiles") == [(WHEN,)] and library.account_hash(ALPHA) is None
+    raw("DROP TABLE profiles")
+    raw(f"CREATE TABLE profiles ({FIRST_VERSION}) STRICT")  # and the first version's table had no such column
+    raw(BY_POSITION, *first_version_row(ALPHA, None))
+    assert library.account_hash(ALPHA) is None
+
+
+def clock(monkeypatch):
+    """Make the library's clock tick a second each time it is read, from midnight. Returns what second n reads as."""
+    seconds = iter(range(3600))
+    monkeypatch.setattr(store, "_now", lambda: at(next(seconds)))
+    return at
+
+
+def at(second):
+    return f"2026-10-12T00:{second // 60:02d}:{second % 60:02d}+00:00"
+
+
+def test_a_skip_is_noted_with_its_time_and_counts_the_runs_a_profile_was_unavailable(monkeypatch):
+    clock(monkeypatch)
+    assert library.note_skip(ALPHA) == 0
+    assert library.note_skip(BRAVO, unavailable=True) == 1
+    assert library.note_skip(BRAVO, unavailable=True) == 2
+    assert library.note_skip(BRAVO, unavailable=True) == 3
+    assert library.last_attempts() == {ALPHA: at(0), BRAVO: at(3)}
+    assert rows("skipped") == [
+        {"artist_key": ALPHA, "skipped_at": at(0), "unavailable": 0},
+        {"artist_key": BRAVO, "skipped_at": at(3), "unavailable": 3},
+    ]
+    assert library.note_skip(BRAVO) == 0  # any other skip, and the run of unavailability is over
+    assert library.note_skip(BRAVO, unavailable=True) == 1
+    assert library.artist_keys() == []  # a skip is not something kept about an artist's work
+    for key in ("zz-fake-alpha", "da:ZZ-Fake-Alpha", "*", None):
+        with pytest.raises(ValueError):
+            library.note_skip(key)
+
+
+def test_storing_an_artist_ends_their_skip_and_the_last_attempt_is_then_when_they_were_stored(monkeypatch):
+    clock(monkeypatch)
+    library.note_skip(ALPHA, unavailable=True)  # second 0
+    library.note_skip(BRAVO)  # second 1
+    keep(ALPHA, [fields()], tagline="FAKE-TAGLINE")  # the profile at second 2, the work at second 3
+    assert [row["artist_key"] for row in rows("skipped")] == [BRAVO]
+    assert library.last_attempts() == {ALPHA: at(2), BRAVO: at(1)}
+    assert library.note_skip(ALPHA, unavailable=True) == 1  # and a new run of unavailability starts from one
+    assert library.last_attempts()[ALPHA] == at(4)  # whichever is later: stored, or passed over
+
+
+def test_a_purge_forgets_the_skip_too_unless_the_collector_asks_to_keep_it():
+    """Hard rule 7: for a removed artist nothing stays, the note that names them included. The collector keeps
+    the note when it purges for a reason of its own, so that it does not ask about that artist first every run."""
+    two_artists()
+    library.note_skip(ALPHA, unavailable=True)
+    library.note_skip(BRAVO)
+    library.purge(ALPHA, keep_skip=True)
+    assert library.artist_keys() == [BRAVO] and [row["artist_key"] for row in rows("skipped")] == [ALPHA, BRAVO]
+    assert library.note_skip(ALPHA, unavailable=True) == 2  # the count went on
+    library.purge(ALPHA)
+    library.purge(BRAVO)
+    assert rows("skipped") == rows("profiles") == rows("works") == []
+    assert b"zz-fake-alpha" not in database_bytes() and b"zz-fake-bravo" not in database_bytes()
 
 
 def test_drop_orphans_deletes_every_cached_file_that_no_row_names(tmp_path):
