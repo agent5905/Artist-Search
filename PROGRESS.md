@@ -1,6 +1,6 @@
 # Artist Search: Progress
 
-**Status, 2026-10-14:** The first 55 real artist profiles are written and with a blind critic. Tagging is on its third round and the full run over all 4,381 works is under way (about 9 hours on the local GPU). Five blind A/B tests on real artwork are done. Collect and the database have each failed their critics again on narrower gaps and are in rounds 4 and 5. Nothing is in the public database yet.
+**Status, 2026-10-14 (later):** The pipeline runs end to end for the first time. 119 real artists with 1,130 works and their similar-style neighbours are in the public database, and search answers real queries through the public key. Tagging continues over the remaining works; the site is next.
 
 ## Waiting on the owner
 
@@ -391,3 +391,49 @@ The correction is adopted. The larger gain came from the pool: real matches rose
 **A scheduling mistake by the lead:** the full tagging run was started on round 2 code while round 3 was changing the prompt version. It was stopped and restarted on round 3, with one artist's works tagged together so profiles can start early.
 
 **Pipeline counts:** artists discovered 472, collected 442, works 4,381, images cached 4,381, style vectors 4,381, works with checked tags 600 and rising, artists profiled 55. **Database:** 12.1 MB of 400 MB, artists 0, works 0.
+
+### Round 8: first real data in the public database (2026-10-14)
+
+**End to end.** Discover, collect, style vectors, tags, profiles, push, and the database's public functions have now all run on real data.
+
+| In the public database | Count |
+|---|---|
+| Artists | 119 |
+| Works (source links and thumbnail URLs only) | 1,130 |
+| Similar-style neighbour links | 2,856 (24 per artist) |
+| Artists with a search embedding | 119 |
+| Artists whose own words say open for work | 11 |
+| Database size | 16.8 MB of 400 MB |
+
+Held back by the push stage's rules: 300 artists not yet analysed, 21 with adult-oriented portfolios (30% or more of rated works suggestive or explicit), 169 works rated suggestive, 13 declared AI-made, 12 not artwork.
+
+**First real search results, through the public key** (profile lines as served):
+- "dark fantasy creature designer": "Monster art, mostly creature designs, concept sketches, and creature sheets, with fantasy and dark fantasy themes"; "Fantasy creature and character art, including concept sketches and dragons."
+- "sci-fi environment concept artist": "Environments with science fiction themes, including keyframes or scenes and buildings."
+- "concpet artist charcter desing" (misspelled on purpose): three character artists.
+
+**Tags and descriptions: third blind test.** Works with an unsupported claim: 15, then 11, then **7 of 30**. Genres and subjects: 12 unsupported claims, then 3, then **0**. Six of the seven remaining errors are a thing misnamed in the description ("dark scales" on a shaggy beast). A two-model agreed description removes about half of those on development works but costs 5 seconds a work; it is built and not run at scale by default.
+
+**Profiles: two blind tests.**
+
+| | Round 1 | Round 2 |
+|---|---|---|
+| Artists with an unsupported claim | 2 of 20 | 3 of 20 |
+| Critic's verdict on the set | "Too generic to choose by: 19 of 20 say digital painting" | "Only into about six buckets, not within them" |
+
+- Round 2 added specifics from a per-work format pick and the artist's own tags, and those brought new errors ("mostly elves" at 3 of 10 works; a card format that was not there).
+- Round 3 changes the source: the model looks at one sheet of the artist's works, proposes what recurs, and a second question makes it count. A claim is stated only at the share its wording implies. On 140 artists the count removed 37 of 96 proposed phrases, 42 own-tag words and 26 formats. Not yet judged.
+
+**Database, round 6: a simplification.** Similar-style results are computed on the owner's machine with the rule the blind tests chose, and the database stores each artist's 24 nearest. Style vectors left the database.
+
+| Full scale (3,000 artists, 30,000 works) | Round 5 | Round 6 |
+|---|---|---|
+| Size loaded | 172 MB | 88 MB |
+| Peak during a reload | 200 MB | 103 MB |
+| Visitor calls failing during a reload | 5 of 1,812 in one run | 0 of 4,016 over three runs |
+
+**Push: built with two safety stops.** It writes nothing if more than 10% of the artists already in the database would be deleted, and it refuses to run while test rows are present. Both came from the builder's own review of what a half-finished analysis run would do.
+
+**A process error by the lead, corrected.** Two commits went in after combined test runs that had failures, because the commit command checked the last line of output, not the test result. Both sets of failures were in another builder's in-progress files. Commit commands now stop on a failing run.
+
+**Pipeline counts:** artists discovered 472, collected 442, works 4,381, works with checked tags about 1,500 and rising, artists profiled 140, artists public 119. **Database:** 16.8 MB of 400 MB.
