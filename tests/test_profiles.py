@@ -5,6 +5,8 @@ written straight into the test's own database: no model, no GPU, no network. Ope
 test. Every handle, title, tag, tagline, address and credential below is invented.
 """
 
+import base64
+import io
 import json
 import logging
 import math
@@ -17,13 +19,14 @@ from datetime import UTC, datetime, timedelta
 
 import httpx
 import pytest
+from PIL import Image
 
 from pipeline import config, library, profiles, store, tagging
 
 ALPHA, BRAVO, CHARLIE = "zz-fake-alpha", "zz-fake-bravo", "zz-fake-charlie"
 NOW = datetime(2026, 10, 1, tzinfo=UTC)
 RECENT, OLD = NOW - timedelta(days=10), NOW - timedelta(days=profiles.RECENT_DAYS + 1)
-JPEG = b"\xff\xd8\xff" + b"FAKE-IMAGE-BYTES-" * 20
+PNG = b"\x89PNG\r\n\x1a\n"  # how each invented picture begins: a small square of one colour, which says which it is
 VERIFIED = tagging.result_set(profiles.TAGGER, profiles.TAGGER)
 ACCOUNT, TOKEN = "FAKE-ACCOUNT-0123456789abcdef", "FAKE-TOKEN-zyxwvutsrqponmlk"
 SECRETS = {"CLOUDFLARE_ACCOUNT_ID": ACCOUNT, "CLOUDFLARE_API_TOKEN": TOKEN, "OTHER_SECRET": "FAKE-OTHER-SECRET"}
@@ -31,6 +34,7 @@ COUNTS = re.compile(
     r'\{"profiled": \d+, "excluded_mostly_ai_declared": \d+, "excluded_mostly_explicit": \d+, '
     r'"excluded_too_few_works": \d+, "excluded_nothing_clear": \d+, "unchanged": \d+, "waiting_for_tags": \d+, '
     r'"left_for_next_run": \d+, "removed": \d+, "open_for_work": \d+, "written_fallback": \d+, '
+    r'"with_recurring": \d+, "phrases_removed": \d+, "own_words_removed": \d+, "formats_removed": \d+, '
     r'"seconds_per_artist": \d+\.\d+\}\n'
 )
 
@@ -80,8 +84,8 @@ def artist(handle, results, *, tagline=None, own_tags=None, declared=None, publi
     """
     base = {ALPHA: 1000, BRAVO: 2000, CHARLIE: 3000}[handle]
     ids = [f"00000000-0000-4000-A000-{base + n:012d}" for n in range(len(results))]
-    for work_id in ids:
-        library.save_image(work_id, "image/jpeg", JPEG + work_id.encode())
+    for n, work_id in enumerate(ids):
+        library.save_image(work_id, "image/png", picture(n))
     rows = [
         {
             "work_id": work_id,
@@ -107,6 +111,27 @@ def artist(handle, results, *, tagline=None, own_tags=None, declared=None, publi
         with closing(sqlite3.connect(config.LOCAL_DB)) as conn, conn:
             conn.execute("INSERT OR REPLACE INTO artist_contact VALUES (?, ?, ?, ?, ?)", row)
     return ids
+
+
+def picture(n):
+    """A real PNG, 40 pixels square, whose colour says it is the artist's work number n."""
+    held = io.BytesIO()
+    Image.new("RGB", (40, 40), (10 + 20 * n, 60, 200)).save(held, "PNG")
+    return held.getvalue()
+
+
+def works_on(sheet):
+    """The numbers of the works on a contact sheet (base64), in the order of the sheet, read from their colours."""
+    image = Image.open(io.BytesIO(base64.b64decode(sheet))).convert("RGB")
+    found = []
+    for cell in range(image.width // profiles.CELL * (image.height // (profiles.CELL + profiles.LABEL))):
+        left = cell % profiles.PER_ROW * profiles.CELL + 24
+        red, green, blue = image.getpixel(
+            (left, cell // profiles.PER_ROW * (profiles.CELL + profiles.LABEL) + profiles.LABEL + 20)
+        )
+        if abs(green - 60) < 30 and abs(blue - 200) < 30:  # not the white of an empty place
+            found.append(round((red - 10) / 20))
+    return found
 
 
 def tag(work_id, result, declared="no", result_set=VERIFIED, words_only=False):
@@ -150,17 +175,23 @@ def sentence_for(question):
 
 
 class Fake:
-    """Ollama's writer (/api/chat) and embedder (/api/embed), and Workers AI, told apart by host and path.
+    """Ollama's vision model, writer (/api/chat) and embedder (/api/embed), and Workers AI, told apart by host,
+    path and system prompt.
 
     write: what the writer says. None for a sentence that states the facts it was given and nothing else, a str
            for that sentence every time, or a function (question, attempt from 1) -> a str for the sentence, a
            dict for the model's whole JSON, a Response, or an exception to raise.
+    propose: what the vision model says recurs on a sheet: a list of (many, one, kind), a function (the numbers
+           of the works on the sheet) -> such a list, or anything else to send as its whole answer.
+    count: in how many pictures it finds a claim: {claim: how many, or which numbers}; a claim not named there
+           it finds in every picture. Or a function (claim, pictures) -> the same, or a whole answer to send.
     embed: a function (text) -> the vector Ollama gives. cloud: the same for Workers AI, or a Response.
     """
 
-    def __init__(self, write=None, embed=vector, cloud=vector):
-        self.write, self.embed, self.cloud = write, embed, cloud
+    def __init__(self, write=None, embed=vector, cloud=vector, propose=(), count=None):
+        self.write, self.embed, self.cloud, self.propose, self.count = write, embed, cloud, propose, count
         self.requests, self.chats, self.embeds, self.clouds = [], [], [], []
+        self.sheets = []  # each call about a sheet: which prompt, the works on it, the question, the claims
 
     def __call__(self, request):
         self.requests.append(request)
@@ -176,8 +207,28 @@ class Fake:
             self.embeds.append(body)
             return httpx.Response(200, json={"embeddings": [self.embed(text) for text in body["input"]]})
         assert request.url.path == "/api/chat"
+        prompt, question = body["messages"][0]["content"], body["messages"][-1]["content"]
+        if prompt in (profiles.PROPOSE_PROMPT, profiles.COUNT_PROMPT):
+            (sheet,) = body["messages"][-1]["images"]
+            works = works_on(sheet)
+            claims = [name for name in body["format"]["properties"] if name not in ("pictures", "recurring")]
+            asked = {"prompt": prompt, "works": works, "question": question, "claims": claims, "body": body}
+            self.sheets.append(asked)
+            if prompt == profiles.PROPOSE_PROMPT:
+                said = self.propose(works) if callable(self.propose) else self.propose
+                if isinstance(said, list | tuple):
+                    said = {"recurring": [dict(zip(("many", "one", "kind"), item, strict=True)) for item in said]}
+                return self.say(said)
+            answer = {"pictures": ["FAKE-LOOK"] * len(works)}
+            for claim in claims:
+                found = (
+                    self.count(claim, len(works)) if callable(self.count) else (self.count or {}).get(claim, len(works))
+                )
+                if not isinstance(found, int | list) or isinstance(found, bool):
+                    return self.say(found)
+                answer[claim] = list(range(1, found + 1)) if isinstance(found, int) else found
+            return self.say(answer)
         self.chats.append(body)
-        question = body["messages"][-1]["content"]
         attempt = sum(
             chat["messages"][-1]["content"].split("\n\n")[0] == question.split("\n\n")[0] for chat in self.chats
         )
@@ -209,9 +260,12 @@ def table():
         return conn.execute("SELECT * FROM artist_profiles ORDER BY 1").fetchall()
 
 
-def facts(specialties=(), mediums=(), genres=(), style_words=(), own_words=(), formats=(), hedged=()):
-    """The part of an artist's facts that a profile is written from. hedged: those that hold for part of the works."""
+def facts(specialties=(), mediums=(), genres=(), style_words=(), own_words=(), formats=(), hedged=(), recurring=()):
+    """The part of an artist's facts that a profile is written from. hedged: those that hold for part of the
+    works. recurring: (many, one, kind) for each subject the sheet pass kept."""
+    kept = {many: {"many": many, "one": one, "kind": kind, "count": 9} for many, one, kind in recurring}
     return {
+        "recurring": list(kept),
         "specialties": list(specialties),
         "mediums": list(mediums),
         "genres": list(genres),
@@ -219,6 +273,7 @@ def facts(specialties=(), mediums=(), genres=(), style_words=(), own_words=(), f
         "own_words": list(own_words),
         "formats": list(formats),
         "hedged": list(hedged),
+        "sheet": {"recurring": kept},
     }
 
 
@@ -239,11 +294,22 @@ def body(*groups):
     return works
 
 
-def said(*groups):
-    """The template's sentence for such a body of work."""
+def held(found, proposed=(), counts=None):
+    """The facts as the sheet pass leaves them. The sheet shows every counted work, and what the tags and the
+    artist's own words say of a work is plain to see on it, but for the claims `counts` gives another count."""
+    claims = profiles._claims(found, [])
+    tagged = found["counts"]["own_words"] | found["counts"]["formats"] | found["counts"]["genres"]
+    agreed = {profiles._spellings(term)[0]: tagged[term] for term in tagged if profiles._spellings(term)[0] in claims}
+    recurring = [dict(zip(("many", "one", "kind"), item, strict=True)) for item in proposed]
+    return profiles.specifics(found, recurring, agreed | (counts or {}), found["eligible"])
+
+
+def said(*groups, proposed=(), counts=None):
+    """The template's sentence for such a body of work, once the sheet pass has held it to its counts."""
     found, reason = profiles.facts_of(body(*groups))
     assert reason is None
-    assert profiles.unsupported(profiles.template(found), found) is None
+    found = held(found, proposed, counts)
+    assert profiles.unsupported(profiles.template(found), found) is None, profiles.template(found)
     return profiles.template(found)
 
 
@@ -466,31 +532,27 @@ def test_a_style_word_is_said_only_when_the_verifier_checked_it_or_nearly_all_wo
 
 
 DRAGON = tags(subjects=["creature"], genres=[], style_words=[])
+SCENERY = tags(subjects=["environment"], genres=[], style_words=[])
 
 
 @pytest.mark.parametrize(
     ("groups", "sentence"),
     [
-        ([(6, DRAGON, ["dragon"]), (4, DRAGON)], "Creature art, mostly dragons."),
+        # most of the works, by the tags and then by the count of the sheet: "mostly" at 7 in 10, "including" below
+        ([(7, DRAGON, ["dragon"]), (3, DRAGON)], "Creature art, mostly dragons."),
+        ([(6, DRAGON, ["dragon"]), (4, DRAGON)], "Creature art, including dragons."),
         (
-            [(2, DRAGON, ["Dragon"]), (2, DRAGON, ["dragons"]), (2, DRAGON, ["DRAGON", "faketag"]), (4, DRAGON)],
+            [(2, DRAGON, ["Dragon"]), (2, DRAGON, ["dragons"]), (3, DRAGON, ["DRAGON", "faketag"]), (3, DRAGON)],
             "Creature art, mostly dragons.",
         ),
-        ([(5, DRAGON, ["dragon"]), (5, DRAGON)], "Creature art."),  # half is not most
-        ([(3, DRAGON, ["dragon"]), (2, DRAGON)], "Creature art, mostly dragons."),
+        ([(5, DRAGON, ["dragon"]), (5, DRAGON)], "Creature art."),  # half the works do not make a word theirs
+        ([(3, DRAGON, ["dragon"]), (2, DRAGON)], "Creature art, including dragons."),
         # the artist's word for the kind of art itself takes its place, and is not said twice
         ([(10, PLAIN, ["characterdesign", "warrior"])], "Character designs, mostly warriors."),
         ([(10, PLAIN, ["character_design"])], "Character designs."),
-        ([(6, PLAIN, ["characterconcept"]), (4, PLAIN, ["knight"])], "Character designs."),
-        (
-            [(6, PLAIN, ["characterdesign"]), (4, tags(subjects=["environment"], genres=[], style_words=[]))],
-            "Character designs and environment art.",
-        ),
-        ([(10, PLAIN, ["fanart"])], "Character art, mostly fan art."),
-        (
-            [(10, tags(subjects=["environment"], genres=[], style_words=[]), ["landscape", "fanart"])],
-            "Environment art, mostly landscapes and fan art.",
-        ),
+        ([(6, PLAIN, ["characterconcept"]), (4, PLAIN, ["knight"])], "Character art, including designs."),
+        ([(6, PLAIN, ["characterdesign"]), (4, SCENERY)], "Character and environment art, including designs."),
+        ([(10, SCENERY, ["landscape", "environmentdesign"])], "Environment designs, mostly landscapes."),
         (
             [(10, tags(subjects=["vehicle or mech"], genres=[], style_words=[]), ["mecha"])],
             "Vehicle or mech art, mostly mechs.",
@@ -499,7 +561,7 @@ DRAGON = tags(subjects=["creature"], genres=[], style_words=[])
         ([(10, PLAIN, ["elf", "mage", "portrait"])], "Character art, mostly elves and mages."),
         (
             [(6, PLAIN, ["elf", "mage", "portrait"]), (4, PLAIN, ["portrait"])],
-            "Character art, mostly portraits and elves.",
+            "Character art, mostly portraits, including elves.",
         ),
     ],
 )
@@ -514,9 +576,11 @@ def test_a_word_of_the_artists_own_is_used_when_most_works_carry_it_and_the_veri
         ["art", "digitalart", "oc", "commission", "conceptart", "fantasy", "illustration", "digitalpainting"],
         ["originalcharacter", "artwork", "drawing", "design", "deviantart", "artist", "character", "creature"],
         ["adoptablesopen", "commissionsopen", "forsale", "sale", "auction", "paypal", "noai", "dailydeviation"],
+        # what it takes knowing a franchise to check
+        ["fanart", "fanarts", "fan_art", "videogamefanart", "warhammer", "pokemon", "sonicthehedgehog"],
         # a tag that only contains a word of the list, or a name
         ["dragonage", "dragonfly", "snapdragon", "dragonart", "mydragon", "dragonoc", "reddragon", "drag", "on"],
-        ["catgirl", "wolfgang", "elfquest", "warriorcats", "knightrider", "warhammer", "tankgirl", "shipping"],
+        ["catgirl", "wolfgang", "elfquest", "warriorcats", "knightrider", "tankgirl", "shipping"],
         # a word of the list that is a kind of some other subject than the one the verifier saw
         ["dragon", "monster", "landscape", "castle", "mech", "spaceship", "sword", "weapon", "wolf", "architecture"],
         [],
@@ -526,7 +590,7 @@ def test_no_spam_generic_or_disagreeing_tag_of_the_artists_gets_into_a_profile(o
     found, _ = profiles.facts_of(body((10, PLAIN, own)))
 
     assert found["own_words"] == [] and found["counts"]["own_words"] == {}
-    assert profiles.template(found) == "Character art."
+    assert profiles.template(held(found)) == "Character art."
 
 
 def test_an_own_word_counts_work_by_work_and_only_where_the_verifier_saw_its_subject():
@@ -566,7 +630,7 @@ def test_every_own_word_is_a_kind_of_a_verified_subject_and_none_can_be_mistaken
 
 
 SHEET, BUST = "character sheet or turnaround", "portrait or bust"
-FOR_SALE = "adoptable or design-for-sale sheet"
+FOR_SALE, KEYFRAME = "adoptable or design-for-sale sheet", "environment keyframe or scene"
 
 
 @pytest.mark.parametrize(
@@ -576,31 +640,37 @@ FOR_SALE = "adoptable or design-for-sale sheet"
         ([(10, PLAIN)], "Character art.", [], []),
         ([(10, PLAIN | {"formats": None})], "Character art.", [], []),
         ([(10, PLAIN | {"formats": []})], "Character art.", [], []),
-        # most works: what the artist makes. Part of them: hedged. Fewer than 3 in 10: nothing
+        # 7 in 10: what the artist mostly makes. 3 in 10: hedged. Fewer: nothing. And "character" is said once
         (
-            [(6, PLAIN | {"formats": [SHEET]}), (4, PLAIN | {"formats": []})],
-            "Character art, mostly character sheets.",
+            [(7, PLAIN | {"formats": [SHEET]}), (3, PLAIN | {"formats": []})],
+            "Character art, mostly sheets or turnarounds.",
             [SHEET],
             [],
         ),
         (
-            [(4, PLAIN | {"formats": [SHEET]}), (6, PLAIN | {"formats": []})],
-            "Character art, including character sheets.",
+            [(6, PLAIN | {"formats": [SHEET]}), (4, PLAIN | {"formats": []})],
+            "Character art, including sheets or turnarounds.",
+            [SHEET],
+            [SHEET],
+        ),
+        (
+            [(3, PLAIN | {"formats": [SHEET]}), (7, PLAIN | {"formats": []})],
+            "Character art, including sheets or turnarounds.",
             [SHEET],
             [SHEET],
         ),
         ([(2, PLAIN | {"formats": [SHEET]}), (8, PLAIN | {"formats": []})], "Character art.", [], []),
         (
             [(7, PLAIN | {"formats": [SHEET, BUST]}), (3, PLAIN | {"formats": [BUST]})],
-            "Character art, mostly portraits and character sheets.",
+            "Character art, mostly portraits and sheets or turnarounds.",
             [BUST, SHEET],
             [],
         ),
         (
             [(6, PLAIN | {"formats": [SHEET]}), (4, PLAIN | {"formats": ["sprite sheet"]})],
-            "Character art, mostly character sheets, including sprite sheets.",
+            "Character art, including sheets or turnarounds and sprite sheets.",
             [SHEET, "sprite sheet"],
-            ["sprite sheet"],
+            [SHEET, "sprite sheet"],
         ),
         # half the works are not sorted yet: the counts would be short, so nothing is said of formats
         ([(5, PLAIN | {"formats": [SHEET]}), (5, PLAIN | {"formats": None})], "Character art.", [], []),
@@ -631,24 +701,30 @@ FOR_SALE = "adoptable or design-for-sale sheet"
         ([(10, PLAIN | {"formats": [FOR_SALE]}, ["adoptable"])], "Character art, mostly adoptable designs.", [], []),
         (
             [(10, PLAIN | {"formats": [FOR_SALE, SHEET]}, ["adopts"])],
-            "Character art, mostly adoptable designs and character sheets.",
+            "Character art, mostly adoptable designs and sheets or turnarounds.",
             [SHEET],
             [],
         ),
         # a format that names a subject counts only on the works where the verifier saw that subject
-        ([(10, PLAIN | {"formats": ["environment keyframe or scene", "creature sheet"]})], "Character art.", [], []),
+        ([(10, PLAIN | {"formats": [KEYFRAME, "creature sheet"]})], "Character art.", [], []),
         (
-            [
-                (
-                    4,
-                    tags(subjects=["environment"], genres=[], style_words=[])
-                    | {"formats": ["environment keyframe or scene"]},
-                )
-            ]
-            + [(6, PLAIN | {"formats": ["environment keyframe or scene"]})],
-            "Character and environment art, including environment scenes.",
-            ["environment keyframe or scene"],
-            ["environment keyframe or scene"],
+            [(4, SCENERY | {"formats": [KEYFRAME]}), (6, PLAIN | {"formats": [KEYFRAME]})],
+            "Character and environment art, including keyframes or scenes.",
+            [KEYFRAME],
+            [KEYFRAME],
+        ),
+        # no clause says again what the one before it said
+        (
+            [(10, SCENERY | {"formats": [KEYFRAME]}, ["environmentdesign"])],
+            "Environment designs, mostly keyframes or scenes.",
+            [KEYFRAME],
+            [],
+        ),
+        (
+            [(10, DRAGON | {"formats": ["creature sheet"]}, ["creaturedesign"])],
+            "Creature designs, mostly design sheets.",
+            ["creature sheet"],
+            [],
         ),
     ],
 )
@@ -657,7 +733,7 @@ def test_a_format_is_read_when_the_tagging_stage_gives_one_and_nothing_breaks_wh
 ):
     listed = ["lore page", "x/y; DROP", "Stunning!", "", "a b c d e f g"]
     monkeypatch.setattr(tagging, "FORMATS", dict.fromkeys(listed, "FAKE-MEANING"), raising=False)
-    found, _ = profiles.facts_of(body(*groups))
+    found = held(profiles.facts_of(body(*groups))[0])
 
     assert (found["formats"], [value for value in found["hedged"] if value in formats]) == (formats, hedged)
     assert said(*groups) == sentence
@@ -1038,7 +1114,7 @@ def test_a_sentence_made_of_the_facts_and_plain_words_is_supported(text):
         'Character art in "traditional media".',
         "Character art (fantasy) in traditional media.",
         "Character art in traditional media: fantasy.",
-        "Character art in traditional media, " + "and fantasy art, " * 20 + "in a painterly style.",
+        "Character art in traditional media, " + "and fantasy art, " * 30 + "in a painterly style.",
         "",
         ".",
         "Art.",  # says too little
@@ -1065,7 +1141,7 @@ SPLIT = facts(
 def test_the_template_leads_with_what_holds_for_the_body_of_work_and_hedges_the_rest():
     assert profiles.template(SPLIT) == (
         "Fantasy character and creature art, mostly dragons, with science fiction themes, partly in an anime style, "
-        "including creature sheets."
+        "including design sheets."
     )
     assert profiles.unsupported(profiles.template(SPLIT), SPLIT) is None
 
@@ -1143,42 +1219,69 @@ def test_a_value_counted_below_its_threshold_may_not_be_stated():
         assert profiles.unsupported(text, found) is not None, text
 
 
+SEEN = [("dinosaurs", "dinosaur", "creature"), ("armoured knights", "armoured knight", "character")]
+SEEN += [("castles", "castle", "environment"), ("old sailing ships", "old sailing ship", "vehicle or mech")]
+
+
 def random_facts(chooser):
     """Facts of every shape the rules can give, and some they cannot."""
     worlds = chooser.sample(list(profiles.WORLD_FORMS), chooser.randint(0, profiles.AT_MOST["worlds"]))
     manners = chooser.sample(list(profiles.MANNER_FORMS), chooser.randint(0, 1))
     formats = chooser.sample([*profiles.FORMAT_FORMS, "lore page"], chooser.randint(0, profiles.AT_MOST["formats"]))
     own = chooser.sample(list(profiles.OWN_FORMS), chooser.randint(0, profiles.AT_MOST["own_words"]))
-    part = [*worlds, *manners, *formats]
+    # as facts_of() has it: what a format says already is not said again in the artist's word for it; and here
+    # no two things that are shortened to the same word ("designs") are said of one artist
+    own = [word for word in own if word not in {profiles._spellings(value)[0] for value in formats}]
+    short = [profiles.SHORT.get(profiles._spellings(term)[0]) for term in (*own, *formats)]
+    if len(set(filter(None, short))) < len(list(filter(None, short))):
+        own = []
+    seen = chooser.sample(SEEN, chooser.randint(0, 2))
+    specific = [*formats, *own, *(many for many, _, _ in seen)]
+    part = [*worlds, *manners, *chooser.sample(specific, min(len(specific), profiles.AT_MOST["hedged"]))]
     return facts(
         chooser.sample(list(profiles.SUBJECT_FORMS), chooser.randint(0, profiles.AT_MOST["specialties"])),
         chooser.sample(list(profiles.MEDIUM_FORMS), chooser.randint(0, 1)),
         worlds + manners,
         chooser.sample(list(profiles.STYLE_FORMS), chooser.randint(0, profiles.AT_MOST["style_words"])),
-        # as facts_of() has it: what a format says already is not said again in the artist's word for it
-        [word for word in own if word not in {profiles._spellings(value)[0] for value in formats}],
+        own,
         formats,
         chooser.sample(part, chooser.randint(0, len(part))),
+        seen,
     )
 
 
 def test_the_template_states_every_fact_it_is_given_and_passes_the_check_whatever_the_facts():
     chooser = random.Random(7)
-    for _ in range(600):
+    for _ in range(800):
         found = random_facts(chooser)
         stated = [term for name in profiles.STATED for term in found[name] if term != profiles.COMMON_MEDIUM]
         if not stated:
             continue
         text = profiles.template(found)
         assert profiles.unsupported(text, found) is None, text
-        for term in stated:  # each fact is in it, as the template spells it
-            assert profiles._spellings(term)[0].lower() in text.lower(), (term, text)
-        assert "digital painting" not in text
+        head, *later = re.split(r", (?:mostly|with|partly|including) ", text.lower())
+        for clause in later:  # no clause begins with a subject word that the head said
+            assert clause.split()[0] not in profiles.SUBJECT_FORMS or clause.split()[0] not in head.split(), text
+        # a recurring character or creature that most pictures show stands in the place of that word
+        for many in found["recurring"]:
+            kind = found["sheet"]["recurring"][many]["kind"]
+            if many not in found["hedged"] and kind in ("character", "creature"):
+                assert kind not in re.findall(r"[a-z-]+", head), text
         said_as_designs = {subject for subject in found["specialties"] if f"{subject} designs" in found["own_words"]}
+        stood_for = {
+            found["sheet"]["recurring"][many]["kind"] for many in found["recurring"] if many not in found["hedged"]
+        }
+        for term in stated:  # each fact is in it, in one of its spellings, unless a recurring subject stands for it
+            if term not in stood_for & {"character", "creature"}:
+                assert any(form.lower() in text.lower() for form in profiles._forms(found, term)), (term, text)
+        assert "digital painting" not in text
         for term in stated:  # with any one fact taken away it no longer passes
-            if term in said_as_designs:
-                continue  # "character designs" is the artist's word, and is all the sentence says of characters
-            without = {name: [t for t in terms if t != term] for name, terms in found.items()}
+            if term in said_as_designs or term in stood_for & {"character", "creature"}:
+                continue  # the sentence says the artist's word, or the recurring subject, in the place of this one
+            without = {
+                name: [t for t in terms if t != term] if isinstance(terms, list) else terms
+                for name, terms in found.items()
+            }
             assert profiles.unsupported(text, without) is not None, (term, text)
         for term in stated:  # nor when a fact it states flat is one that holds for part of the works only
             if term in (*profiles.GENRE_FORMS, *found["formats"]) and term not in found["hedged"]:
@@ -1195,7 +1298,11 @@ def test_the_longest_sentence_the_template_can_write_fits_the_limit():
     most = profiles.AT_MOST
     worlds, manners = longest(profiles.WORLD_FORMS, most["worlds"]), longest(profiles.MANNER_FORMS, most["manners"])
     formats, own = longest(profiles.FORMAT_FORMS, most["formats"]), longest(profiles.OWN_FORMS, most["own_words"])
-    for hedged in ([], worlds, manners, formats, [*worlds, *manners, *formats]):
+    seen = [
+        ("a" * 12 + f" {kind[:5]} things", "a" * 12 + f" {kind[:5]} thing", kind)
+        for kind in ("character", "creature", "environment")
+    ]
+    for hedged in ([], worlds, manners, [*formats, *own][: most["hedged"]], [*worlds, *manners, *formats]):
         found = facts(
             longest(profiles.SUBJECT_FORMS, most["specialties"]),
             longest([term for term in profiles.MEDIUM_FORMS if term != profiles.COMMON_MEDIUM], 1),
@@ -1204,8 +1311,12 @@ def test_the_longest_sentence_the_template_can_write_fits_the_limit():
             own,
             formats,
             hedged,
+            seen,
         )
-        assert len(profiles.template(found)) <= profiles.MAX_PROFILE, profiles.template(found)
+        assert len(profiles.template(found)) <= profiles.MAX_PROFILE, (
+            len(profiles.template(found)),
+            profiles.template(found),
+        )
         assert profiles.unsupported(profiles.template(found), found) is None
 
 
@@ -1262,7 +1373,7 @@ def test_a_refused_text_is_sent_back_with_the_reason_and_a_good_rewrite_is_kept(
         "Anime fantasy character art.",
         "Fantasy character art, partly anime.",
     ]
-    fake = Fake(write=lambda question, attempt: answers[attempt - 1])
+    fake = Fake(write=lambda question, attempt: answers[attempt - 1], count={"anime": 3})  # the sheet agrees: part
 
     assert run(fake) == {"profiled": 1}
 
@@ -1341,14 +1452,15 @@ def test_the_vector_is_1024_numbers_of_unit_length_made_from_the_template_and_ev
     sheets = tags(genres=["fantasy", "anime style"]) | {"formats": ["character sheet or turnaround"], "rating": "safe"}
     artist(ALPHA, [sheets] * 6, tagline="Commissions open", own_tags=dict.fromkeys(range(6), ["warrior"]))
     # whatever the writer makes of the facts, the vector is of the same words
-    fake = Fake(write="Anime fantasy warriors, with a painterly look.")
+    fake = Fake(write="Anime fantasy warriors, with a painterly look.", propose=[("knights", "knight", "character")])
 
-    assert run(fake) == {"profiled": 1, "open_for_work": 1}
+    assert run(fake) == {"profiled": 1, "open_for_work": 1, "with_recurring": 1}
 
     (profile,) = profiles.profiles()
     text = (
-        "Painterly anime fantasy character art, mostly warriors and character sheets. Open for commissions.\n"
-        "Specialties: character.\nIn the artist's words: warriors.\nMediums: digital painting.\n"
+        "Painterly anime fantasy knight art, mostly warriors and character sheets. Open for commissions.\n"
+        "Recurring subjects: knights.\nSpecialties: character.\nIn the artist's words: warriors.\n"
+        "Mediums: digital painting.\n"
         "Genres: fantasy, anime style.\nFormats: character sheet or turnaround.\nStyle: painterly."
     )
     assert profile["written"] == "Anime fantasy warriors, with a painterly look. Open for commissions."
@@ -1442,7 +1554,8 @@ def test_every_request_of_a_run_goes_to_the_loopback_ollama():
     assert run(fake) == {"profiled": 2, "open_for_work": 1}
 
     assert [(request.url.host, request.url.port, request.url.path) for request in fake.requests] == [
-        ("127.0.0.1", 11434, "/api/chat"),
+        ("127.0.0.1", 11434, "/api/chat"),  # the sheet
+        ("127.0.0.1", 11434, "/api/chat"),  # the sentence
         ("127.0.0.1", 11434, "/api/embed"),
     ] * 2
     assert fake.clouds == []
@@ -1682,7 +1795,7 @@ def test_a_profile_does_not_outlive_the_works_it_was_made_from():
 def test_a_work_that_failed_tagging_or_has_no_image_does_not_hold_an_artist_back():
     ids = artist(ALPHA, [tags()] * 6 + [None, None])
     tag(ids[6], None)  # the tagging stage's row for a work it could not analyze
-    (library.image_dir() / f"{ids[7]}.jpg").unlink()
+    (library.image_dir() / f"{ids[7]}.png").unlink()
     with closing(sqlite3.connect(config.LOCAL_DB)) as conn, conn:
         conn.execute("UPDATE works SET image_file = NULL WHERE deviation_id = ?", (ids[7],))
 
@@ -1712,6 +1825,10 @@ def test_stdout_carries_counts_only(capsys):
         "removed": 0,
         "open_for_work": 1,
         "written_fallback": 0,
+        "with_recurring": 0,
+        "phrases_removed": 0,
+        "own_words_removed": 0,
+        "formats_removed": 0,
         "seconds_per_artist": 0,
     }
     assert printed.err == ""
@@ -1741,9 +1858,9 @@ def test_the_sample_prints_one_json_object_a_line_for_the_critic(capsys):
     assert alpha["open_for_work"] is True
     assert alpha["open_evidence"] == [{"source": "tagline", "says": "Commissions open", "kind": "commissions"}]
     assert alpha["facts"]["counts"]["subjects"] == {"character": 6}
-    assert alpha["images"] == [str(library.image_dir() / f"{work_id}.jpg") for work_id in ids[:6]]
-    assert alpha["images_left_out"] == [str(library.image_dir() / f"{ids[6]}.jpg")]
-    assert all(open(path, "rb").read().startswith(JPEG) for path in alpha["images"])
+    assert alpha["images"] == [str(library.image_dir() / f"{work_id}.png") for work_id in ids[:6]]
+    assert alpha["images_left_out"] == [str(library.image_dir() / f"{ids[6]}.png")]
+    assert all(open(path, "rb").read().startswith(PNG) for path in alpha["images"])
 
     profiles.main(["--sample", "1", "--seed", "3"])
     assert [json.loads(line) for line in capsys.readouterr().out.splitlines()] == lines[:1]  # the same order again
@@ -1752,3 +1869,266 @@ def test_the_sample_prints_one_json_object_a_line_for_the_critic(capsys):
         profiles.main(["--sample", "2", "--seed", str(seed)])
         orders.add(tuple(json.loads(line)["artist"] for line in capsys.readouterr().out.splitlines()))
     assert len(orders) == 2  # the seed decides
+
+
+# 8. The sheet pass: what recurs across an artist's works, proposed from one contact sheet of them and then counted.
+
+
+WARRIORS = dict.fromkeys(range(10), ["warrior"])
+
+
+@pytest.mark.parametrize(
+    ("count", "sentence", "removed"),
+    [
+        (10, "Dinosaur art.", 0),  # most pictures: it leads, in the place of "creature"
+        (7, "Dinosaur art.", 0),
+        (6, "Creature art, including dinosaurs.", 0),  # part of them: hedged
+        (3, "Creature art, including dinosaurs.", 0),
+        (2, "Creature art.", 1),  # the model proposed it, and the count does not bear it out
+        (0, "Creature art.", 1),
+    ],
+)
+def test_a_recurring_subject_is_said_as_far_as_the_count_of_the_sheet_bears_it_out(count, sentence, removed):
+    artist(ALPHA, [DRAGON] * 10)
+    fake = Fake(propose=[("dinosaurs", "dinosaur", "creature")], count={"dinosaurs": count})
+
+    counts = run(fake)
+
+    assert (counts.get("phrases_removed", 0), counts.get("with_recurring", 0)) == (removed, int(count >= 3))
+    assert "written_fallback" not in counts
+    (profile,) = profiles.profiles()
+    assert profile["template"] == sentence
+    assert profile["recurring"] == (["dinosaurs"] if count >= 3 else [])
+    assert profile["facts"]["sheet"]["counts"] == {"dinosaurs": count}  # the count is kept beside the phrase
+    assert profile["facts"]["sheet"]["pictures"] == 10
+    proposing, counting = fake.sheets  # the count is asked in a call of its own
+    assert (proposing["prompt"], counting["prompt"]) == (profiles.PROPOSE_PROMPT, profiles.COUNT_PROMPT)
+    assert counting["claims"] == ["dinosaurs"] and "10 pictures, numbered 1 to 10" in counting["question"]
+
+
+@pytest.mark.parametrize(
+    ("counts", "sentence", "removed"),
+    [
+        ({}, "Creature art, mostly dragons and design sheets.", {}),  # every picture shows both
+        ({"dragons": 7, "creature sheets": 7}, "Creature art, mostly dragons and design sheets.", {}),
+        ({"dragons": 6, "creature sheets": 4}, "Creature art, including dragons and design sheets.", {}),
+        ({"dragons": 2}, "Creature art, mostly design sheets.", {"own_words_removed": 1}),
+        ({"creature sheets": 1}, "Creature art, mostly dragons.", {"formats_removed": 1}),
+        ({"dragons": 0, "creature sheets": 0}, "Creature art.", {"own_words_removed": 1, "formats_removed": 1}),
+    ],
+)
+def test_a_word_of_the_artists_own_and_a_format_are_said_only_as_far_as_the_count_agrees(counts, sentence, removed):
+    # every work is tagged "dragon" by the artist and picked as a creature sheet by the tagging stage
+    artist(
+        ALPHA,
+        [DRAGON | {"formats": ["creature sheet"], "rating": "safe"}] * 10,
+        own_tags=dict.fromkeys(range(10), ["dragon"]),
+    )
+
+    assert run(Fake(count=counts)) == {"profiled": 1} | removed
+    assert profiles.profiles()[0]["template"] == sentence
+
+
+def test_a_recurring_subject_the_count_did_not_keep_may_not_be_written():
+    seen = [("dinosaurs", "dinosaur", "creature"), ("horses", "horse", "creature"), ("ferns", "fern", "environment")]
+    found = held(profiles.facts_of(body((10, DRAGON)))[0], seen, {"dinosaurs": 8, "horses": 2, "ferns": 9})
+
+    assert found["recurring"] == ["dinosaurs"]  # horses: 2 of 10. Ferns: no environment among the verified subjects
+    assert found["sheet"]["removed"]["recurring"] == ["horses"]
+    for text in ("Dinosaur art.", "Art of dinosaurs.", "Creature art, mostly dinosaurs."):
+        assert profiles.unsupported(text, found) is None, text
+    for text in ("Horse and dinosaur art.", "Dinosaur art, including horses.", "Dinosaur and fern art.", "Dragon art."):
+        assert profiles.unsupported(text, found) is not None, text
+
+
+@pytest.mark.parametrize(
+    "said",
+    [
+        [("characters", "character", "character")],  # too general to tell one artist from another
+        [("faces", "face", "character")],
+        [("women", "woman", "character")],
+        [("fantasy warriors", "fantasy warrior", "character")],  # a genre is said from the verified tags
+        [("anime girls", "anime girl", "character")],
+        [("painterly knights", "painterly knight", "character")],
+        [("Knights", "Knight", "character")],  # not plain lowercase words
+        [("knights of the old republic", "knight of the old republic", "character")],
+        [("knights!", "knight", "character")],
+        [("knights", "paladin", "character")],  # the one is not the many
+        [("knights", "knight", "nonsense")],
+        [("swords", "sword", "prop or weapon")],  # a kind of a subject the verifier did not give this artist
+        {"recurring": [{"many": "knights"}]},
+        {"recurring": "knights"},
+        {"things": []},
+        httpx.Response(200, json={"message": {"content": "not json"}}),
+    ],
+)
+def test_a_proposal_that_is_no_plain_recurring_subject_of_this_artist_is_never_said(said):
+    artist(ALPHA, [PLAIN] * 6)
+    fake = Fake(propose=said)
+
+    assert "with_recurring" not in run(fake)
+    (profile,) = profiles.profiles()
+    assert (profile["recurring"], profile["template"]) == ([], "Character art.")
+    assert "knight" not in fake.embeds[0]["input"][0].lower()
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        {"pictures": [], "warriors": "many", "knights": [1]},
+        {"pictures": [], "warriors": [1, 2, 99], "knights": [1]},  # a number that is not on the sheet
+        {"pictures": [], "warriors": [True, 2], "knights": [1]},
+        {"pictures": [], "warriors": [1, 2, 3, 4, 5, 6]},  # a claim left out
+        httpx.Response(200, json={"message": {"content": "not json"}}),
+    ],
+)
+def test_a_count_that_is_no_whole_answer_counts_nothing_and_then_nothing_specific_is_said(bad):
+    artist(ALPHA, [PLAIN] * 6, own_tags=WARRIORS)
+    fake = Fake(propose=[("knights", "knight", "character")], count=lambda claim, pictures: bad)
+
+    assert run(fake) == {"profiled": 1, "own_words_removed": 1, "phrases_removed": 1}
+    assert profiles.profiles()[0]["template"] == "Character art."
+    assert [asked["prompt"] for asked in fake.sheets] == [profiles.PROPOSE_PROMPT] + [profiles.COUNT_PROMPT] * 3
+
+
+@pytest.mark.parametrize(
+    ("count", "sentence"),
+    [
+        (10, "Anime character art."),
+        (9, "Anime character art."),  # nearly every picture: the manner is the body of work, whatever the tags missed
+        (8, "Character art, partly in an anime style."),
+        (0, "Character art, partly in an anime style."),  # the verifier saw it in 4 works: the count takes nothing away
+    ],
+)
+def test_a_manner_the_tags_gave_part_of_the_works_is_stated_flat_when_nearly_every_picture_is_drawn_so(count, sentence):
+    artist(ALPHA, [tags(genres=["anime style"], style_words=[])] * 4 + [PLAIN] * 6)
+    fake = Fake(count={"anime": count})
+
+    assert run(fake) == {"profiled": 1}
+    assert profiles.profiles()[0]["template"] == sentence
+    assert "- anime: drawn in this manner. the manner of Japanese anime" in fake.sheets[1]["question"]
+
+
+def test_the_sheet_is_built_only_from_the_eligible_works():
+    results = [tags()] * 3 + [tags(explicit=True)] + [tags()] * 2 + [tags(not_artwork=True)] + [tags()] * 3
+    artist(ALPHA, results, declared={9: "yes"})
+    fake = Fake(propose=[("knights", "knight", "character")])
+
+    assert run(fake) == {"profiled": 1, "with_recurring": 1}
+
+    assert [asked["works"] for asked in fake.sheets] == [[0, 1, 2, 4, 5, 7, 8]] * 2  # never 3, 6 or 9
+    assert all("7 pictures, numbered 1 to 7" in asked["question"] for asked in fake.sheets)
+    assert profiles.profiles()[0]["facts"]["sheet"]["pictures"] == 7
+
+
+def test_with_too_few_pictures_that_open_there_is_no_sheet_and_nothing_specific_is_said():
+    ids = artist(ALPHA, [PLAIN] * 6, own_tags=WARRIORS)
+    for work_id in ids[:2]:
+        (library.image_dir() / f"{work_id}.png").write_bytes(PNG + b"FAKE-NOT-A-PICTURE")
+    fake = Fake(propose=[("knights", "knight", "character")])
+
+    assert run(fake) == {"profiled": 1, "own_words_removed": 1}
+    assert fake.sheets == [] and profiles.profiles()[0]["template"] == "Character art."
+
+
+def test_a_sheet_request_goes_to_the_loopback_model_and_carries_the_pictures_and_nothing_of_the_artists_own():
+    own = dict.fromkeys(range(6), ["fakeowntag", "warrior", "digitalart"])
+    artist(ALPHA, [PLAIN] * 6, tagline="FAKE-TAGLINE", own_tags=own)
+    fake = Fake(propose=[("knights", "knight", "character")])
+
+    assert run(fake) == {"profiled": 1, "with_recurring": 1}
+
+    assert all((request.url.host, request.url.port) == ("127.0.0.1", 11434) for request in fake.requests)
+    for asked in fake.sheets:
+        system, user = asked["body"]["messages"]
+        assert asked["body"]["model"] == profiles.WRITER and set(user) == {"role", "content", "images"}
+        assert len(user["images"]) == 1  # the one sheet, and no picture besides
+        said = (system["content"] + user["content"]).lower()
+        for kept_back in ("zz-fake", "fake-title", "fakeowntag", "fake-tagline", "digitalart", "00000000-0000"):
+            assert kept_back not in said
+    # the artist's tag is not sent: the word of the list that it spells is, beside what the model proposed
+    assert fake.sheets[1]["claims"] == ["knights", "warriors"]
+    assert profiles.profiles()[0]["template"] == "Knight art, mostly warriors."
+
+    again = Fake(propose=[("dragons", "dragon", "creature")])
+    assert run(again) == {"unchanged": 1}  # and a rerun asks nothing a second time
+    assert again.requests == [] and again.sheets == []
+
+
+def test_each_claim_is_counted_by_what_it_means_and_a_card_by_what_the_word_says():
+    picked = PLAIN | {"formats": ["card or splash illustration", "character sheet or turnaround"], "rating": "safe"}
+    artist(ALPHA, [picked] * 6, own_tags=dict.fromkeys(range(6), ["characterdesign"]))
+    fake = Fake(count={"card or splash illustrations": 0})
+
+    assert run(fake) == {"profiled": 1, "formats_removed": 1}
+
+    question = fake.sheets[1]["question"]
+    assert "- card or splash illustrations: laid out as a playing card" in question
+    assert "A logo, a caption or a name plate on a design sheet does not make one" in question
+    assert f"- character sheets: {tagging.FORMATS['character sheet or turnaround']}" in question
+    assert "- character designs: drawn to show a design" in question
+    assert profiles.profiles()[0]["template"] == "Character designs, mostly sheets or turnarounds."
+    # and the writer is told it as the template says it: no word of the kind of art a second time
+    (asked,) = (chat["messages"][-1]["content"] for chat in fake.chats)
+    assert asked.splitlines() == [
+        "Facts",
+        "kinds of art: character designs",
+        "most of the works: sheets or turnarounds",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("groups", "proposed", "counts", "sentence"),
+    [
+        # a recurring place or thing does not take the place of its subject: it is what most of the works are
+        ([(10, SCENERY)], [("castles", "castle", "environment")], {"castles": 9}, "Environment art, mostly castles."),
+        (
+            [(10, SCENERY)],
+            [("castles", "castle", "environment")],
+            {"castles": 4},
+            "Environment art, including castles.",
+        ),
+        # two recurring subjects lead together, and a subject neither stands for stays
+        (
+            [(6, PLAIN), (5, DRAGON), (5, SCENERY)],
+            [("dragons", "dragon", "creature"), ("armoured knights", "armoured knight", "character")],
+            {"dragons": 12, "armoured knights": 13},
+            "Dragon, armoured knight and environment art.",
+        ),
+        # what the model proposed and the artist also says is one claim, and leads
+        ([(10, DRAGON, ["dragon"])], [("dragons", "dragon", "creature")], {"dragons": 10}, "Dragon art."),
+        # "mostly" takes both: the tagging stage's pick, work by work, and the count of the sheet
+        (
+            [(4, PLAIN | {"formats": [SHEET]}), (6, PLAIN | {"formats": []})],
+            [],
+            {"character sheets": 10},
+            "Character art, including sheets or turnarounds.",
+        ),
+        (
+            [(7, PLAIN | {"formats": [SHEET]}), (3, PLAIN | {"formats": []})],
+            [],
+            {"character sheets": 5},
+            "Character art, including sheets or turnarounds.",
+        ),
+        # two hedged things at most, those that most pictures show
+        (
+            [(10, DRAGON, ["dragon", "monster"])],
+            [("wolves", "wolf", "creature")],
+            {"dragons": 5, "monsters": 4, "wolves": 6},
+            "Creature art, including wolves and dragons.",
+        ),
+    ],
+)
+def test_how_the_counted_subjects_are_worded(groups, proposed, counts, sentence):
+    assert said(*groups, proposed=proposed, counts=counts) == sentence
+
+
+def test_a_picture_listed_twice_is_counted_once():
+    artist(ALPHA, [DRAGON] * 10)
+    fake = Fake(propose=[("dinosaurs", "dinosaur", "creature")], count={"dinosaurs": [1, 1, 1, 2, 2, 3, 3, 3]})
+
+    run(fake)
+
+    (profile,) = profiles.profiles()
+    assert profile["facts"]["sheet"]["counts"] == {"dinosaurs": 3}
+    assert profile["template"] == "Creature art, including dinosaurs."

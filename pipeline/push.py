@@ -250,7 +250,7 @@ def build(local: pathlib.Path | str | None = None) -> tuple[Rows, Rows, Rows, Co
         profile = written[key]
         used = Counter(tag for _, _, _, own, _ in ready for tag in set(own))
         most_used = [tag for tag, _ in sorted(used.items(), key=lambda item: (-item[1], item[0]))]
-        facts = [value for field in profiles.STATED for value in profile[field]]
+        facts = [value for field in profiles.STATED for value in profile.get(field, [])]  # an older row may lack a kind
         # ponytail: the specialty the artist picked on DeviantArt is not in it: nothing has read that field
         # for a private contact. Add it when the tagging stage does.
         search_text = " ".join([*facts, *(title for _, _, title, _, _ in ready if title), *most_used])
