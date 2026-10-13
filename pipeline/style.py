@@ -10,7 +10,7 @@ Every other command loads weights from local files only, with the hub's offline 
 
     uv run python -m pipeline.style --download --model csd        once per model
     uv run python -m pipeline.style --model csd --max-works 500
-    uv run python -m pipeline.style --neighbors da:somebody --model csd --top 10 --rule local
+    uv run python -m pipeline.style --neighbors da:somebody --model csd --top 10 --rule mutual
 
 Stdout is counts and throughput only, except `--neighbors`: one JSON object per line.
 """
@@ -23,7 +23,7 @@ import pathlib
 import sqlite3
 import sys
 import time
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Container, Iterator
 
 import numpy as np
 import torch
@@ -34,7 +34,7 @@ from pipeline import library
 DIMENSIONS = 768  # sql/001_schema.sql: works.style_embedding is halfvec(768)
 BATCH = 16
 WRITE_EVERY = 256  # works a transaction. The file is shared, and a commit can take seconds when the disk is busy
-RULES = ("best", "mutual", "local")  # how neighbors() scores a candidate
+RULES = ("best", "mutual", "local")  # how all_neighbors() scores a candidate
 NEAREST = 10  # rule "local": how many of an artist's nearest artists their usual closeness is taken over
 
 # model -> (repository on huggingface.co, pinned commit, the files needed). Nothing else is ever fetched.
@@ -228,14 +228,20 @@ def artist_vectors(artist_key: str, model: str, db: pathlib.Path | str | None = 
     return _vectors(model, db, artist_key).get(artist_key, {})
 
 
-def neighbors(
-    artist_key: str, model: str, top: int = 10, rule: str = "mutual", db: pathlib.Path | str | None = None
-) -> list[tuple[str, float]]:
-    """The artists most like this one, best first, as (artist key, score).
+def all_neighbors(
+    model: str,
+    top: int = 24,
+    rule: str = "local",
+    among: Container[str] | None = None,
+    db: pathlib.Path | str | None = None,
+) -> dict[str, list[tuple[str, float]]]:
+    """For every artist with vectors: the artists most like them, best first, as (artist key, score).
 
-    rule "best" is the score similar_artists gives in sql/002_functions.sql: the mean, over the seed's works,
-    of the best cosine match among the candidate's works. One work of a candidate can be the best match for
-    all of them, so it favors an artist with a bit of everything.
+    `among`, when given, is the pool: the artist keys that count. An artist outside it has no entry, is in
+    nobody's list, and is not one of anybody's nearest artists for rule "local".
+
+    rule "best" is the mean, over the seed's works, of the best cosine match among the candidate's works. One
+    work of a candidate can be the best match for all of them, so it favors an artist with a bit of everything.
     rule "mutual" is the average of that and the same the other way round: the mean, over the candidate's
     works, of the best match among the seed's. A candidate's works that match nothing of the seed's count
     against them.
@@ -243,20 +249,20 @@ def neighbors(
     twice the pair's mutual score, less each one's usual closeness, which is the mean of their mutual scores
     with their NEAREST nearest artists (all the others, when there are fewer). It can be negative.
 
-    Ties go to the lower key. Never the seed, and never an artist without vectors. Empty when the seed has no
-    vectors. ValueError for any other rule.
+    Ties go to the lower key. Never the artist themselves, and never an artist without vectors, who has no
+    entry either. ValueError for any other rule.
     """
     if rule not in RULES:
         raise ValueError(f"rule must be one of {RULES}")
-    vectors = _vectors(model, db)
-    if artist_key not in vectors or len(vectors) < 2:
-        return []
-    # ponytail: every call reads every vector and scores every pair of artists, whatever the rule: 0.2 s at
-    # 4,400 works, growing with the square (about 10 s at 30,000). Only "local" needs every pair. When a call
-    # gets slow, score the seed's pairs alone for the other rules, or keep each artist's usual closeness in a
-    # table. The database scores only the 100 nearest by centroid, on 10 works an artist, which is all collect
-    # keeps: past a few hundred artists the two can differ at the tail of a long list.
-    keys = list(vectors)
+    vectors = {key: works for key, works in _vectors(model, db).items() if among is None or key in among}
+    keys = sorted(vectors)
+    if len(keys) < 2:
+        return {key: [] for key in keys}
+    # ponytail: reads every vector and scores every pair of artists, whatever the rule. Measured: 0.25 s at
+    # 442 artists; 7 s and 0.8 GB at 3,000 artists with 10 works each (invented vectors). It grows with the
+    # square of the works. Right for every artist at once; neighbors() pays all of it for one artist. If
+    # that gets slow, score the seed's pairs alone for "best" and "mutual", or keep each artist's usual
+    # closeness in a table.
     counts = np.array([len(vectors[key]) for key in keys])
     starts = np.cumsum(counts) - counts  # where each artist's works begin in the stack
     works = np.stack([vector for key in keys for vector in vectors[key].values()]).astype(np.float32)
@@ -269,13 +275,22 @@ def neighbors(
     scores = np.add.reduceat(best, starts, axis=0) / counts[:, None]  # scores[a, b]: "best", seed a, candidate b
     if rule != "best":
         scores = (scores + scores.T) / 2
+    np.fill_diagonal(scores, -np.inf)  # an artist is not their own neighbor, nor one of their own nearest
     if rule == "local":
-        np.fill_diagonal(scores, -np.inf)  # an artist is not one of their own nearest
         usual = np.sort(scores, axis=1)[:, -min(NEAREST, len(keys) - 1) :].mean(axis=1)
         scores = 2 * scores - usual[:, None] - usual
-    row = scores[keys.index(artist_key)]
-    found = [(key, float(score)) for key, score in zip(keys, row, strict=True) if key != artist_key]
-    return sorted(found, key=lambda pair: (-pair[1], pair[0]))[:top]
+    found = {}
+    for key, row in zip(keys, scores, strict=True):
+        order = np.argsort(-row, kind="stable")[: min(top, len(keys) - 1)]  # stable: a tie goes to the lower key
+        found[key] = [(keys[at], float(row[at])) for at in order]
+    return found
+
+
+def neighbors(
+    artist_key: str, model: str, top: int = 10, rule: str = "local", db: pathlib.Path | str | None = None
+) -> list[tuple[str, float]]:
+    """One artist's entry in all_neighbors(), with every artist as the pool. Empty when they have no vectors."""
+    return all_neighbors(model, top, rule, None, db).get(artist_key, [])
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -284,7 +299,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--max-works", type=int, default=500, help="embed at most this many works in this run")
     parser.add_argument("--neighbors", metavar="ARTIST_KEY", help="print the artists nearest to this one")
     parser.add_argument("--top", type=int, default=10, help="how many neighbors to print")
-    parser.add_argument("--rule", choices=RULES, default="mutual", help="how --neighbors scores (see neighbors)")
+    parser.add_argument("--rule", choices=RULES, default="local", help="how --neighbors scores (see all_neighbors)")
     parser.add_argument("--download", action="store_true", help="fetch the model's weights from huggingface.co")
     args = parser.parse_args(argv)
     if args.download:

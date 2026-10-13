@@ -5,6 +5,7 @@ stand-in that turns a square's red value into a vector, so nothing touches the G
 The cache directory and the database are moved into pytest's temporary directory.
 """
 
+import inspect
 import io
 import json
 import os
@@ -304,7 +305,6 @@ def test_the_mutual_rule_puts_a_consistent_artist_above_one_with_a_bit_of_everyt
     # "mutual" adds the way back. BRAVO's four works find 1, 1, 0 and 0 in ALPHA: (1.0 + 0.5) / 2 = 0.75.
     # CHARLIE's two each find 0.8: (0.8 + 0.8) / 2 = 0.8. DELTA's one finds 0.7071: (0.3536 + 0.7071) / 2.
     assert nearest(ALPHA, "mutual") == [(CHARLIE, 0.8), (BRAVO, 0.75), (DELTA, 3 * half / 4)]
-    assert style.neighbors(ALPHA, "csd") == style.neighbors(ALPHA, "csd", rule="mutual")  # and it is the default
     # It is the same score from either end, which "best" is not. From BRAVO, "best": its four works find
     # 1, 1, 0 and 0 in ALPHA (0.5), 0.8, 0.8, 0 and 0 in CHARLIE (0.4), and 0, 0.7071, 0.7071 and 0 in DELTA.
     assert nearest(BRAVO, "best") == [(ALPHA, 0.5), (CHARLIE, 0.4), (DELTA, half / 2)]
@@ -324,12 +324,23 @@ def test_the_mutual_rule_puts_a_consistent_artist_above_one_with_a_bit_of_everyt
         return [(row["artist"], pytest.approx(row["score"], abs=1e-3)) for row in rows]
 
     assert printed("--rule", "best") == [(BRAVO, 1.0), (CHARLIE, 0.8)]
-    assert printed() == printed("--rule", "mutual") == [(CHARLIE, 0.8), (BRAVO, 0.75)]
+    assert printed("--rule", "mutual") == [(CHARLIE, 0.8), (BRAVO, 0.75)]
     with pytest.raises(SystemExit):
         style.main(["--neighbors", ALPHA, "--model", "csd", "--rule", "closest"])
 
 
-def test_the_local_rule_puts_a_specific_match_above_an_artist_who_is_near_everyone(model, monkeypatch, capsys):
+def collect_an_artist_near_everyone(model):
+    """Five invented artists, one of them (CHARLIE) fairly near all the others. Their mutual scores:
+
+    ALPHA and BRAVO: ALPHA's work finds 0.8, BRAVO's two find 0.8 and 0: (0.8 + 0.4) / 2. BRAVO and CHARLIE:
+    (0.5333 + 0.2667) / 2. Every other pair is one work against one work: their cosine.
+                 ALPHA   BRAVO   CHARLIE  DELTA   ECHO
+      ALPHA        -      0.6    0.6667    0       0
+      BRAVO       0.6      -     0.4       0       0
+      CHARLIE    0.6667   0.4      -      0.3333  0.6667
+      DELTA       0       0      0.3333    -       0
+      ECHO        0       0      0.6667    0       -
+    """
     model.table = {
         1: [1, 0, 0, 0, 0],  # ALPHA, the seed
         2: [4, 0, 0, 3, 0],  # BRAVO, the specific match: cosine 0.8 with ALPHA's work, 0.5333 with CHARLIE's,
@@ -340,20 +351,16 @@ def test_the_local_rule_puts_a_specific_match_above_an_artist_who_is_near_everyo
     }
     for artist, shades in ((ALPHA, (1,)), (BRAVO, (2, 3)), (CHARLIE, (4,)), (DELTA, (5,)), (ECHO, (6,))):
         collect(artist, *shades)
+
+
+def test_the_local_rule_puts_a_specific_match_above_an_artist_who_is_near_everyone(model, monkeypatch, capsys):
+    collect_an_artist_near_everyone(model)
     style.run("csd", 500)
     capsys.readouterr()
 
     def nearest(seed, rule):
         return [(key, pytest.approx(score, abs=1e-3)) for key, score in style.neighbors(seed, "csd", rule=rule)]
 
-    # The mutual scores. ALPHA and BRAVO: ALPHA's work finds 0.8, BRAVO's two find 0.8 and 0: (0.8 + 0.4) / 2.
-    # BRAVO and CHARLIE: (0.5333 + 0.2667) / 2. Every other pair is one work against one work: their cosine.
-    #              ALPHA   BRAVO   CHARLIE  DELTA   ECHO
-    #   ALPHA        -      0.6    0.6667    0       0
-    #   BRAVO       0.6      -     0.4       0       0
-    #   CHARLIE    0.6667   0.4      -      0.3333  0.6667
-    #   DELTA       0       0      0.3333    -       0
-    #   ECHO        0       0      0.6667    0       -
     assert nearest(ALPHA, "mutual") == [(CHARLIE, 2 / 3), (BRAVO, 0.6), (DELTA, 0.0), (ECHO, 0.0)]
     # "local" starts from those and not from "best", which has 0.8 for ALPHA and BRAVO: every figure below
     # would then be another.
@@ -376,10 +383,78 @@ def test_the_local_rule_puts_a_specific_match_above_an_artist_who_is_near_everyo
     # DELTA 0.6667 - 0.6667 - 0.1667 = -0.1667, BRAVO 0.8 - 0.6667 - 0.5 = -0.3667.
     assert nearest(CHARLIE, "local") == [(ECHO, 1 / 3), (ALPHA, 1 / 30), (DELTA, -1 / 6), (BRAVO, -11 / 30)]
     assert style.neighbors("da:nobody", "csd", rule="local") == []
+    assert style.neighbors(ALPHA, "csd") == style.neighbors(ALPHA, "csd", rule="local")  # and it is the default
 
-    assert style.main(["--neighbors", ALPHA, "--model", "csd", "--rule", "local", "--top", "2"]) == 0
-    rows = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
-    assert [row["artist"] for row in rows] == [BRAVO, CHARLIE]
+    def printed(*extra):
+        assert style.main(["--neighbors", ALPHA, "--model", "csd", "--top", "2", *extra]) == 0
+        return [json.loads(line)["artist"] for line in capsys.readouterr().out.splitlines()]
+
+    assert printed() == printed("--rule", "local") == [BRAVO, CHARLIE]
+    assert printed("--rule", "mutual") == [CHARLIE, BRAVO]
+
+
+def test_all_neighbors_is_every_artists_list_in_one_pass_and_among_narrows_the_pool(model, monkeypatch):
+    collect_an_artist_near_everyone(model)
+    collect(FOXTROT, bare=[7])  # collected, but no image
+    collect(GOLF, broken=[8])  # collected, but no vector could be made
+    style.run("csd", 500)
+    artists = [ALPHA, BRAVO, CHARLIE, DELTA, ECHO]
+
+    def near(found):
+        return {key: [(other, pytest.approx(score, abs=1e-3)) for other, score in rows] for key, rows in found.items()}
+
+    # Every artist's list is what neighbors() gives for them, and an artist without vectors has no entry.
+    for rule in style.RULES:
+        for top in (1, 3, 24):
+            assert style.all_neighbors("csd", top, rule) == {
+                key: style.neighbors(key, "csd", top, rule) for key in artists
+            }
+    # The defaults, in the order the push stage passes them. Five artists cannot show a top of 24.
+    given = {name: parameter.default for name, parameter in inspect.signature(style.all_neighbors).parameters.items()}
+    assert given == {"model": inspect.Parameter.empty, "top": 24, "rule": "local", "among": None, "db": None}
+    assert style.all_neighbors("csd") == style.all_neighbors("csd", 24, "local")
+    # The figures worked out in the test above, for the first of them.
+    assert near(style.all_neighbors("csd"))[ALPHA] == [
+        (BRAVO, 19 / 30),
+        (CHARLIE, 0.5),
+        (DELTA, -0.4),
+        (ECHO, -29 / 60),
+    ]
+
+    # Over the two nearest, the whole pool, as in the test above: CHARLIE's usual closeness is 0.6667, the
+    # mean of its scores with ALPHA and ECHO, and it comes second for ALPHA.
+    monkeypatch.setattr(style, "NEAREST", 2)
+    assert near(style.all_neighbors("csd"))[ALPHA] == [
+        (BRAVO, 1 / 15),
+        (CHARLIE, 1 / 30),
+        (DELTA, -0.8),
+        (ECHO, -29 / 30),
+    ]
+    # A pool without ECHO. CHARLIE's two nearest are now ALPHA and BRAVO: (0.6667 + 0.4) / 2 = 0.5333. The
+    # others' are as they were: ALPHA 0.6333, BRAVO 0.5, DELTA (0.3333 + 0) / 2 = 0.1667.
+    #   ALPHA and BRAVO    2 x 0.6    - 0.6333 - 0.5    =  0.0667
+    #   ALPHA and CHARLIE  2 x 0.6667 - 0.6333 - 0.5333 =  0.1667   (first for ALPHA now)
+    #   ALPHA and DELTA    0          - 0.6333 - 0.1667 = -0.8
+    #   BRAVO and CHARLIE  2 x 0.4    - 0.5    - 0.5333 = -0.2333
+    #   BRAVO and DELTA    0          - 0.5    - 0.1667 = -0.6667
+    #   CHARLIE and DELTA  2 x 0.3333 - 0.5333 - 0.1667 = -0.0333
+    pool = {ALPHA, BRAVO, CHARLIE, DELTA, FOXTROT, "da:zz-fake-nobody"}  # two of them have no vectors
+    assert near(style.all_neighbors("csd", among=pool)) == {
+        ALPHA: [(CHARLIE, 1 / 6), (BRAVO, 1 / 15), (DELTA, -0.8)],
+        BRAVO: [(ALPHA, 1 / 15), (CHARLIE, -7 / 30), (DELTA, -2 / 3)],
+        CHARLIE: [(ALPHA, 1 / 6), (DELTA, -1 / 30), (BRAVO, -7 / 30)],
+        DELTA: [(CHARLIE, -1 / 30), (BRAVO, -2 / 3), (ALPHA, -0.8)],
+    }
+    # The other rules have no correction: the pool only decides who is listed.
+    assert near(style.all_neighbors("csd", rule="mutual", among=pool))[CHARLIE] == [
+        (ALPHA, 2 / 3),
+        (BRAVO, 0.4),
+        (DELTA, 1 / 3),
+    ]
+    assert style.all_neighbors("csd", among={ALPHA, FOXTROT}) == {ALPHA: []}
+    assert style.all_neighbors("csd", among=set()) == style.all_neighbors("siglip2") == {}
+    with pytest.raises(ValueError):
+        style.all_neighbors("csd", rule="closest")
 
 
 # 5. Stdout carries counts and throughput only.
