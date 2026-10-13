@@ -50,7 +50,8 @@ PROMPT_VERSION = 3  # bump when a prompt, a vocabulary or a request changes what
 MAX_ATTEMPTS = 3  # per question; then a work is recorded as failed, and a tag as not confirmed
 MAX_DESCRIPTION = 400  # characters
 LOCK_WAIT = 600  # seconds to wait for another stage to let go of the database before giving up
-WORK_TABLES = ("work_tags", "work_ai_declared", "work_contact")  # keyed by work
+RETRY_AFTER = (5, 15, 45, 120)  # seconds waited before each new try of a request that Ollama failed
+WORK_TABLES = ("work_tags", "work_ai_declared", "work_contact", "work_format", "work_second", "work_agreed")
 TABLES = (*WORK_TABLES, "artist_contact")  # this stage's own; it writes to no other
 
 # The fixed vocabularies: value -> what the models are told it means. Search filters on these values.
@@ -281,6 +282,88 @@ Answer with one JSON object with these fields.
 found: the words of the text that are the way to contact someone, or "nothing".
 contact: yes or no."""
 
+# Round 4, all of it beside the passes above and none of it part of run(): each has a command, a table and a
+# version of its own, so that it can go over the works afterwards without touching what is stored already.
+
+# How a work is presented, and how suitable it is for a public site that studios use: one call an image.
+FORMAT_VERSION = 1  # bump when FORMAT_PROMPT or these two vocabularies change what a model would answer
+FORMATS = {
+    "character sheet or turnaround": "one character in several views or poses for design: front, side and back, "
+    "or a full figure with close-ups of details",
+    "creature sheet": "one creature or monster in several views, poses or details for design",
+    "expression or pose sheet": "one character's face or body repeated with different expressions or poses",
+    "environment keyframe or scene": "a finished picture whose subject is the place: a landscape, a city, an "
+    "interior, or a wide scene in which any figures are small. A figure or creature that fills the frame is not "
+    "one, whatever is behind it",
+    "concept sketches or thumbnails": "several rough sketches, studies or small thumbnails on one page",
+    "card or splash illustration": "a finished illustration laid out as a game card or a loading screen: a card "
+    "frame, a name plate, a logo or game text is laid over the picture",
+    "portrait or bust": "one figure from the chest or shoulders up, the face the subject",
+    "adoptable or design-for-sale sheet": "a character design offered for sale or adoption: marked adoptable, "
+    "open, sold or with a price, often beside a colour palette",
+    "comic page or panel sequence": "panels that tell a sequence, with or without speech balloons",
+    "icons or interface elements": "a set of icons, emblems, buttons or interface parts",
+    "sprite sheet": "small game sprites or animation frames laid out in rows",
+    "colour keys or mood studies": "several small colour or lighting studies of scenes",
+}
+_NO_FORMAT = "none of these"
+# What else a picture can be. Not stored: without the first of these to pick, a trial on 100 works called 55 of
+# them environment scenes, every plain picture of a figure among them.
+_OTHER_FORMATS = {
+    "single illustration": "one finished picture of a character, a creature or an object, whole or in part, that "
+    "is none of the above. Most work is this",
+    _NO_FORMAT: "something else, or you cannot tell",
+}
+RATINGS = {
+    "safe": "nothing of what follows",
+    "suggestive": "a sexualised pin-up pose, fetish wear, a lingerie-style or barely-there outfit, nudity seen from "
+    "behind or covered by hair or hands, or moderate blood and wounds",
+    "explicit": "exposed genitals or nipples, a sexual act, or strong gore such as dismemberment or exposed innards",
+}
+# A format is picked as the best fit of a list, twice, never ticked yes or no: asked yes or no, the models agreed
+# with whatever they were shown (see CHECK_PROMPT).
+FORMAT_PROMPT = f"""You sort one image for a search index of artists that game studios use, by how the work is \
+presented and by how suitable it is to show there. A reviewer will hold your answer against the image.
+
+Answer with one JSON object with these fields.
+
+shows: a few words on how the image is laid out: one picture, several views of one design, a sheet, panels, a grid.
+format: the one that fits best
+{_listed(FORMATS | _OTHER_FORMATS)}
+also: a second one from the same list that plainly fits as well, or "{_NO_FORMAT}". A character sheet marked \
+adoptable is both of those.
+rating: exactly one of
+{_listed(RATINGS)}"""
+
+# A description that two models agree on. The second model describes the image for itself, under the first pass's
+# own rules; then the first model, given the two descriptions and no image, keeps what both of them say.
+AGREE_VERSION = 1  # bump when SECOND_PROMPT or AGREE_PROMPT changes what a model would answer
+SECOND_PROMPT = (
+    "You describe one image for a search index of artists. A reviewer will hold every word you write against the "
+    "image. Anything the image does not plainly show counts against you; leaving something out never does.\n\n"
+    + PROMPT[PROMPT.index("Rules\n") : PROMPT.index("Answer with one JSON object")]
+    + "Answer with one JSON object with this field.\n\n"
+    "description: two short sentences saying what the image shows: the main subject, what it wears or carries, its "
+    "pose or action, and the setting if there is one. No praise, no interpretation, no story."
+)
+AGREE_PROMPT = """Two people each described the same image without seeing the other's words. You are given both \
+descriptions and not the image. Write the description that both of them support.
+
+- Keep a detail that both give, in the same words or in different ones.
+- Where they name a thing, a material or a being differently (a mace and a hammer, scales and fur, a cat and a \
+hyena), use the general word that covers both (a large weapon, a creature), or leave the detail out.
+- Leave out a detail that only one of them gives.
+- Write it with the words of the first description and these general words only: figure, creature, animal, \
+object, item, weapon, tool, container, garment, structure, building, vehicle, machine, shape, several, some, group. \
+Never take a word from the second description that the first does not have, and add nothing that the first does \
+not say, however likely.
+
+Answer with one JSON object with these fields.
+
+differ: each thing the two describe differently: the first one's words, a slash, the second one's words. An empty \
+list when they do not differ.
+description: one or two short sentences."""
+
 
 def _choices(vocabulary: dict[str, str]) -> dict[str, Any]:
     # maxItems is enforced by Ollama 0.34.2: without it a model can repeat one value until it runs out of tokens.
@@ -337,6 +420,25 @@ _CONTACT = {
     "properties": {"found": {"type": "string"}, "contact": {"type": "string", "enum": list(CONTACT_ANSWERS)}},
     "required": ["found", "contact"],
 }
+_FORMATTED = {
+    "type": "object",
+    "properties": {
+        "shows": {"type": "string"},
+        "format": {"type": "string", "enum": [*FORMATS, *_OTHER_FORMATS]},
+        "also": {"type": "string", "enum": [*FORMATS, *_OTHER_FORMATS]},
+        "rating": {"type": "string", "enum": list(RATINGS)},
+    },
+    "required": ["shows", "format", "also", "rating"],
+}
+_SECOND = {"type": "object", "properties": {"description": {"type": "string"}}, "required": ["description"]}
+_AGREED = {
+    "type": "object",
+    "properties": {
+        "differ": {"type": "array", "items": {"type": "string"}, "maxItems": 6},
+        "description": {"type": "string"},
+    },
+    "required": ["differ", "description"],
+}
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS work_tags (
@@ -375,6 +477,21 @@ CREATE TABLE IF NOT EXISTS artist_contact (
     asked_at TEXT NOT NULL,          -- ISO-8601 UTC
     PRIMARY KEY (artist_key, model, prompt_version)
 ) STRICT;
+-- Round 4's passes, each beside the rest: how a work is presented and rated (a JSON object, NULL when the model
+-- gave no whole answer), a second model's own description of it (NULL likewise), and the description that the
+-- second model and a result set agree on. In work_agreed, model names both: "<result set>~<second model>".
+CREATE TABLE IF NOT EXISTS work_format (
+    deviation_id TEXT NOT NULL, model TEXT NOT NULL, prompt_version INTEGER NOT NULL,  -- FORMAT_VERSION
+    result TEXT, asked_at TEXT NOT NULL, PRIMARY KEY (deviation_id, model, prompt_version)
+) STRICT;
+CREATE TABLE IF NOT EXISTS work_second (
+    deviation_id TEXT NOT NULL, model TEXT NOT NULL, prompt_version INTEGER NOT NULL,  -- AGREE_VERSION
+    result TEXT, asked_at TEXT NOT NULL, PRIMARY KEY (deviation_id, model, prompt_version)
+) STRICT;
+CREATE TABLE IF NOT EXISTS work_agreed (
+    deviation_id TEXT NOT NULL, model TEXT NOT NULL, prompt_version INTEGER NOT NULL,  -- AGREE_VERSION
+    result TEXT NOT NULL, asked_at TEXT NOT NULL, PRIMARY KEY (deviation_id, model, prompt_version)
+) STRICT;
 """
 
 # ponytail: splits on any full stop followed by a space, so "Dr. Who" counts as a sentence end. A sentence
@@ -406,7 +523,7 @@ _GENERAL = frozenset(
 )
 
 
-def plainer(original: str, checked: object) -> str | None:
+def plainer(original: str, checked: object, general: frozenset[str] = _GENERAL) -> str | None:
     """The checked description, when it only leaves out or generalises what the original said. None otherwise.
 
     Every word of it must be a word of the original, a form of one (holds, holding), or one of _GENERAL. That is
@@ -421,7 +538,7 @@ def plainer(original: str, checked: object) -> str | None:
         return None
     had = set(re.findall(r"[a-z]+", original.lower()))
     stems = {word[:4] for word in had if len(word) >= 4}
-    new = [word for word in re.findall(r"[a-z]+", description.lower()) if word not in had | _GENERAL]
+    new = [word for word in re.findall(r"[a-z]+", description.lower()) if word not in had | general]
     return description if all(len(word) >= 4 and word[:4] in stems for word in new) else None
 
 
@@ -479,6 +596,26 @@ def _client(url: str, transport: httpx.BaseTransport | None = None) -> httpx.Cli
     return httpx.Client(base_url=address, transport=transport, timeout=timeout, trust_env=False, follow_redirects=False)
 
 
+def _post(client: httpx.Client, path: str, body: dict[str, Any]) -> httpx.Response:
+    """One request to Ollama, tried again after an error: a status that is not success, a timeout, no connection.
+
+    A nine-hour run once stopped on a single request that failed. RETRY_AFTER is waited between tries; when the
+    last one fails too, its httpx.HTTPError is raised and the run stops. 400 is returned, not retried: it is
+    Ollama's answer to an image it cannot decode, and the same bytes would get it again.
+    """
+    for wait in (*RETRY_AFTER, None):
+        try:
+            response = client.post(path, json=body)
+            if response.status_code != 400:
+                response.raise_for_status()
+            return response
+        except httpx.HTTPError:
+            if wait is None:
+                raise
+            time.sleep(wait)
+    raise AssertionError("unreachable")
+
+
 def _chat(
     client: httpx.Client, model: str, prompt: str, question: str, image: str | None, shape: dict[str, Any], attempt: int
 ) -> object:
@@ -503,7 +640,7 @@ def _chat(
         # The first try is the model's single most likely answer. A retry at the same setting would repeat it.
         "options": {"temperature": 0.3 * attempt, "seed": attempt, "num_ctx": 8192, "num_predict": 700},
     }
-    response = client.post("/api/chat", json=request)
+    response = _post(client, "/api/chat", request)
     # ponytail: the bytes go as they are, and 400 is what Ollama answers for bytes it cannot decode. A file cut
     # short still decodes, and is described as the half picture it is. Opening each file with Pillow first, and
     # deleting the ones that do not open, is the upgrade.
@@ -671,7 +808,7 @@ def _image(name: str) -> str | None:
 
 
 def _require_vision(client: httpx.Client, model: str) -> None:
-    shown = client.post("/api/show", json={"model": model})
+    shown = _post(client, "/api/show", {"model": model})
     shown.raise_for_status()
     if "vision" not in shown.json().get("capabilities", []):
         raise ValueError(f"{model} cannot read images")  # it would answer anyway, from nothing
@@ -836,32 +973,219 @@ def run(
     }
 
 
+def _formatted(client: httpx.Client, model: str, image: str) -> dict[str, Any] | None:
+    """How one work is presented and rated: {"formats": [...], "rating": ...}, or None after MAX_ATTEMPTS bad answers.
+
+    The model picks the format that fits best and a second that fits as well, each from the whole list; what it
+    picks outside FORMATS (the "none of these" most pictures are) is not kept. A rating outside RATINGS is no answer.
+    """
+    for attempt in range(MAX_ATTEMPTS):
+        answer = _chat(client, model, FORMAT_PROMPT, "Sort this image.", image, _FORMATTED, attempt)
+        if isinstance(answer, dict) and answer.get("rating") in RATINGS:
+            picked = [answer.get("format"), answer.get("also")]
+            return {"formats": [value for value in FORMATS if value in picked], "rating": answer["rating"]}
+    return None
+
+
+# A few more general words for an agreed description than a checked one may use: what two different names for
+# a thing have in common is often one of these. The check of the first pass keeps its own, shorter list.
+_AGREE_WORDS = _GENERAL | frozenset(
+    "container vessel liquid garment clothing device depicted visible featuring features includes there has "
+    "have surrounded".split()
+)
+
+
+def _agreed(client: httpx.Client, model: str, first: str, second: str) -> str:
+    """The description two models agree on: what `first` says that `second` says too, or `first` unchanged.
+
+    The model gets the two descriptions and no image. What it writes is kept only if it adds nothing to the first
+    (see plainer): after MAX_ATTEMPTS answers that are malformed or add something, the first stays as it was.
+    """
+    question = f"First description: {first}\nSecond description: {second}"
+    for attempt in range(MAX_ATTEMPTS):
+        answer = _chat(client, model, AGREE_PROMPT, question, None, _AGREED, attempt)
+        if isinstance(answer, dict) and (kept := plainer(first, answer.get("description"), _AGREE_WORDS)):
+            return kept
+    return first
+
+
+def _works_with_images(conn: sqlite3.Connection, table: str, name: str, version: int) -> list[tuple[str, str, int]]:
+    """Every work with a cached image, artist by artist: its id, its file, and whether `table` has its row."""
+    for own in WORK_TABLES:  # hard rule 7, as in run()
+        conn.execute(f"DELETE FROM {own} WHERE deviation_id NOT IN (SELECT deviation_id FROM works)")
+    query = (
+        f"SELECT w.deviation_id, w.image_file, EXISTS (SELECT 1 FROM {table} t "
+        "WHERE t.deviation_id = w.deviation_id AND t.model = ? AND t.prompt_version = ?) "
+        "FROM works w WHERE w.image_file IS NOT NULL ORDER BY w.artist_key, w.deviation_id"
+    )
+    return conn.execute(query, (name, version)).fetchall()
+
+
+def _insert(db: pathlib.Path | str | None, table: str, *row: object) -> None:
+    """One row of five into a table keyed by work, in a transaction of its own, unless the work was removed."""
+    query = (
+        f"INSERT OR IGNORE INTO {table} SELECT ?, ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM works WHERE deviation_id = ?)"
+    )
+    _transact(db, lambda conn: conn.execute(query, (*row, store._now(), row[0])))
+
+
+def run_formats(
+    max_works: int,
+    model: str = DEFAULT_MODEL,
+    *,
+    ollama_url: str = OLLAMA_URL,
+    db: pathlib.Path | str | None = None,
+    transport: httpx.BaseTransport | None = None,
+) -> dict[str, float]:
+    """Sort up to `max_works` works that have a cached image by format and rating: one call an image.
+
+    A pass of its own, with FORMAT_VERSION: it needs no other result and changes none. Returns counts only:
+    sorted, failed (no whole answer in MAX_ATTEMPTS; stored, and not asked again), skipped (already had a row, or
+    the image file is gone), how many of those sorted got each rating and any format at all, and seconds_per_image.
+    """
+    counts = {"sorted": 0, "failed": 0, "skipped": 0, "with_a_format": 0} | {
+        f"rating_{rating}": 0 for rating in RATINGS
+    }
+    seconds = 0.0
+    with _client(ollama_url, transport) as client:
+        works = _transact(db, lambda conn: _works_with_images(conn, "work_format", model, FORMAT_VERSION))
+        counts["skipped"] = sum(done for _, _, done in works)
+        pending = [work for work in works if not work[2]][:max_works]
+        if pending:
+            _require_vision(client, model)
+        for work_id, name, _ in pending:
+            image = _image(name)
+            if image is None:
+                counts["skipped"] += 1
+                continue
+            started = time.monotonic()
+            result = _formatted(client, model, image)
+            seconds += time.monotonic() - started
+            _insert(db, "work_format", work_id, model, FORMAT_VERSION, result and json.dumps(result))
+            counts["sorted" if result else "failed"] += 1
+            if result:
+                counts[f"rating_{result['rating']}"] += 1
+                counts["with_a_format"] += bool(result["formats"])
+    asked = counts["sorted"] + counts["failed"]
+    return {**counts, "seconds_per_image": round(seconds / asked, 2) if asked else 0.0}
+
+
+def run_agreed(
+    max_works: int,
+    second: str,
+    model: str = DEFAULT_MODEL,
+    verifier: str | None = None,
+    *,
+    ollama_url: str = OLLAMA_URL,
+    db: pathlib.Path | str | None = None,
+    transport: httpx.BaseTransport | None = None,
+) -> dict[str, float]:
+    """Write, for up to `max_works` works of a result set, the description that two models agree on.
+
+    First `second` describes each image for itself; then `model`, given that and the set's own description and
+    no image, keeps what both say (see _agreed). All of the first step before any of the second, because two
+    models do not fit on the GPU together. The agreed description is stored beside the set, under AGREE_VERSION,
+    and read with results(second=...): the set's own rows are not touched.
+
+    Returns counts only: described (by the second model in this run), agreed (stored), changed (of those, how
+    many differ from the set's own description), unmatched (the second model gave no whole answer, so the set's
+    description stands), skipped (the image file is gone), and the seconds each step took per image.
+    """
+    base = result_set(model, verifier)
+    name = f"{base}~{second}"
+    counts = {"described": 0, "agreed": 0, "changed": 0, "unmatched": 0, "skipped": 0}
+    seconds = [0.0, 0.0]
+
+    def listed(conn: sqlite3.Connection) -> list[tuple[str, str, str, int, str | None]]:
+        return conn.execute(
+            "SELECT w.deviation_id, w.image_file, t.result, s.deviation_id IS NOT NULL, s.result FROM works w "
+            "JOIN work_tags t ON t.deviation_id = w.deviation_id AND t.model = ? AND t.prompt_version = ? "
+            "LEFT JOIN work_second s ON s.deviation_id = w.deviation_id AND s.model = ? AND s.prompt_version = ? "
+            "WHERE w.image_file IS NOT NULL AND t.result IS NOT NULL AND NOT EXISTS (SELECT 1 FROM work_agreed a "
+            "WHERE a.deviation_id = w.deviation_id AND a.model = ? AND a.prompt_version = ?) "
+            "ORDER BY w.artist_key, w.deviation_id LIMIT ?",
+            (base, PROMPT_VERSION, second, AGREE_VERSION, name, AGREE_VERSION, max(max_works, 0)),
+        ).fetchall()
+
+    with _client(ollama_url, transport) as client:
+        pending = _transact(db, listed)
+        others: dict[str, str | None] = {work_id: other for work_id, _, _, described, other in pending if described}
+        if len(others) < len(pending):
+            _require_vision(client, second)
+        for work_id, file, _, described, _ in pending:
+            image = None if described else _image(file)
+            if image is None:
+                continue
+            started = time.monotonic()
+            other = None
+            for attempt in range(MAX_ATTEMPTS):
+                answer = _chat(client, second, SECOND_PROMPT, "Describe this image.", image, _SECOND, attempt)
+                text = answer.get("description") if isinstance(answer, dict) else None
+                if other := _two_sentences(text) if isinstance(text, str) else None:
+                    break
+            others[work_id] = other
+            seconds[0] += time.monotonic() - started
+            _insert(db, "work_second", work_id, second, AGREE_VERSION, others[work_id])
+            counts["described"] += 1
+        for work_id, _, result, _, _ in pending:
+            if work_id not in others:
+                counts["skipped"] += 1
+                continue
+            checked = json.loads(result)["description"]
+            started = time.monotonic()
+            agreed = _agreed(client, model, checked, other) if (other := others[work_id]) else checked
+            seconds[1] += time.monotonic() - started
+            _insert(db, "work_agreed", work_id, name, AGREE_VERSION, agreed)
+            counts["agreed"] += 1
+            counts["changed"] += agreed != checked
+            counts["unmatched"] += other is None
+    return {
+        **counts,
+        "seconds_per_second_description": round(seconds[0] / counts["described"], 2) if counts["described"] else 0.0,
+        "seconds_per_agreement": round(seconds[1] / counts["agreed"], 2) if counts["agreed"] else 0.0,
+    }
+
+
 def results(
     model: str = DEFAULT_MODEL,
     prompt_version: int = PROMPT_VERSION,
     db: pathlib.Path | str | None = None,
     *,
     verifier: str | None = None,
+    second: str | None = None,
 ) -> dict[str, dict[str, Any]]:
     """Each analyzed work's result, by deviation id, for one result set and prompt version.
 
-    A result has medium, subjects, genres, style_words, description, explicit and not_artwork, and what the
+    With `second`, the variant whose description is the one that the set and that second model agree on (see
+    run_agreed): only the works that have one, everything but the description as in the set itself.
+
+    A result has medium, subjects, genres, style_words, description, explicit and not_artwork; what the
     work's own title and tags were read to say: declared_ai ("yes", "no", "unclear": see declared_ai()) and
-    contact_in_text ("yes", "no": see contacts()), each None while they have not been read. Flagged works are in
-    it, for the caller to exclude. Failed works, and works the library no longer holds, are not.
+    contact_in_text ("yes", "no": see contacts()); and how it is presented and rated: formats (from FORMATS) and
+    rating (from RATINGS: see run_formats). Each of those four is None while that pass has not been run.
+    Flagged works are in it, for the caller to exclude. Failed works, and works the library no longer holds, are
+    not.
     """
     query = (
-        "SELECT t.deviation_id, t.result, a.declared, c.contact FROM work_tags t "
+        "SELECT t.deviation_id, t.result, a.declared, c.contact, f.result, g.result FROM work_tags t "
         "JOIN works w ON w.deviation_id = t.deviation_id "
         "LEFT JOIN work_ai_declared a ON a.deviation_id = t.deviation_id AND a.model = ? AND a.prompt_version = ? "
         "LEFT JOIN work_contact c ON c.deviation_id = t.deviation_id AND c.model = ? AND c.prompt_version = ? "
+        "LEFT JOIN work_format f ON f.deviation_id = t.deviation_id AND f.model = ? AND f.prompt_version = ? "
+        "LEFT JOIN work_agreed g ON g.deviation_id = t.deviation_id AND g.model = ? AND g.prompt_version = ? "
         "WHERE t.model = ? AND t.prompt_version = ? AND t.result IS NOT NULL"
     )
-    key = (model, AI_PROMPT_VERSION, model, CONTACT_PROMPT_VERSION, result_set(model, verifier), prompt_version)
+    name = result_set(model, verifier)
+    key = [model, AI_PROMPT_VERSION, model, CONTACT_PROMPT_VERSION, model, FORMAT_VERSION]
+    key += [f"{name}~{second}", AGREE_VERSION, name, prompt_version]
     rows = _transact(db, lambda conn: conn.execute(query, key).fetchall())
     return {
-        work_id: json.loads(result) | {"declared_ai": declared, "contact_in_text": contact}
-        for work_id, result, declared, contact in rows
+        work_id: json.loads(result)
+        | ({"description": agreed} if second else {})
+        | {"declared_ai": declared, "contact_in_text": contact}
+        | (json.loads(sorted_as) if sorted_as else {"formats": None, "rating": None})
+        for work_id, result, declared, contact, sorted_as, agreed in rows
+        if agreed or not second
     }
 
 
@@ -902,28 +1226,36 @@ def sample(
     db: pathlib.Path | str | None = None,
     *,
     verifier: str | None = None,
+    second: str | None = None,
 ) -> list[dict[str, Any]]:
     """A random sample of the stored rows for the critic, failed ones included (their result is null).
 
     The order is a hash of the seed and the work, not of the row's place in a list: result sets that cover the
     same works give the same works for the same seed, and a work added later does not reshuffle the rest.
+
+    With `second`, a sample of the works that have a description agreed with that second model (see run_agreed).
+    Each row then carries both, to be compared: "result" has the agreed description, and "checked" is the set's
+    own description of the same work.
     """
     query = (
-        "SELECT t.deviation_id, w.image_file, t.result FROM work_tags t "
+        "SELECT t.deviation_id, w.image_file, t.result, g.result FROM work_tags t "
         "JOIN works w ON w.deviation_id = t.deviation_id "
+        "LEFT JOIN work_agreed g ON g.deviation_id = t.deviation_id AND g.model = ? AND g.prompt_version = ? "
         "WHERE t.model = ? AND t.prompt_version = ?"
     )
     name = result_set(model, verifier)
-    rows = _transact(db, lambda conn: conn.execute(query, (name, PROMPT_VERSION)).fetchall())
+    key = (f"{name}~{second}", AGREE_VERSION, name, PROMPT_VERSION)
+    rows = [row for row in _transact(db, lambda conn: conn.execute(query, key).fetchall()) if row[3] or not second]
     rows.sort(key=lambda row: hashlib.sha256(f"{seed}:{row[0]}".encode()).digest())
     return [
         {
             "image": image and str(library.image_dir() / image),
             "deviation_id": work_id,
-            "model": name,
-            "result": result and json.loads(result),
+            "model": f"{name}~{second}" if second else name,
+            "result": result and json.loads(result) | ({"description": agreed} if second else {}),
         }
-        for work_id, image, result in rows[: max(count, 0)]
+        | ({"checked": json.loads(result)["description"]} if second and result else {})
+        for work_id, image, result, agreed in rows[: max(count, 0)]
     ]
 
 
@@ -936,13 +1268,25 @@ def main(argv: list[str] | None = None, transport: httpx.BaseTransport | None = 
     parser.add_argument("--model", default=DEFAULT_MODEL, help="the Ollama model that describes and tags")
     parser.add_argument("--verifier", help="the Ollama model that checks each tag; its results are a set of their own")
     parser.add_argument("--ollama-url", default=OLLAMA_URL, help="a loopback address, nothing else is accepted")
+    parser.add_argument("--formats", action="store_true", help="with --max-works: sort works by format and rating")
+    parser.add_argument(
+        "--second",
+        help="a second model. With --max-works: write the description it and the result set agree on. "
+        "With --sample: show that variant beside the set's own description",
+    )
     args = parser.parse_args(argv)
     if args.sample is not None:
-        for row in sample(args.sample, args.seed, args.model, verifier=args.verifier):
+        for row in sample(args.sample, args.seed, args.model, verifier=args.verifier, second=args.second):
             print(json.dumps(row))
         return
+    local: dict[str, Any] = {"ollama_url": args.ollama_url, "transport": transport}
     try:
-        counts = run(args.max_works, args.model, args.verifier, ollama_url=args.ollama_url, transport=transport)
+        if args.formats:  # the passes beside the main one: each asked for by name, none of them run by default
+            counts = run_formats(args.max_works, args.model, **local)
+        elif args.second:
+            counts = run_agreed(args.max_works, args.second, args.model, args.verifier, **local)
+        else:
+            counts = run(args.max_works, args.model, args.verifier, **local)
     except ValueError as error:
         sys.exit(f"stopped: {error}")
     except httpx.HTTPError as error:  # the name of the error only; what was stored before it is kept

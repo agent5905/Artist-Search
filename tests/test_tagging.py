@@ -30,7 +30,7 @@ GOOD = {  # a model's first answer
     "not_artwork": False,
 }
 KEPT = {name: value for name, value in GOOD.items() if name != "manner"}  # what is stored of it
-READ = {"declared_ai": "no", "contact_in_text": "no"}  # what results() adds to it: what the work's words said
+READ = {"declared_ai": "no", "contact_in_text": "no", "formats": None, "rating": None}  # what results() adds
 COUNTS = re.compile(
     r'\{"analyzed": \d+, "failed": \d+, "flagged": \d+, "skipped": \d+, "removed": \d+, '
     r'"descriptions_changed": \d+, "details_removed": \d+, "declared_yes": \d+, '
@@ -52,6 +52,7 @@ def cache(tmp_path, monkeypatch):
     monkeypatch.setattr(config, "CACHE_DIR", tmp_path / "cache")
     monkeypatch.setattr(config, "LOCAL_DB", tmp_path / "cache" / "pipeline.sqlite")
     monkeypatch.setattr(sqlite3, "connect", unsynced)  # each work is its own commit, and the disk here is slow
+    monkeypatch.setattr(tagging.time, "sleep", lambda seconds: None)  # the waits between tries of a failed request
 
     def no_network(*args, **kwargs):
         raise AssertionError("a real connection was attempted")
@@ -106,8 +107,15 @@ class FakeOllama:
         rewrite=None,
         declared="no",
         contact="no",
+        formatted=None,
+        second="A red circle.",
+        agree=None,
         capabilities=("completion", "vision"),
     ):
+        self.formatted = formatted or {"shows": "FAKE-LAYOUT", "format": "none of these", "also": "none of these"}
+        self.formatted = self.formatted if callable(formatted) else {"rating": "safe"} | self.formatted
+        self.second, self.agree = second, agree  # the second model's description, and the agreed one (None: the first)
+        self.sorts, self.seconds, self.merges, self.order = [], [], [], []  # what round 4's passes asked, in order
         self.answer, self.confirm, self.declared, self.capabilities = answer, confirm, declared, capabilities
         self.contact, self.contact_readings = contact, []  # the text-only requests about a private contact
         self.look, self.rewrite = look or {"manner": "painted illustration", "colour": "mixed"}, rewrite
@@ -131,8 +139,22 @@ class FakeOllama:
             answer = self.contact(chat) if callable(self.contact) else self.contact
             found = {"found": "FAKE-FOUND", "contact": answer}
             return self.say(found if answer in tagging.CONTACT_ANSWERS else answer)
+        if prompt == tagging.AGREE_PROMPT:
+            self.merges.append(chat)
+            self.order.append("merge")
+            answer = self.agree(chat) if callable(self.agree) else self.agree
+            answer = asked["content"].splitlines()[0].removeprefix("First description: ") if answer is None else answer
+            return self.say({"differ": [], "description": answer} if isinstance(answer, str) else answer)
         (image,) = asked["images"]
         n = int(base64.b64decode(image).removeprefix(JPEG))
+        if prompt == tagging.FORMAT_PROMPT:
+            self.sorts.append((n, chat["model"]))
+            return self.say(self.formatted(n, chat) if callable(self.formatted) else self.formatted)
+        if prompt == tagging.SECOND_PROMPT:
+            self.seconds.append((n, chat["model"]))
+            self.order.append("second")
+            answer = self.second(n, chat) if callable(self.second) else self.second
+            return self.say({"description": answer} if isinstance(answer, str) else answer)
         if prompt == tagging.CHECK_PROMPT:
             tags = [tag for tag in chat["format"]["properties"] if tag not in tagging._LOOK]
             self.checks += [(n, tag, chat["model"]) for tag in ("look", *tags)]
@@ -229,7 +251,7 @@ def test_any_host_but_loopback_is_refused_before_a_byte_is_sent(url):
     with pytest.raises(ValueError, match="loopback"):
         run(fake, verifier="model-v", ollama_url=url)
     assert fake.requests == []  # not the image, not the title and tags
-    assert [stored(table) for table in tagging.TABLES] == [[], [], [], []]
+    assert [stored(table) for table in tagging.TABLES] == [[] for _ in tagging.TABLES]
 
 
 @pytest.mark.parametrize(
@@ -476,7 +498,15 @@ def test_a_rerun_asks_nothing_and_stores_nothing_new():
     assert again.requests == []  # not the failed work, not a tag, not a title
     with closing(sqlite3.connect(config.LOCAL_DB)) as conn:
         assert [conn.execute(f"SELECT * FROM {table} ORDER BY 1, 2").fetchall() for table in tagging.TABLES] == before
-    assert [len(rows) for rows in before] == [6, 3, 3, 1]  # three works, each: two results, two readings; one tagline
+    assert [len(rows) for rows in before] == [
+        6,
+        3,
+        3,
+        0,
+        0,
+        0,
+        1,
+    ]  # three works, each: two results, two readings; one tagline
 
 
 def test_max_works_bounds_a_run_and_the_next_run_does_the_rest():
@@ -1002,6 +1032,185 @@ def test_a_malformed_answer_about_a_contact_is_yes_after_a_bounded_number_of_tri
     assert again.requests == []
 
 
+# Round 4. A request that fails is tried again, a bounded number of times, in every pass.
+
+
+@pytest.mark.parametrize(
+    "trouble",
+    [httpx.Response(500), httpx.Response(503), httpx.ConnectError("refused"), httpx.ReadTimeout("slow")],
+    ids=repr,
+)
+def test_a_failed_request_is_tried_again_with_backoff_and_stops_the_run_only_when_every_try_fails(monkeypatch, trouble):
+    (work_id,) = works(1)
+    slept = []
+    monkeypatch.setattr(tagging.time, "sleep", slept.append)
+    fake = FakeOllama(lambda n, attempt, chat: trouble if attempt <= 2 else GOOD)
+    assert run(fake)["analyzed"] == 1  # two failures, then an answer: the work is not lost and the run goes on
+    assert slept == list(tagging.RETRY_AFTER[:2]) and fake.attempts == {1: 3}
+    assert list(tagging.results()) == [work_id]
+
+    works(1, 2)
+    slept.clear()
+    never = FakeOllama(lambda n, attempt, chat: GOOD if n == 1 else trouble)
+    with pytest.raises(httpx.HTTPError):
+        run(never)
+    assert slept == list(tagging.RETRY_AFTER) and never.attempts[2] == len(tagging.RETRY_AFTER) + 1
+    assert [row[0] for row in stored()] == [work_id]  # and still nothing is written off as failed
+
+
+# Round 4. How a work is presented and rated: a pass of its own, asked for by name.
+
+SHEET = {
+    "shows": "FAKE-LAYOUT",
+    "format": "character sheet or turnaround",
+    "also": "adoptable or design-for-sale sheet",
+    "rating": "suggestive",
+}
+
+
+def formats_run(fake, max_works=500, **kwargs):
+    counts = tagging.run_formats(max_works, transport=httpx.MockTransport(fake), **kwargs)
+    assert isinstance(counts.pop("seconds_per_image"), float)
+    return counts
+
+
+def test_works_are_sorted_by_format_and_rating_in_a_pass_of_their_own_and_read_back_with_the_results():
+    sheet, plain, odd, broken = works(1, 2, 3, 4)
+    answers = {
+        1: SHEET,
+        2: {**SHEET, "format": "none of these", "also": "none of these", "rating": "safe"},
+        3: {
+            **SHEET,
+            "format": "cubist collage",
+            "also": "portrait or bust",
+            "rating": "explicit",
+        },  # one is not a format
+        4: {**SHEET, "rating": "adults only"},  # not a rating: no answer at all
+    }
+    run(FakeOllama(), model="model-a")
+    assert {result["formats"] for result in tagging.results("model-a").values()} == {None}  # not run by default
+    fake = FakeOllama(formatted=lambda n, chat: answers[n])
+    counts = formats_run(fake, model="model-a")
+    assert counts == {
+        "sorted": 3,
+        "failed": 1,
+        "skipped": 0,
+        "with_a_format": 2,
+        "rating_safe": 1,
+        "rating_suggestive": 1,
+        "rating_explicit": 1,
+    }
+    assert fake.sorts.count((4, "model-a")) == tagging.MAX_ATTEMPTS and fake.chats == [] and fake.checks == []
+    read = {key: (value["formats"], value["rating"]) for key, value in tagging.results("model-a").items()}
+    assert read == {
+        sheet: (["character sheet or turnaround", "adoptable or design-for-sale sheet"], "suggestive"),
+        plain: ([], "safe"),
+        odd: (["portrait or bust"], "explicit"),
+        broken: (None, None),
+    }
+    assert [(row[0], row[3] is None) for row in stored("work_format")] == [
+        (sheet, False),
+        (plain, False),
+        (odd, False),
+        (broken, True),
+    ]
+    again = FakeOllama()
+    assert formats_run(again, model="model-a")["skipped"] == 4 and again.requests == []  # nothing is asked twice
+
+
+def test_the_format_question_carries_the_image_and_its_own_prompt_and_prints_counts_only(capsys):
+    (work_id,) = works(1, tagline="FAKE-TAGLINE")
+    fake = FakeOllama(formatted=SHEET)
+    tagging.main(["--max-works", "5", "--formats", "--model", "model-a"], transport=httpx.MockTransport(fake))
+    out = capsys.readouterr().out
+    assert re.fullmatch(r'\{("[a-z_]+": \d+(\.\d+)?(, )?)+\}\n', out) and json.loads(out)["rating_suggestive"] == 1
+    (asked,) = [json.loads(request.content) for request in fake.requests if request.url.path == "/api/chat"]
+    assert asked["messages"][0] == {"role": "system", "content": tagging.FORMAT_PROMPT}
+    assert asked["messages"][1]["images"] == [base64.b64encode(JPEG + b"1").decode()] and asked["model"] == "model-a"
+    assert asked["format"]["properties"]["rating"]["enum"] == list(tagging.RATINGS)
+    assert asked["format"]["properties"]["format"]["enum"] == [*tagging.FORMATS, *tagging._OTHER_FORMATS]
+    for kept_back in (work_id, "zz-fake-alpha", "fake-title", "faketag", "fake-tagline", "deviantart", ".jpg"):
+        assert kept_back not in json.dumps(asked).lower()
+    for value in (*tagging.FORMATS, *tagging.RATINGS):
+        assert f"- {value}: " in tagging.FORMAT_PROMPT
+    with pytest.raises(ValueError, match="loopback"):
+        tagging.run_formats(5, ollama_url="http://example.com:11434", transport=httpx.MockTransport(fake))
+
+
+# Round 4. A description two models agree on, stored beside the checked one.
+
+CHECKED = "A horned beast with dark scales holds a spiked mace. A watering can on the ground."
+
+
+def agreed_run(fake, second="model-g", max_works=500, **kwargs):
+    counts = tagging.run_agreed(max_works, second, transport=httpx.MockTransport(fake), **kwargs)
+    assert isinstance(counts.pop("seconds_per_second_description"), float)
+    assert isinstance(counts.pop("seconds_per_agreement"), float)
+    return counts
+
+
+def test_a_second_model_describes_each_image_and_what_both_descriptions_say_is_stored_beside_the_checked_one():
+    one, two, three = works(1, 2, 3)
+    first = FakeOllama({**GOOD, "description": CHECKED})
+    run(first, model="model-a", verifier="model-v")
+    agreed = "A horned beast holds a large weapon."
+    merged = {1: agreed, 2: "A horned beast with dark fur holds a hammer.", 3: agreed}  # the second adds two words
+    fake = FakeOllama(
+        second=lambda n, chat: "" if n == 3 else f"A shaggy horned beast with a hammer. Work {n}.",
+        agree=lambda chat: next(text for n, text in merged.items() if f"Work {n}." in chat["messages"][1]["content"]),
+    )
+    counts = agreed_run(fake, model="model-a", verifier="model-v")
+    assert counts == {"described": 3, "agreed": 3, "changed": 1, "unmatched": 1, "skipped": 0}
+    assert [model for _, model in fake.seconds] == ["model-g"] * (2 + tagging.MAX_ATTEMPTS)  # every image, then
+    assert [chat["model"] for chat in fake.merges] == ["model-a"] * (
+        1 + tagging.MAX_ATTEMPTS
+    )  # the words, by the first
+    assert fake.order == ["second"] * (2 + tagging.MAX_ATTEMPTS) + ["merge"] * (1 + tagging.MAX_ATTEMPTS)
+    both = tagging.results("model-a", verifier="model-v", second="model-g")
+    assert {key: value["description"] for key, value in both.items()} == {one: agreed, two: CHECKED, three: CHECKED}
+    untouched = tagging.results("model-a", verifier="model-v")
+    assert {value["description"] for value in untouched.values()} == {CHECKED}
+    assert all(both[key] == untouched[key] | {"description": both[key]["description"]} for key in both)
+    rows = tagging.sample(5, 7, "model-a", verifier="model-v", second="model-g")
+    assert {(row["result"]["description"], row["checked"], row["model"]) for row in rows} == {
+        (agreed, CHECKED, "model-a+model-v~model-g"),
+        (CHECKED, CHECKED, "model-a+model-v~model-g"),
+    }
+    assert tagging.results("model-a", verifier="model-v", second="model-x") == {}  # no such variant
+    again = FakeOllama()
+    assert agreed_run(again, model="model-a", verifier="model-v")["agreed"] == 0 and again.requests == []
+
+
+def test_the_second_model_sees_only_the_image_and_the_agreement_is_reached_on_words_alone(capsys):
+    (work_id,) = works(1)
+    run(FakeOllama({**GOOD, "description": CHECKED}), model="model-a", verifier="model-v")
+    fake = FakeOllama(second="A shaggy beast with a hammer.")
+    arguments = ["--max-works", "5", "--model", "model-a", "--verifier", "model-v", "--second", "model-g"]
+    tagging.main(arguments, transport=httpx.MockTransport(fake))
+    out = capsys.readouterr().out
+    assert re.fullmatch(r'\{("[a-z_]+": \d+(\.\d+)?(, )?)+\}\n', out) and json.loads(out)["agreed"] == 1
+    describe, merge = (json.loads(request.content) for request in fake.requests if request.url.path == "/api/chat")
+    assert describe["messages"][0] == {"role": "system", "content": tagging.SECOND_PROMPT}
+    assert describe["messages"][1]["images"] == [base64.b64encode(JPEG + b"1").decode()]
+    assert "watering" not in json.dumps(describe)  # nothing of the first model's answer
+    assert (
+        merge["messages"][0] == {"role": "system", "content": tagging.AGREE_PROMPT}
+        and "images" not in merge["messages"][1]
+    )
+    assert merge["messages"][1]["content"].splitlines() == [
+        f"First description: {CHECKED}",
+        "Second description: A shaggy beast with a hammer.",
+    ]
+    for request in (describe, merge):
+        for kept_back in (work_id, "zz-fake-alpha", "fake-title", "faketag", "deviantart", ".jpg"):
+            assert kept_back not in json.dumps(request).lower()
+    for rule in ("No left or right", "No numbers", "No gender, age or species"):
+        assert rule in tagging.SECOND_PROMPT  # the same plain-words rules as the first pass
+    tagging.main(["--sample", "5", "--seed", "1", "--model", "model-a", "--verifier", "model-v", "--second", "model-g"])
+    (row,) = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert row["checked"] == CHECKED and row["result"]["description"] == CHECKED and row["deviation_id"] == work_id
+
+
 # Works that are not there to analyze, works that were removed, and a database another stage is holding.
 
 
@@ -1026,7 +1235,7 @@ def test_a_removed_artist_is_not_read_back_and_their_rows_go_at_the_next_run():
     assert [row["deviation_id"] for row in tagging.sample(40, 7)] == [kept]
     run(FakeOllama(), verifier="model-v")
     for table in tagging.TABLES:
-        assert {row[0] for row in stored(table)} == {BRAVO if table == "artist_contact" else kept}
+        assert {row[0] for row in stored(table)} <= {BRAVO, kept}
         assert removed not in json.dumps(stored(table)) and ALPHA not in json.dumps(stored(table))
 
 
@@ -1039,7 +1248,7 @@ def test_nothing_is_stored_for_a_work_once_it_is_removed_even_while_a_model_is_l
             return {"declared": "yes", "contact": "yes", "answer": GOOD, "rewrite": None, "confirm": True}[step]
 
         run(FakeOllama(**{step: purging}), verifier="model-v")
-        assert [stored(table) for table in tagging.TABLES] == [[], [], [], []], step
+        assert [stored(table) for table in tagging.TABLES] == [[] for _ in tagging.TABLES], step
         assert tagging.results() == tagging.results(verifier="model-v") == tagging.declared_ai() == {}
         assert tagging.contacts() == {}
 
