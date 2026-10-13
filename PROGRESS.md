@@ -1,6 +1,6 @@
 # Artist Search: Progress
 
-**Status, 2026-10-14 (later):** The pipeline runs end to end for the first time. 119 real artists with 1,130 works and their similar-style neighbours are in the public database, and search answers real queries through the public key. Tagging continues over the remaining works; the site is next.
+**Status, 2026-10-15:** The site exists and won its first comparison against ArtStation and Behance, 7 pairs of 8. 119 real artists are in the public database and searchable. Tagging continues over the remaining works. The site runs locally only; nothing is deployed.
 
 ## Waiting on the owner
 
@@ -437,3 +437,22 @@ Held back by the push stage's rules: 300 artists not yet analysed, 21 with adult
 **A process error by the lead, corrected.** Two commits went in after combined test runs that had failures, because the commit command checked the last line of output, not the test result. Both sets of failures were in another builder's in-progress files. Commit commands now stop on a failing run.
 
 **Pipeline counts:** artists discovered 472, collected 442, works 4,381, works with checked tags about 1,500 and rising, artists profiled 140, artists public 119. **Database:** 16.8 MB of 400 MB.
+
+### Round 9: the site, and its first comparison (2026-10-14 to 15)
+
+**Pieces 7 to 9, site pages: built.** Search, similar style, artist profile and a claim-or-remove flow, in React on Cloudflare Pages' stack, running locally against the real database. A search function embeds the query on Workers AI and calls the database, falls back to keywords if the embedding fails, and retries a failed call once. Thumbnails load straight from the source's image host; nothing is proxied or stored. Screenshots stay in the git-ignored cache and were sent to the owner.
+
+**First comparison against the spec's bar.** Eight pairs: each of our pages against the same page type at the same width (1280 and 390) on ArtStation or Behance, A and B shuffled per pair. The critic judged first screens as someone at a studio trying to find and choose an artist to hire.
+
+| Against | Our pages won | Lost |
+|---|---|---|
+| ArtStation | 3 of 4 | Desktop profile |
+| Behance | 4 of 4 | None |
+
+- **Why ours won, in the critic's words:** "results are artists, not artworks. Each card answers 'who is this and what do they do' in one plain sentence plus tags, with four samples and two obvious actions." The platforms' search pages return anonymous artwork tiles, with blurred mature-content placeholders on one and an ad tile on the other.
+- **The loss and the biggest gap:** ArtStation's desktop profile has a complete hiring card (open status, role, location, Message). Ours "gives a hirer no way to tell whether the artist is available or how to reach them", its one filled button leads away from the artist, and the claim-or-remove box sits among the actions.
+- **Honest limits of this test:** it is not truly blind, because each platform's logo is visible; it covers first screens only; and it judges pages for our job, which those platforms' search pages were not designed for.
+- **Round 2 for the site:** contacting the artist becomes the primary action (their own site, otherwise their DeviantArt profile), availability is stated or marked "not stated", and claim-or-remove stays visible but leaves the action column. Phone fixes: a cue that filters scroll, tighter cards, works higher on the profile.
+- **Needs the data stages:** thumbnails are 300 pixels wide at the source, so they are soft on dense screens, and works are cropped to a fixed tile because the database holds no image dimensions.
+
+**Pipeline counts:** artists discovered 472, collected 442, works 4,381, artists public 119, works public 1,130. **Database:** 16.8 MB of 400 MB.
