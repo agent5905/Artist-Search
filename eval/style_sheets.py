@@ -3,6 +3,11 @@
     uv run python eval/style_sheets.py --a csd --b siglip2 --seeds 12 --name round1
     uv run python eval/style_sheets.py --a csd:best --b csd:mutual --seeds 12 --name round2
     uv run python eval/style_sheets.py --a csd:mutual --b csd:local --frozen --seeds 12 --name round3
+    uv run python eval/style_sheets.py --a csd:local --b reference --frozen --seeds 30 --name style_ab_r1
+
+"reference" is DeviantArt's own More Like This, as captured by eval/style_reference.py under the same --name.
+Against it both sheets show the same number of works in shuffled order, so one row per artist cannot give our
+side away.
 
 --frozen takes the first N seed artists from eval/seeds.jsonl (stored as hashes) instead of drawing new ones.
 
@@ -14,6 +19,7 @@ which the critic is not given.
 
 import argparse
 import hashlib
+import itertools
 import json
 import pathlib
 import random
@@ -52,6 +58,37 @@ def sheet(rows: list[list[pathlib.Path]], out: pathlib.Path) -> None:
     canvas.save(out, quality=85)
 
 
+def eligible(conn: sqlite3.Connection) -> list[str]:
+    rows = conn.execute(
+        "select artist_key from works where image_file is not null group by artist_key having count(*) >= ? "
+        "order by artist_key",
+        (MIN_WORKS,),
+    )
+    return [key for (key,) in rows]
+
+
+def frozen_seeds(artists: list[str]) -> list[str]:
+    """The seed artists of eval/seeds.jsonl, in file order. A removed or uncollected seed is skipped."""
+    by_hash = {hashlib.sha256(key.encode()).hexdigest(): key for key in artists}
+    lines = (pathlib.Path(__file__).parent / "seeds.jsonl").read_text(encoding="utf-8").splitlines()
+    return [key for key in (by_hash.get(json.loads(line)["artist_sha256"]) for line in lines) if key]
+
+
+def reference(folder: pathlib.Path, artist: str) -> list[pathlib.Path]:
+    """DeviantArt's suggestions for this seed, in its order; empty when the seed was not captured."""
+    listing = folder / f"{hashlib.sha256(artist.encode()).hexdigest()[:16]}.json"
+    if not listing.exists():
+        return []
+    return [folder / row["file"] for row in json.loads(listing.read_text(encoding="utf-8"))]
+
+
+def mixed(rows: list[list[pathlib.Path]], count: int, rng: random.Random) -> list[list[pathlib.Path]]:
+    """The first `count` works taken across the rows in turn, shuffled, PER_ARTIST to a row."""
+    cells = [path for column in itertools.zip_longest(*rows) for path in column if path][:count]
+    rng.shuffle(cells)
+    return [cells[i : i + PER_ARTIST] for i in range(0, len(cells), PER_ARTIST)]
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Blind A/B contact sheets for the style critic.")
     parser.add_argument("--a", required=True, help="first style model")
@@ -68,30 +105,29 @@ def main() -> int:
     keys.mkdir(parents=True, exist_ok=True)
     rng = random.Random(args.rng)
     conn = sqlite3.connect(f"file:{config.LOCAL_DB.as_posix()}?mode=ro", uri=True, timeout=60)
-    eligible = [
-        key
-        for (key,) in conn.execute(
-            "select artist_key from works where image_file is not null group by artist_key having count(*) >= ? "
-            "order by artist_key",
-            (MIN_WORKS,),
-        )
-    ]
+    artists = eligible(conn)
     answer = []
-    if args.frozen:
-        by_hash = {hashlib.sha256(key.encode()).hexdigest(): key for key in eligible}
-        lines = (pathlib.Path(__file__).parent / "seeds.jsonl").read_text(encoding="utf-8").splitlines()
-        frozen = [by_hash.get(json.loads(line)["artist_sha256"]) for line in lines]
-        seeds = [key for key in frozen if key][: args.seeds]  # a removed or uncollected seed is skipped
-    else:
-        seeds = rng.sample(eligible, args.seeds)
+    seeds = frozen_seeds(artists)[: args.seeds] if args.frozen else rng.sample(artists, args.seeds)
     for n, artist in enumerate(seeds, start=1):
-        sheet([works(conn, artist, 6)], out / f"seed_{n:02d}.jpg")
         models = [args.a, args.b]
         rng.shuffle(models)
-        for label, model in zip("AB", models, strict=True):
+        rows = {}
+        for model in models:
+            if model == "reference":
+                rows[model] = [reference(out / "reference", artist)]
+                continue
             name, _, rule = model.partition(":")  # "csd" or "csd:mutual"
             nearest = [key for key, _ in style.neighbors(artist, name, top=NEIGHBORS, rule=rule or "best")]
-            sheet([works(conn, key, PER_ARTIST) for key in nearest], out / f"seed_{n:02d}_{label}.jpg")
+            rows[model] = [works(conn, key, PER_ARTIST) for key in nearest]
+        if "reference" in rows:
+            count = min(sum(len(row) for row in side) for side in rows.values())
+            if not count:
+                print(f"seed {n}: no reference captured, skipped")
+                continue
+            rows = {model: mixed(side, count, rng) for model, side in rows.items()}
+        sheet([works(conn, artist, 6)], out / f"seed_{n:02d}.jpg")
+        for label, model in zip("AB", models, strict=True):
+            sheet(rows[model], out / f"seed_{n:02d}_{label}.jpg")
         answer.append({"n": n, "artist": artist, "A": models[0], "B": models[1]})
     (keys / f"{args.name}.json").write_text(json.dumps({"seeds": answer}, indent=1), encoding="utf-8")
     print(f"sheets: {len(answer)} seeds in {out}")
