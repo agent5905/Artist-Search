@@ -166,7 +166,7 @@ textarea {
   display: flex;
   align-items: center;
   gap: 12px;
-  min-height: 62px;
+  min-height: 56px;
 }
 
 .brand {
@@ -334,15 +334,45 @@ textarea {
 
 /* ------------------------------------------------------------------------------- filters and chips */
 
+.filters-wrap {
+  position: relative;
+}
+
 .filters {
   display: flex;
   align-items: center;
   gap: 8px 18px;
   margin-inline: -16px;
-  padding: 14px 16px 6px;
+  padding: 10px 64px 4px 16px; /* room at the end, so the last filter comes clear of the arrow */
   overflow-x: auto;
   scrollbar-width: none;
   white-space: nowrap;
+}
+
+/* On a phone the filters are one row to swipe: they fade out under an arrow at the screen's edge, which says so. */
+.filters-more {
+  position: absolute;
+  top: 10px;
+  right: -16px;
+  bottom: 4px;
+  z-index: 1;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  width: 84px;
+  padding: 0 10px 0 0;
+  border: 0;
+  background: linear-gradient(to right, transparent, var(--bg) 55%);
+  color: var(--ink);
+  cursor: pointer;
+}
+
+.filters-more .icon {
+  box-sizing: content-box;
+  padding: 7px;
+  border: 1px solid var(--line-2);
+  border-radius: 50%;
+  background: var(--surface);
 }
 
 .filter-group {
@@ -431,12 +461,12 @@ textarea {
   align-items: baseline;
   justify-content: space-between;
   gap: 2px 16px;
-  margin: 14px 0 14px;
+  margin: 10px 0;
 }
 
 .results-head h1,
 .results-head h2 {
-  font-size: 1.25rem;
+  font-size: 1.0625rem;
   font-weight: 650;
   letter-spacing: -0.015em;
   line-height: 1.3;
@@ -451,7 +481,7 @@ textarea {
 .grid {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(min(100%, 320px), 1fr));
-  gap: 20px;
+  gap: 16px;
 }
 
 .dim {
@@ -629,9 +659,27 @@ textarea {
 .credit {
   overflow: hidden;
   color: var(--ink-3);
-  font-size: 12px;
+  font-size: 12.5px;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+/* The credit on a card leads to the artist's page at the source, and is dressed as the link it is. */
+.credit a {
+  padding-block: 4px;
+  color: var(--ink-2);
+  text-decoration: underline;
+  text-decoration-color: color-mix(in srgb, var(--ink-2) 45%, transparent);
+}
+
+.credit a:hover {
+  color: var(--ink);
+  text-decoration-color: currentColor;
+}
+
+.credit .icon {
+  margin-left: 3px;
+  vertical-align: -2px;
 }
 
 .btn {
@@ -767,13 +815,11 @@ textarea {
 }
 
 .profile {
-  padding-top: 24px;
+  padding-top: 16px;
 }
 
 .profile-head {
-  display: grid;
-  gap: 24px;
-  margin-bottom: 32px;
+  margin-bottom: 12px;
 }
 
 .profile-about {
@@ -783,27 +829,93 @@ textarea {
   min-width: 0;
 }
 
-.name-row {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 8px 14px;
-}
-
-.name-row .open {
-  align-self: center;
-}
-
 .tagline {
   margin-top: -8px;
   color: var(--ink-3);
   overflow-wrap: anywhere;
 }
 
-.profile-links {
+/* The hiring panel: is the artist taking work, and where to reach them. */
+.hire {
   display: flex;
   flex-direction: column;
-  gap: 12px;
+  gap: 14px;
+}
+
+.avail {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 5px;
+  color: var(--ink-3);
+  font-size: 13px;
+}
+
+/* Not stated is not "closed": small, neutral words. Stated is the same green chip a card carries. */
+.avail strong {
+  color: var(--ink-2);
+  font-size: 14px;
+  font-weight: 500;
+}
+
+.avail.is-open strong {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 4px 12px 4px 10px;
+  border-radius: 999px;
+  background: var(--ok-bg);
+  color: var(--ok);
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.avail.is-open strong::before {
+  content: '';
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #22b573;
+}
+
+.hire-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.hire-actions .btn {
+  flex: 1 1 auto;
+  min-height: 44px;
+  padding-inline: 12px;
+}
+
+.hire-actions .wide {
+  flex-basis: 196px;
+}
+
+.hire .fine {
+  font-size: 12.5px;
+  line-height: 1.45;
+}
+
+/* Hard rule 7: on every profile, in plain sight, but not among the buttons a visitor uses to hire. */
+.claim-line {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 14px;
+  color: var(--ink-3);
+  font-size: 14px;
+}
+
+.claim-line a {
+  color: var(--ink-2);
+  font-weight: 500;
+}
+
+.claim-line a:hover {
+  color: var(--ink);
 }
 
 .facts {
@@ -827,45 +939,6 @@ textarea {
   font-size: 14px;
 }
 
-.actions {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 8px;
-}
-
-.actions .btn {
-  flex: 1 1 auto;
-  min-height: 42px;
-}
-
-.actions .wide {
-  flex-basis: 100%;
-}
-
-.claim {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  padding: 12px 14px;
-  border: 1px solid var(--line-2);
-  border-radius: 12px;
-  background: var(--surface);
-  font-size: 14px;
-  line-height: 1.35;
-  text-decoration: none;
-  transition: border-color 0.15s;
-}
-
-.claim:hover {
-  border-color: var(--ink);
-}
-
-.claim strong {
-  display: block;
-  text-decoration: underline;
-  text-underline-offset: 0.18em;
-}
-
 .profile-works .results-head {
   margin-top: 0;
 }
@@ -874,6 +947,18 @@ textarea {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 16px 12px;
+}
+
+/* When the data carries every work's size, the tiles take the works' own shapes, uncropped, in columns. */
+.works.natural {
+  display: block;
+  columns: 2;
+  column-gap: 12px;
+}
+
+.works.natural li {
+  margin-bottom: 16px;
+  break-inside: avoid;
 }
 
 .works .thumb {
@@ -1180,9 +1265,137 @@ code {
 
 /* ---------------------------------------------------------------------------------- wider screens */
 
+@media (max-width: 639.98px) {
+  /* A phone shows one card across. These bring the next artist's samples onto the first screen. */
+  .mosaic .thumb {
+    aspect-ratio: 3 / 2;
+  }
+
+  .card-body {
+    gap: 7px;
+    padding: 12px 14px;
+  }
+
+  .card-foot {
+    padding-top: 4px;
+  }
+
+  .card-foot .btn {
+    min-height: 36px;
+  }
+}
+
+@media (max-width: 899.98px) {
+  /* One column. The header's two halves dissolve so their parts can sit in the order a phone wants: the name
+     with availability beside it, the summary, then contact; and the works start as high as they can. */
+  .profile-head {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 10px 12px;
+  }
+
+  .profile-about,
+  .hire {
+    display: contents;
+  }
+
+  .profile-about > *,
+  .hire > * {
+    flex: 1 1 100%;
+    min-width: 0;
+  }
+
+  .profile-head .display {
+    flex: 0 1 auto;
+    order: 1;
+  }
+
+  .profile-head .avail {
+    flex: 0 0 auto;
+    order: 2;
+  }
+
+  .tagline {
+    order: 3;
+    margin-top: -6px;
+  }
+
+  .lead {
+    order: 4;
+    font-size: 1.0625rem;
+    line-height: 1.45;
+  }
+
+  .facts {
+    order: 5;
+    gap: 6px;
+    margin-top: 0;
+  }
+
+  /* The two labelled groups become one row of chips; the labels stay for screen readers. */
+  .facts > div,
+  .facts dd,
+  .facts .tags {
+    display: contents;
+  }
+
+  .facts dt {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip-path: inset(50%);
+  }
+
+  .hire-actions {
+    order: 6;
+    margin-top: 4px;
+  }
+
+  .avail span,
+  .hire .fine {
+    display: none;
+  }
+
+  .avail:not(.is-open) strong {
+    color: var(--ink-3);
+    font-size: 13px;
+    font-weight: 400;
+  }
+}
+
 @media (min-width: 640px) {
   .top-in {
     gap: 20px;
+    min-height: 62px;
+  }
+
+  .filters {
+    padding-top: 14px;
+    padding-bottom: 6px;
+  }
+
+  .filters-more {
+    display: none;
+  }
+
+  .results-head {
+    margin-block: 14px;
+  }
+
+  .results-head h1,
+  .results-head h2 {
+    font-size: 1.25rem;
+  }
+
+  .grid {
+    gap: 20px;
+  }
+
+  .works.natural {
+    columns: 5 200px;
+    column-gap: 16px;
   }
 
   .top:not(.is-hero) .brand span {
@@ -1240,10 +1453,34 @@ code {
   }
 
   .profile-head {
-    grid-template-columns: minmax(0, 1fr) 340px;
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) 360px;
     align-items: start;
-    gap: 64px;
-    margin-bottom: 40px;
+    gap: 56px;
+    margin-bottom: 18px;
+  }
+
+  .hire {
+    padding: 20px;
+    border: 1px solid var(--line);
+    border-radius: 16px;
+    background: var(--surface);
+    box-shadow: var(--shadow);
+  }
+
+  .hire-actions .btn {
+    min-height: 40px;
+    padding-inline: 10px;
+  }
+
+  .hire-actions .wide {
+    flex-basis: 100%;
+    min-height: 46px;
+    font-size: 15px;
+  }
+
+  .claim-line {
+    margin-bottom: 28px;
   }
 
   .seed {

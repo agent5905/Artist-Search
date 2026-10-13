@@ -20,6 +20,29 @@ export const host = (url: string) => {
 /** Where a work lives, for the credit beside it. */
 export const sourceName = (work: Work) => (work.source === 'deviantart' ? 'DeviantArt' : host(work.page_url) || 'the artist’s site')
 
+/** The artist's own page at the source of a work: on DeviantArt a work sits at /<username>/art/<title>. */
+export const sourceHome = (work: Work) => {
+  try {
+    const page = new URL(work.page_url)
+    return web(work.source === 'deviantart' ? `${page.origin}/${page.pathname.split('/')[1]}` : page.origin)
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * Whether the artist says they take work, in the words their profile line uses. Null when they have not said:
+ * that is unknown, never "closed".
+ */
+export const availability = (artist: Artist) =>
+  !artist.open_for_work
+    ? null
+    : /available for hire/i.test(artist.profile ?? '')
+      ? 'Available for hire'
+      : /open for commissions/i.test(artist.profile ?? '')
+        ? 'Open for commissions'
+        : 'Open for work'
+
 const ICONS = {
   search: 'M11 4a7 7 0 1 0 0 14 7 7 0 0 0 0-14Zm9 16-4.1-4.1',
   out: 'M8 16 16 8m-6.5 0H16v6.5',
@@ -28,6 +51,7 @@ const ICONS = {
   image: 'M4 5h16v14H4zm0 11 4.5-4.5L13 16l2.5-2.5L20 18M3 3l18 18',
   person: 'M12 12a4 4 0 1 0 0-8 4 4 0 0 0 0 8Zm-8 8a8 8 0 0 1 16 0',
   check: 'm5 12.5 4.5 4.5L19 7.5',
+  chevron: 'm9.5 6 6 6-6 6',
 }
 
 export function Icon({ name, size = 18 }: { name: keyof typeof ICONS; size?: number }) {
@@ -62,13 +86,24 @@ export function Logo({ size = 26 }: { size?: number }) {
 /**
  * One work: the source's own thumbnail in a plain <img> (never a copy, hard rule 1), linking to the work's page
  * at the source. The tile keeps its shape while the image loads, and when it cannot load.
+ *
+ * `natural` gives the tile the work's own shape, uncropped. It needs the image's width and height from the data,
+ * which the database does not return yet: without both, the tile stays the fixed shape the stylesheet gives it.
  */
-export function Thumb({ work, by, eager }: { work: Work; by: string; eager?: boolean }) {
+export function Thumb({ work, by, eager, natural }: { work: Work; by: string; eager?: boolean; natural?: boolean }) {
   const [failed, setFailed] = useState(false)
   const title = work.title?.trim() || 'Untitled'
   const source = sourceName(work)
+  const sized = !!work.width && !!work.height
   return (
-    <a className="thumb" href={web(work.page_url)} target="_blank" rel="noopener" title={`${title}, by ${by}. Opens on ${source}.`}>
+    <a
+      className="thumb"
+      href={web(work.page_url)}
+      target="_blank"
+      rel="noopener"
+      title={`${title}, by ${by}. Opens on ${source}.`}
+      style={natural && sized ? { aspectRatio: `${work.width} / ${work.height}` } : undefined}
+    >
       {failed ? (
         <span className="thumb-off">
           <Icon name="image" size={22} />
@@ -78,6 +113,8 @@ export function Thumb({ work, by, eager }: { work: Work; by: string; eager?: boo
         <img
           src={web(work.image_url)}
           alt={`${title}, by ${by}`}
+          width={sized ? work.width! : undefined}
+          height={sized ? work.height! : undefined}
           loading={eager ? 'eager' : 'lazy'}
           decoding="async"
           onError={() => setFailed(true)}
@@ -88,7 +125,15 @@ export function Thumb({ work, by, eager }: { work: Work; by: string; eager?: boo
   )
 }
 
-export const OpenBadge = () => <span className="open">Open for work</span>
+/** Shown only when the artist has said so. An artist who has not said gets no chip on a card. */
+export function OpenBadge({ artist }: { artist: Artist }) {
+  const status = availability(artist)
+  return status ? (
+    <span className="open" title="Stated by the artist">
+      {status}
+    </span>
+  ) : null
+}
 
 export function Tags({ values }: { values: string[] | null }) {
   if (!values?.length) return null
@@ -119,7 +164,7 @@ export function Card({ artist, eager }: { artist: Artist; eager?: boolean }) {
           <h3>
             <Link to={`/artist/${slug}`}>{artist.name}</Link>
           </h3>
-          {artist.open_for_work && <OpenBadge />}
+          <OpenBadge artist={artist} />
         </div>
         {artist.tagline && <p className="card-tagline">{artist.tagline}</p>}
         {artist.profile && <p className="card-profile">{artist.profile}</p>}
@@ -134,7 +179,11 @@ export function Card({ artist, eager }: { artist: Artist; eager?: boolean }) {
         </div>
         {works.length > 0 && (
           <p className="credit">
-            Art © {artist.name}, shown from {sourceName(works[0])}
+            {/* The credit is a way through to the artist's own page at the source, and looks like one. */}
+            <a href={sourceHome(works[0])} target="_blank" rel="noopener">
+              Art © {artist.name} on {sourceName(works[0])}
+              <Icon name="out" size={13} />
+            </a>
           </p>
         )}
       </div>

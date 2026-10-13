@@ -1,9 +1,9 @@
 // The pages: search, similar style, profile, and claim or remove.
-import { useState, type FormEvent, type ReactNode } from 'react'
+import { useRef, useState, type FormEvent, type ReactNode } from 'react'
 import { Link, useNavigate, useParams, useSearchParams } from 'react-router'
 import { getArtist, PAGE, removalCode, requestRemoval, search, similarArtists } from './api'
 import facets from './facets.json'
-import { Cards, Failed, host, Icon, label, Notice, OpenBadge, Skeletons, sourceName, Tags, Thumb, useLoad, web } from './ui'
+import { availability, Cards, Failed, host, Icon, label, Notice, Skeletons, sourceName, Tags, Thumb, useLoad, web } from './ui'
 
 const TITLE = 'Artist Search'
 
@@ -24,6 +24,8 @@ export function Search() {
     ...(open ? [['open', '1']] : []),
   ]).toString()
 
+  const row = useRef<HTMLDivElement>(null)
+  const [rowEnded, setRowEnded] = useState(false)
   const [more, setMore] = useState({ filters, pages: 1 })
   const pages = more.filters === filters ? more.pages : 1
   const { data, stale, failed, retry } = useLoad(`${filters} ${pages}`, async () => ({
@@ -53,29 +55,49 @@ export function Search() {
     <main id="main" className="wrap">
       <title>{q ? `${q} · ${TITLE}` : `${TITLE}: find game concept and character artists`}</title>
 
-      <div className="filters" role="group" aria-label="Filters">
-        <label className="chip chip-open">
-          <input type="checkbox" checked={open} onChange={() => change((next) => (open ? next.delete('open') : next.set('open', '1')))} />
-          Open for work
-        </label>
-        {(['specialty', 'medium'] as const).map((name) => (
-          <div className="filter-group" role="group" aria-label={label(name)} key={name}>
-            <span className="filter-label" aria-hidden="true">
-              {label(name)}
-            </span>
-            {facets[name === 'specialty' ? 'specialties' : 'mediums'].map((value) => (
-              <label className="chip" key={value}>
-                <input type="checkbox" checked={picked[name].includes(value)} onChange={() => toggle(name, value)} />
-                {label(value)}
-              </label>
-            ))}
-          </div>
-        ))}
-        {filtered && (
-          <button className="link" type="button" onClick={clear}>
-            Clear filters
+      <div className="filters-wrap">
+        {/* On a phone the filters are one row to swipe. The arrow says so, moves the row along, and goes at the end. */}
+        {!rowEnded && (
+          <button
+            className="filters-more"
+            type="button"
+            tabIndex={-1}
+            aria-hidden="true"
+            onClick={() => row.current?.scrollBy({ left: 200, behavior: 'smooth' })}
+          >
+            <Icon name="chevron" size={16} />
           </button>
         )}
+        <div
+          className="filters"
+          role="group"
+          aria-label="Filters"
+          ref={row}
+          onScroll={({ currentTarget: at }) => setRowEnded(at.scrollLeft + at.clientWidth >= at.scrollWidth - 8)}
+        >
+          <label className="chip chip-open">
+            <input type="checkbox" checked={open} onChange={() => change((next) => (open ? next.delete('open') : next.set('open', '1')))} />
+            Open for work
+          </label>
+          {(['specialty', 'medium'] as const).map((name) => (
+            <div className="filter-group" role="group" aria-label={label(name)} key={name}>
+              <span className="filter-label" aria-hidden="true">
+                {label(name)}
+              </span>
+              {facets[name === 'specialty' ? 'specialties' : 'mediums'].map((value) => (
+                <label className="chip" key={value}>
+                  <input type="checkbox" checked={picked[name].includes(value)} onChange={() => toggle(name, value)} />
+                  {label(value)}
+                </label>
+              ))}
+            </div>
+          ))}
+          {filtered && (
+            <button className="link" type="button" onClick={clear}>
+              Clear filters
+            </button>
+          )}
+        </div>
       </div>
 
       {/* Without a query the page's h1 is the headline above the search box. */}
@@ -213,6 +235,10 @@ export function ProfilePage() {
   const artist = data
   const source = artist.works[0] ? sourceName(artist.works[0]) : 'DeviantArt'
   const site = web(artist.site_url)
+  const deviantart = web(artist.deviantart_url)
+  const status = availability(artist)
+  // Uncropped tiles need every work's size, which the database does not return yet.
+  const natural = artist.works.length > 0 && artist.works.every((work) => work.width && work.height)
 
   return (
     <Page>
@@ -220,10 +246,7 @@ export function ProfilePage() {
       <div className="profile">
         <header className="profile-head">
           <div className="profile-about">
-            <div className="name-row">
-              <h1 className="display">{artist.name}</h1>
-              {artist.open_for_work && <OpenBadge />}
-            </div>
+            <h1 className="display">{artist.name}</h1>
             {artist.tagline && <p className="tagline">{artist.tagline}</p>}
             {artist.profile && <p className="lead">{artist.profile}</p>}
             <dl className="facts">
@@ -245,46 +268,56 @@ export function ProfilePage() {
               )}
             </dl>
           </div>
-          <div className="profile-links">
-            <div className="actions">
-              <Link className="btn wide" to={`/similar/${encodeURIComponent(artist.slug)}`}>
-                <Icon name="similar" /> More like this artist
-              </Link>
-              <a className="btn quiet" href={web(artist.deviantart_url)} target="_blank" rel="noopener">
-                DeviantArt profile <Icon name="out" size={16} />
+
+          {/* What someone hiring needs: is the artist taking work, and where to reach them. No email, rate or
+              location is stored, so none is shown: contact goes to the artist's own site, or their DeviantArt page. */}
+          <aside className="hire" aria-label={`Hiring ${artist.name}`}>
+            <p className={status ? 'avail is-open' : 'avail'}>
+              <strong>{status ?? 'Availability not stated'}</strong>
+              <span>{status ? 'Stated by the artist' : 'Ask the artist directly'}</span>
+            </p>
+            <div className="hire-actions">
+              <a className="btn wide" href={site ?? deviantart} target="_blank" rel="noopener">
+                {site ? `Contact via ${host(site)}` : 'Contact on DeviantArt'} <Icon name="out" size={16} />
               </a>
+              <Link className="btn quiet" to={`/similar/${encodeURIComponent(artist.slug)}`} aria-label={`More artists like ${artist.name}`}>
+                <Icon name="similar" size={16} /> More like this
+              </Link>
               {site && (
-                <a className="btn quiet" href={site} target="_blank" rel="noopener">
-                  {host(site)} <Icon name="out" size={16} />
+                <a className="btn quiet" href={deviantart} target="_blank" rel="noopener">
+                  DeviantArt profile <Icon name="out" size={16} />
                 </a>
               )}
             </div>
-            <Link className="claim" to={`/remove/${encodeURIComponent(artist.slug)}`}>
-              <Icon name="person" size={20} />
-              <span>
-                Is this you? <strong>Claim or remove this profile</strong>
-              </span>
-            </Link>
-          </div>
+            <p className="fine">Artist Search holds no email, rates or location: you reach {artist.name} on their own pages.</p>
+          </aside>
         </header>
+
+        <p className="claim-line">
+          <Icon name="person" size={16} />
+          <span>
+            Is this you? <Link to={`/remove/${encodeURIComponent(artist.slug)}`}>Claim or remove this profile</Link>
+          </span>
+        </p>
 
         <section className="profile-works" aria-labelledby="works">
           <div className="results-head">
             <h2 id="works">Works</h2>
             <p>
-              {artist.works.length} shown from {source}, where {artist.name} posted them
+              {artist.works.length}, shown from {source}
             </p>
           </div>
-          <ul className="works">
+          <ul className={natural ? 'works natural' : 'works'}>
             {artist.works.map((work) => (
               <li key={work.page_url}>
-                <Thumb work={work} by={artist.name} />
+                <Thumb work={work} by={artist.name} natural={natural} />
                 <p>{work.title?.trim() || 'Untitled'}</p>
               </li>
             ))}
           </ul>
           <p className="credit">
-            All artwork © {artist.name}. Each thumbnail is served by {source} and opens the work on its own page there.
+            All artwork © {artist.name}. Each thumbnail is served by {source}, where {artist.name} posted it, and opens the work on its own
+            page there.
           </p>
           {!!artist.top_tags?.length && (
             <div className="own-tags">

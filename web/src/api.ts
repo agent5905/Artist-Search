@@ -2,8 +2,18 @@
 // the rest are public database functions, called with the publishable key.
 import { rpc, twice } from './rpc'
 
-/** A work as the database returns it. The image is never copied: image_url is the source's own thumbnail. */
-export type Work = { image_url: string; page_url: string; title: string | null; source: string }
+/**
+ * A work as the database returns it. The image is never copied: image_url is the source's own thumbnail.
+ * width and height are the thumbnail's pixels: not returned yet, used when they are (see Thumb).
+ */
+export type Work = {
+  image_url: string
+  page_url: string
+  title: string | null
+  source: string
+  width?: number | null
+  height?: number | null
+}
 export type Artist = {
   slug: string
   name: string
