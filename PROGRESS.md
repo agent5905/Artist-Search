@@ -1,6 +1,6 @@
 # Artist Search: Progress
 
-**Status, 2026-10-13:** Two of the spec's bars were tested today and neither is met yet. Style lost to DeviantArt's "More Like This", 11 seeds to 17 after one fix, mostly for want of a bigger pool. Profiles have had an unsupported claim on 2 of 20 artists for five rounds, so that piece is changing approach. Collection passed its check on real data and the wide discovery is running, toward 3,000-plus artists. 119 artists are public and searchable. The site runs locally only; nothing is deployed.
+**Status, 2026-10-13:** No push to the public database until the push stage is fixed: its first critic failed it on five of ten properties. Style lost to DeviantArt's "More Like This", 11 seeds to 17 after one fix, mostly for want of a bigger pool. Profiles have had an unsupported claim on 2 of 20 artists for five rounds and are changing approach. Collection passed its check on real data and the wide discovery is running, toward 3,000-plus artists. The GPU work can now be paused and resumed. 119 artists are public; the site runs locally only and nothing is deployed.
 
 ## Waiting on the owner
 
@@ -608,3 +608,34 @@ Nothing was lost. A consistent backup of the local store was taken first.
 **Pipeline counts:** artists discovered 472, collected 472, works 5,034, artists public 119, works public 1,130. **Database:** 16.8 MB of 400 MB.
 
 **Added the same day: pausing the GPU work.** The owner confirmed that days of GPU time are fine, provided the work can be paused. `uv run python scripts/gpu.py pause` frees the GPU, `resume` carries on, `status` shows what is done, what is left and the pace, and `start` begins the background worker again after a reboot. Every stage holds before its next request to a model while paused, whoever started it, so nothing is lost. Collection and discovery do not use the GPU and keep running.
+
+### Round 13: the push stage's first critic (2026-10-13)
+
+Push had four unjudged rounds. It is the last gate before the public, so it was judged before the larger push. **Verdict: fail, on five of ten properties, each with a real counterexample.** The critic's answer to "would you run this on 3,000 artists today?": no.
+
+| # | Property | Verdict | Counterexample |
+|---|---|---|---|
+| 1 | Nothing forbidden is sent | Fail | A tagline was read once and found clean. The artist changed it to name a messaging handle; nothing read it again, and push sent it. A model-written description holding an email also went out unchecked |
+| 2 | Held-back works stay back | Fail | An artist replaced a work's image. The new thumbnail was sent under the old image's rating |
+| 3 | Held-back artists stay back | Fail | 4 of 10 works rated explicit but not yet tagged: only tagged works were counted, so the share came to 0 and the artist was sent |
+| 4 | Removal first, and for good | Fail | A removal whose file deletion hit a locked file was never recorded; the artist stayed public. An account renamed before its removal survived under the new handle |
+| 5 | A bad local state cannot wipe public data | Fail | An emptied table deleted every similar-artist row, unguarded. A store with its artist list emptied was read as "everyone removed", during a dry run too, and a real run would have written that to the permanent removal list |
+| 6 | A rerun changes nothing | Pass | 200 reruns identical |
+| 7 | Similar artists and their picked works are only ones that are sent | Pass | |
+| 8 | A dry run writes nothing public | Pass | It does write locally, which it should not |
+| 9 | No secret printed | Pass | One error path cuts a message before scrubbing it |
+| 10 | The tests catch regressions | Pass | 51 of 52 deliberate breaks caught |
+
+- **How it was tried:** 15 targeted sequences and 40 random ones, 400 runs in all, on invented stores with a stand-in database. No real push and no call to the real database.
+- **The critic's biggest gap:** "A reading is not tied to what was read." A model's "no contact details", "not AI", rating and tags are stored once. Collection keeps the artist's words and thumbnails up to date. Push then pairs today's words with yesterday's reading.
+- **Why this had not shown yet:** the live database was loaded once, before any second collection. The gap opens with repeated collection, which is exactly what scaling does.
+- **The tests' blind spot, in the critic's words:** "Every fixture is read once and never changes afterwards."
+
+**What follows**
+- **Push round 5 (in progress):** every rating counts toward an artist's share, and an unrated work counts against; a removal is recorded before any file is deleted and covers every handle of the account; a missing row is never read as a removal; similar-artist deletions are guarded; many removals at once stop the run; a dry run changes nothing anywhere; every text field passes the contact rule at the moment it is sent.
+- **Readings tied to what was read (next, after profiles round 6 lands):** each reading carries a fingerprint of the words or image it was made from, and anything whose words or image changed since is held back until it is read again. A replaced image is fetched and read again.
+- **No push until both are in and a critic has passed them.** This does not hold up discovery, collection or tagging.
+
+**Discovery, first wide run: stopped by an outage.** After 202 of 2,160 browse pages DeviantArt's API answered 504, and minutes later 503 on the token request. A probe a few minutes on found every depth answering in about a second, so depth was not the cause. Discovery stores nothing until browsing ends, so 45 minutes were lost and nothing else. It now waits out a server error for up to about 16 minutes (retries after 2, 4 and 8 seconds, then 1, 5 and 10 minutes) and has been started again.
+
+**Pipeline counts:** artists discovered 472, collected 472, works 5,126, works tagged about 4,800, artists public 119, works public 1,130. **Database:** 16.8 MB of 400 MB.
