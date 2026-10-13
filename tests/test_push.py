@@ -208,6 +208,7 @@ def artist(
     angle=0.0,
     edits=None,
     user=None,
+    old_keys=(),
     sheet=None,
 ):
     """Collect, tag, rate and profile one invented artist, and return their works, the most recent first.
@@ -215,8 +216,10 @@ def artist(
     Every work is fit to send unless `edits` says otherwise for its place in the list: "result": None (no
     verified tags), "explicit" or "not_artwork": True, "declared" (AI: "yes", "unclear", None for not read),
     "contact" ("yes", None for not read), "rating" ("suggestive", "explicit", None for not rated), "thumb".
+    And "size": its thumbnail's (width, height), as the API gave it: without one, none is kept for the work.
     profile: "written", "excluded" (the profile stage ruled them out) or None (no row there yet).
-    user: the handle whose account this is, when it is an account that took another handle.
+    user: the handle whose account this is, when it is an account that took another handle, and old_keys: the
+    keys the collector found that account kept under, which it names when it stores the new one.
     sheet: (pictures on the sheet the profile stage looked at, how many of them it counted as unsuitable).
     Everything about the artist carries their handle, with or without its hyphens, so it can be looked for.
     """
@@ -286,9 +289,11 @@ def artist(
                 "tags": work["tags"],
                 "thumb_url": work["thumb"],
                 "published": str(PUBLISHED - 86_400 * n),
+                "thumb_size": edits.get(n, {}).get("size"),
             }
             for n, work in enumerate(made)
         ],
+        old_keys=old_keys,
     )
     tagging.results(), profiles.profiles(), style.artist_vectors(key, "csd")  # so that their tables exist
     with closing(sqlite3.connect(config.LOCAL_DB)) as conn, conn:
@@ -962,7 +967,9 @@ def test_a_dry_run_writes_nothing_to_the_database_and_prints_the_same_counts(fak
 
 # What the collect stage marks, and what it no longer deletes (round 3).
 
-WORK_MARKS = {  # the collect stage's words for a work that no longer qualifies -> the count line
+# The collect stage's words for a work that no longer qualifies -> the count line. Nothing here knows the words:
+# the two about AI are ones it gave until its round 6 and may still be in a file, the last one is of no round yet.
+WORK_MARKS = {
     "mature": "works_held_marked_mature",
     "tagged AI-made": "works_held_marked_tagged_ai_made",
     "not a public image": "works_held_marked_not_a_public_image",
@@ -1035,11 +1042,82 @@ def test_the_handle_an_account_had_before_is_not_sent_once_it_is_kept_under_the_
     artist(ALPHA, angle=0.0)
     artist(BRAVO, angle=0.2)
     push.run(False)
-    artist(CHARLIE, angle=0.21, user=BRAVO)  # the same account under another handle: the old key is marked renamed
+    # As the collect stage does it. First the API calls the old handle gone, and that is all that is known.
+    library.mark_artist(f"da:{BRAVO}", "account gone")
+    assert push.run(False)["artists_held_marked_account_gone"] == 1 and sorted(sent_artists(fake)) == [ALPHA]
+    # Then the same account answers under another handle. The collector finds the key that account is kept
+    # under, believes it because that handle is gone, and names it when it stores the new one.
+    account = f"FAKE-USER-{BRAVO}"
+    old_keys = [key for key in library.holders(account) if key != f"da:{CHARLIE}"]
+    assert old_keys == [f"da:{BRAVO}"] and library.artist_marks()[f"da:{BRAVO}"][0] == "account gone"
+    artist(CHARLIE, angle=0.21, user=BRAVO, old_keys=old_keys)
     assert library.artist_marks()[f"da:{BRAVO}"][::2] == ("renamed", f"da:{CHARLIE}")
+
     counts = push.run(False)
-    assert counts["artists_held_marked_renamed"] == 1 and sorted(sent_artists(fake)) == [ALPHA, CHARLIE]
+
+    assert counts["artists_held_marked_renamed"] == 1 and "artists_held_marked_account_gone" not in counts
+    assert sorted(sent_artists(fake)) == [ALPHA, CHARLIE]
+    assert not any(word in json.dumps(fake.loads[-1]).lower() for word in of_artist(BRAVO))
     assert not any(word in fake.held() for word in of_artist(BRAVO))
+
+
+def test_a_works_thumbnail_size_is_sent_when_the_library_has_it_both_numbers_or_neither(fake):
+    edits = {0: {"size": (300, 420)}, 2: {"size": (1, 100_000)}, 4: {"size": (640, 360), "rating": None}}
+    works = artist(ALPHA, 7, edits=edits)
+    assert library.thumb_sizes() == {
+        works[0]["id"]: (300, 420),
+        works[2]["id"]: (1, 100_000),
+        works[4]["id"]: (640, 360),
+    }
+    # And two sizes the database would refuse, as a later round's library might come to hold them.
+    with closing(sqlite3.connect(config.LOCAL_DB)) as conn, conn:
+        conn.execute(
+            "INSERT INTO work_sizes (deviation_id, width, height) VALUES (?, ?, ?)", (works[5]["id"], 100_001, 50)
+        )
+        conn.execute(
+            "INSERT INTO work_sizes (deviation_id, width, height) VALUES (?, ?, ?)", (works[6]["id"], 50, 100_001)
+        )
+
+    push.run(False)
+
+    rows = fake.loads[-1][1]
+    assert all(set(row) == WORK_FIELDS for row in rows)  # both keys on every work: one shape a load
+    assert {row["page_url"]: (row["width"], row["height"]) for row in rows} == {
+        works[0]["page"]: (300, 420),
+        works[1]["page"]: (None, None),  # a work stored before sizes were kept
+        works[2]["page"]: (1, 100_000),
+        works[3]["page"]: (None, None),
+        works[5]["page"]: (None, None),  # one number the database would not take: neither is sent
+        works[6]["page"]: (None, None),
+    }
+    assert all(
+        type(side) is int and side > 0 for row in rows for side in (row["width"], row["height"]) if side is not None
+    )
+
+
+@pytest.mark.parametrize(
+    ("size", "sent"),
+    [
+        ((300, 420), (300, 420)),
+        ([300, 420], (300, 420)),
+        ((100_000, 1), (100_000, 1)),
+        (None, (None, None)),
+        ((0, 420), (None, None)),
+        ((300, 0), (None, None)),
+        ((-300, 420), (None, None)),
+        ((300, 100_001), (None, None)),
+        ((300, None), (None, None)),
+        ((None, 420), (None, None)),
+        ((300.0, 420), (None, None)),
+        (("300", "420"), (None, None)),
+        ((True, 420), (None, None)),
+        ((300,), (None, None)),
+        ((300, 420, 3), (None, None)),
+        ("300x420", (None, None)),
+    ],
+)
+def test_a_size_is_two_whole_numbers_the_database_takes_or_it_is_no_size(size, sent):
+    assert push._size(size) == sent
 
 
 def test_a_work_that_was_not_in_the_artists_latest_answer_is_not_sent(fake):

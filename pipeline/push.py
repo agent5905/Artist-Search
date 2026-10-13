@@ -174,6 +174,15 @@ def _marked(reason: str) -> str:
     return "marked_" + "_".join(re.findall(r"[a-z0-9]+", reason.lower()))
 
 
+def _size(size: object) -> tuple[int | None, int | None]:
+    """A thumbnail's (width, height) as the database takes them: two whole numbers of pixels, each from 1 to
+    100,000 (sql/001_schema.sql). Anything else is no size: two Nones, never one number without the other."""
+    if isinstance(size, list | tuple) and len(size) == 2:
+        if all(type(side) is int and 0 < side <= 100_000 for side in size):
+            return size[0], size[1]
+    return None, None
+
+
 def _too_many(part: int, whole: int) -> bool:
     """True when `part` is ADULT_PERCENT or more of a `whole` that is not nothing."""
     return whole > 0 and 100 * part >= ADULT_PERCENT * whole
@@ -221,10 +230,11 @@ def build(local: pathlib.Path | str | None = None) -> tuple[Rows, Rows, Rows, Co
     pictures on their sheet, whichever says so), and MIN_WORKS of their works may be sent.
 
     A work may be sent when the collect stage has left no mark on it, it was in the artist's latest answer from
-    DeviantArt, and it passes _held. The collect stage deletes nothing any more: a work it finds mature, AI-made,
-    somebody else's or no longer public stays here with a mark, and a work the artist has taken down stays with
-    the time it was last seen, which is before their profile was last stored. Of the works that may be sent,
-    the MAX_WORKS most recently published are.
+    DeviantArt, and it passes _held. The collect stage deletes nothing any more: a work it finds mature,
+    somebody else's, no longer public or titled with contact details stays here with a mark, and a work the
+    artist has taken down stays with the time it was last seen, which is before their profile was last stored.
+    Of the works that may be sent, the MAX_WORKS most recently published are, each with its thumbnail's size
+    when the collect stage has it.
 
     Everything in an artist's row that comes from their works comes from the works that are sent, and a
     neighbour is always an artist who is sent too. An artist who goes and has no neighbour gets one row that
@@ -232,6 +242,7 @@ def build(local: pathlib.Path | str | None = None) -> tuple[Rows, Rows, Rows, Co
     """
     listed = {key: username for key, username, _ in store.all_artists(local)}
     marked_artists, marked_works = library.artist_marks(local), library.work_marks(local)
+    sizes = library.thumb_sizes(local)  # of the thumbnails the works' rows name; a work stored before sizes has none
     written = {row["artist_key"]: row for row in profiles.profiles(local)}
     excluded = profiles.excluded(local)
     # The description is the verified set's own, checked against the image by the verifier.
@@ -244,7 +255,8 @@ def build(local: pathlib.Path | str | None = None) -> tuple[Rows, Rows, Rows, Co
     works: Rows = []
     slugs: dict[str, str] = {}  # artist key -> slug, for every artist who goes
     for key in sorted(listed.keys() & (works_of.keys() | fields.keys())):
-        ready: list[tuple[str, str, str | None, list[str], dict[str, Any]]] = []  # page, thumbnail, title, tags, result
+        # page, thumbnail, title, the artist's tags, verified result, the thumbnail's (width, height)
+        ready: list[tuple[str, str, str | None, list[str], dict[str, Any], tuple[int | None, int | None]]] = []
         ratings: list[str] = []
         tagline, website, stored = fields.get(key, (None, None, ""))
         for work_id, page, title, own_tags, thumb, seen in works_of.get(key, []):
@@ -260,7 +272,8 @@ def build(local: pathlib.Path | str | None = None) -> tuple[Rows, Rows, Rows, Co
             if result is None or reason or address is None or address[0] in {page_url for page_url, *_ in ready}:
                 counts[f"works_held_{reason or 'bad_address'}"] += 1
             else:
-                ready.append((*address, title, [tag for tag in json.loads(own_tags) if isinstance(tag, str)], result))
+                own = [tag for tag in json.loads(own_tags) if isinstance(tag, str)]
+                ready.append((*address, title, own, result, _size(sizes.get(work_id))))
         site_url, site_domain = _own_site(website)
         slug = _slug(listed[key])
         why = None
@@ -289,12 +302,12 @@ def build(local: pathlib.Path | str | None = None) -> tuple[Rows, Rows, Rows, Co
         ready = ready[:MAX_WORKS]  # the most recently published: that is the order they were read in
         slugs[key] = slug
         profile = written[key]
-        used = Counter(tag for _, _, _, own, _ in ready for tag in set(own))
+        used = Counter(tag for _, _, _, own, *_ in ready for tag in set(own))
         most_used = [tag for tag, _ in sorted(used.items(), key=lambda item: (-item[1], item[0]))]
         facts = [value for field in profiles.STATED for value in profile.get(field, [])]  # an older row may lack a kind
         # ponytail: the specialty the artist picked on DeviantArt is not in it: nothing has read that field
         # for a private contact. Add it when the tagging stage does.
-        search_text = " ".join([*facts, *(title for _, _, title, _, _ in ready if title), *most_used])
+        search_text = " ".join([*facts, *(title for _, _, title, *_ in ready if title), *most_used])
         if len(search_text) > MAX_SEARCH_TEXT:
             search_text = search_text[:MAX_SEARCH_TEXT].rsplit(" ", 1)[0]
         artists.append(
@@ -314,7 +327,7 @@ def build(local: pathlib.Path | str | None = None) -> tuple[Rows, Rows, Rows, Co
                 "profile_embedding": profile["embedding"],
             }
         )
-        for position, (page_url, image_url, title, _, result) in enumerate(ready):
+        for position, (page_url, image_url, title, _, result, (width, height)) in enumerate(ready):
             verified = [result["medium"], *result["subjects"], *result["genres"], *result["style_words"]]
             verified += result.get("formats") or []
             works.append(
@@ -327,11 +340,10 @@ def build(local: pathlib.Path | str | None = None) -> tuple[Rows, Rows, Rows, Co
                     "description": result["description"],
                     "tags": [tag for tag in dict.fromkeys(verified) if tag != "unclear"],
                     "position": position,
-                    # ponytail: the library keeps no size for a thumbnail, so there is none to send. Every work
-                    # carries both keys all the same: the database wants one shape a load. Fill them from the
-                    # library when it has them (both or neither, whole numbers of pixels).
-                    "width": None,
-                    "height": None,
+                    # The thumbnail's size, when the collect stage has it. Every work carries both keys either
+                    # way, because the database wants one shape a load: two numbers, or two Nones.
+                    "width": width,
+                    "height": height,
                 }
             )
     # One site is one artist's in the database (a unique index). A domain two of them give is neither's.
