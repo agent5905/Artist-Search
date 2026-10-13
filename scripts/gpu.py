@@ -116,6 +116,12 @@ def status() -> list[str]:
             line += f"; {hour[label]} in the last hour"
             line += f", so about {left / hour[label]:.0f} h left at that pace" if hour[label] and left else ""
         lines.append(line)
+    for told in sorted(config.CACHE_DIR.glob("*.status")):  # where a discovery or a collection run says it is
+        try:
+            when, *said = told.read_text(encoding="utf-8").splitlines() or [""]
+        except OSError:  # the run ended just now, and took its file with it
+            continue
+        lines += [f"{told.stem} is running, or was killed. As of {when}:", *(f"  {line}" for line in said)]
     try:
         asked = ["nvidia-smi", "--query-gpu=memory.used,memory.total,utilization.gpu", "--format=csv,noheader"]
         lines.append("GPU in use: " + subprocess.run(asked, capture_output=True, text=True).stdout.strip())

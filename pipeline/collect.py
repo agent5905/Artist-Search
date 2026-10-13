@@ -35,6 +35,16 @@ No single artist ends a run, and none can stand in the way of the next one: whoe
 is noted as passed over first, and the next run takes them last. A run in which the API or the image host was
 failing exits non-zero.
 
+This is the one stage that reads a profile: discovery stores an artist from the tally of the browse pages and
+reads none. So what a profile's website field says is judged here, on the artist's turn, by the rules discovery
+used to enforce: every host the field names is asked of the removal list and recorded for the shared-domain
+rule (store.record_listing), a link is written into the store's row only when the field is, as written, the
+front page of a domain of their own (_external_links), and the summary says which of five kinds each stored
+profile's field was.
+
+Requests to the API wait their turn in discover.Pace, and downloads from the image host in a Pace of their own:
+either host asking us to slow down slows every later request to it, not only the one that is asked again.
+
 Endpoints (deviantart.readme.io, read 2026-10-12). Each is documented under the security scheme
 "oauth2AuthorizationCodeOrClientCredentials" with scope "browse", so a client_credentials token is accepted:
     GET /api/v1/oauth2/user/profile/{username}   no parameters: "expand" would add age, sex and location
@@ -47,27 +57,32 @@ import argparse
 import pathlib
 import sqlite3
 import sys
-import time
 import traceback
 from typing import Any
 
 import httpx
 
-from pipeline import config, discover, library, store
+from pipeline import config, crawl, discover, library, store
 
 MAX_WORKS = 10  # works kept per artist, each run
 # ponytail: one gallery page, the documented maximum of 24. An artist with fewer than MAX_WORKS qualifying works
 # among their 24 newest gets fewer. Follow next_offset if too many artists come up short.
 GALLERY_LIMIT = 24
-IMAGE_INTERVAL = 0.5  # seconds waited before every image download: two a second at most
-_WAITS = discover.SERVER_WAITS  # 2, 4 and 8 seconds, then no more: one schedule for the API and the image host
-SERVER_RETRIES = len(_WAITS) - 1  # times a 5XX answer, or an image host's 429, is asked for again
+IMAGE_INTERVAL = 0.5  # seconds before an image download while the image host has not asked for more (discover.Pace)
+SERVER_RETRIES = discover.SERVER_RETRIES  # times an image the host refuses or fails to serve is asked for again
 MAX_FAILURES = 5  # artists failing one after another before the run gives up: by then it is the API, not them
 MAX_REFUSALS = 3  # works in a row, whoever's, whose image could not be had, whatever was answered, before the run stops
 NOT_IMAGE_KEYS = frozenset(("videos", "flash", "text_content", "excerpt"))  # what a film or a text carries
 
 PROCESSED = "artists processed"
 PROFILES = "profiles stored"
+# Every profile stored falls under exactly one of these five, by what its website field says. Only the count is
+# kept. An own site is optional (owner decision 7): an artist is stored either way.
+OWN_SITE = "of those, with an own-site link"
+NO_WEBSITE = "of those, no website given"
+ON_PLATFORM = "of those, website on a listed platform"  # DeviantArt itself is one
+OTHER_SHAPE = "of those, website on another domain, not a bare front page"  # a path, subdomain, query or fragment
+NO_HOST = "of those, website names no public host"  # free text, a local name, no registrable domain
 WORKS = "works stored"
 DOWNLOADED = "images downloaded"
 CACHED = "images already cached"
@@ -97,12 +112,15 @@ IMAGE_FAILED = "skipped works (image not served)"
 IMAGE_LIMITED = "skipped works (image host failing or rate limiting)"
 IMAGE_WRONG_TYPE = "skipped works (image not an accepted type)"
 IMAGE_TOO_LARGE = "skipped works (image over the size cap)"
+IMAGE_HOST = "the image host"  # the name its Pace goes by in the summary
 _COUNTS = (
-    *(PROCESSED, PROFILES, WORKS, DOWNLOADED, CACHED, PURGED, ORPHANS, UNDELETED, BAD_KEY),
+    *(PROCESSED, PROFILES, OWN_SITE, NO_WEBSITE, ON_PLATFORM, OTHER_SHAPE, NO_HOST),
+    *(WORKS, DOWNLOADED, CACHED, PURGED, ORPHANS, UNDELETED, BAD_KEY),
     *(NOT_STORED, ROW_REFUSED, FAILED, API_FAILED, BAD_NAME, REMOVED, RENAMED, NO_IMAGE),
     *(UNAVAILABLE, LISTS_REMOVED, ANSWER_REFUSED, MARKED),
     *(MALFORMED, NOT_OWN, NOT_IMAGE, MATURE, NO_METADATA, TITLE),
     *(IMAGE_FAILED, IMAGE_LIMITED, IMAGE_WRONG_TYPE, IMAGE_TOO_LARGE),
+    *(*discover._PACING, *discover.Pace(IMAGE_INTERVAL, IMAGE_HOST).counts()),  # what each host's pace did
 )
 # The counts that say the API or the image host was failing. Any of them makes the run exit non-zero.
 _FAILING = (FAILED, API_FAILED, IMAGE_LIMITED)
@@ -149,9 +167,47 @@ def _why_not(entry: dict[str, Any], username: str) -> tuple[str, bool] | None:
     return None
 
 
-def _get(api: discover._Api, path: str, **params: str | int) -> httpx.Response:
-    """api.get(), with a 5XX answer asked for again up to SERVER_RETRIES times: discover's loop, used by both."""
-    return discover.patient_get(api, path, **params)
+def _website(website: object) -> httpx.URL | None:
+    """The profile's website field as a URL whose host is in its one spelling. None when it names no public host."""
+    if not isinstance(website, str) or len(website) > 300:
+        return None
+    text = website.strip()
+    try:
+        url = httpx.URL(text if "://" in text else f"https://{text}")  # the parser is_own_site itself uses
+        host = store.canonical_host(url.raw_host.decode("ascii"))
+        return url.copy_with(host=host) if host else None
+    except (httpx.InvalidURL, UnicodeError):  # UnicodeError: a lone surrogate, which JSON can carry
+        return None
+
+
+def _external_links(website: object) -> list[str]:
+    """The profile's website field as zero or one link: the front page of the artist's own domain.
+
+    crawl.is_own_site is the rule, and it sees the whole URL: only http(s)://janedoe.art/ or its www. form passes.
+    A link with a path, a query, a fragment, a user subdomain, a port or credentials is dropped whole, never
+    trimmed to the site root, because it cannot be told from a profile on a platform. What is kept is rebuilt
+    as scheme://host/, so nothing else in the field can reach the store.
+    """
+    url = _website(website)
+    if url is None or not crawl.is_own_site(str(url)):
+        return []
+    return [f"{url.scheme}://{url.raw_host.decode('ascii')}/"]
+
+
+def _why_no_link(website: object, hosts: set[str]) -> str:
+    """Which count a stored profile with no own-site link falls under, given the hosts its website field names.
+
+    For the printed summary only. Nothing about the profile or the link is kept: the answer is one of four labels.
+    """
+    if not isinstance(website, str) or not website.strip():
+        return NO_WEBSITE
+    if any(store.registrable_domain(host) for host in hosts):  # a domain that could be their own, in another shape
+        return OTHER_SHAPE
+    for labels in (host.split(".") for host in hosts):  # the two lists the crawl stage refuses: names, then domains
+        on_a_listed_domain = any(".".join(labels[start:]) in crawl.PLATFORM_DOMAINS for start in range(len(labels)))
+        if on_a_listed_domain or not crawl.PLATFORM_NAMES.isdisjoint(labels):
+            return ON_PLATFORM
+    return NO_HOST
 
 
 def _body(response: httpx.Response, what: str, *lists: str) -> dict[str, Any]:
@@ -184,17 +240,20 @@ def _gone(response: httpx.Response) -> bool:
     return isinstance(body, dict) and type(body.get("error_code")) is int and body["error_code"] in (0, 1, 2)
 
 
-def _fetch_once(http: httpx.Client, url: str) -> tuple[str, bytes] | str:
+def _fetch_once(http: httpx.Client, url: str, pace: discover.Pace) -> tuple[str, bytes] | str:
     """One request for an image: (content type, bytes), or the count it falls under when there is none to keep.
 
     Sent without the API token. The type is checked before the body is read, and the body is read only as far
     as the size cap. A redirect is not followed, so the image is not served. A 429, a 5XX or no answer at all
-    is the host refusing or failing: IMAGE_LIMITED, which _fetch_image() backs off from.
+    is the host refusing or failing: IMAGE_LIMITED, and the host's pace is told, so that every later download
+    waits longer. Any other answer lets the pace ease.
     """
     try:
         with http.stream("GET", url) as response:
             if response.status_code == 429 or response.status_code >= 500:
+                pace.slow(response)
                 return IMAGE_LIMITED
+            pace.ease()
             if response.status_code != 200:
                 return IMAGE_FAILED
             content_type = response.headers.get("content-type", "").partition(";")[0].strip().lower()
@@ -206,21 +265,21 @@ def _fetch_once(http: httpx.Client, url: str) -> tuple[str, bytes] | str:
                 if len(data) > library.MAX_IMAGE_BYTES:
                     return IMAGE_TOO_LARGE
     except httpx.HTTPError:
+        pace.slow()
         return IMAGE_LIMITED
     return content_type, bytes(data)
 
 
-def _fetch_image(http: httpx.Client, url: str) -> tuple[str, bytes] | str:
-    """_fetch_once() after the wait that is due, with a 429 asked for again like a 5XX from the API: up to
-    SERVER_RETRIES times, each after twice as long a wait. IMAGE_LIMITED when the host still refuses."""
+def _fetch_image(http: httpx.Client, url: str, api: discover.Pace, images: discover.Pace) -> tuple[str, bytes] | str:
+    """_fetch_once() at the pace of the host the image is on, asked for again up to SERVER_RETRIES times while the
+    host refuses or fails. IMAGE_LIMITED when it still does: that work is left out, and the pace stays slowed."""
     # An image served from the API's own host is one more request to that host, so it waits the API's interval.
-    on_api_host = httpx.URL(url).host == httpx.URL(discover.API_URL).host
-    time.sleep(discover.MIN_INTERVAL if on_api_host else IMAGE_INTERVAL)  # the tests replace time.sleep
-    for wait in _WAITS:
-        fetched = _fetch_once(http, url)
-        if fetched != IMAGE_LIMITED or wait is None:
+    pace = api if httpx.URL(url).host == httpx.URL(discover.API_URL).host else images
+    for left in range(SERVER_RETRIES, -1, -1):
+        pace.wait()
+        fetched = _fetch_once(http, url, pace)
+        if fetched != IMAGE_LIMITED or not left:
             break
-        time.sleep(wait)
     return fetched
 
 
@@ -275,15 +334,17 @@ def _sweep(counts: dict[str, int], db: pathlib.Path | str | None) -> None:
 def _collect_artist(
     api: discover._Api,
     http: httpx.Client,
+    images: discover.Pace,
     username: str,
     counts: dict[str, int],
     db: pathlib.Path | str | None,
     refused: list[int],
 ) -> None:
-    """One artist's turn. `refused` is the run's one count, kept in a list so that it outlives the turn: the
-    works in a row, this artist's and the ones before, whose image the host would not serve, retries and all."""
+    """One artist's turn. `images` is the image host's pace. `refused` is the run's one count, kept in a list so
+    that it outlives the turn: the works in a row, this artist's and the ones before, whose image the host would
+    not serve, retries and all."""
     key = store.artist_key(username)
-    response = _get(api, f"/user/profile/{username}")
+    response = api.get(f"/user/profile/{username}")
     if _gone(response):
         # The API's own word that the account is suspended, inactive or missing. It is written down beside
         # whatever is kept under the handle, and nothing is deleted for it.
@@ -315,15 +376,21 @@ def _collect_artist(
         _remove(key, counts, db, user_id)
         counts[RENAMED] += 1
         return
-    # A profile that names a removed site is one answer's word, and one such answer given for every profile
-    # once purged and barred every artist. So nothing is deleted and nobody is barred for it: the artist is
-    # marked, which holds them back from being published, and the mark goes when they are next stored.
-    if store.record_listing(username, store.hosts_in(profile.get("website")), db):
+    # The removal list is asked about every host the website field names, however it is written, and the same
+    # hosts are recorded as hashes for the shared-domain rule. A profile that names a removed site is one
+    # answer's word, and one such answer given for every profile once purged and barred every artist. So
+    # nothing is deleted and nobody is barred for it: the artist is marked, which holds them back from being
+    # published, and the mark goes when they are next stored.
+    # ponytail: the website field is the only link the profile response documents. Links typed into the bio
+    # are not read, because that means parsing DeviantArt text. Revisit if too few artists have a website.
+    website = profile.get("website")
+    hosts = store.hosts_in(website)
+    if store.record_listing(username, hosts, db):
         library.mark_artist(key, LISTED, db)
         library.note_skip(key, db)
         counts[LISTS_REMOVED] += 1
         return
-    page = _body(_get(api, "/gallery/all", username=username, limit=GALLERY_LIMIT), "gallery lookup", "results")
+    page = _body(api.get("/gallery/all", username=username, limit=GALLERY_LIMIT), "gallery lookup", "results")
     if not isinstance(page.get("has_more"), bool):
         raise _ApiFailed("gallery lookup answered with a body of the wrong shape")
 
@@ -352,7 +419,7 @@ def _collect_artist(
     metadata: dict[str, dict[str, Any]] = {}  # deviation id -> its metadata, which is where the tags are
     if candidates:
         asked = {f"deviationids[{n}]": id_ for n, id_ in enumerate(candidates)}
-        body = _body(_get(api, "/deviation/metadata", **asked), "metadata lookup", "metadata")
+        body = _body(api.get("/deviation/metadata", **asked), "metadata lookup", "metadata")
         for item in body["metadata"]:
             if isinstance(item, dict) and isinstance(item.get("deviationid"), str):
                 # Of two items for one id, the one that is read is the one that does not say "not mature".
@@ -423,7 +490,7 @@ def _collect_artist(
         else:
             if store.is_removed(key, db):  # hard rule 7: asked again before every download
                 break
-            fetched = _fetch_image(http, preview)
+            fetched = _fetch_image(http, preview, api.pace, images)
             if not isinstance(fetched, str):
                 try:
                     library.save_image(work_id, *fetched)
@@ -476,13 +543,17 @@ def _collect_artist(
     counts[PROFILES] += 1
     counts[WORKS] += len(kept) - not_stored
     # The website that is kept now, whichever answer gave it. On a removed site, the mark the store just took
-    # off goes back on. A site of their own is written into the store's row, where a removal of it looks.
+    # off goes back on. A site of their own is written into the store's row, where a removal of it looks, and
+    # only on an answer whose field is the bare front page as written: the library keeps a website with its
+    # query, fragment or port cut off, and a link of that shape is dropped whole, never trimmed to the root.
+    links = _external_links(website)
     site = library.website(key, db)
     if store.record_listing(username, store.hosts_in(site), db):
         library.mark_artist(key, LISTED, db)
         counts[LISTS_REMOVED] += 1
-    else:
+    elif links:
         store.keep_own_site(username, site, db)
+    counts[OWN_SITE if links else _why_no_link(website, hosts)] += 1
 
 
 def _where(exc: Exception) -> str:
@@ -493,7 +564,12 @@ def _where(exc: Exception) -> str:
 
 
 def _run(
-    api: discover._Api, http: httpx.Client, counts: dict[str, int], max_artists: int, db: pathlib.Path | str | None
+    api: discover._Api,
+    http: httpx.Client,
+    images: discover.Pace,
+    counts: dict[str, int],
+    max_artists: int,
+    db: pathlib.Path | str | None,
 ) -> None:
     tried = library.last_attempts(db)
     # Whoever has never had a turn comes first, then whoever had theirs longest ago. A run that was cut short
@@ -513,7 +589,7 @@ def _run(
                 counts[REMOVED] += 1
                 continue
             counts[PROCESSED] += 1
-            _collect_artist(api, http, username, counts, db, refused)
+            _collect_artist(api, http, images, username, counts, db, refused)
             failed_in_a_row = 0
         except discover.Stop:
             # A rate limit, or no token to be had: the next artist would fare no better. The one it stopped at
@@ -544,19 +620,24 @@ def collect(
     counts = dict.fromkeys(_COUNTS, 0)
     status = 0
     try:
-        # The same client settings as discovery: the project user agent on every request, images included, and no
-        # redirect ever followed. discover._Api adds the token, the 1 second between API requests, the backoff
-        # on 429 and the one token refresh on 401.
+        # The same client settings as discovery: the project user agent and Accept-Encoding on every request,
+        # images included, and no redirect ever followed. discover._Api adds the token, its one refresh on 401,
+        # and the pace of the API; the image host has a pace of its own.
         with (
             discover._http_logs_off(),
             httpx.Client(
                 headers={"User-Agent": config.USER_AGENT}, transport=transport, timeout=30, follow_redirects=False
             ) as http,
         ):
+            api, images = discover._Api(http, client_id, client_secret), discover.Pace(IMAGE_INTERVAL, IMAGE_HOST)
+            # Before every request to either host, the run says where it is (see discover.tell).
+            api.pace.tell = images.tell = lambda: discover.tell("collect", counts | api.pace.counts() | images.counts())
             _sweep(counts, db)
             try:
-                _run(discover._Api(http, client_id, client_secret), http, counts, max_artists, db)
+                _run(api, http, images, counts, max_artists, db)
             finally:
+                counts.update(api.pace.counts() | images.counts())
+                discover.tell("collect")
                 _sweep(counts, db)  # however the run ended: a removal that landed during it is honoured before exit
     except discover.Stop as stop:
         print(f"stopped: {stop}", file=sys.stderr)

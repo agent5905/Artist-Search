@@ -3,6 +3,7 @@
 A removal identifier is 'da:<lowercased handle>' for an artist or 'site:<registrable domain>' for a site, and
 the list holds only the sha256 of each. normalize() turns what an operator might type into one, or raises.
 The removal list of record lives in the remote database; this file is a cache, and import_removed() refills it.
+Once discovery has run, it also holds how far its browsing has got (browsing_pass): tags, offsets and hashes.
 Every function takes an optional `db` path; the default is config.LOCAL_DB.
 """
 
@@ -41,6 +42,24 @@ CREATE TABLE IF NOT EXISTS listed (
     artist_hash TEXT NOT NULL,       -- sha256 hex of 'da:<lowercased username>'
     PRIMARY KEY (domain_hash, artist_hash)
 );
+"""
+# Discovery's own two tables, which only its functions make, on first use (see _open_pass): no other stage's run
+# adds a table to the file, and nothing here changes a table that exists.
+_PASS = """
+-- Where discovery's browsing pass has got to, so that a run that is stopped carries on from there.
+CREATE TABLE IF NOT EXISTS browsed (
+    tag TEXT PRIMARY KEY,            -- one of discovery's own niche tags
+    next_offset INTEGER,             -- where the tag's next page is; NULL when the API says there is no more
+    pages INTEGER NOT NULL,          -- pages of the tag read in this pass
+    began_at TEXT NOT NULL           -- ISO-8601 UTC, set once: a pass is as old as its first page
+);
+-- The pass's tally: one row for each work seen, so that a work under two tags counts once. Hashes only: no
+-- title, no id, no handle. A handle is written down when its author has works enough, and then in `artists`.
+CREATE TABLE IF NOT EXISTS counted (
+    work_hash TEXT PRIMARY KEY,      -- sha256 hex of 'work:<deviation id>'
+    author_hash TEXT                 -- sha256 hex of 'da:<lowercased username>'; NULL for a work counted for nobody
+);
+CREATE INDEX IF NOT EXISTS counted_by_author ON counted (author_hash);
 """
 
 HANDLE = re.compile(r"[A-Za-z0-9_-]{1,40}")  # a DeviantArt handle. Also what makes one safe to put in a URL path.
@@ -237,6 +256,15 @@ def _open(db: pathlib.Path | str | None) -> Iterator[sqlite3.Connection]:
         conn.close()
 
 
+@contextlib.contextmanager
+def _open_pass(db: pathlib.Path | str | None) -> Iterator[sqlite3.Connection]:
+    """_open(), with discovery's two tables made when there are none. Only the functions that read or write a
+    browsing pass come in this way, so it is a discovery run that adds them to a store, and no other stage's."""
+    with _open(db) as conn:
+        conn.executescript(_PASS)
+        yield conn
+
+
 def _removed(conn: sqlite3.Connection, keys: Iterable[str]) -> bool:
     """True when any of these normalized keys is on the removal list."""
     query = "SELECT 1 FROM removed WHERE key_hash = ?"
@@ -335,25 +363,29 @@ def record_listing(username: str, hosts: Iterable[str], db: pathlib.Path | str |
 
 
 def upsert_artist(
-    username: str, profile_url: str, links: list[str], niche_hits: int, db: pathlib.Path | str | None = None
+    username: str, profile_url: str, links: list[str] | None, niche_hits: int, db: pathlib.Path | str | None = None
 ) -> bool:
     """Insert one artist, or refresh the row already there. Safe to repeat.
+
+    `links` given as None is discovery's "not known here": it reads no profile. A new row then has no link, and a
+    row that is there keeps the one the collect stage wrote into it (see keep_own_site).
 
     Returns False and changes nothing when the artist is on the removal list, or a link is on a removed site:
     a row they have stays as it was, and nobody is barred for it. ValueError for a username that is not a plain
     handle, or a link that has no public hostname.
     """
     key = artist_key(username)
-    if None in map(_host, links):
+    if None in map(_host, links or []):
         raise ValueError("a link has no public hostname")
     with _open(db) as conn:
-        if _removed(conn, [key, *_link_keys(links)]):
+        if _removed(conn, [key, *_link_keys(links or [])]):
             return False
         conn.execute(
             "INSERT INTO artists VALUES (?, ?, ?, ?, ?, ?) "
             "ON CONFLICT(key) DO UPDATE SET da_username = excluded.da_username, "
-            "da_profile_url = excluded.da_profile_url, links = excluded.links, niche_hits = excluded.niche_hits",
-            (key, username, profile_url, json.dumps(links), niche_hits, _now()),
+            "da_profile_url = excluded.da_profile_url, niche_hits = excluded.niche_hits"
+            + ("" if links is None else ", links = excluded.links"),
+            (key, username, profile_url, json.dumps(links or []), niche_hits, _now()),
         )
     return True
 
@@ -361,7 +393,7 @@ def upsert_artist(
 def keep_own_site(username: str, website: str | None, db: pathlib.Path | str | None = None) -> bool:
     """Write the front page of an artist's own site into their row, as their one link. True when a row changed.
 
-    For the collect stage, which reads a profile after discovery did and may keep a site discovery never saw.
+    For the collect stage, the one stage that reads a profile: discovery stores an artist with no link.
     One place then says whose site is whose, and a removal of the site finds the artist (see _remove). Nothing
     is changed unless the website is an own site (crawl.is_own_site is the rule), the artist has a row, and
     neither they nor the site are on the removal list.
@@ -375,15 +407,65 @@ def keep_own_site(username: str, website: str | None, db: pathlib.Path | str | N
         return conn.execute("UPDATE artists SET links = ? WHERE key = ?", (json.dumps([website]), key)).rowcount == 1
 
 
-def stored_since(since: datetime, db: pathlib.Path | str | None = None) -> set[str]:
-    """The keys of the artists whose row was first stored at this time or later.
+def browsing_pass(since: datetime, db: pathlib.Path | str | None = None) -> dict[str, tuple[int | None, int]]:
+    """Where discovery's saved browsing pass has got to: tag -> (the offset of the tag's next page, or None when
+    the API said it has no more; the pages of it that are read).
 
-    ponytail: discovered_at is set once, so an artist stored on an earlier day never counts, however lately
-    their row was refreshed. Keep the time of the last refresh too if that is what makes a rerun slow.
+    A pass that began at or before `since` is forgotten first, tally and all, and the answer is empty: the run
+    starts browsing afresh. Nothing else forgets a pass.
     """
     at = since.astimezone(UTC).isoformat(timespec="seconds")
-    with _open(db) as conn:
-        return {key for (key,) in conn.execute("SELECT key FROM artists WHERE discovered_at >= ?", (at,))}
+    with _open_pass(db) as conn:
+        if conn.execute("SELECT 1 FROM browsed WHERE began_at <= ?", (at,)).fetchone():
+            conn.execute("DELETE FROM browsed")
+            conn.execute("DELETE FROM counted")
+        rows = conn.execute("SELECT tag, next_offset, pages FROM browsed").fetchall()
+    return {tag: (next_offset, pages) for tag, next_offset, pages in rows}
+
+
+def count_works(works: Iterable[tuple[str, str | None]], db: pathlib.Path | str | None = None) -> dict[str, int]:
+    """Add one browse page to the pass's tally: each work as (deviation id, its author's handle), with None for
+    the handle of a work that is to count for nobody. A work that is in the tally already is not counted again.
+
+    Hashes are all that is written, of the id and of the handle. Returns how many works each of these authors has
+    in the tally now, by the handle as it was given. ValueError for a handle that is not a plain one.
+    """
+    works = list(works)
+    authors = {username: _hash(artist_key(username)) for _, username in works if username is not None}
+    with _open_pass(db) as conn:
+        conn.executemany(
+            "INSERT OR IGNORE INTO counted VALUES (?, ?)",
+            [(_hash(f"work:{work_id}"), username and authors[username]) for work_id, username in works],
+        )
+        count = "SELECT count(*) FROM counted WHERE author_hash = ?"
+        return {username: conn.execute(count, (author,)).fetchone()[0] for username, author in authors.items()}
+
+
+def note_browsed(tag: str, next_offset: int | None, db: pathlib.Path | str | None = None) -> None:
+    """Note that one more page of a tag is read, and where the tag's next page is: None when it has no more."""
+    with _open_pass(db) as conn:
+        conn.execute(
+            "INSERT INTO browsed VALUES (?, ?, 1, ?) "
+            "ON CONFLICT(tag) DO UPDATE SET next_offset = excluded.next_offset, pages = pages + 1",
+            (tag, next_offset, _now()),
+        )
+
+
+def tally(at_least: int, db: pathlib.Path | str | None = None) -> tuple[int, int, int, int, int, int, int, int]:
+    """The saved browsing pass in eight numbers, in the order discovery prints them: pages read, works counted,
+    mature works passed over, authors seen, and of the authors with `at_least` works: how many there are, how
+    many are on the removal list, how many are not stored yet, and how many are stored."""
+    with _open_pass(db) as conn:
+        pages, works, mature, authors = conn.execute(
+            "SELECT (SELECT coalesce(sum(pages), 0) FROM browsed), count(author_hash), "
+            "count(*) - count(author_hash), count(DISTINCT author_hash) FROM counted"
+        ).fetchone()
+        enough = "SELECT author_hash FROM counted WHERE author_hash IS NOT NULL GROUP BY 1 HAVING count(*) >= ?"
+        candidates = {author for (author,) in conn.execute(enough, (at_least,))}
+        removed = candidates & {key_hash for (key_hash,) in conn.execute("SELECT key_hash FROM removed")}
+        stored = (candidates - removed) & {_hash(key) for (key,) in conn.execute("SELECT key FROM artists")}
+    waiting = len(candidates) - len(removed) - len(stored)
+    return pages, works, mature, authors, len(candidates), len(removed), waiting, len(stored)
 
 
 def all_artists(db: pathlib.Path | str | None = None) -> list[tuple[str, str, str]]:
@@ -408,8 +490,8 @@ def own_site_candidates(db: pathlib.Path | str | None = None) -> list[tuple[str,
     that any other artist's profile was seen to list, in a link of any shape, is a platform whatever any list
     says, so nobody who lists it qualifies. Nobody on the removal list qualifies either.
 
-    ponytail: a profile is only seen when discovery reads it. A run cut short by --max-artists has not read
-    every candidate's profile, so it can miss a second listing; the next full run finds it.
+    ponytail: a profile is only seen when the collect stage reads it. An artist who has not had their turn yet
+    has listed nothing, so a second listing can be missed until every stored artist has had one.
     """
     found = []
     with _open(db) as conn:

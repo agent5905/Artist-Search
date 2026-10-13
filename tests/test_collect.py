@@ -12,18 +12,19 @@ import inspect
 import itertools
 import json
 import logging
+import random
 import re
 import sqlite3
 import threading
 import time
 from contextlib import closing
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from unittest import mock
 
 import httpx
 import pytest
 
-from pipeline import collect, config, discover, library, store
+from pipeline import collect, config, crawl, discover, library, store
 
 CLIENT_ID = "FAKE-CLIENT-ID-0002"
 CLIENT_SECRET = "FAKE-CLIENT-SECRET-0002"
@@ -52,9 +53,14 @@ PRIVATE = (
 PRIVATE += ("FAKE-USERID", "FAKE-ICON", "FAKE-COVER", "FAKE-STATUS", "FAKE-DESCRIPTION", "FAKE-LICENSE", "FAKE-EXCERPT")
 PRIVATE += ("987654321", "555000111", "777000333", "444000")  # age, two country ids, the profile's statistics
 
-EXPECTED_STDOUT = """\
+EXPECTED_COUNTS = """\
 artists processed: 5
 profiles stored: 3
+of those, with an own-site link: 1
+of those, no website given: 0
+of those, website on a listed platform: 2
+of those, website on another domain, not a bare front page: 0
+of those, website names no public host: 0
 works stored: 13
 images downloaded: 13
 images already cached: 0
@@ -85,7 +91,26 @@ skipped works (image host failing or rate limiting): 0
 skipped works (image not an accepted type): 0
 skipped works (image over the size cap): 0
 """
+# After the counts, what each host's pace did: in a run that met no trouble, a request every 2 seconds to the API
+# and an image every half second. The seconds are whole ones, rounded up.
+EXPECTED_STDOUT = (
+    EXPECTED_COUNTS
+    + """\
+requests to the API: 11
+rate limit answers from the API: 0
+longest interval between requests to the API, in seconds: 2
+interval between requests to the API now, in seconds: 2
+seconds spent waiting between requests to the API: 20
+requests to the image host: 13
+rate limit answers from the image host: 0
+longest interval between requests to the image host, in seconds: 1
+interval between requests to the image host now, in seconds: 1
+seconds spent waiting between requests to the image host: 6
+"""
+)
 BASE_REQUESTS = 24  # 1 token, 10 to the API (3 + 3 + 1 + 1 + 2 for the five artists), 13 images
+KEPT = "Everything stored is kept: run again later"
+LIMITED = f"stopped: rate limited: the API answered HTTP 429 12 times in a row, 5 minutes apart. {KEPT}\n"
 ALPHA_KEPT = [12, 11, 10, 9, 8, 7, 6, 5, 4, 3]  # the ten newest of twelve
 BRAVO_KEPT = [23, 22, 21]
 PNG_START = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR"
@@ -234,6 +259,7 @@ class World:
     def __init__(self):
         self.now = 0.0
         self.waits = []
+        self.slept = None  # the last wait, until the request it was for arrives
         self.log = []  # (fake time, request), in order
         self.threads = set()
         self.profiles = {}  # lowercased handle -> a profile body, an HTTP status, or a response
@@ -248,6 +274,13 @@ class World:
     def sleep(self, seconds):
         self.waits.append(seconds)
         self.now += seconds
+        self.slept = seconds
+
+    def waited(self, where):
+        """The seconds slept right before each request to the API ("api") or anywhere else ("images"), in order.
+        None for a request that nothing was waited for. The two hosts share one clock, so the gap between two
+        requests to one of them has the other's waits in it: this is the wait itself."""
+        return [request.extensions["waited"] for request in self.requests(where)]
 
     def artist(self, username, links=(), **changes):
         """An artist discovery has stored, with a profile and an empty gallery on the fake API."""
@@ -263,6 +296,7 @@ class World:
 
     def handle(self, request):
         self.log.append((self.now, request))
+        request.extensions["waited"], self.slept = self.slept, None
         self.threads.add(threading.get_ident())
         for detour in self.detours:
             response = detour(request)
@@ -1537,8 +1571,23 @@ def test_a_removal_that_lands_before_the_first_image_means_no_image_is_fetched(p
     assert library.account_removed(f"FAKE-USERID-{ALPHA}")
 
 
-def test_an_artist_whose_first_answer_names_a_removed_site_is_marked_and_not_collected_and_nobody_is_barred(capsys):
-    world = solo(website="https://zz-fake-gone.art/")
+@pytest.mark.parametrize(
+    "website",
+    [
+        "https://zz-fake-gone.art/",
+        "https://www.zz-fake-gone.art/folio?page=2",  # the own-site rule drops each of these shapes,
+        "https://shop.zz-fake-gone.art",  # so the removal list is asked before it
+        "https://zz-fake-gone.art/#/zz-fake-alpha",
+        "http://zz-fake-gone.art:8080/",
+    ],
+)
+def test_an_artist_whose_first_answer_names_a_removed_site_is_marked_and_not_collected_and_nobody_is_barred(
+    website, capsys
+):
+    """Discovery stores a candidate without reading their profile, so this is where a profile that names a removed
+    site is first met. In a link of any shape: the artist is marked, nothing of theirs is collected, and the
+    site is written into nobody's row."""
+    world = solo(website=website)
     assert store.mark_removed("zz-fake-gone.art") == 0
     counts = counts_of(world, capsys)
     assert counts[collect.LISTS_REMOVED] == 1 and counts[collect.REMOVED] == counts[collect.PROFILES] == 0
@@ -1546,6 +1595,7 @@ def test_an_artist_whose_first_answer_names_a_removed_site_is_marked_and_not_col
     assert world.requests("images") == [] and [artist[0] for artist in store.all_artists()] == [key(ALPHA)]
     assert not store.is_removed(ALPHA) and not library.account_removed(f"FAKE-USERID-{ALPHA}")
     assert key(ALPHA) in library.last_attempts()  # passed over: the next run takes them last
+    assert links() == [None] and b"zz-fake-gone" not in config.LOCAL_DB.read_bytes()
 
 
 def test_a_removal_that_lands_after_the_artist_was_stored_is_honoured_before_the_run_ends(capsys, tmp_path):
@@ -1564,7 +1614,7 @@ def test_a_run_that_is_stopped_still_purges_before_it_exits(capsys):
     world.detours.append(rate_limited(PROFILE_PATH + DELTA, 99))
     assert run(world) == 1
     captured = capsys.readouterr()
-    assert captured.err == f"stopped: rate limited: {discover.MAX_429} HTTP 429 responses in a row\n"
+    assert captured.err == LIMITED
     assert summary(captured.out)[collect.PURGED] == 1
     assert library.artist_keys() == [key(BRAVO)] and cached() == image_files(BRAVO_KEPT)
 
@@ -1604,7 +1654,8 @@ def test_the_purge_comes_before_any_request_and_survives_a_run_that_fails(capsys
     world.detours.append(all_fail)
     seen = len(world.log)
     assert run(world) == 1
-    assert len(world.since(seen)) == 1 and purged_at_first_request == [True]  # the token request, which failed
+    # The token request, which failed, asked for again three times like any other.
+    assert len(world.since(seen)) == 1 + collect.SERVER_RETRIES and purged_at_first_request == [True] * 4
     assert rows("profiles", BRAVO) == rows("works", BRAVO) == []
     assert cached() == image_files(ALPHA_KEPT)
 
@@ -2187,33 +2238,43 @@ def test_an_error_outside_any_artists_turn_stops_the_run_and_is_named_by_type_an
 # --- 6. politeness ---
 
 
-def test_api_requests_are_a_second_apart_and_image_downloads_at_most_two_a_second():
+def test_api_requests_are_two_seconds_apart_and_image_downloads_at_most_two_a_second():
     world = base()
     assert run(world) == 0
-    assert len(world.gaps("api")) == 10 and min(world.gaps("api")) >= 1.0
+    assert len(world.gaps("api")) == 10 and min(world.gaps("api")) >= 2.0
     assert len(world.gaps("images")) == 12 and min(world.gaps("images")) >= 0.5
     times = [at for at, _ in world.log]
-    assert times == sorted(times) and len(set(times)) == len(times)  # one at a time, each after a wait of its own
+    # One at a time, each after a wait of its own: all but the first request to the image host, which had none.
+    assert times == sorted(times) and len(set(times)) == len(times) - 1
+    assert world.waited("api") == [None] + [2.0] * 10 and world.waited("images") == [None] + [0.5] * 12
     assert world.threads == {threading.get_ident()}  # sequential: no worker threads
 
 
 def test_the_production_path_waits_before_every_request_but_the_first(monkeypatch):
-    """Nothing injected: only time.sleep is replaced. One wait a request, 1 second for the API, half for an image."""
+    """Nothing injected: only time.sleep is replaced. One wait a request, 2 seconds for the API and half a second
+    for an image, and none before the first request to either host."""
     waits = []
     monkeypatch.setattr(time, "sleep", waits.append)
     world = base()
     assert collect.collect(CLIENT_ID, CLIENT_SECRET, max_artists=200, transport=world.transport) == 0
-    assert len(world.log) == BASE_REQUESTS and len(waits) == BASE_REQUESTS - 1
-    expected = [1.0 if request.url.host == API_HOST else 0.5 for request in world.requests()[1:]]
-    assert waits == expected and waits.count(0.5) == 13
-    assert collect.IMAGE_INTERVAL == 0.5 and discover.MIN_INTERVAL == 1.0
+    assert len(world.log) == BASE_REQUESTS and len(waits) == BASE_REQUESTS - 2
+    first_image = world.requests("images")[0]
+    expected = [
+        2.0 if request.url.host == API_HOST else 0.5 for request in world.requests()[1:] if request is not first_image
+    ]
+    assert waits == expected and waits.count(0.5) == 12
+    assert collect.IMAGE_INTERVAL == 0.5 and discover.BASE_INTERVAL == 2.0
     assert "sleep" not in inspect.signature(collect.collect).parameters
 
 
 def test_every_request_carries_the_project_user_agent_and_the_token_goes_to_the_api_alone():
     world = base()
-    assert run(world) == 0
+    world.detours.append(rate_limited(GALLERY_PATH, 1))  # a request that is asked for again is a request too
+    world.detours.append(rate_limited(preview_path(12), 1))
+    assert run(world) == 0 and len(world.log) == BASE_REQUESTS + 2
     assert {request.headers["user-agent"] for request in world.requests()} == {config.USER_AGENT}
+    # The API docs ask for both of every client: a user agent, and compression accepted.
+    assert all("gzip" in request.headers["accept-encoding"] for request in world.requests())
     assert config.CONTACT_URL in config.USER_AGENT
     for request in world.requests("images"):
         assert "authorization" not in request.headers and "cookie" not in request.headers
@@ -2234,15 +2295,24 @@ def rate_limited(path, times):
 
 
 @pytest.mark.parametrize("path", [TOKEN_PATH, PROFILE_PATH + ALPHA, GALLERY_PATH, METADATA_PATH])
-def test_a_429_from_the_api_is_waited_out_with_a_doubling_wait(path, capsys):
+def test_a_429_from_the_api_slows_every_request_that_follows_and_not_only_the_one_asked_again(path, capsys):
+    """The flaw this replaces: a 429 was waited out for that one request, and the next request went back to one a
+    second. The pace is the run's now (discover.Pace): doubled by each 429, and down a tenth with each answer."""
     world = base()
     world.detours.append(rate_limited(path, 3))
     assert run(world) == 0
-    assert capsys.readouterr().out == EXPECTED_STDOUT
-    assert len(world.log) == BASE_REQUESTS + 3
-    at = next(index for index, (_, request) in enumerate(world.log) if request.url.path == path)
-    assert world.waits[at : at + 3] == [2.0, 4.0, 8.0]  # the waits before the three retries
-    assert min(world.gaps("api")) >= 1.0
+    out = capsys.readouterr().out
+    assert out.startswith(EXPECTED_COUNTS) and len(world.log) == BASE_REQUESTS + 3  # collected as ever
+    counts = summary(out)
+    at = next(index for index, request in enumerate(world.requests("api")) if request.url.path == path)
+    waited = world.waited("api")[1:]  # before every request to the API but the first
+    assert waited[:at] == [2.0] * at and waited[at : at + 3] == [4.0, 8.0, 16.0]  # before the three askings again
+    eased = [16.0 * 0.9**n for n in range(1, 11 - at)]  # 14.4, 12.96 and so on: every request that is left
+    assert waited[at + 3 :] == pytest.approx(eased) and min(eased) > discover.BASE_INTERVAL
+    assert world.waited("images") == [None] + [0.5] * 12  # the image host, which said nothing, is asked as before
+    assert counts["rate limit answers from the API"] == 3 and counts["rate limit answers from the image host"] == 0
+    assert counts["longest interval between requests to the API, in seconds"] == 16
+    assert counts["requests to the API"] == 14 and counts["requests to the image host"] == 13
 
 
 def test_repeated_429s_stop_the_run_cleanly_with_what_was_finished_kept(capsys):
@@ -2250,15 +2320,17 @@ def test_repeated_429s_stop_the_run_cleanly_with_what_was_finished_kept(capsys):
     world.detours.append(rate_limited(PROFILE_PATH + BRAVO, 99))
     assert run(world) == 1
     captured = capsys.readouterr()
-    assert captured.err == f"stopped: rate limited: {discover.MAX_429} HTTP 429 responses in a row\n"
+    assert captured.err == LIMITED
     counts = summary(captured.out)
     assert counts[collect.PROCESSED] == 2 and counts[collect.PROFILES] == 1 and counts[collect.WORKS] == 10
     assert kept(ALPHA) == ALPHA_KEPT and cached() == image_files(ALPHA_KEPT)
-    assert (
-        len([request for request in world.requests() if request.url.path == PROFILE_PATH + BRAVO]) == discover.MAX_429
-    )
+    assert len([request for request in world.requests() if request.url.path == PROFILE_PATH + BRAVO]) == 20
     assert world.asked_about(DELTA) == world.asked_about(FOXTROT) == []
-    assert world.waits[-5:] == [2.0, 4.0, 8.0, 16.0, 32.0]
+    # Eight minutes of doubling, and then an hour at the ceiling: twelve more, five minutes apart.
+    assert world.waits[-19:] == [4.0, 8.0, 16.0, 32.0, 64.0, 128.0, 256.0] + [300.0] * 12
+    assert counts["rate limit answers from the API"] == 20
+    assert counts["longest interval between requests to the API, in seconds"] == 300
+    assert key(BRAVO) in library.last_attempts()  # noted as passed over: the next run does not begin with them
 
 
 def limited(*numbers):
@@ -2274,8 +2346,8 @@ def limited(*numbers):
 def test_an_image_the_host_refuses_for_the_rate_limit_is_asked_for_again_and_then_that_work_alone_is_left_out(capsys):
     """The critic's finding: one work's image always answered 429, and four runs in a row stopped at the same first
     artist with nobody behind them asked, the images before it downloaded again each time. Now it is asked for
-    again after 2, 4 and 8 seconds, then that work is left out, and everybody gets their turn. The run says so
-    with its exit code: the image host was failing."""
+    again three times, each after twice as long a wait, then that work is left out, and everybody gets their
+    turn. The run says so with its exit code: the image host was failing."""
     world = trio()
     world.detours.append(limited(3))
     for nth in range(4):
@@ -2288,8 +2360,9 @@ def test_an_image_the_host_refuses_for_the_rate_limit_is_asked_for_again_and_the
         others = [preview_path(n) for n in (4, 2, 1, 21, 41)] if nth == 0 else []  # downloaded once, and never again
         assert sorted(asked) == sorted([preview_path(3)] * (1 + collect.SERVER_RETRIES) + others)
         times = [at for at, request in world.log[seen:] if request.url.path == preview_path(3)]
-        assert [later - earlier for earlier, later in itertools.pairwise(times)] == [2.0, 4.0, 8.0]
+        assert [later - earlier for earlier, later in itertools.pairwise(times)] == pytest.approx([1.0, 2.0, 4.0])
         assert counts[collect.IMAGE_LIMITED] == 1 and counts[collect.PROFILES] == 3 and counts[collect.ORPHANS] == 0
+        assert counts["rate limit answers from the image host"] == 4
         assert kept(ALPHA) == [4, 2, 1] and kept(BRAVO) == [21] and cached() == image_files([1, 2, 4, 21, 41])
     world.detours.clear()
     assert counts_of(world, capsys)[collect.DOWNLOADED] == 1 and kept(ALPHA) == [4, 3, 2, 1]
@@ -2402,7 +2475,7 @@ def test_refusals_count_across_artists_only_while_nothing_is_served_between_them
 
 
 def test_an_image_served_from_the_apis_own_host_waits_the_apis_interval():
-    """It is one more request to that host, and requests to that host are a second apart."""
+    """It is one more request to that host, and requests to that host wait the pace of the API."""
     world = solo(3)
     for entry in world.galleries[ALPHA]:
         entry["preview"]["src"] = entry["preview"]["src"].replace(CDN, f"https://{API_HOST}")
@@ -2415,7 +2488,7 @@ def test_an_image_served_from_the_apis_own_host_waits_the_apis_interval():
     assert run(world) == 0
     images = [request for request in world.requests("api") if request.url.path in world.images]
     assert kept(ALPHA) == [3, 2, 1] and len(images) == 3 and world.requests("images") == []
-    assert min(world.gaps("api")) >= discover.MIN_INTERVAL == 1.0
+    assert set(world.gaps("api")) == {discover.BASE_INTERVAL} and len(world.gaps("api")) == 3 + 3
     assert not any("authorization" in request.headers for request in images)  # and the token does not go with it
 
 
@@ -2529,14 +2602,18 @@ def test_a_failed_image_download_skips_that_work_and_the_run_carries_on(failure,
     assert len([request for request in world.requests("images") if request.url.path == preview_path(9)]) == (
         1 if not_served else 1 + collect.SERVER_RETRIES
     )  # asked for again only when it is the host that fails
+    # And only then are the downloads after it slowed: a host that answers, whatever it answers, has not asked.
+    longest = counts["longest interval between requests to the image host, in seconds"]
+    assert longest == 1 if not_served else longest > 5
     assert {request.url.host for request in world.requests()} == {API_HOST, CDN_HOST}  # the redirect was not followed
     assert min(world.gaps("images")) >= 0.5
 
 
 def test_an_image_host_that_answers_5xx_is_backed_off_from_and_then_the_run_stops(capsys):
     """The critic's finding: a host answering 5XX was neither backed off from nor stopped at: 48 of 48 requests,
-    two a second. It is treated like a 429 now: asked again after 2, 4 and 8 seconds, and three works in a row end
-    the run, with the artist noted as passed over."""
+    two a second. It is treated like a 429 now: asked again three times, every request after twice as long a
+    wait as the one before, the next work's too, and three works in a row end the run, with the artist noted as
+    passed over."""
     world = solo(6)
     world.detours.append(lambda request: httpx.Response(503) if request.url.host == CDN_HOST else None)
     assert run(world) == 1
@@ -2546,7 +2623,9 @@ def test_an_image_host_that_answers_5xx_is_backed_off_from_and_then_the_run_stop
     )
     counts = summary(captured.out)
     assert counts[collect.IMAGE_LIMITED] == 3 and len(world.requests("images")) == 3 * (1 + collect.SERVER_RETRIES)
-    assert [wait for wait in world.waits if wait > 1.0] == [2.0, 4.0, 8.0] * 3
+    assert world.gaps("images") == [1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0, 256.0, 300.0, 300.0]
+    assert counts["rate limit answers from the image host"] == 0  # a 5XX is not a 429, and is backed off from alike
+    assert counts["longest interval between requests to the image host, in seconds"] == 300
     assert rows("works") == [] and list(library.last_attempts()) == [key(ALPHA)]
 
 
@@ -2569,15 +2648,23 @@ def failing(world, path, status, username, times=99):
 @pytest.mark.parametrize("status", [500, 502, 503])
 @pytest.mark.parametrize("path", [PROFILE_PATH, GALLERY_PATH, METADATA_PATH])
 def test_a_5xx_answer_is_asked_for_again_after_a_doubling_wait(path, status, capsys):
-    """The API docs say a 500 is worth retrying, up to three times. Here the fourth answer is a good one."""
+    """The API docs say a 500 is worth retrying, up to three times, and call a 503 "try again later". Here the
+    fourth answer is a good one. Each 5XX slows the pace of the run as a 429 does."""
     world = base()
     failing(world, path, status, BRAVO, times=3)
     assert run(world) == 0
-    assert capsys.readouterr() == (EXPECTED_STDOUT, "")
+    captured = capsys.readouterr()
+    assert captured.out.startswith(EXPECTED_COUNTS) and captured.err == ""
     asked = [at for at, request in world.log if request.url.path.startswith(path) and world.concerns(request, BRAVO)]
     waits = [later - earlier for earlier, later in itertools.pairwise(asked)]
-    assert waits == [3.0, 5.0, 9.0]  # 2, 4 and 8 seconds, on top of the second before every API request
-    assert len(world.log) == BASE_REQUESTS + 3 and min(world.gaps("api")) >= 1.0
+    assert waits == [4.0, 8.0, 16.0]  # the base doubled, and doubled again
+    assert len(world.log) == BASE_REQUESTS + 3 and min(world.gaps("api")) >= 2.0
+    mine = [world.concerns(request, BRAVO) and request.url.path.startswith(path) for request in world.requests("api")]
+    following = world.waited("api")[len(mine) - mine[::-1].index(True)]  # before the next request, another one
+    assert following == pytest.approx(14.4)
+    counts = summary(captured.out)
+    assert counts["rate limit answers from the API"] == 0
+    assert counts["longest interval between requests to the API, in seconds"] == 16
     assert collect.SERVER_RETRIES == 3
 
 
@@ -3178,7 +3265,7 @@ def test_stdout_is_counts_and_nothing_else(capsys):
     world = base()
     assert run(world) == 0
     out = capsys.readouterr().out
-    assert summary(out) and len(out.splitlines()) == len(collect._COUNTS) == 31
+    assert summary(out) and len(out.splitlines()) == len(collect._COUNTS) == 46
     assert not re.search(r"FAKE|zz-fake|https?:|deviantart|wixmp|[0-9A-F]{8}-", out, re.IGNORECASE)
     for word in ("artists processed", "profiles stored", "works stored", "images downloaded", "skipped"):
         assert word in out
@@ -3310,3 +3397,511 @@ def test_a_store_made_before_readings_carried_fingerprints_stops_the_run_before_
         run(world)
     assert "uv run python -m pipeline.tagging --migrate --backup" in str(stopped.value)
     assert config.LOCAL_DB.read_bytes() == before and world.since(seen) == [] and cached() == image_files([1, 2])
+
+
+# --- 9. what a profile's website field is taken for ---
+#
+# Discovery read every candidate's profile for this one field, and enforced these rules itself. It reads no
+# profile now and stores a candidate straight from its tally, so they are enforced here, where the profile is
+# read: the removal list is asked about every host the field names, every such host is recorded for the
+# shared-domain rule, and a link reaches the store's row only when the field is, as written, the front page of a
+# domain of the artist's own. The made-up domains sit under real suffixes (.art, .com, .co.uk) because the
+# own-site rule reads the Public Suffix List and turns .example and .test away. Nothing ever fetches them.
+
+
+def crowd(websites):
+    """A world of one artist per website, each with a profile and no works, and their handles in key order."""
+    world = World()
+    names = [f"zz-fake-n{i:02d}" for i in range(len(websites))]
+    for name, website in zip(names, websites, strict=True):
+        world.artist(name, website=website)
+    return world, names
+
+
+def links():
+    """The link in each stored artist's row, in key order: None for a row that has none."""
+    return [(json.loads(found) or [None])[0] for (found,) in raw("SELECT links FROM artists ORDER BY key")]
+
+
+# Every way of writing a host that is DeviantArt's, or an image host, a social network or a hosted platform.
+NOT_THEIR_OWN_SITE = [
+    "https://www.deviantart.com/zz-fake/gallery",
+    "https://DeviantArt.com/zz-fake",
+    "zz-fake.deviantart.com",
+    "https://www.deviantart.com./zz-fake/art/FAKE-TITLE-99",  # a trailing dot
+    "https://www.deviantart.com../zz-fake/art/FAKE-TITLE-99",
+    "https://www.deviantart。com/zz-fake/art/FAKE-TITLE-98",  # an ideographic full stop
+    "https://www.deviantart.com．/zz-fake/art/FAKE-TITLE-98",  # a fullwidth one, trailing
+    "https://www.deviantart%2Ecom/zz-fake/art/FAKE-TITLE-97",  # a percent-encoded dot
+    "https://www.deviantart.com\\.zz-fake-site.art/",  # a backslash, which browsers read as a slash
+    "https://www.Ｄeviantart.com/zz-fake",  # a fullwidth letter
+    "https://www.deviantart.com:443/zz-fake",
+    "https://images-wixmp-fake.wixmp.com/f/FAKE-IMAGE.jpg",
+    "https://images-wixmp-fake.wixmp.com./f/FAKE-IMAGE-1.jpg",
+    "https://a.deviantart.net/avatars/FAKE.gif",
+    "fav.me/dfake",
+    "fav.me./dfake",
+    "sta.sh/0fake",
+    "https://www.artstation.com/zz-fake",
+    "https://twitter.com/zz-fake",
+    "https://x.com/zz-fake",
+    "https://www.instagram.com./zz-fake",
+    "https://zz-fake.tumblr.com",
+    "https://zz-fake.carrd.co",
+    "https://linktr.ee/zz-fake",
+    "https://zz-fake.wixsite.com/folio",
+    "https://www.fiverr.com/zz-fake",
+]
+
+
+@pytest.mark.parametrize("website", NOT_THEIR_OWN_SITE)
+def test_no_spelling_of_a_platform_host_becomes_a_link(website):
+    assert collect._external_links(website) == []
+
+
+def test_no_spelling_of_a_platform_host_reaches_the_stores_row(capsys):
+    world, names = crowd(NOT_THEIR_OWN_SITE)
+    counts = counts_of(world, capsys)
+    assert counts[collect.PROFILES] == len(names) and links() == [None] * len(names)  # each stored, none with a link
+    # All of them count as a platform but one: the backslash spelling also names a domain that is not one.
+    assert (counts[collect.ON_PLATFORM], counts[collect.OTHER_SHAPE]) == (len(names) - 1, 1)
+    assert counts[collect.OWN_SITE] == counts[collect.NO_WEBSITE] == counts[collect.NO_HOST] == 0
+    assert store.own_site_candidates() == []
+
+
+# The lead's rule: only the front page of a bare custom domain is an artist's own site. Each of these may well be
+# on a domain of their own, but it has the shape of a profile on a platform, so it is dropped whole. Trimming it
+# to the site root would turn "someone's page on a platform nobody has listed" into "the platform is their site".
+PROFILE_SHAPED = [
+    "https://zz-fake-site.art/work",  # a path
+    "https://zz-fake-site.art/zz-fake-user",
+    "https://zz-fake-site.art/a/b/",
+    "https://zz-fake-site.art//",
+    "https://zz-fake-site.art/?user=zz-fake-user",  # a query
+    "https://zz-fake-site.art?mail=fake.person@mail.invalid",
+    "https://zz-fake-user.zz-fake-site.art",  # a user subdomain
+    "https://shop.zz-fake-site.art/",
+    "https://www2.zz-fake-site.art",
+    "https://www.www.zz-fake-site.art",
+    "https://zz-fake-user.zz-fake-site.co.uk",
+    "https://zz-fake-site.art/#/zz-fake-user",  # a fragment used as a path
+    "https://zz-fake-site.art/#fake.person@mail.invalid",
+    "https://zz-fake-site.art/fake.person@mail.invalid",  # an email address, in any position or spelling
+    "https://zz-fake-site.art/contact/fake.person%40mail.invalid",
+    "https://zz-fake-site.art/fake.person%2540mail.invalid",
+    "https://zz-fake-site.art/a;mail=fake.person@mail.invalid",
+    "https://fake.person@zz-fake-site.art",
+    "https://fake-user:fake-pass@zz-fake-site.art",
+    "https://zz-fake-site.art:8443",  # a port of their own
+    "https://zz-fake-site.art:8443/",
+    "http://zz-fake-site.art:443",  # the other scheme's port
+    "https://zz-fake-site.art\\zz-fake-user",  # a backslash, which browsers read as the start of a path
+    "https://zz-fake-site.art/%2f",
+    "https://zz-fake-site.art/;zz-fake-user",
+]
+
+
+@pytest.mark.parametrize("website", PROFILE_SHAPED)
+def test_a_link_with_a_path_a_subdomain_or_a_query_is_dropped(website):
+    assert collect._external_links(website) == []
+    assert collect._external_links("https://zz-fake-site.art") == ["https://zz-fake-site.art/"]  # the shape decides
+
+
+def test_profile_shaped_links_are_dropped_whole_and_never_trimmed_to_the_root(capsys):
+    """The library keeps a website with its query, its fragment or its port cut off, and that is what this stage
+    wrote into the store's row once discovery's own link was no longer the last word. Whose site a site is
+    is decided on the field as it is written."""
+    world, names = crowd(PROFILE_SHAPED)
+    counts = counts_of(world, capsys)
+    assert counts[collect.PROFILES] == counts[collect.OTHER_SHAPE] == len(names)
+    assert links() == [None] * len(names)  # stored with no link: not the bare domain
+    cut = [row["website"] for row in rows("profiles") if row["website"]]
+    assert len(cut) > 3 and set(cut) <= {"https://zz-fake-site.art/", "http://zz-fake-site.art/"}  # not a hollow check
+
+
+@pytest.mark.parametrize(
+    ("website", "kept_links"),
+    [
+        # the front page of a bare custom domain: kept, rebuilt as scheme://host/ in one spelling
+        ("https://zz-fake-site.art", ["https://zz-fake-site.art/"]),
+        ("https://zz-fake-site.art/", ["https://zz-fake-site.art/"]),
+        ("http://zz-fake-site.art", ["http://zz-fake-site.art/"]),
+        ("https://www.zz-fake-site.art", ["https://www.zz-fake-site.art/"]),
+        ("  zz-fake-site.art  ", ["https://zz-fake-site.art/"]),
+        ("zz-fake-site.art/", ["https://zz-fake-site.art/"]),
+        ("HTTP://WWW.ZZ-Fake-Site.Art./", ["http://www.zz-fake-site.art/"]),
+        ("zz-fake-site.art.", ["https://zz-fake-site.art/"]),  # a trailing dot
+        ("https://www.zz-fake-site.art。/", ["https://www.zz-fake-site.art/"]),  # an ideographic one
+        ("https://zz-fake-site。art", ["https://zz-fake-site.art/"]),
+        ("https://zz-fake-site.art．", ["https://zz-fake-site.art/"]),  # a fullwidth one
+        ("https://zz-fäke-site.art", ["https://xn--zz-fke-site-o8a.art/"]),
+        ("https://zz-fake-straße.de", ["https://xn--zz-fake-strae-mdb.de/"]),  # spelled as browsers spell it
+        ("https://zz-fake-site.co.uk", ["https://zz-fake-site.co.uk/"]),  # a two-part public suffix
+        ("https://www.zz-fake-site.co.uk/", ["https://www.zz-fake-site.co.uk/"]),
+        ("https://fakedeviantart.com", ["https://fakedeviantart.com/"]),  # a name that only contains a platform's
+        # the same front page written with parts that change nothing: they are not stored
+        ("https://zz-fake-site.art:443", ["https://zz-fake-site.art/"]),
+        ("http://zz-fake-site.art:80/", ["http://zz-fake-site.art/"]),
+        ("https://zz-fake-site.art?", ["https://zz-fake-site.art/"]),
+        ("https://zz-fake-site.art/#", ["https://zz-fake-site.art/"]),
+        # not a public site at all
+        ("", []),
+        (" ", []),
+        (".", []),
+        (None, []),
+        (12345, []),
+        (["https://zz-fake-site.art"], []),
+        (b"https://zz-fake-site.art", []),
+        ("FAKE-TAGLINE free text, not a link", []),
+        ("see zz-fake-site.art", []),
+        ("zz-fake-site.art\n/FAKE-TITLE-1", []),
+        ("fake-person@mail.invalid", []),
+        ("mailto:fake-person@mail.invalid", []),
+        ("ftp://zz-fake-site.art", []),
+        ("javascript://zz-fake-site.art/%0aalert(1)", []),
+        ("//zz-fake-site.art", []),
+        ("https:///zz-fake-site.art", []),
+        ("https://", []),
+        ("https://localhost", []),
+        ("https://127.0.0.1", []),
+        ("https://[::1]", []),
+        ("https://[not-a-host", []),
+        ("https://zz-fake-site.art:99999", []),
+        # no public suffix, a suffix on its own, or a subdomain some host hands out
+        ("https://zz-fake-site.example", []),
+        ("https://zz-fake-site.test", []),
+        ("https://zz-fake-site.invalid", []),
+        ("https://zz-fake-site.local", []),
+        ("https://co.uk", []),
+        ("https://art", []),
+        ("https://zz-fake.github.io", []),
+        ("https://zz-fake.blogspot.com", []),
+        # a host that is not a plain name
+        ("https://zz-fake_site.art", []),
+        ("https://zz-fake-site..art", []),
+        ("https://-zz-fake-site.art", []),
+        ("https://zz-fake-site-.art", []),
+        ("https://zz-fake-site%2Eart", []),
+        ("https://zz-fake‍-site.art", []),
+        ("https://zz-fake-site.art/" + "x" * 300, []),
+        ("zz-fake-site.art" + " " * 300, []),
+    ],
+)
+def test_only_the_front_page_of_their_own_domain_is_kept(website, kept_links):
+    assert collect._external_links(website) == kept_links
+
+
+def test_a_lone_surrogate_in_the_website_field_is_dropped_without_raising():
+    """JSON can carry half a surrogate pair, and URL parsers choke on it. One odd profile must not end a turn."""
+    half = chr(0xD800)
+    for website in (half + "zz-fake-site.art", "https://zz-fake-site.art/" + half, f"https://zz-fake{half}-site.art"):
+        assert collect._external_links(website) == []
+
+
+def test_whatever_the_website_field_holds_a_kept_link_is_a_canonical_front_page():
+    """A seeded fuzz. No input may raise, and only scheme://host/ of an own site comes out."""
+    odd = [chr(code) for code in (0x00, 0x09, 0x0A, 0xDF, 0xE4, 0x130, 0x200D, 0x3002, 0xFF0E, 0xFF24, 0xFF61, 0xD800)]
+    plain = "https:// http:// HTTPS:// ftp:// // : / ? # @ . .. www. zz-fake-site art com co.uk github.io deviantart"
+    plain += " example - _ %2E %40 \\ [ ] ::1 127.0.0.1 :443 :8443 a=b xn-- localhost ; zz-fake-site.art"
+    pieces = [*plain.split(), " ", "www.zz-fake-site.art", "https://zz-fake-site.co.uk", *odd]
+    rng = random.Random(20261012)
+    found = 0
+    for _ in range(20_000):
+        website = "".join(rng.choice(pieces) for _ in range(rng.randint(1, 7)))
+        for link in collect._external_links(website):
+            found += 1
+            host = link.removeprefix("https://").removeprefix("http://").removesuffix("/")
+            assert re.fullmatch(r"https?://[a-z0-9.-]+/", link), ascii(website)
+            assert store.canonical_host(host) == host, ascii(website)
+            assert crawl.is_own_site(link), ascii(website)
+            assert store.site_key(link) in (f"site:{host}", f"site:{host.removeprefix('www.')}"), ascii(website)
+    assert found > 100  # the fuzz does reach the kept branch
+
+
+@pytest.mark.parametrize(
+    ("website", "count"),
+    [
+        ("", collect.NO_WEBSITE),
+        ("   ", collect.NO_WEBSITE),
+        (None, collect.NO_WEBSITE),
+        (12345, collect.NO_WEBSITE),
+        ("https://www.deviantart.com/zz-fake/gallery", collect.ON_PLATFORM),
+        ("https://www.deviantart.com./zz-fake/art/FAKE-TITLE-99", collect.ON_PLATFORM),
+        ("https://www.artstation.com/zz-fake", collect.ON_PLATFORM),  # a listed name, in any label
+        ("zz-fake.tumblr.com", collect.ON_PLATFORM),
+        ("https://www.pinterest.de/zz-fake", collect.ON_PLATFORM),
+        ("https://zz-fake.github.io", collect.ON_PLATFORM),
+        ("https://x.com/zz-fake", collect.ON_PLATFORM),  # a listed domain
+        ("fav.me/dfake", collect.ON_PLATFORM),
+        ("https://zz-fake.cargo.site", collect.ON_PLATFORM),
+        ("https://zz-fake-site.art/folio", collect.OTHER_SHAPE),  # a path
+        ("https://shop.zz-fake-site.art", collect.OTHER_SHAPE),  # a subdomain
+        ("https://zz-fake-site.art/?u=zz-fake", collect.OTHER_SHAPE),  # a query
+        ("https://zz-fake-site.art/#/zz-fake", collect.OTHER_SHAPE),  # a fragment
+        ("https://zz-fake-site.co.uk:8443", collect.OTHER_SHAPE),
+        ("<https://zz-fake-site.art>", collect.OTHER_SHAPE),
+        ("zz-fake-site.art (commissions open)", collect.OTHER_SHAPE),
+        ("FAKE-TAGLINE free text", collect.NO_HOST),
+        ("https://localhost/x", collect.NO_HOST),
+        ("https://127.0.0.1", collect.NO_HOST),
+        ("https://zz-fake-site.example", collect.NO_HOST),  # no registrable domain, and on no list
+        ("https://zz-fake-site.test/folio", collect.NO_HOST),
+    ],
+)
+def test_a_profile_with_no_link_to_keep_is_counted_under_exactly_one_reason(website, count):
+    assert collect._external_links(website) == []
+    assert collect._why_no_link(website, store.hosts_in(website)) == count
+
+
+def test_the_summary_says_which_of_five_kinds_each_stored_profiles_website_was_and_prints_counts_only(capsys):
+    websites = [
+        "",
+        "https://www.artstation.com/zz-fake-one",
+        "https://www.deviantart.com/zz-fake-two/gallery",
+        "https://zz-fake-three.art/folio",
+        "https://zz-fake-user.zz-fake-four.art",
+        "https://zz-fake-five.art/?page=2",
+        "FAKE-TAGLINE free text",
+        "https://zz-fake-kept.art",
+    ]
+    world, names = crowd(websites)
+    assert run(world) == 0
+    out, err = capsys.readouterr()
+    counts = summary(out)
+    assert err == ""
+    assert counts[collect.NO_WEBSITE] == 1
+    assert counts[collect.ON_PLATFORM] == 2
+    assert counts[collect.OTHER_SHAPE] == 3
+    assert counts[collect.NO_HOST] == 1
+    assert counts[collect.OWN_SITE] == 1
+    kinds = (collect.OWN_SITE, collect.NO_WEBSITE, collect.ON_PLATFORM, collect.OTHER_SHAPE, collect.NO_HOST)
+    assert sum(counts[kind] for kind in kinds) == counts[collect.PROFILES] == len(names)  # each profile under one
+    assert list(counts)[1:7] == [collect.PROFILES, *kinds]  # "of those" comes right after what it is a part of
+    for told in ("zz-fake", "artstation", "folio", "free text", ".art", "http", "tagline"):
+        assert told not in out.lower()  # a count says how many, never who or where
+    assert links() == [None] * 7 + ["https://zz-fake-kept.art/"]  # all stored, one with a link
+    kept_rows = str(raw("SELECT * FROM artists"))
+    assert "fake-three" not in kept_rows and "fake-four" not in kept_rows and "fake-five" not in kept_rows
+
+
+def odd_spellings(host):
+    """Ways a profile's website field can name a host that no two URL parsers read alike."""
+    joiner, soft_hyphen, fullwidth_zz = chr(0x200D), chr(0xAD), chr(0xFF5A) * 2
+    return [
+        f"https://{host}\\x",  # a backslash
+        f"<https://{host}>",
+        f"({host})",
+        f'"https://{host}"',
+        f"[url=https://{host}]my site[/url]",
+        f"{host} (commissions open)",
+        f"my site: {host}!",
+        f"my site...{host}",  # an ellipsis run into the name
+        f"*.{host}",
+        f"https://xn--zz-fake-{chr(0xE9)}.art and {host}",  # beside a name that is not valid: still found
+        f"portfolio at {host}, prints at zz-fake-prints.art",
+        f"https://{host}\n(second line)",
+        f"{host};{host}",
+        f"https://{host}/" + "x" * 400,  # over the length the own-site rule reads
+        "x" * 400 + f" https://{host}",
+        f"  {host.upper()}  ",
+        f"https://{host}./",
+        f"https://www.{host}",
+        f"https://shop.{host}/folio",
+        f"http://{host}:8080/x?y=1#z",
+        f"https://{host}/#/zz-fake-user",
+        f"https://fake-user:fake-pass@{host}/",
+        f"fake.person@{host}",
+        f"//{host}",
+        f"https:///{host}",
+        f"https://{host.replace('.', '%2E')}/",  # a percent-encoded dot
+        f"https://{host.replace('.', chr(0x3002))}",  # an ideographic full stop
+        f"https://{host}{chr(0xFF0E)}",  # a fullwidth one, trailing
+        f"https://{host.replace('.', chr(0x3002))}/folio",  # the same three inside the name of a link with a path,
+        f"https://{host.replace('.', chr(0xFF0E))}/folio",  # which only the scan of the raw field can recognise
+        host.replace(".", chr(0xFF61)) + " (commissions open)",
+        host.replace("zz", fullwidth_zz),  # fullwidth letters
+        host[:3] + joiner + host[3:],  # an invisible character inside the name
+        host[:3] + soft_hyphen + host[3:],
+        f"https://zz-fake-redirect.art/?to=https://{host}/",
+        f"https://zz-fake-redirect.art/out?url=https%3A%2F%2F{host}%2F",
+        f"https://{host.replace('.', '%252E')}/",  # encoded twice
+        host.replace(".", "&#46;"),  # an HTML entity for the dot
+        host.replace(".", "[.]"),  # the dot spelled out, the way people hide an address from robots
+        "hxxps://" + host.replace(".", "(.)") + "/folio",
+        host.replace(".", " [dot] "),
+        host.replace(".", " DOT "),
+    ]
+
+
+FRONT_PAGE_SPELLINGS = [  # each is the front page of the removed site, in a spelling the own-site rule accepts
+    "https://zz-fake-d.art",
+    "https://zz-fake-d.art./",  # a trailing dot
+    "https://www.zz-fake-d.art.",
+    "zz-fake-d.art.",
+    "HTTPS://WWW.ZZ-Fake-D.Art/",
+    "http://zz-fake-d.art:80",
+    "https://zz-fake-d。art/",
+    "https://www.zz-fake-d.art．",
+]
+
+
+@pytest.mark.parametrize("spellings", [FRONT_PAGE_SPELLINGS, odd_spellings("zz-fake-d.art")], ids=["plain", "odd"])
+def test_a_removed_site_is_recognised_however_the_website_field_spells_it(spellings, capsys):
+    """Hard rule 7. The removal list is asked about every host the field names, before the own-site rule gets to
+    drop the link. An artist whose profile names a removed site is marked and held back, and nothing of theirs
+    is collected. That is one answer's word, so nobody is barred for it, and the next answer is read afresh."""
+    assert store.mark_removed("site:zz-fake-d.art") == 0
+    world, names = crowd(spellings)
+    counts = counts_of(world, capsys)
+    assert counts[collect.LISTS_REMOVED] == len(names) and counts[collect.PROFILES] == 0  # in every spelling
+    assert artist_marks() == dict.fromkeys(map(key, names), "lists a removed site") and library.artist_keys() == []
+    assert len(world.requests()) == 1 + len(names)  # a token and a profile each: nothing more is asked of them
+    assert not any(store.is_removed(name) for name in names) and len(raw("SELECT * FROM removed")) == 1
+    assert links() == [None] * len(names) and b"zz-fake-d" not in config.LOCAL_DB.read_bytes().lower()
+    for n, name in enumerate(names):  # the next run: each shows a clean site of their own, and is stored like anybody
+        world.profiles[name]["website"] = f"https://zz-fake-new-{n:02d}.art"
+    counts = counts_of(world, capsys)
+    assert counts[collect.PROFILES] == len(names) and artist_marks() == {}
+    assert links() == [f"https://zz-fake-new-{n:02d}.art/" for n in range(len(names))]
+
+
+def test_a_removed_site_with_a_name_outside_ascii_is_recognised_too(capsys):
+    name = "zz-f" + chr(0xE4) + "ke-d.art"  # a-umlaut: xn--zz-fke-d-... once encoded
+    assert store.mark_removed(f"site:{name}") == 0
+    spellings = [f"<https://{name}/folio>", f"{name.upper()} (commissions open)", f"https://www.{name}/?page=2"]
+    world, names = crowd(spellings)
+    counts = counts_of(world, capsys)
+    assert counts[collect.LISTS_REMOVED] == 3 and library.artist_keys() == []
+    assert not any(store.is_removed(name) for name in names)
+
+
+def test_only_the_website_field_is_read_for_hosts_never_the_bio_or_the_rest_of_the_profile(capsys):
+    """Reading hosts out of DeviantArt text is not allowed, so the removal of a site that a bio names touches
+    nobody."""
+    store.mark_removed("site:zz-fake-bio-link.art")
+    world = base()
+    for body in world.profiles.values():
+        if isinstance(body, dict):
+            body["bio"] = "FAKE-BIO with a link to a bare domain, https://zz-fake-bio-link.art which is never read"
+            body["last_status"] = {"body": "FAKE-STATUS see zz-fake-bio-link.art"}
+    assert run(world) == 0
+    assert capsys.readouterr() == (EXPECTED_STDOUT, "")  # nobody marked for it, and everybody collected as ever
+    assert "lists a removed site" not in artist_marks().values()
+
+
+# The seeding list never offers the crawl stage a domain that several profiles list.
+FRONT, PATH, SUBDOMAIN = "https://zz-fake-plat.art/", "https://zz-fake-plat.art/u2", "https://u3.zz-fake-plat.art"
+
+
+def test_a_domain_listed_by_three_profiles_is_nobodys_own_and_the_two_listings_not_kept_are_hashes(capsys):
+    """The front page is a bare domain and is kept. The other two listings have a profile's shape and are
+    dropped, but they are counted: three profiles naming one domain make it a platform, whatever any list says."""
+    world, names = crowd([FRONT, PATH, SUBDOMAIN, "https://zz-fake-solo.art"])
+    counts_of(world, capsys)
+    assert links() == [FRONT, None, None, "https://zz-fake-solo.art/"]
+    assert store.own_site_candidates() == [(key(names[3]), "https://zz-fake-solo.art/")]
+    kept_rows = str(raw("SELECT * FROM artists")) + str(rows("profiles"))
+    assert "u2" not in kept_rows and "u3" not in kept_rows
+    assert len(raw("SELECT * FROM listed")) == 4  # three for the one domain, and one for the other
+
+
+@pytest.mark.parametrize("second_listing", [PATH, SUBDOMAIN, "https://www.zz-fake-plat.art/?u=u4", f"<{FRONT}>"])
+def test_a_domain_stops_being_a_candidate_when_a_later_run_finds_a_second_listing(second_listing, capsys):
+    world, names = crowd([FRONT, "", ""])
+    counts_of(world, capsys)
+    assert store.own_site_candidates() == [(key(names[0]), FRONT)]  # one artist, one domain: a candidate
+    world.profiles[names[1]]["website"] = second_listing
+    counts_of(world, capsys)
+    assert store.own_site_candidates() == [] and links() == [FRONT, None, None]
+
+
+def test_a_domain_listed_in_an_earlier_run_is_not_a_candidate_when_its_front_page_turns_up(capsys):
+    world, names = crowd(["", PATH, SUBDOMAIN])
+    counts_of(world, capsys)
+    kept_rows = str(raw("SELECT * FROM artists")) + str(rows("profiles"))
+    assert links() == [None] * 3 and "plat" not in kept_rows  # of the two listings nothing is kept but hashes
+    world.profiles[names[0]]["website"] = FRONT
+    counts_of(world, capsys)
+    assert links()[0] == FRONT and store.own_site_candidates() == []
+
+
+def test_the_same_artist_listing_their_domain_twice_is_still_one_listing(capsys):
+    world, names = crowd([FRONT, ""])
+    counts_of(world, capsys)
+    world.profiles[names[0]]["website"] = "https://www.zz-fake-plat.art"  # another spelling of the one front page
+    counts_of(world, capsys)
+    assert store.own_site_candidates() == [(key(names[0]), "https://www.zz-fake-plat.art/")]
+
+
+# --- 10. the image host has a pace of its own, and it is the run's ---
+
+
+def test_the_image_host_asking_us_to_slow_down_slows_every_later_download_and_not_the_api(capsys):
+    """The same flaw as the API's had, and the same rule in its place: a 429 from the image host was backed off
+    from for that one image, and the next image was asked for half a second later, as if nothing had been said."""
+    world, left = trio(), [2]
+
+    def twice(request):  # the second image asked for is refused twice, and then served
+        if request.url.path == preview_path(3) and left[0]:
+            left[0] -= 1
+            return httpx.Response(429, text="FAKE-SLOW-DOWN")
+
+    world.detours.append(twice)
+    counts = counts_of(world, capsys)
+    assert kept(ALPHA) == [4, 3, 2, 1] and counts[collect.DOWNLOADED] == 6 and counts[collect.IMAGE_LIMITED] == 0
+    waited = world.waited("images")
+    assert waited[:4] == [None, 0.5, 1.0, 2.0]  # the first image, then work 3: asked for, and asked again twice
+    assert waited[4:] == pytest.approx([1.8, 1.62, 1.458, 1.3122])  # the works after it, the other artists' too
+    assert waited[4] > collect.IMAGE_INTERVAL  # the next image, which is another one
+    assert world.waited("api") == [None] + [2.0] * 9  # and the API, which said nothing, is asked as before
+    assert counts["rate limit answers from the image host"] == 2 and counts["rate limit answers from the API"] == 0
+    assert counts["longest interval between requests to the image host, in seconds"] == 2
+    assert counts["requests to the image host"] == 8 and counts["requests to the API"] == 10
+    assert counts["seconds spent waiting between requests to the image host"] == round(sum(waited[1:]))
+
+
+def test_the_image_hosts_interval_comes_down_a_tenth_an_image_to_half_a_second_and_no_lower():
+    world = solo(10)
+    world.detours.append(rate_limited(preview_path(9), 1))
+    assert run(world) == 0 and kept(ALPHA) == list(range(10, 0, -1))
+    waited = world.waited("images")
+    assert waited[:3] == [None, 0.5, 1.0]  # work 10, work 9, and work 9 asked for again
+    assert waited[3:] == pytest.approx([max(0.5, 0.9**n) for n in range(1, 9)]) and waited[-2:] == [0.5, 0.5]
+
+
+def test_a_retry_after_from_the_image_host_is_waited_when_it_asks_for_longer():
+    world, left = solo(3), [1]
+
+    def once(request):
+        if request.url.path == preview_path(2) and left[0]:
+            left[0] = 0
+            return httpx.Response(429, headers={"Retry-After": "30"}, text="FAKE-SLOW-DOWN")
+
+    world.detours.append(once)
+    assert run(world) == 0 and kept(ALPHA) == [3, 2, 1]
+    assert world.waited("images") == [None, 0.5, 30.0, pytest.approx(0.9)]
+
+
+def test_a_collection_run_says_where_it_is_in_a_file_while_it_runs_and_the_file_goes_when_it_ends(capsys, tmp_path):
+    """Counts only, as the summary prints them, before every request to either host: the first asking and every
+    asking again. Nothing of it is on standard error, so a clean run's is still empty."""
+    world, said = base(), []
+    told = config.CACHE_DIR / "collect.status"
+    world.detours.append(lambda request: said.append(told.read_text(encoding="utf-8")))
+    world.detours.append(rate_limited(GALLERY_PATH, 1))
+    assert run(world) == 0
+    assert capsys.readouterr().err == "" and len(said) == BASE_REQUESTS + 1
+    assert not told.exists() and "cache/collect.status" not in files(tmp_path)  # there only while a run is on
+    for text in said:
+        when, *lines = text.splitlines()
+        assert datetime.now(UTC) - datetime.fromisoformat(when) < timedelta(minutes=1)
+        assert summary("\n".join(lines))  # the summary's own lines, each a label and a number
+        assert not re.search(r"FAKE|zz-fake|https?:|deviantart|wixmp|[0-9A-F]{8}-", text, re.IGNORECASE)
+    assert "artists processed: 1\n" in said[0] and "requests to the API: 0\n" in said[0]  # the first artist's turn
+    now = "interval between requests to the API now, in seconds"  # collecting, or waiting: this is how to tell
+    assert [int(re.search(f"{now}: (\\d+)", text)[1]) for text in said[1:5]] == [2, 2, 4, 4]
+    assert "rate limit answers from the API: 1\n" in said[3] and "artists processed: 1\n" in said[3]
+    assert "requests to the image host: 4\n" in said[9] and "images downloaded: 4\n" in said[9]  # between two images
+    last = summary("\n".join(said[-1].splitlines()[1:]))
+    assert (last[collect.PROCESSED], last[collect.PROFILES], last[collect.DOWNLOADED]) == (5, 2, 13)
+    assert last["requests to the image host"] == 13 and last["requests to the API"] == 11

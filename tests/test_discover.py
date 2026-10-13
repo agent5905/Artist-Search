@@ -10,89 +10,81 @@ import inspect
 import itertools
 import json
 import logging
-import random
+import pathlib
 import re
 import sqlite3
+import sys
 import threading
 import time
 from contextlib import closing
+from datetime import UTC, datetime, timedelta
 from unittest import mock
 from urllib.parse import parse_qs
 
 import httpx
 import pytest
 
-from pipeline import config, crawl, discover, store
+from pipeline import config, discover, store
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "scripts"))
+import gpu  # noqa: E402
 
 CLIENT_ID = "FAKE-CLIENT-ID-0001"
 CLIENT_SECRET = "FAKE-CLIENT-SECRET-0001"
 TOKEN_PATH = "/oauth2/token"
 BROWSE_PATH = "/api/v1/oauth2/browse/tags"
-PROFILE_PATH = "/api/v1/oauth2/user/profile/"
 
 ALPHA, BRAVO, CHARLIE, DELTA = "zz-fake-alpha", "ZZ-Fake-Bravo", "zz-fake-charlie", "zz-fake-delta"
 ECHO, FOXTROT, GOLF, HOTEL = "zz-fake-echo", "zz-fake-foxtrot", "zz-fake-golf", "zz-fake-hotel"
 INDIA, JULIET, KILO = "zz-fake-india", "zz-fake-juliet", "zz-fake-kilo"
 
-# The website each base-world artist gives on their profile. HOTEL has no profile: the lookup answers 400.
-# The made-up domains sit under real suffixes (.art, .com, .co.uk) because the own-site rule reads the Public
-# Suffix List and turns .example and .test away. Nothing ever fetches them.
-WEBSITES = {
-    ALPHA: "https://zz-fake-alpha.art/",
-    BRAVO: "http://www.zz-fake-bravo.com",
-    CHARLIE: "https://zz-fake-charlie.art",  # 2 hits: must never be looked up
-    DELTA: "ZZ-Fake-Delta.co.uk.",  # no scheme, capitals, a trailing dot: still the front page of their domain
-    ECHO: "https://zz-fake-echo.art",  # 2 clean hits: must never be looked up
-    FOXTROT: "",
-    GOLF: f"https://www.deviantart.com/{GOLF}/gallery",  # DeviantArt itself
-    INDIA: f"https://www.deviantart.com./{INDIA}/art/FAKE-TITLE-99",  # the same, behind a trailing dot
-    JULIET: f"https://www.artstation.com/{JULIET}",  # a hosted gallery, not a site of their own
-    # A domain of their own, but with a path, a query and a fragment: dropped whole, never trimmed to the root.
-    KILO: "https://zz-fake-kilo.art/folio?mail=fake.kilo@mail.invalid#FAKE-FRAGMENT",
-}
 
-
-def expected_row(name, links, hits):
-    return (f"da:{name.lower()}", name, f"https://www.deviantart.com/{name}", links, hits)
+def expected_row(name, hits, links=()):
+    return (f"da:{name.lower()}", name, f"https://www.deviantart.com/{name}", list(links), hits)
 
 
 # What the base world must leave in the store: key, handle, profile URL, links, hits. Nothing else.
-# Every author with three clean works and a readable profile is stored (owner decision 7). A link is kept only
-# when the website field is the front page of a domain of their own.
+# Every author with three clean works under the niche tags is stored (owner decision 7), with no link: discovery
+# reads no profile, so it knows no site. CHARLIE and ECHO have two clean works each, and are not.
 EXPECTED = [
-    expected_row(ALPHA, ["https://zz-fake-alpha.art/"], 4),
-    expected_row(BRAVO, ["http://www.zz-fake-bravo.com/"], 3),
-    expected_row(DELTA, ["https://zz-fake-delta.co.uk/"], 3),
-    expected_row(FOXTROT, [], 3),  # no website
-    expected_row(GOLF, [], 3),  # DeviantArt itself
-    expected_row(INDIA, [], 3),
-    expected_row(JULIET, [], 3),  # a hosted gallery
-    expected_row(KILO, [], 3),  # a path on their own domain: dropped, not trimmed
+    expected_row(ALPHA, 4),
+    expected_row(BRAVO, 3),
+    expected_row(DELTA, 3),
+    expected_row(FOXTROT, 3),
+    expected_row(GOLF, 3),
+    expected_row(HOTEL, 5),
+    expected_row(INDIA, 3),
+    expected_row(JULIET, 3),
+    expected_row(KILO, 3),
 ]
-OWN_SITES = [(key, links[0]) for key, _, _, links, _ in EXPECTED if links]  # what the crawl stage is offered
-EXPECTED_STDOUT = """\
+# The browsing pass as the summary prints it, and after it what the pace did in a run that met no trouble.
+EXPECTED_TALLY = """\
 pages fetched: 19
 deviations counted: 94
 mature skipped: 7
 authors seen: 71
 candidates (>= 3 hits): 9
 skipped (removed): 0
-skipped (stored within the last day): 0
-profiles unavailable: 1
 not reached (--max-artists): 0
-profiles fetched: 8
-artists stored: 8
-of those, with an own-site link: 3
-of those, no website given: 1
-of those, website on a listed platform or DeviantArt: 3
-of those, website on another domain, not a bare front page: 1
-of those, website names no public host: 0
+artists stored: 9
 """
-# The base world's requests in order: 0 token, 1-19 browse (two pages of the first tag, one of each of the other
-# 17), then the lookups: HOTEL (400), ALPHA, BRAVO, DELTA...
-FIRST_LOOKUP = 20
-BASE_REQUESTS = FIRST_LOOKUP + 9  # 1 token + 19 browse pages + 9 profile lookups
+EXPECTED_STDOUT = (
+    EXPECTED_TALLY
+    + """\
+requests to the API: 20
+rate limit answers from the API: 0
+longest interval between requests to the API, in seconds: 2
+interval between requests to the API now, in seconds: 2
+seconds spent waiting between requests to the API: 38
+"""
+)
+# The base world's requests in order: 0 the token, 1 and 2 two pages of the first tag, 3 the second tag, and one
+# page of each of the other sixteen. The fifth tag, request 6, is the one with most of the artists under it.
+BASE_REQUESTS = 20
+GAMEART = 6
 LONG_AGO = "2020-01-01T00:00:00+00:00"
+KEPT = "Everything stored is kept: run again later"
+LIMITED = f"stopped: rate limited: the API answered HTTP 429 12 times in a row, 5 minutes apart. {KEPT}\n"
 
 
 def without(*keys):
@@ -125,46 +117,11 @@ def deviation(n, username, mature=False):
     }
 
 
-def profile(username, website):
-    """A made-up profile response, private fields included (the real API can return all of these)."""
-    return {
-        "user": {
-            "userid": f"FAKE-USERID-{username}",
-            "username": username,
-            "usericon": f"https://a.fake-cdn.invalid/avatars/FAKE-ICON-{username}.gif",
-            "type": "FAKE-USERTYPE",
-            "email": f"FAKE-EMAIL-{username}@mail.invalid",
-            "details": {"sex": "FAKE-SEX", "age": 987654321, "joindate": "FAKE-JOINDATE"},
-            "geo": {"country": "FAKE-GEO-COUNTRY", "countryid": 555000111, "timezone": "FAKE-TIMEZONE"},
-            "profile": {"real_name": f"FAKE-NESTED-REALNAME-{username}", "tagline": "FAKE-NESTED-TAGLINE"},
-        },
-        "is_watching": False,
-        "profile_url": f"https://www.deviantart.com/{username}",
-        "user_is_artist": True,
-        "artist_level": "FAKE-LEVEL",
-        "artist_specialty": "FAKE-SPECIALTY",
-        "real_name": f"FAKE-REALNAME-{username}",
-        "tagline": f"FAKE-TAGLINE-{username}",
-        "countryid": 777000333,
-        "country": "FAKE-COUNTRY",
-        "website": website,
-        "bio": f"FAKE-BIO-{username} with a link to a bare domain, https://zz-fake-bio-link.art which is never read",
-        "cover_photo": f"https://images.fake-cdn.invalid/FAKE-COVER-{username}.jpg",
-        "last_status": {"body": f"FAKE-STATUS-{username}"},
-        "stats": {"user_deviations": 444000111, "profile_pageviews": 444000222},
-    }
-
-
-PRIVATE_MARKERS = ("FAKE-EMAIL", "REALNAME", "FAKE-COUNTRY", "FAKE-GEO", "FAKE-SEX", "FAKE-TIMEZONE", "FAKE-JOINDATE")
-PRIVATE_NUMBERS = ("987654321", "555000111", "777000333")  # age and the two country ids
-
-
 class FakeDA:
     """A made-up DeviantArt behind httpx.MockTransport, with a clock that only its sleep() moves."""
 
-    def __init__(self, by_tag, profiles):
+    def __init__(self, by_tag):
         self.by_tag = by_tag
-        self.profiles = {name.lower(): body for name, body in profiles.items()}
         # Like the real API, the fake decides how much a page holds: fewer than the client asks for, so a client
         # that works out the next offset by itself, instead of reading next_offset, skips works.
         self.page_size = 40
@@ -211,46 +168,42 @@ class FakeDA:
         if request.method != "GET" or request.headers.get("authorization", "")[len("Bearer ") :] not in self.valid:
             return httpx.Response(401, json={"error": "invalid_token", "error_description": "FAKE-ERROR-TEXT"})
         # The fake is stricter than the real API on purpose: a parameter the client was never meant to send
-        # (mature_content, expand, with_session) is answered 400, so a test notices it.
-        asked = sorted(request.url.params.keys())
-        if asked != (["limit", "offset", "tag"] if path == BROWSE_PATH else []):
+        # (mature_content, expand, with_session) is answered 400, so a test notices it. Browsing is all there is:
+        # a request for anything else, a profile say, is answered 404, and every test would see it in the log.
+        if path != BROWSE_PATH:
+            return httpx.Response(404, json={})
+        if sorted(request.url.params.keys()) != ["limit", "offset", "tag"]:
             return httpx.Response(400, json={"error": "invalid_request", "error_description": "FAKE-ERROR-TEXT"})
-        if path == BROWSE_PATH:
-            tag = request.url.params["tag"]
-            offset, limit = int(request.url.params["offset"]), int(request.url.params["limit"])
-            if not (1 <= limit <= 50 and 0 <= offset <= 50000):  # the documented ranges
-                return httpx.Response(400, json={"error": "invalid_request", "error_description": "FAKE-ERROR-TEXT"})
-            works = self.by_tag.get(tag, [])
-            end = offset + min(limit, self.page_size)
-            page = {"has_more": end < len(works), "next_offset": end if end < len(works) else None}
-            page |= {"results": works[offset:end]} | self.page_patch.get((tag, offset), {})
-            return httpx.Response(200, json=page)
-        if path.startswith(PROFILE_PATH):
-            body = self.profiles.get(path.removeprefix(PROFILE_PATH).lower())
-            if body is None:  # what the docs give for a suspended, inactive or missing account
-                error = {"error": "invalid_request", "error_description": "FAKE-ERROR-TEXT", "error_code": 2}
-                return httpx.Response(400, json=error)
-            return httpx.Response(200, json=body)
-        return httpx.Response(404, json={})
+        tag = request.url.params["tag"]
+        offset, limit = int(request.url.params["offset"]), int(request.url.params["limit"])
+        if not (1 <= limit <= 50 and 0 <= offset <= 50000):  # the documented ranges
+            return httpx.Response(400, json={"error": "invalid_request", "error_description": "FAKE-ERROR-TEXT"})
+        works = self.by_tag.get(tag, [])
+        end = offset + min(limit, self.page_size)
+        page = {"has_more": end < len(works), "next_offset": end if end < len(works) else None}
+        page |= {"results": works[offset:end]} | self.page_patch.get((tag, offset), {})
+        return httpx.Response(200, json=page)
 
-    def paths(self, prefix):
-        return [request.url.path for _, request, _ in self.log if request.url.path.startswith(prefix)]
+    def paths(self):
+        return [request.url.path for _, request, _ in self.log]
 
-    def looked_up(self):
-        return [path.removeprefix(PROFILE_PATH) for path in self.paths(PROFILE_PATH)]
+    def browsed(self):
+        """The pages the client asked for, in order, as (tag, offset)."""
+        browse = [request.url.params for _, request, _ in self.log if request.url.path == BROWSE_PATH]
+        return [(params["tag"], int(params["offset"])) for params in browse]
 
     def offsets(self, tag):
         """The offsets the client asked for under one tag, in order."""
-        browse = [request.url.params for _, request, _ in self.log if request.url.path == BROWSE_PATH]
-        return [int(params["offset"]) for params in browse if params["tag"] == tag]
+        return [offset for asked, offset in self.browsed() if asked == tag]
 
     def gaps(self):
         times = [clock for clock, _, _ in self.log]
         return [later - earlier for earlier, later in itertools.pairwise(times)]
 
 
-def world(websites=None):
-    """The base world. See EXPECTED and EXPECTED_STDOUT for what a correct run makes of it."""
+def world(more=None):
+    """The base world. See EXPECTED and EXPECTED_STDOUT for what a correct run makes of it. `more` is works to
+    add under a tag of its own, the last one browsed."""
     numbers = itertools.count(1)
 
     def works(username, n, mature=False):
@@ -267,24 +220,24 @@ def world(websites=None):
         + works(ECHO, 2)
         + works(ECHO, 5, mature=True),  # 2 clean + 5 mature: under the threshold
         "gameart": [work for name in (FOXTROT, GOLF, INDIA, JULIET, KILO) for work in works(name, 3)] + works(HOTEL, 5),
+        discover.NICHE_TAGS[-1]: [deviation(1000 + n, name) for n, name in enumerate(more or [])],
     }
-    return FakeDA(by_tag, {name: profile(name, site) for name, site in (WEBSITES | (websites or {})).items()})
+    return FakeDA(by_tag)
 
 
-def small_world(websites):
-    """One artist per website, each with three clean works. Returns the fake and the handles."""
-    names = [f"zz-fake-n{i:02d}" for i in range(len(websites))]
-    works = [deviation(3 * i + j, name) for i, name in enumerate(names) for j in (1, 2, 3)]
-    profiles = {name: profile(name, site) for name, site in zip(names, websites, strict=True)}
-    return FakeDA({"gameart": works}, profiles), names
+def age_the_pass(db, age=None):
+    """Make the saved browsing pass as old as this, or far older than discovery carries one on from."""
+    began = LONG_AGO if age is None else (datetime.now(UTC) - age).isoformat(timespec="seconds")
+    with closing(sqlite3.connect(db)) as conn, conn:
+        if conn.execute("SELECT 1 FROM sqlite_master WHERE name = 'browsed'").fetchone():  # no run, no table
+            conn.execute("UPDATE browsed SET began_at = ?", (began,))
 
 
-def run(fake, db, max_artists=200, same_day=False):
-    """One run. Unless it is to be on the same day as the run before, every row there is has been there long:
-    an artist stored within the last day is not looked up again, and most tests here are about the lookup."""
-    if db.exists() and not same_day:
-        with closing(sqlite3.connect(db)) as conn, conn:
-            conn.execute("UPDATE artists SET discovered_at = ?", (LONG_AGO,))
+def run(fake, db, max_artists=200, afresh=True):
+    """One run. Unless it is to carry on the pass that is saved, that pass is made too old to carry on first, so
+    that the run browses afresh: most tests here are about what a whole pass does."""
+    if afresh and db.exists():
+        age_the_pass(db)
     with mock.patch.object(time, "sleep", fake.sleep):
         return discover.discover(CLIENT_ID, CLIENT_SECRET, max_artists=max_artists, db=db, transport=fake.transport)
 
@@ -292,14 +245,18 @@ def run(fake, db, max_artists=200, same_day=False):
 def summary(out):
     """The printed counts as a dict. It also checks that every line is a label and a number, and nothing more."""
     assert all(re.fullmatch(r"[A-Za-z ,()>=0-9-]+: \d+", line) for line in out.splitlines()), out
-    return {label: int(count) for label, count in (line.rsplit(": ", 1) for line in out.splitlines())}
+    counts = {label: int(count) for label, count in (line.rsplit(": ", 1) for line in out.splitlines())}
+    assert list(counts) == list(discover._COUNTS)
+    parts = ("skipped (removed)", discover.NOT_REACHED, "artists stored")
+    assert sum(counts[part] for part in parts) == counts["candidates (>= 3 hits)"]  # the summary adds up
+    return counts
 
 
-def all_rows(db):
+def all_rows(db, table="artists"):
     if not db.exists():
         return []
     with closing(sqlite3.connect(db)) as conn:
-        return conn.execute("SELECT * FROM artists ORDER BY key").fetchall()
+        return conn.execute(f"SELECT * FROM {table} ORDER BY 1").fetchall()
 
 
 def stored(db):
@@ -331,6 +288,10 @@ def strings(value):
         yield str(value)
 
 
+def sha(text):
+    return hashlib.sha256(text.encode()).hexdigest()
+
+
 @pytest.fixture(autouse=True)
 def isolated(tmp_path, monkeypatch):
     """No test may read the real .env, write the real store, or really sleep."""
@@ -350,13 +311,13 @@ def nothing_logged(caplog, recwarn):
     """In every test: no log record and no warning may carry made-up DeviantArt data, a handle or a credential.
 
     Every made-up string in this file has "fake" in it, so that word, in any case, in any record of any logger at
-    any level, fails the test. So does one of the private numbers.
+    any level, fails the test.
     """
     caplog.set_level(logging.DEBUG)  # on the root logger, which every logger that propagates reaches
     yield
     said = [logging.Formatter().format(record) + str(record.args) for record in caplog.get_records("call")]
     said += [str(warning.message) for warning in recwarn.list]
-    assert [text for text in said if any(mark in text.lower() for mark in ("fake", *PRIVATE_NUMBERS))] == []
+    assert [text for text in said if "fake" in text.lower()] == []
 
 
 @pytest.fixture
@@ -364,7 +325,7 @@ def db(tmp_path):
     return tmp_path / "store" / "pipeline.sqlite"
 
 
-# --- 1 and 2: no DeviantArt content and no private data, in the store or in the output ---
+# --- 1: what a run stores: handles and counts, no DeviantArt content, and no profile is read ---
 
 
 def test_base_run_stores_exactly_the_expected_rows(db):
@@ -374,25 +335,40 @@ def test_base_run_stores_exactly_the_expected_rows(db):
     assert len(fake.log) == BASE_REQUESTS
 
 
-def test_every_candidate_whose_profile_can_be_read_is_stored_with_or_without_a_site(db):
-    """Owner decision 7: an own site is optional. Three clean works under the niche tags are what it takes."""
-    assert run(world(), db) == 0
-    assert [name for _, name, _, links, _ in stored(db) if links] == [ALPHA, BRAVO, DELTA]
-    assert [name for _, name, _, links, _ in stored(db) if not links] == [FOXTROT, GOLF, INDIA, JULIET, KILO]
+def test_every_candidate_is_stored_straight_from_the_tally_and_no_profile_is_ever_asked_for(db):
+    """Discovery asked for some 3,500 profiles a run, only to read the website field, which the collect stage reads
+    again on the artist's turn. Three clean works under the niche tags are what it takes (owner decision 7)."""
+    fake = world()
+    assert run(fake, db) == 0
+    assert set(fake.paths()) == {TOKEN_PATH, BROWSE_PATH} and fake.paths().count(TOKEN_PATH) == 1
+    assert [links for *_, links, _ in stored(db)] == [[]] * 9  # no profile read, so no site known
     assert store.all_artists(db) == [(key, name, url) for key, name, url, _, _ in EXPECTED]  # for the collect stage
-    assert store.own_site_candidates(db) == OWN_SITES  # for the crawl stage: only those with a site of their own
-    for never in (HOTEL, CHARLIE, ECHO):  # no profile to read; two works; two clean works
+    assert store.own_site_candidates(db) == []  # for the crawl stage: nobody, until collection has read a profile
+    for never in (CHARLIE, ECHO):  # two works; two clean works
         assert f"da:{never}" not in [key for key, *_ in stored(db)]
+
+
+def test_a_later_pass_leaves_the_link_the_collect_stage_wrote_into_a_row(db):
+    """Discovery used to write each row's link from the profile it read. It reads none now, and must not blank
+    the own site that collection keeps in the row, which is where the removal of a site looks."""
+    assert run(world(), db) == 0
+    assert store.keep_own_site(ALPHA, "https://zz-fake-alpha.art/", db) is True
+    assert run(world(more=[ALPHA]), db) == 0  # a later pass, in which ALPHA has one work more
+    assert stored(db)[0] == expected_row(ALPHA, 5, ["https://zz-fake-alpha.art/"])
+    assert stored(db)[1:] == EXPECTED[1:]
+    assert store.mark_removed("site:zz-fake-alpha.art", db) == 1  # and so the removal still finds them
 
 
 def test_a_removed_artist_is_in_neither_list_handed_to_the_later_stages(db):
     assert run(world(), db) == 0
+    assert store.keep_own_site(ALPHA, "https://zz-fake-alpha.art/", db)  # as the collect stage does
+    assert store.keep_own_site(BRAVO, "http://www.zz-fake-bravo.com/", db)
     store.mark_removed(f"da:{FOXTROT}", db)  # stored with no link
     store.mark_removed("site:zz-fake-alpha.art", db)  # stored with a link
     left = [key for key, *_ in without("da:zz-fake-foxtrot", "da:zz-fake-alpha")]
     assert [key for key, _, _ in store.all_artists(db)] == left
-    assert store.own_site_candidates(db) == OWN_SITES[1:]
-    assert run(world(), db) == 0  # and a rerun brings neither back
+    assert store.own_site_candidates(db) == [("da:zz-fake-bravo", "http://www.zz-fake-bravo.com/")]
+    assert run(world(), db) == 0  # and a later pass brings neither back
     assert [key for key, _, _ in store.all_artists(db)] == left
 
 
@@ -400,43 +376,40 @@ def test_store_holds_no_deviantart_content(db):
     fake = world()
     assert run(fake, db) == 0
     allowed = {text for row in EXPECTED for text in strings(list(row))}
-    forbidden = {text for text in strings([fake.by_tag, fake.profiles]) if not any(text in ok for ok in allowed)}
-    # The check is not hollow: titles, image URLs, bios and the handles of artists we did not keep are all in it.
+    forbidden = {text for text in strings(fake.by_tag) if not any(text in ok for ok in allowed)}
+    # The check is not hollow: ids, titles, image URLs and the handles of authors we did not keep are all in it.
     assert len(forbidden) > 900
-    assert {"FAKE-TITLE-1", "FAKE-TAG-1", "FAKE-EXCERPT-1", "FAKE-DESCRIPTION-1", HOTEL, CHARLIE} <= forbidden
+    assert {"FAKE-TITLE-1", "FAKE-TAG-1", "FAKE-EXCERPT-1", "FAKE-DESCRIPTION-1", ECHO, CHARLIE} <= forbidden
+    assert {"00000000-0000-4000-8000-000000000001", "zz-fake-filler-00", f"FAKE-USERID-{ALPHA}"} <= forbidden
     assert "https://images.fake-cdn.invalid/FAKE-THUMB-1.jpg" in forbidden
-    assert f"FAKE-TAGLINE-{ALPHA}" in forbidden and profile(ALPHA, "")["bio"] in forbidden
-    assert {WEBSITES[GOLF], WEBSITES[INDIA], WEBSITES[JULIET], WEBSITES[KILO]} <= forbidden
     disk = everything_on_disk(db)
     assert [text for text in forbidden if text in disk] == []
-    for text in ("FAKE", "fake-cdn", "fake-bio-link", "/art/", "artstation", "mail.invalid", "@", "?", "#", "folio"):
+    for text in ("FAKE", "fake-cdn", "/art/", "@", "?", "#"):
         assert text not in "\n".join(str(row) for row in all_rows(db))
-    assert "FAKE" not in disk and "fake-cdn" not in disk and "mail.invalid" not in disk and "artstation" not in disk
-    assert "zz-fake-kilo.art" not in disk and "folio" not in disk  # a link with a path is dropped whole
+    for text in ("FAKE", "fake-cdn", "/art/", "0000-4000", "filler", "charlie", "echo"):
+        assert text not in disk
     for text in allowed:  # and the scan can see what is stored
         assert text in disk
 
 
-def test_store_holds_no_private_data_even_when_the_api_returns_it(db):
-    fake = world()
-    assert run(fake, db) == 0
-    sent = "".join(fake.served)
-    disk = everything_on_disk(db)
-    for marker in (*PRIVATE_MARKERS, *PRIVATE_NUMBERS, "fake.kilo@mail.invalid"):
-        assert marker in sent  # the API did return it
-        assert marker not in disk
+def test_the_saved_pass_is_tags_offsets_and_hashes_that_name_nobody(db):
+    """What may be saved of a browsing pass, which earlier critics pinned: no title, description or text, and no
+    handle of anybody who posted once or twice under a tag. A hash is enough to count them."""
+    assert run(world(), db) == 0
     with closing(sqlite3.connect(db)) as conn:
         tables = {name for (name,) in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
         columns = [row[1] for row in conn.execute("PRAGMA table_info(artists)")]
-    assert tables == {"artists", "removed", "listed"}
-    with closing(sqlite3.connect(db)) as conn:  # the two other tables hold sha256 digests and nothing else
-        hashes = [
-            value
-            for row in conn.execute("SELECT key_hash, '' FROM removed UNION SELECT * FROM listed")
-            for value in row
-        ]
-    assert len(hashes) == 8 and all(re.fullmatch(r"[0-9a-f]{64}", value) for value in hashes)  # 4 artists, 4 domains
+    assert tables == {"artists", "removed", "listed", "browsed", "counted"}
     assert columns == ["key", "da_username", "da_profile_url", "links", "niche_hits", "discovered_at"]
+    counted = all_rows(db, "counted")
+    assert len(counted) == 101 and len([author for _, author in counted if author is None]) == 7  # the mature ones
+    assert all(re.fullmatch(r"[0-9a-f]{64}", value) for row in counted for value in row if value is not None)
+    assert (sha("work:00000000-0000-4000-8000-000000000001"), sha(f"da:{ALPHA}")) in counted
+    assert len([author for _, author in counted if author == sha(f"da:{CHARLIE}")]) == 2  # counted, and not named
+    browsed = {tag: (next_offset, pages) for tag, next_offset, pages, _ in all_rows(db, "browsed")}
+    assert browsed == {tag: (None, 2 if tag == "conceptart" else 1) for tag in discover.NICHE_TAGS}
+    assert all(datetime.fromisoformat(began).utcoffset() == timedelta(0) for *_, began in all_rows(db, "browsed"))
+    assert all_rows(db, "removed") == all_rows(db, "listed") == []
 
 
 def test_output_is_counts_only(db, capfd):
@@ -447,7 +420,7 @@ def test_output_is_counts_only(db, capfd):
     assert err == ""
     printed = (out + err).lower()
     secrets = [CLIENT_ID, CLIENT_SECRET, *fake.tokens]
-    for text in [*strings([fake.by_tag, fake.profiles]), *secrets]:  # handles and links included
+    for text in [*strings(fake.by_tag), *secrets]:  # handles included
         assert text.lower() not in printed
 
 
@@ -470,277 +443,16 @@ def test_a_broken_response_stops_the_run_without_echoing_it(db, capsys, failure,
 
 
 def test_unsafe_handles_are_ignored(db):
-    unsafe = ["../../oauth2/placebo", "FAKE TITLE WITH SPACES", "zz-fake/x", "zz-fake?x=1", "", "\u00e9" * 5, "z" * 41]
+    unsafe = ["../../oauth2/placebo", "FAKE TITLE WITH SPACES", "zz-fake/x", "zz-fake?x=1", "", "é" * 5, "z" * 41]
     works = [deviation(n, name) for n, name in enumerate(unsafe * 3, 1)]  # 3 works each: enough to be a candidate
     works += [deviation(n, "zz-fake-orphan") | {"author": None} for n in (101, 102, 103)]  # no author at all
-    fake = FakeDA({"conceptart": works}, {name: profile(name, "https://zz-fake-unsafe.art") for name in unsafe})
+    fake = FakeDA({"conceptart": works})
     assert run(fake, db) == 0
-    assert len(fake.log) == 1 + len(discover.NICHE_TAGS)  # the token and one page per tag: no profile lookup
-    assert all_rows(db) == []
+    assert len(fake.log) == 1 + len(discover.NICHE_TAGS)  # the token and one page per tag
+    assert all_rows(db) == [] and all_rows(db, "counted") == []  # not stored, and not counted either
 
 
-# Every way of writing a host that is DeviantArt's, or an image host, a social network or a hosted platform.
-NOT_THEIR_OWN_SITE = [
-    "https://www.deviantart.com/zz-fake/gallery",
-    "https://DeviantArt.com/zz-fake",
-    "zz-fake.deviantart.com",
-    "https://www.deviantart.com./zz-fake/art/FAKE-TITLE-99",  # a trailing dot
-    "https://www.deviantart.com../zz-fake/art/FAKE-TITLE-99",
-    "https://www.deviantart\u3002com/zz-fake/art/FAKE-TITLE-98",  # an ideographic full stop
-    "https://www.deviantart.com\uff0e/zz-fake/art/FAKE-TITLE-98",  # a fullwidth one, trailing
-    "https://www.deviantart%2Ecom/zz-fake/art/FAKE-TITLE-97",  # a percent-encoded dot
-    "https://www.deviantart.com\\.zz-fake-site.art/",  # a backslash, which browsers read as a slash
-    "https://www.\uff24eviantart.com/zz-fake",  # a fullwidth letter
-    "https://www.deviantart.com:443/zz-fake",
-    "https://images-wixmp-fake.wixmp.com/f/FAKE-IMAGE.jpg",
-    "https://images-wixmp-fake.wixmp.com./f/FAKE-IMAGE-1.jpg",
-    "https://a.deviantart.net/avatars/FAKE.gif",
-    "fav.me/dfake",
-    "fav.me./dfake",
-    "sta.sh/0fake",
-    "https://www.artstation.com/zz-fake",
-    "https://twitter.com/zz-fake",
-    "https://x.com/zz-fake",
-    "https://www.instagram.com./zz-fake",
-    "https://zz-fake.tumblr.com",
-    "https://zz-fake.carrd.co",
-    "https://linktr.ee/zz-fake",
-    "https://zz-fake.wixsite.com/folio",
-    "https://www.fiverr.com/zz-fake",
-]
-
-
-@pytest.mark.parametrize("website", NOT_THEIR_OWN_SITE)
-def test_no_spelling_of_a_platform_host_becomes_a_link(website):
-    assert discover._external_links(website) == []
-
-
-def test_no_spelling_of_a_platform_host_reaches_the_store(db, capsys):
-    fake, names = small_world(NOT_THEIR_OWN_SITE)
-    assert run(fake, db) == 0
-    assert fake.looked_up() == names  # every profile was read
-    assert [links for *_, links, _ in stored(db)] == [[]] * len(names)  # each is stored, and none with a link
-    counts = summary(capsys.readouterr().out)
-    # All of them count as a platform but one: the backslash spelling also names a domain that is not one.
-    assert (counts[discover.ON_PLATFORM], counts[discover.OTHER_SHAPE]) == (len(names) - 1, 1)
-    assert counts[discover.NO_WEBSITE] == counts[discover.NO_HOST] == 0
-    assert "FAKE" not in everything_on_disk(db)
-
-
-# The lead's rule: only the front page of a bare custom domain is an artist's own site. Each of these may well be
-# on a domain of their own, but it has the shape of a profile on a platform, so it is dropped whole. Trimming it
-# to the site root would turn "someone's page on a platform nobody has listed" into "the platform is their site".
-PROFILE_SHAPED = [
-    "https://zz-fake-site.art/work",  # a path
-    "https://zz-fake-site.art/zz-fake-user",
-    "https://zz-fake-site.art/a/b/",
-    "https://zz-fake-site.art//",
-    "https://zz-fake-site.art/?user=zz-fake-user",  # a query
-    "https://zz-fake-site.art?mail=fake.person@mail.invalid",
-    "https://zz-fake-user.zz-fake-site.art",  # a user subdomain
-    "https://shop.zz-fake-site.art/",
-    "https://www2.zz-fake-site.art",
-    "https://www.www.zz-fake-site.art",
-    "https://zz-fake-user.zz-fake-site.co.uk",
-    "https://zz-fake-site.art/#/zz-fake-user",  # a fragment used as a path
-    "https://zz-fake-site.art/#fake.person@mail.invalid",
-    "https://zz-fake-site.art/fake.person@mail.invalid",  # an email address, in any position or spelling
-    "https://zz-fake-site.art/contact/fake.person%40mail.invalid",
-    "https://zz-fake-site.art/fake.person%2540mail.invalid",
-    "https://zz-fake-site.art/a;mail=fake.person@mail.invalid",
-    "https://fake.person@zz-fake-site.art",
-    "https://fake-user:fake-pass@zz-fake-site.art",
-    "https://zz-fake-site.art:8443",  # a port of their own
-    "https://zz-fake-site.art:8443/",
-    "http://zz-fake-site.art:443",  # the other scheme's port
-    "https://zz-fake-site.art\\zz-fake-user",  # a backslash, which browsers read as the start of a path
-    "https://zz-fake-site.art/%2f",
-    "https://zz-fake-site.art/;zz-fake-user",
-]
-
-
-@pytest.mark.parametrize("website", PROFILE_SHAPED)
-def test_a_link_with_a_path_a_subdomain_or_a_query_is_dropped(website):
-    assert discover._external_links(website) == []
-    assert discover._external_links("https://zz-fake-site.art") == ["https://zz-fake-site.art/"]  # the shape decides
-
-
-def test_profile_shaped_links_are_dropped_whole_and_never_trimmed_to_the_root(db, capsys):
-    fake, names = small_world(PROFILE_SHAPED)
-    assert run(fake, db) == 0
-    assert fake.looked_up() == names  # every profile was read
-    assert [links for *_, links, _ in stored(db)] == [[]] * len(names)  # stored with no link: not the bare domain
-    assert summary(capsys.readouterr().out)[discover.OTHER_SHAPE] == len(names)
-    disk = everything_on_disk(db)
-    assert "zz-fake-site" not in disk and "mail.invalid" not in disk
-
-
-@pytest.mark.parametrize(
-    ("website", "links"),
-    [
-        # the front page of a bare custom domain: kept, rebuilt as scheme://host/ in one spelling
-        ("https://zz-fake-site.art", ["https://zz-fake-site.art/"]),
-        ("https://zz-fake-site.art/", ["https://zz-fake-site.art/"]),
-        ("http://zz-fake-site.art", ["http://zz-fake-site.art/"]),
-        ("https://www.zz-fake-site.art", ["https://www.zz-fake-site.art/"]),
-        ("  zz-fake-site.art  ", ["https://zz-fake-site.art/"]),
-        ("zz-fake-site.art/", ["https://zz-fake-site.art/"]),
-        ("HTTP://WWW.ZZ-Fake-Site.Art./", ["http://www.zz-fake-site.art/"]),
-        ("zz-fake-site.art.", ["https://zz-fake-site.art/"]),  # a trailing dot
-        ("https://www.zz-fake-site.art\u3002/", ["https://www.zz-fake-site.art/"]),  # an ideographic one
-        ("https://zz-fake-site\u3002art", ["https://zz-fake-site.art/"]),
-        ("https://zz-fake-site.art\uff0e", ["https://zz-fake-site.art/"]),  # a fullwidth one
-        ("https://zz-f\u00e4ke-site.art", ["https://xn--zz-fke-site-o8a.art/"]),
-        ("https://zz-fake-stra\u00dfe.de", ["https://xn--zz-fake-strae-mdb.de/"]),  # spelled as browsers spell it
-        ("https://zz-fake-site.co.uk", ["https://zz-fake-site.co.uk/"]),  # a two-part public suffix
-        ("https://www.zz-fake-site.co.uk/", ["https://www.zz-fake-site.co.uk/"]),
-        ("https://fakedeviantart.com", ["https://fakedeviantart.com/"]),  # a name that only contains a platform's
-        # the same front page written with parts that change nothing: they are not stored
-        ("https://zz-fake-site.art:443", ["https://zz-fake-site.art/"]),
-        ("http://zz-fake-site.art:80/", ["http://zz-fake-site.art/"]),
-        ("https://zz-fake-site.art?", ["https://zz-fake-site.art/"]),
-        ("https://zz-fake-site.art/#", ["https://zz-fake-site.art/"]),
-        # not a public site at all
-        ("", []),
-        (" ", []),
-        (".", []),
-        (None, []),
-        (12345, []),
-        (["https://zz-fake-site.art"], []),
-        (b"https://zz-fake-site.art", []),
-        ("FAKE-TAGLINE free text, not a link", []),
-        ("see zz-fake-site.art", []),
-        ("zz-fake-site.art\n/FAKE-TITLE-1", []),
-        ("fake-person@mail.invalid", []),
-        ("mailto:fake-person@mail.invalid", []),
-        ("ftp://zz-fake-site.art", []),
-        ("javascript://zz-fake-site.art/%0aalert(1)", []),
-        ("//zz-fake-site.art", []),
-        ("https:///zz-fake-site.art", []),
-        ("https://", []),
-        ("https://localhost", []),
-        ("https://127.0.0.1", []),
-        ("https://[::1]", []),
-        ("https://[not-a-host", []),
-        ("https://zz-fake-site.art:99999", []),
-        # no public suffix, a suffix on its own, or a subdomain some host hands out
-        ("https://zz-fake-site.example", []),
-        ("https://zz-fake-site.test", []),
-        ("https://zz-fake-site.invalid", []),
-        ("https://zz-fake-site.local", []),
-        ("https://co.uk", []),
-        ("https://art", []),
-        ("https://zz-fake.github.io", []),
-        ("https://zz-fake.blogspot.com", []),
-        # a host that is not a plain name
-        ("https://zz-fake_site.art", []),
-        ("https://zz-fake-site..art", []),
-        ("https://-zz-fake-site.art", []),
-        ("https://zz-fake-site-.art", []),
-        ("https://zz-fake-site%2Eart", []),
-        ("https://zz-fake\u200d-site.art", []),
-        ("https://zz-fake-site.art/" + "x" * 300, []),
-        ("zz-fake-site.art" + " " * 300, []),
-    ],
-)
-def test_only_the_front_page_of_their_own_domain_is_kept(website, links):
-    assert discover._external_links(website) == links
-
-
-def test_a_lone_surrogate_in_the_website_field_is_dropped_without_raising():
-    """JSON can carry half a surrogate pair, and URL parsers choke on it. One odd profile must not end a run."""
-    half = chr(0xD800)
-    for website in (half + "zz-fake-site.art", "https://zz-fake-site.art/" + half, f"https://zz-fake{half}-site.art"):
-        assert discover._external_links(website) == []
-
-
-def test_whatever_the_website_field_holds_a_kept_link_is_a_canonical_front_page():
-    """A seeded fuzz. No input may raise (that would end a run), and only scheme://host/ of an own site comes out."""
-    odd = [chr(code) for code in (0x00, 0x09, 0x0A, 0xDF, 0xE4, 0x130, 0x200D, 0x3002, 0xFF0E, 0xFF24, 0xFF61, 0xD800)]
-    plain = "https:// http:// HTTPS:// ftp:// // : / ? # @ . .. www. zz-fake-site art com co.uk github.io deviantart"
-    plain += " example - _ %2E %40 \\ [ ] ::1 127.0.0.1 :443 :8443 a=b xn-- localhost ; zz-fake-site.art"
-    pieces = [*plain.split(), " ", "www.zz-fake-site.art", "https://zz-fake-site.co.uk", *odd]
-    rng = random.Random(20261012)
-    kept = 0
-    for _ in range(20_000):
-        website = "".join(rng.choice(pieces) for _ in range(rng.randint(1, 7)))
-        for link in discover._external_links(website):
-            kept += 1
-            host = link.removeprefix("https://").removeprefix("http://").removesuffix("/")
-            assert re.fullmatch(r"https?://[a-z0-9.-]+/", link), ascii(website)
-            assert store.canonical_host(host) == host, ascii(website)
-            assert crawl.is_own_site(link), ascii(website)
-            assert store.site_key(link) in (f"site:{host}", f"site:{host.removeprefix('www.')}"), ascii(website)
-    assert kept > 100  # the fuzz does reach the kept branch
-
-
-@pytest.mark.parametrize(
-    ("website", "count"),
-    [
-        ("", discover.NO_WEBSITE),
-        ("   ", discover.NO_WEBSITE),
-        (None, discover.NO_WEBSITE),
-        (12345, discover.NO_WEBSITE),
-        ("https://www.deviantart.com/zz-fake/gallery", discover.ON_PLATFORM),
-        ("https://www.deviantart.com./zz-fake/art/FAKE-TITLE-99", discover.ON_PLATFORM),
-        ("https://www.artstation.com/zz-fake", discover.ON_PLATFORM),  # a listed name, in any label
-        ("zz-fake.tumblr.com", discover.ON_PLATFORM),
-        ("https://www.pinterest.de/zz-fake", discover.ON_PLATFORM),
-        ("https://zz-fake.github.io", discover.ON_PLATFORM),
-        ("https://x.com/zz-fake", discover.ON_PLATFORM),  # a listed domain
-        ("fav.me/dfake", discover.ON_PLATFORM),
-        ("https://zz-fake.cargo.site", discover.ON_PLATFORM),
-        ("https://zz-fake-site.art/folio", discover.OTHER_SHAPE),  # a path
-        ("https://shop.zz-fake-site.art", discover.OTHER_SHAPE),  # a subdomain
-        ("https://zz-fake-site.art/?u=zz-fake", discover.OTHER_SHAPE),  # a query
-        ("https://zz-fake-site.art/#/zz-fake", discover.OTHER_SHAPE),  # a fragment
-        ("https://zz-fake-site.co.uk:8443", discover.OTHER_SHAPE),
-        ("<https://zz-fake-site.art>", discover.OTHER_SHAPE),
-        ("zz-fake-site.art (commissions open)", discover.OTHER_SHAPE),
-        ("FAKE-TAGLINE free text", discover.NO_HOST),
-        ("https://localhost/x", discover.NO_HOST),
-        ("https://127.0.0.1", discover.NO_HOST),
-        ("https://zz-fake-site.example", discover.NO_HOST),  # no registrable domain, and on no list
-        ("https://zz-fake-site.test/folio", discover.NO_HOST),
-    ],
-)
-def test_a_profile_with_no_link_to_keep_is_counted_under_exactly_one_reason(website, count):
-    assert discover._external_links(website) == []
-    assert discover._why_no_link(website, store.hosts_in(website)) == count
-
-
-def test_the_summary_splits_the_profiles_with_no_link_and_prints_counts_only(db, capfd):
-    websites = [
-        "",
-        "https://www.artstation.com/zz-fake-one",
-        "https://www.deviantart.com/zz-fake-two/gallery",
-        "https://zz-fake-three.art/folio",
-        "https://zz-fake-user.zz-fake-four.art",
-        "https://zz-fake-five.art/?page=2",
-        "FAKE-TAGLINE free text",
-        "https://zz-fake-kept.art",
-    ]
-    fake, names = small_world(websites)
-    assert run(fake, db) == 0
-    out, err = capfd.readouterr()
-    counts = summary(out.replace("\r\n", "\n"))
-    assert err == ""
-    assert counts[discover.NO_WEBSITE] == 1
-    assert counts[discover.ON_PLATFORM] == 2
-    assert counts[discover.OTHER_SHAPE] == 3
-    assert counts[discover.NO_HOST] == 1
-    assert counts[discover.OWN_SITE] == 1
-    assert counts["artists stored"] == counts["profiles fetched"] == counts["candidates (>= 3 hits)"] == len(names)
-    reasons = (discover.OWN_SITE, discover.NO_WEBSITE, discover.ON_PLATFORM, discover.OTHER_SHAPE, discover.NO_HOST)
-    assert sum(counts[label] for label in reasons) == counts["artists stored"]  # each stored artist under one
-    printed = out.lower()
-    for told in ("zz-fake", "artstation", "folio", "free text", ".art", "http", "tagline"):
-        assert told not in printed  # a count says how many, never who or where
-    assert [bool(links) for *_, links, _ in stored(db)] == [False] * 7 + [True]  # all stored, one with a link
-    assert "fake-three" not in everything_on_disk(db) and "fake-four" not in everything_on_disk(db)
-
-
-# --- 3: rerunning creates no duplicates ---
+# --- 2: a second run makes no duplicates, and browsing survives a stop ---
 
 
 def test_rerun_creates_no_duplicates(db):
@@ -749,47 +461,100 @@ def test_rerun_creates_no_duplicates(db):
         conn.execute("UPDATE artists SET discovered_at = '2020-01-01T00:00:00+00:00'")  # so a rewrite would show
     first = all_rows(db)
     assert len(first) == len(EXPECTED)
-    assert run(world(), db) == 0
-    assert run(world(), db) == 0
-    assert all_rows(db) == first
+    assert run(world(), db) == 0  # a later pass
+    assert run(world(), db, afresh=False) == 0  # and a run on the pass that is saved
+    assert all_rows(db) == first and len(all_rows(db, "counted")) == 101
     with closing(sqlite3.connect(db)) as conn:
-        assert conn.execute("SELECT count(*), count(DISTINCT lower(da_username)) FROM artists").fetchone() == (8, 8)
+        assert conn.execute("SELECT count(*), count(DISTINCT lower(da_username)) FROM artists").fetchone() == (9, 9)
 
 
-def test_max_artists_caps_what_one_run_stores(db, capsys):
-    fake = world()
-    assert run(fake, db, max_artists=1) == 0
-    assert stored(db) == EXPECTED[:1]
-    assert fake.looked_up() == [HOTEL, ALPHA]  # and the lookups stop there
+def test_a_finished_pass_is_carried_on_from_for_a_week_and_then_a_run_browses_afresh(db, capsys):
+    """How long saved progress stays valid: PASS_VALID from the pass's first page. Until then a run on a finished
+    pass has nothing to browse and makes no request. After it, the pass is forgotten, tally and all."""
+    assert discover.PASS_VALID == timedelta(days=7)
+    assert run(world(), db) == 0
+    capsys.readouterr()
+    for age in (timedelta(0), timedelta(days=6, hours=23)):
+        age_the_pass(db, age)
+        again = world()
+        assert run(again, db, afresh=False) == 0 and again.log == []  # not even a token
+        out = capsys.readouterr().out
+        assert out.startswith(EXPECTED_TALLY) and summary(out)["requests to the API"] == 0  # the pass, as saved
+    age_the_pass(db, timedelta(days=7, hours=1))
+    later = world()
+    del later.by_tag["conceptart"]  # by now BRAVO has taken their works down, and ALPHA all but one
+    assert run(later, db, afresh=False) == 0 and len(later.log) == BASE_REQUESTS - 1
     counts = summary(capsys.readouterr().out)
-    assert counts[discover.NOT_REACHED] == 7  # 9 candidates: one unavailable, one stored, seven not reached
-    capped = world()
-    assert run(capped, db, max_artists=4) == 0  # a cap on what is stored, with or without a site
-    assert stored(db) == EXPECTED[:4]
-    assert summary(capsys.readouterr().out)[discover.NOT_REACHED] == 4
+    # The old tally is gone, not added to: ALPHA would have five works otherwise, and still be a candidate.
+    assert (counts["pages fetched"], counts["deviations counted"], counts["candidates (>= 3 hits)"]) == (18, 27, 7)
+    assert len(all_rows(db, "counted")) == 34
+    assert stored(db) == EXPECTED  # and discovery never takes anybody out of the store
 
 
-def test_a_run_that_is_stopped_keeps_what_it_stored_and_the_run_after_it_does_not_look_them_up_again(db, capsys):
-    """Round 8: a run now reads some 3,500 profiles, a second apart. Each artist is stored as their profile is
-    read, and one stored within the last day is not read again, so a run after a stop goes on where it stopped."""
+def test_max_artists_caps_the_artists_a_run_adds_and_the_next_run_stores_the_rest(db, capsys):
+    first = world()
+    assert run(first, db, max_artists=1) == 0
+    assert stored(db) == [expected_row(ALPHA, 3)]  # the first to have works enough, on the first page
+    assert first.browsed() == [("conceptart", 0)]  # and browsing stops there
+    counts = summary(capsys.readouterr().out)
+    assert (counts["candidates (>= 3 hits)"], counts["artists stored"], counts[discover.NOT_REACHED]) == (2, 1, 1)
+    second = world()
+    assert run(second, db, max_artists=4, afresh=False) == 0  # four more: a cap on what is added, not on the store
+    assert [name for _, name, *_ in stored(db)] == [ALPHA, BRAVO, DELTA, FOXTROT, GOLF]
+    # The page the cap was reached on is read again, so that nobody on it is lost; no other page is.
+    assert second.browsed()[:3] == [("conceptart", 0), ("conceptart", 40), ("characterdesign", 0)]
+    assert second.browsed()[-1] == ("gameart", 0)
+    counts = summary(capsys.readouterr().out)
+    assert (counts["candidates (>= 3 hits)"], counts["artists stored"], counts[discover.NOT_REACHED]) == (9, 5, 4)
+    third = world()
+    assert run(third, db, afresh=False) == 0
+    assert third.browsed()[0] == ("gameart", 0) and len(third.browsed()) == 14
+    assert stored(db) == EXPECTED and capsys.readouterr().out.startswith(EXPECTED_TALLY)
+    none = world()
+    assert run(none, db, max_artists=0) == 0 and stored(db) == EXPECTED  # nobody new, so nothing to cap
+
+
+@pytest.mark.parametrize("stopped_by", ["the API", "a person"])
+def test_a_run_that_is_stopped_while_browsing_keeps_what_it_stored_and_the_next_run_carries_on(db, capsys, stopped_by):
+    """A run of 2,160 browse pages was stopped by a 504 after 202 of them and had stored nothing: nothing was
+    stored until browsing ended, and the rerun began again from nothing. Progress is saved page by page now, and
+    an artist reaches the store on the page that gives them works enough."""
     stopped = world()
-    stopped.before = lambda index, request: 503 if request.url.path == PROFILE_PATH + FOXTROT else None
-    assert run(stopped, db) == 1  # at the fifth lookup
-    assert capsys.readouterr().err == "stopped: profile lookup failed with HTTP 503\n"
-    assert stored(db) == EXPECTED[:3]  # ALPHA, BRAVO and DELTA
+    if stopped_by == "the API":
+        stopped.before = lambda index, request: 504 if request.url.params.get("tag") == "gameart" else None
+        assert run(stopped, db) == 1
+        assert capsys.readouterr().err == "stopped: browse failed with HTTP 504\n"
+        assert stopped.browsed()[-4:] == [("gameart", 0)] * 4  # asked for again three times, then the run stops
+    else:
+
+        def interrupt(index, request):
+            if request.url.params.get("tag") == "gameart":
+                raise KeyboardInterrupt
+
+        stopped.before = interrupt
+        with pytest.raises(KeyboardInterrupt):
+            run(stopped, db)
+    assert stored(db) == EXPECTED[:3]  # ALPHA, BRAVO and DELTA: stored already, not all at the end
+    assert not (config.CACHE_DIR / "discover.status").exists()
     again = world()
-    assert run(again, db, same_day=True) == 0
-    assert again.looked_up() == [HOTEL, FOXTROT, GOLF, INDIA, JULIET, KILO]  # HOTEL has no profile, so no row
-    counts = summary(capsys.readouterr().out)
-    assert stored(db) == EXPECTED and (counts[discover.LATELY], counts["artists stored"]) == (3, 5)
-    parts = ("skipped (removed)", discover.LATELY, "profiles unavailable", discover.NOT_REACHED, "artists stored")
-    assert sum(counts[part] for part in parts) == counts["candidates (>= 3 hits)"] == 9  # the summary still adds up
-    a_day_later = world()
-    assert run(a_day_later, db) == 0 and len(a_day_later.looked_up()) == 9  # and then everybody is read again
-    assert discover.STORED_LATELY.total_seconds() == 24 * 3600
+    assert run(again, db, afresh=False) == 0
+    assert again.browsed() == [(tag, 0) for tag in discover.NICHE_TAGS[4:]]  # from the page it stopped at, and on
+    assert len(again.log) == 1 + 14
+    assert stored(db) == EXPECTED  # ALPHA with four works: the one filed under two tags was not counted again
+    assert capsys.readouterr().out.startswith(EXPECTED_TALLY)  # the whole pass, whichever runs made it
 
 
-def test_the_niche_is_eighteen_tags_each_browsed_a_hundred_and_twenty_pages_deep(db):
+def test_a_work_counted_before_a_stop_is_not_counted_again_after_it(db):
+    """ALPHA's fourth work is filed under the first tag and the second. The run stops between the two."""
+    stopped = world()
+    stopped.before = lambda index, request: 500 if request.url.params.get("tag") == "characterdesign" else None
+    assert run(stopped, db) == 1
+    assert stored(db) == [expected_row(ALPHA, 3), expected_row(BRAVO, 3)]
+    assert run(world(), db, afresh=False) == 0
+    assert stored(db) == EXPECTED
+
+
+def test_the_niche_is_eighteen_tags_each_browsed_a_hundred_and_twenty_pages_deep(db, monkeypatch):
     """Round 8: six tags at 40 pages found about 400 artists, and the owner needs some 3,500 found. The tags are
     specific to concept and character art for games: a broad one would let in anybody."""
     first_six = ("conceptart", "characterdesign", "characterconcept", "creaturedesign", "gameart", "environmentconcept")
@@ -798,48 +563,48 @@ def test_the_niche_is_eighteen_tags_each_browsed_a_hundred_and_twenty_pages_deep
     assert all(re.fullmatch(r"[a-z]{7,20}", tag) for tag in discover.NICHE_TAGS)
     assert not {"digitalart", "fantasy", "art", "drawing", "illustration", "fanart"} & set(discover.NICHE_TAGS)
     assert discover.PAGES_PER_TAG * discover.PAGE_SIZE <= discover.MAX_OFFSET
-    fake = FakeDA({discover.NICHE_TAGS[-1]: [deviation(n, ALPHA) for n in range(1, 201)]}, {ALPHA: profile(ALPHA, "")})
+    last = discover.NICHE_TAGS[-1]
+    fake = FakeDA({last: [deviation(n, ALPHA) for n in range(1, 201)]})
     fake.page_size = 1  # 200 pages of one work each under the last tag: 120 of them are read, and no more
     assert run(fake, db) == 0
-    assert fake.offsets(discover.NICHE_TAGS[-1]) == list(range(120))
-    assert stored(db) == [expected_row(ALPHA, [], 120)]
+    assert fake.offsets(last) == list(range(120))
+    assert stored(db) == [expected_row(ALPHA, 120)]
+    monkeypatch.setattr(discover, "PAGES_PER_TAG", 125)  # browsed deeper, the saved pass is carried on from there
+    deeper = FakeDA(fake.by_tag)
+    deeper.page_size = 1
+    assert run(deeper, db, afresh=False) == 0
+    assert deeper.browsed() == [(last, offset) for offset in range(120, 125)]
+    assert stored(db) == [expected_row(ALPHA, 125)]
 
 
-# --- 4: removed artists are skipped and never re-added (hard rule 7) ---
+# --- 3: removed artists are never stored again (hard rule 7) ---
 
 
-def test_a_removed_artist_is_skipped_without_a_lookup(db, capsys):
+def test_a_removed_artist_is_never_stored_again_however_often_they_are_browsed(db, capsys):
     assert run(world(), db) == 0
     capsys.readouterr()
     assert store.mark_removed("da:ZZ-FAKE-ALPHA", db) == 1  # another case than the API uses
     for _ in range(2):
-        fake = world()
-        assert run(fake, db) == 0
-        assert ALPHA not in fake.looked_up()
+        assert run(world(), db) == 0
         assert stored(db) == without("da:zz-fake-alpha")
-        assert "skipped (removed): 1\n" in capsys.readouterr().out
+        counts = summary(capsys.readouterr().out)
+        assert (counts["skipped (removed)"], counts["artists stored"]) == (1, 8)
 
 
-@pytest.mark.parametrize("handle", [ALPHA, HOTEL, FOXTROT, JULIET, KILO])  # with a site, and the four without
+@pytest.mark.parametrize("handle", [ALPHA, HOTEL, FOXTROT, JULIET, KILO])
 @pytest.mark.parametrize("how", ["mark_removed", "import_removed"])
-def test_a_removed_handle_never_seen_here_is_never_looked_up_and_bars_only_itself(db, capsys, how, handle):
-    """Round 7. Such a handle used to be read once, solely to put the site it named on the removal list, and the
-    next account to list that site was barred with it. A removal of a handle now bars the handle."""
-    key_hash = hashlib.sha256(f"da:{handle.lower()}".encode()).hexdigest()
+def test_a_removed_handle_never_seen_here_is_never_stored_and_bars_only_itself(db, how, handle):
+    """Round 7. A removal of a handle bars the handle, and nobody else."""
+    key_hash = sha(f"da:{handle.lower()}")
     if how == "mark_removed":
         assert store.mark_removed(f"da:{handle.upper()}", db) == 0  # nothing is known about them here
     else:  # the removal arrives from the list of record, into a fresh cache
         assert store.import_removed([key_hash], db) == 0
     for _ in range(2):
-        fake = world({BRAVO: WEBSITES[ALPHA]})  # and a second account lists the site ALPHA lists
-        assert run(fake, db) == 0
-        assert handle not in fake.looked_up()
-        assert stored(db) == [
-            row if row[1] != BRAVO else expected_row(BRAVO, [WEBSITES[ALPHA]], 3) for row in without(f"da:{handle}")
-        ]
-    with closing(sqlite3.connect(db)) as conn:
-        assert conn.execute("SELECT key_hash FROM removed").fetchall() == [(key_hash,)]  # the handle, and no site
-    assert not hasattr(store, "site_unresolved")
+        assert run(world(), db) == 0
+        assert stored(db) == without(f"da:{handle}")
+    assert all_rows(db, "removed") == [(key_hash, mock.ANY)]  # the handle, and nothing else
+    assert handle.lower() not in everything_on_disk(db).lower()
 
 
 def test_artist_removed_after_discovery_is_gone_and_never_readded(db):
@@ -848,236 +613,63 @@ def test_artist_removed_after_discovery_is_gone_and_never_readded(db):
     store.mark_removed(f"https://www.deviantart.com/{BRAVO}", db)  # the way an artist would send it
     assert stored(db) == without("da:zz-fake-bravo")
     for _ in range(2):
-        fake = world()
-        assert run(fake, db) == 0
-        assert BRAVO not in fake.looked_up()
+        assert run(world(), db) == 0
         assert stored(db) == without("da:zz-fake-bravo")
-    assert "bravo" not in everything_on_disk(db).lower()
+    assert "bravo" not in everything_on_disk(db).lower()  # in the store, or in what is saved of the pass
 
 
-def test_artist_whose_site_was_removed_is_not_stored(db, capsys):
-    store.mark_removed("site:www.zz-fake-delta.co.uk", db)
-    assert run(world(), db) == 0
-    assert stored(db) == without("da:zz-fake-delta")
-    assert "skipped (removed): 1\n" in capsys.readouterr().out
-    assert "delta" not in everything_on_disk(db).lower()
-
-
-def test_a_removed_site_blocks_every_spelling_of_its_host(db, capsys):
-    store.mark_removed("site:zz-fake-d.art", db)
-    spellings = [  # each is the front page of the removed site, so each gets as far as the removal check
-        "https://zz-fake-d.art",
-        "https://zz-fake-d.art./",  # a trailing dot
-        "https://www.zz-fake-d.art.",
-        "zz-fake-d.art.",
-        "HTTPS://WWW.ZZ-Fake-D.Art/",
-        "http://zz-fake-d.art:80",
-        "https://zz-fake-d\u3002art/",
-        "https://www.zz-fake-d.art\uff0e",
-    ]
-    fake, names = small_world(spellings)
-    assert run(fake, db) == 0
-    assert fake.looked_up() == names
-    assert all_rows(db) == []
-    assert f"skipped (removed): {len(names)}\n" in capsys.readouterr().out
-    assert not any(store.is_removed(f"da:{name}", db) for name in names)  # not stored, and nobody is barred for it
-    assert "zz-fake-d" not in everything_on_disk(db).lower()
-
-
-def test_site_removal_bars_the_artist_whatever_site_they_list_next(db):
-    """A site removal is the artist asking to be left out. Moving to a new address must not bring them back."""
-    assert run(world(), db) == 0
-    store.mark_removed("site:zz-fake-delta.co.uk", db)  # removes DELTA, who was already stored
-    store.mark_removed("site:zz-fake-bravo.com", db)  # BRAVO is stored under www.zz-fake-bravo.com: the same site
-    assert stored(db) == without("da:zz-fake-delta", "da:zz-fake-bravo")
-    moved = {DELTA: "https://zz-fake-delta-new.art", BRAVO: "https://zz-fake-bravo-new.art"}
-    for _ in range(2):
-        fake = world(moved)
-        assert run(fake, db) == 0
-        assert DELTA not in fake.looked_up() and BRAVO not in fake.looked_up()
-        assert stored(db) == without("da:zz-fake-delta", "da:zz-fake-bravo")
-    assert "delta" not in everything_on_disk(db).lower() and "bravo" not in everything_on_disk(db).lower()
-
-
-def test_the_store_has_the_last_word_and_an_artist_it_refuses_is_not_counted_as_stored(db, capsys, monkeypatch):
-    """Two checks stand between a removed site and the store. This is the second one, with the first one blind."""
-    store.mark_removed("site:zz-fake-delta.co.uk", db)
-    monkeypatch.setattr(store, "record_listing", lambda username, hosts, db=None: False)
-    assert run(world(), db) == 0
-    counts = summary(capsys.readouterr().out)
-    assert stored(db) == without("da:zz-fake-delta")
-    assert (counts["skipped (removed)"], counts["artists stored"]) == (1, len(EXPECTED) - 1)
-    assert not store.is_removed(f"da:{DELTA}", db)
-
-
-@pytest.mark.parametrize(
-    "website",
-    [
-        "https://zz-fake-delta.co.uk/",
-        "https://www.zz-fake-delta.co.uk/folio?page=2",  # the own-site rule drops each of these shapes,
-        "https://shop.zz-fake-delta.co.uk",  # so the removal has to be checked before it
-        "https://zz-fake-delta.co.uk/#/zz-fake-delta",
-        "http://zz-fake-delta.co.uk:8080/",
-    ],
-)
-@pytest.mark.parametrize("stored_before", [False, True])
-def test_a_profile_that_names_a_removed_site_in_a_link_of_any_shape_is_not_stored_and_nobody_is_barred(
-    db, capsys, website, stored_before
-):
-    """Round 7. One such answer used to delete the artist's row and bar their handle for good. It is one answer's
-    word: an artist who is not stored is not stored on it, and one who is stays exactly as they were."""
-    if stored_before:
-        assert run(world({DELTA: "https://zz-fake-delta-old.art"}), db) == 0
-    before = stored(db)
-    store.mark_removed("site:zz-fake-delta.co.uk", db)
-    fake = world({DELTA: website})
+def test_a_removal_in_the_middle_of_a_pass_leaves_no_row_that_names_the_artist_and_they_do_not_come_back(db, capsys):
+    """What is saved of a pass must outlive a removal without naming anybody: an artist who is removed between a
+    stop and the run that carries on is in no table by name, and more works of theirs do not bring them back."""
+    stopped = world()
+    stopped.before = lambda index, request: 500 if request.url.params.get("tag") == "gameart" else None
+    assert run(stopped, db) == 1
+    assert stored(db) == EXPECTED[:3]
+    assert store.mark_removed(ALPHA, db) == 1
+    assert "alpha" not in everything_on_disk(db).lower()
     capsys.readouterr()
-    assert run(fake, db) == 0
-    assert DELTA in fake.looked_up()
-    assert "skipped (removed): 1\n" in capsys.readouterr().out
-    assert [row for row in stored(db) if row[1] == DELTA] == [row for row in before if row[1] == DELTA]
-    assert len(all_rows(db)) == len(EXPECTED) - (not stored_before)
-    assert not store.is_removed(f"da:{DELTA}", db)
-    with closing(sqlite3.connect(db)) as conn:
-        assert conn.execute("SELECT count(*) FROM removed").fetchone() == (1,)  # the site, as before
-    later = world({DELTA: "https://zz-fake-delta-new.art"})  # an answer that does not name it: stored like anybody
-    assert run(later, db) == 0
-    assert [links for _, name, _, links, _ in stored(db) if name == DELTA] == [["https://zz-fake-delta-new.art/"]]
-
-
-def test_one_website_answered_for_every_profile_and_then_one_removal_by_handle_removes_only_that_artist(db):
-    """The critic's finding, and the biggest of round 7: one run in which every profile answered the same website,
-    then one legitimate removal, purged and barred six artists of six. With honest data it was two who share a
-    studio's site. A handle that is removed bars that handle."""
-    studio = "https://zz-fake-studio.art/"
-    assert run(world(dict.fromkeys(WEBSITES, studio)), db) == 0
-    assert [(key, links) for key, _, _, links, _ in stored(db)] == [(key, [studio]) for key, *_ in EXPECTED]
-    assert store.mark_removed(f"da:{ALPHA}", db) == 1
-    others = [key for key, *_ in without("da:zz-fake-alpha")]
-    assert [key for key, *_ in stored(db)] == others == [key for key, _, _ in store.all_artists(db)]
-    assert not store.is_removed("site:zz-fake-studio.art", db)
-    for _ in range(2):  # and the runs after it bring the one back, and lose none of the others
-        later = world(dict.fromkeys(WEBSITES, studio))
-        assert run(later, db) == 0
-        assert ALPHA not in later.looked_up() and [key for key, *_ in stored(db)] == others
-    assert not any(store.is_removed(name, db) for _, name, *_ in without("da:zz-fake-alpha"))
-    assert store.own_site_candidates(db) == []  # a site that everybody lists is nobody's own, which costs nothing
+    assert run(world(more=[ALPHA] * 3), db, afresh=False) == 0  # three more works of theirs, further on in the pass
+    assert stored(db) == without("da:zz-fake-alpha") and "alpha" not in everything_on_disk(db).lower()
+    counts = summary(capsys.readouterr().out)
+    assert (counts["candidates (>= 3 hits)"], counts["skipped (removed)"], counts["artists stored"]) == (9, 1, 8)
 
 
 def test_a_removed_site_removes_the_artists_whose_stored_link_it_is_and_they_stay_out(db):
     studio = "https://zz-fake-studio.art/"
-    assert run(world({ALPHA: studio, BRAVO: "http://www.zz-fake-studio.art", DELTA: f"{studio}zz-fake-delta"}), db) == 0
-    assert store.mark_removed("site:zz-fake-studio.art", db) == 2  # DELTA's link had a path, and was never stored
+    assert run(world(), db) == 0
+    for name, site in ((ALPHA, studio), (BRAVO, "http://www.zz-fake-studio.art/")):
+        assert store.keep_own_site(name, site, db)  # as the collect stage does, once it has read their profile
+    assert store.mark_removed("site:zz-fake-studio.art", db) == 2
     gone = ("da:zz-fake-alpha", "da:zz-fake-bravo")
-    assert [key for key, *_ in stored(db)] == [key for key, *_ in without(*gone)]
+    assert stored(db) == without(*gone)
     assert store.is_removed(f"da:{ALPHA}", db) and store.is_removed(f"da:{BRAVO}", db)
-    assert not store.is_removed(f"da:{DELTA}", db)
-    later = world({ALPHA: "https://zz-fake-alpha-new.art", BRAVO: "", DELTA: f"{studio}zz-fake-delta"})
-    assert run(later, db) == 0
-    assert ALPHA not in later.looked_up() and BRAVO not in later.looked_up()  # whatever site they list next
-    assert [key for key, *_ in stored(db)] == [key for key, *_ in without(*gone)]  # DELTA: skipped, and still there
+    assert run(world(), db) == 0  # whatever site they list next: discovery knows them by their handle
+    assert stored(db) == without(*gone)
     assert "studio" not in everything_on_disk(db).lower()
+
+
+def test_an_artist_whose_site_was_removed_before_they_were_ever_stored_is_known_here_by_handle_alone(db):
+    """Discovery cannot know whose site a removed one is: it reads no profile. The artist is stored as a handle
+    with no link. The removed site is written into nobody's row, and the collect stage, which reads the profile,
+    marks them and collects nothing (see its tests)."""
+    store.mark_removed("site:www.zz-fake-delta.co.uk", db)
+    assert run(world(), db) == 0
+    assert stored(db) == EXPECTED and not store.is_removed(f"da:{DELTA}", db)
+    assert store.keep_own_site(DELTA, "https://zz-fake-delta.co.uk/", db) is False
+    assert stored(db) == EXPECTED and "co.uk" not in everything_on_disk(db)
 
 
 def test_the_removal_list_of_record_keeps_a_removed_artist_out_of_a_fresh_cache(db):
     assert run(world(), db) == 0
+    assert store.keep_own_site(DELTA, "https://zz-fake-delta.co.uk/", db)
     store.mark_removed(f"da:{ALPHA}", db)
     store.mark_removed("site:zz-fake-delta.co.uk", db)
-    with closing(sqlite3.connect(db)) as conn:
-        of_record = [key_hash for (key_hash,) in conn.execute("SELECT key_hash FROM removed")]
+    of_record = [key_hash for key_hash, _ in all_rows(db, "removed")]
     db.unlink()  # the local store is a cache: gone
     assert store.import_removed(of_record, db) == 0
     for _ in range(2):
-        fake = world()
-        assert run(fake, db) == 0
-        assert ALPHA not in fake.looked_up() and DELTA not in fake.looked_up()
+        assert run(world(), db) == 0
         assert stored(db) == without("da:zz-fake-alpha", "da:zz-fake-delta")
-
-
-def odd_spellings(host):
-    """Ways a profile's website field can name a host that no two URL parsers read alike."""
-    joiner, soft_hyphen, fullwidth_zz = chr(0x200D), chr(0xAD), chr(0xFF5A) * 2
-    return [
-        f"https://{host}\\x",  # a backslash
-        f"<https://{host}>",
-        f"({host})",
-        f'"https://{host}"',
-        f"[url=https://{host}]my site[/url]",
-        f"{host} (commissions open)",
-        f"my site: {host}!",
-        f"my site...{host}",  # an ellipsis run into the name
-        f"*.{host}",
-        f"https://xn--zz-fake-{chr(0xE9)}.art and {host}",  # beside a name that is not valid: still found
-        f"portfolio at {host}, prints at zz-fake-prints.art",
-        f"https://{host}\n(second line)",
-        f"{host};{host}",
-        f"https://{host}/" + "x" * 400,  # over the length the own-site rule reads
-        "x" * 400 + f" https://{host}",
-        f"  {host.upper()}  ",
-        f"https://{host}./",
-        f"https://www.{host}",
-        f"https://shop.{host}/folio",
-        f"http://{host}:8080/x?y=1#z",
-        f"https://{host}/#/zz-fake-user",
-        f"https://fake-user:fake-pass@{host}/",
-        f"fake.person@{host}",
-        f"//{host}",
-        f"https:///{host}",
-        f"https://{host.replace('.', '%2E')}/",  # a percent-encoded dot
-        f"https://{host.replace('.', chr(0x3002))}",  # an ideographic full stop
-        f"https://{host}{chr(0xFF0E)}",  # a fullwidth one, trailing
-        f"https://{host.replace('.', chr(0x3002))}/folio",  # the same three inside the name of a link with a path,
-        f"https://{host.replace('.', chr(0xFF0E))}/folio",  # which only the scan of the raw field can recognise
-        host.replace(".", chr(0xFF61)) + " (commissions open)",
-        host.replace("zz", fullwidth_zz),  # fullwidth letters
-        host[:3] + joiner + host[3:],  # an invisible character inside the name
-        host[:3] + soft_hyphen + host[3:],
-        f"https://zz-fake-redirect.art/?to=https://{host}/",
-        f"https://zz-fake-redirect.art/out?url=https%3A%2F%2F{host}%2F",
-        f"https://{host.replace('.', '%252E')}/",  # encoded twice
-        host.replace(".", "&#46;"),  # an HTML entity for the dot
-        host.replace(".", "[.]"),  # the dot spelled out, the way people hide an address from robots
-        "hxxps://" + host.replace(".", "(.)") + "/folio",
-        host.replace(".", " [dot] "),
-        host.replace(".", " DOT "),
-    ]
-
-
-def test_a_removed_site_is_recognised_however_the_website_field_spells_it(db, capsys):
-    store.mark_removed("site:zz-fake-d.art", db)
-    spellings = odd_spellings("zz-fake-d.art")
-    fake, names = small_world(spellings)
-    assert run(fake, db) == 0
-    assert fake.looked_up() == names
-    assert all_rows(db) == []  # recognised in every spelling: not one of them is stored
-    assert f"skipped (removed): {len(names)}\n" in capsys.readouterr().out
-    assert not any(store.is_removed(name, db) for name in names)  # and nobody is barred on one answer's word
-    assert "zz-fake-d" not in everything_on_disk(db).lower()
-    # The next run: each of them shows a clean site of their own, and is stored like anybody else.
-    later, _ = small_world([f"https://zz-fake-new-{n:02d}.art" for n in range(len(names))])
-    assert run(later, db) == 0
-    assert later.looked_up() == names and len(all_rows(db)) == len(names)
-
-
-def test_a_removed_site_with_a_name_outside_ascii_is_recognised_too(db):
-    name = "zz-f" + chr(0xE4) + "ke-d.art"  # a-umlaut: xn--zz-fke-d-... once encoded
-    assert store.mark_removed(f"site:{name}", db) == 0
-    spellings = [f"<https://{name}/folio>", f"{name.upper()} (commissions open)", f"https://www.{name}/?page=2"]
-    fake, names = small_world(spellings)
-    assert run(fake, db) == 0
-    assert all_rows(db) == [] and not any(store.is_removed(name, db) for name in names)
-
-
-def test_only_the_website_field_is_read_for_hosts_never_the_bio_or_the_rest_of_the_profile(db, capsys):
-    """Every made-up bio names zz-fake-bio-link.art and every profile carries an email at mail.invalid. Reading
-    hosts out of DeviantArt text is not allowed, so a removal of that site must touch nobody."""
-    store.mark_removed("site:zz-fake-bio-link.art", db)
-    fake = world()
-    assert run(fake, db) == 0
-    assert "zz-fake-bio-link.art" in "".join(fake.served)  # the API did send it, in the bio
-    assert stored(db) == EXPECTED
-    assert capsys.readouterr().out == EXPECTED_STDOUT  # nobody skipped as removed
-    assert store.own_site_candidates(db) == OWN_SITES
 
 
 def test_hostnames_are_found_in_running_text_and_nothing_else_is():
@@ -1101,75 +693,14 @@ def test_hostnames_are_found_in_running_text_and_nothing_else_is():
     assert store.hosts_in(chr(0xD800) + " zz-fake-site.art " + chr(0xDFFF)) == {"zz-fake-site.art"}  # no error
 
 
-# --- 9: the seeding list never offers the crawl stage a domain that several profiles list ---
-
-FRONT, PATH, SUBDOMAIN = "https://zz-fake-plat.art/", "https://zz-fake-plat.art/u2", "https://u3.zz-fake-plat.art"
-ALPHA_SEED = ("da:zz-fake-alpha", FRONT)
+# --- 4: the pace: one interval for the whole run, which slows down when the API asks ---
 
 
-def test_the_seeding_list_is_the_stored_artists_with_a_domain_nobody_else_lists(db):
-    assert run(world(), db) == 0
-    assert store.own_site_candidates(db) == OWN_SITES
-
-
-def test_a_domain_listed_by_three_profiles_in_one_run_is_not_a_candidate(db):
-    """The front page is a bare domain and is stored. The other two listings have a profile's shape and are
-    dropped, but they are counted: three profiles naming one domain make it a platform, whatever any list says."""
-    assert run(world({ALPHA: FRONT, BRAVO: PATH, DELTA: SUBDOMAIN}), db) == 0
-    links = {name: links for _, name, _, links, _ in stored(db)}
-    assert (links[ALPHA], links[BRAVO], links[DELTA]) == ([FRONT], [], [])  # all three stored, one link kept
-    assert store.own_site_candidates(db) == []
-    kept = "\n".join(map(str, all_rows(db)))
-    assert "u2" not in kept and "u3" not in kept and kept.count("zz-fake-plat") == 1  # the other two are hashes
-
-
-def test_the_five_profile_case_leaves_only_the_artist_with_a_domain_to_themselves(db):
-    websites = [
-        "https://zz-fake-plat.art/",
-        "https://zz-fake-plat.art/zz-fake-second",
-        "https://zz-fake-third.zz-fake-plat.art",
-        "https://www.zz-fake-plat.art/?u=zz-fake-fourth",
-        "https://zz-fake-solo.art",
-    ]
-    fake, names = small_world(websites)
-    assert run(fake, db) == 0
-    assert store.own_site_candidates(db) == [(f"da:{names[4]}", "https://zz-fake-solo.art/")]
-
-
-@pytest.mark.parametrize("second_listing", [PATH, SUBDOMAIN, "https://www.zz-fake-plat.art/?u=u4", f"<{FRONT}>"])
-def test_a_domain_stops_being_a_candidate_when_a_later_run_finds_a_second_listing(db, second_listing):
-    assert run(world({ALPHA: FRONT, BRAVO: "", DELTA: ""}), db) == 0
-    assert store.own_site_candidates(db) == [ALPHA_SEED]  # one artist, one domain: a candidate
-    assert run(world({ALPHA: FRONT, BRAVO: second_listing, DELTA: ""}), db) == 0
-    assert store.own_site_candidates(db) == []
-
-
-def test_a_domain_listed_in_an_earlier_run_is_not_a_candidate_when_its_front_page_turns_up(db):
-    assert run(world({ALPHA: "", BRAVO: PATH, DELTA: SUBDOMAIN}), db) == 0
-    assert not any(links for *_, links, _ in stored(db))  # nobody has a link,
-    assert "plat" not in everything_on_disk(db).lower()  # and of the two listings nothing is kept but hashes
-    assert run(world({ALPHA: FRONT, BRAVO: "", DELTA: ""}), db) == 0
-    assert stored(db)[0][3] == [FRONT]
-    assert store.own_site_candidates(db) == []
-
-
-def test_the_same_artist_listing_their_domain_twice_is_still_one_listing(db):
-    for website in (FRONT, "https://www.zz-fake-plat.art"):  # two runs, two spellings of one front page
-        assert run(world({ALPHA: website, BRAVO: "", DELTA: ""}), db) == 0
-    assert store.own_site_candidates(db) == [("da:zz-fake-alpha", "https://www.zz-fake-plat.art/")]
-    assert run(world({ALPHA: f"{FRONT}folio", BRAVO: "", DELTA: ""}), db) == 0  # now a path: no link is kept
-    assert stored(db)[0][3] == [] and store.own_site_candidates(db) == []
-
-
-# --- 5: rate limits, backoff, token refresh, redirects, user agent ---
-
-
-def test_requests_are_sequential_and_at_least_a_second_apart(db):
+def test_requests_are_sequential_and_at_least_the_base_interval_apart(db):
     fake = world()
     assert run(fake, db) == 0
-    assert discover.MIN_INTERVAL == 1.0
-    assert len(fake.gaps()) == BASE_REQUESTS - 1  # token, browse and profile requests alike
-    assert min(fake.gaps()) >= discover.MIN_INTERVAL
+    assert discover.BASE_INTERVAL == 2.0  # half the rate that got us limited after most of a day
+    assert fake.gaps() == [2.0] * (BASE_REQUESTS - 1)  # the token request and the browse pages alike
     assert len(fake.threads) == 1  # one thread, one request at a time
 
 
@@ -1180,13 +711,174 @@ def test_the_wait_is_time_sleep_itself_and_no_caller_can_switch_it_off(db, monke
     fake = world()
     assert discover.discover(CLIENT_ID, CLIENT_SECRET, max_artists=200, db=db, transport=fake.transport) == 0
     assert len(fake.log) == BASE_REQUESTS
-    assert len(waits) == BASE_REQUESTS - 1  # one wait before every request but the first
-    assert min(waits) >= 1.0
+    assert waits == [2.0] * (BASE_REQUESTS - 1)  # one wait before every request but the first
     assert "sleep" not in inspect.signature(discover.discover).parameters
 
 
+def limited(fake, indexes, headers=None):
+    """Make the fake answer 429 to the requests with these indexes, counted over everything it is sent."""
+
+    def before(index, request):
+        if index in indexes:
+            return httpx.Response(429, json={"error": "FAKE-RATE-LIMIT"}, headers=headers or {})
+
+    fake.before = before
+
+
+def test_after_a_429_the_next_different_request_waits_longer_than_the_base_too(db, capsys):
+    """The flaw this replaces: a 429 was backed off from for that one request, 1, 2, 4 seconds and so on, and
+    after a success the client went straight back to its fixed rate. The API docs call a 429 "a request to slow
+    down" and say that a client which keeps to its rate stays limited for longer. Four hours of 429s followed."""
+    fake = world()
+    limited(fake, {3})
+    assert run(fake, db) == 0
+    assert [status for _, _, status in fake.log[3:5]] == [429, 200]
+    assert fake.log[3][1].url == fake.log[4][1].url != fake.log[5][1].url  # asked again, and then the next page
+    assert fake.gaps()[2:6] == pytest.approx([2.0, 4.0, 3.6, 3.24])  # the gaps before requests 3 to 6
+    assert fake.gaps()[4] > discover.BASE_INTERVAL  # the one before the next different request
+    assert stored(db) == EXPECTED and capsys.readouterr().out.startswith(EXPECTED_TALLY)  # nothing counted twice
+
+
+def test_a_burst_of_429s_doubles_the_interval_each_time_and_it_comes_down_a_tenth_at_a_time(db, capsys):
+    fake = world()
+    limited(fake, {3, 4, 5})
+    assert run(fake, db) == 0
+    assert [status for _, _, status in fake.log[3:7]] == [429, 429, 429, 200]
+    assert len({str(request.url) for _, request, _ in fake.log[3:7]}) == 1  # the same request, asked again
+    eased = [16.0 * 0.9**n for n in range(1, 17)]  # 14.4, 12.96, 11.66 and so on: sixteen more requests
+    assert fake.gaps() == pytest.approx([2.0, 2.0, 2.0, 4.0, 8.0, 16.0, *eased])
+    assert len(fake.log) == BASE_REQUESTS + 3 and stored(db) == EXPECTED
+    counts = summary(capsys.readouterr().out)  # and the summary counts what happened
+    assert counts["requests to the API"] == 23 and counts["rate limit answers from the API"] == 3
+    assert counts["longest interval between requests to the API, in seconds"] == 16
+    assert counts["interval between requests to the API now, in seconds"] == 3  # 16 x 0.9^17 is 2.67
+    assert counts["seconds spent waiting between requests to the API"] == round(sum(fake.gaps())) == 151
+
+
+def test_429s_that_stop_after_a_while_let_the_interval_back_down_to_the_base_and_never_below_it(db):
+    fake = world()
+    fake.page_size = 2  # 66 pages, so that the run is long enough to see the interval come all the way down
+    limited(fake, {1, 2})
+    assert run(fake, db) == 0
+    gaps = fake.gaps()
+    assert gaps[:3] == [2.0, 4.0, 8.0] and len(gaps) == 66 + 2
+    for earlier, later in itertools.pairwise(gaps[2:]):
+        assert later == pytest.approx(max(discover.BASE_INTERVAL, earlier * discover.EASE))  # a tenth off, a success
+    assert gaps[2:16] == sorted(gaps[2:16], reverse=True) and gaps[15] > 2.0  # fourteen requests to come down
+    assert set(gaps[16:]) == {2.0} and min(gaps) == 2.0
+    assert stored(db) == EXPECTED
+
+
+@pytest.mark.parametrize("first_429", [0, 4])  # the token request, and the fourth browse page
+def test_a_long_stretch_of_429s_raises_the_interval_to_the_ceiling_and_an_hour_there_stops_the_run(
+    db, capsys, first_429
+):
+    fake = world()
+    fake.before = lambda index, request: 429 if index >= first_429 else None
+    assert run(fake, db) == 1
+    out, err = capsys.readouterr()
+    assert err == LIMITED and discover.MAX_INTERVAL == 300.0 and discover.MAX_AT_CEILING == 12
+    refused = fake.log[first_429:]
+    assert len(refused) == 20 and {status for _, _, status in refused} == {429}  # and nothing was sent afterwards
+    assert len({str(request.url) for _, request, _ in refused}) == 1
+    climb = [4.0, 8.0, 16.0, 32.0, 64.0, 128.0, 256.0]
+    assert fake.gaps()[first_429:] == climb + [300.0] * 12  # an hour at the ceiling, after eight minutes of climbing
+    counts = summary(out)
+    assert counts["rate limit answers from the API"] == 20
+    assert counts["longest interval between requests to the API, in seconds"] == 300
+    assert counts["seconds spent waiting between requests to the API"] == 2 * first_429 + 508 + 3600
+    assert "FAKE" not in out + err
+    # Everything stored before the stop is kept, and so is the place: the next run carries on from the same page.
+    assert stored(db) == ([expected_row(ALPHA, 4), expected_row(BRAVO, 3), expected_row(DELTA, 3)] if first_429 else [])
+    again = world()
+    assert run(again, db, afresh=False) == 0 and stored(db) == EXPECTED
+    assert again.browsed()[0] == (discover.NICHE_TAGS[2 if first_429 else 0], 0)
+
+
+def test_429s_at_the_ceiling_that_stop_short_of_an_hour_do_not_stop_the_run(db, capsys):
+    fake = world()
+    limited(fake, set(range(2, 21)))  # nineteen in a row: eleven of them at the ceiling
+    assert run(fake, db) == 0 and capsys.readouterr().err == ""
+    assert fake.gaps()[9:22] == [300.0] * 12 + [270.0]  # and from the first success the interval comes down
+    limited(again := world(), set(range(2, 14)) | set(range(15, 25)))  # ten more after one success: not in a row
+    assert run(again, db) == 0 and stored(db) == EXPECTED
+
+
+@pytest.mark.parametrize(
+    ("asked", "waited"),
+    [
+        ("100", 100.0),  # longer than the doubled interval: honoured
+        ("3600", 3600.0),  # an hour is the most that is waited for
+        ("3", 4.0),  # shorter: the interval is what is waited
+        ("0", 4.0),
+        ("-5", 4.0),  # not a number of seconds
+        ("1e3", 4.0),
+        ("soon", 4.0),
+        ("٣٠٠", 4.0),  # digits, and not ASCII ones
+        ("Wed, 21 Oct 2026 07:28:00 GMT", 4.0),  # a date is not read: see the ponytail note in Pace.slow
+    ],
+)
+def test_a_retry_after_is_honoured_when_it_asks_for_longer_and_only_once(db, asked, waited):
+    fake = world()
+    limited(fake, {3}, {"Retry-After": asked.encode()})
+    assert run(fake, db) == 0
+    assert fake.gaps()[2:6] == pytest.approx([2.0, waited, 3.6, 3.24])  # the interval itself goes on as it would
+    assert stored(db) == EXPECTED
+
+
+def test_a_retry_after_of_more_than_an_hour_stops_the_run_and_what_is_stored_is_kept(db, capsys):
+    fake = world()
+    limited(fake, {4}, {"Retry-After": "3601"})
+    assert run(fake, db) == 1
+    assert capsys.readouterr().err == (f"stopped: rate limited: the API asks for a wait of more than an hour. {KEPT}\n")
+    assert len(fake.log) == 5 and len(stored(db)) == 3
+
+
+def test_a_5xx_is_asked_for_again_three_times_and_slows_the_pace_as_a_429_does(db, capsys):
+    """A 503 is "try again later", and the docs allow a 500 three retries. One rule for every 5XX: it is asked
+    for again SERVER_RETRIES times, and each one doubles the interval for everything that follows. It never
+    counts towards the hour that stops a run: what is left after the retries is the caller's to judge."""
+    assert discover.SERVER_RETRIES == 3
+    fake, failed = world(), []
+
+    def twice(index, request):  # the first two requests for the second tag get a 503; the third is answered
+        if request.url.params.get("tag") == "characterdesign" and len(failed) < 2:
+            failed.append(index)
+            return 503
+
+    fake.before = twice
+    assert run(fake, db) == 0
+    out, err = capsys.readouterr()
+    assert err == "" and stored(db) == EXPECTED and len(fake.log) == BASE_REQUESTS + 2
+    assert fake.gaps()[2:7] == pytest.approx([2.0, 4.0, 8.0, 7.2, 6.48])  # before requests 3 to 7
+    counts = summary(out)
+    assert counts["rate limit answers from the API"] == 0
+    assert counts["longest interval between requests to the API, in seconds"] == 8
+
+
+@pytest.mark.parametrize("status", [500, 502, 503, 504])
+def test_a_5xx_that_outlasts_its_retries_stops_the_run_and_the_next_run_carries_on(db, capsys, status):
+    fake = world()
+    fake.before = lambda index, request: status if index >= 4 else None
+    assert run(fake, db) == 1
+    assert capsys.readouterr().err == f"stopped: browse failed with HTTP {status}\n"
+    assert len(fake.log) == 4 + 1 + discover.SERVER_RETRIES and fake.gaps()[3:] == [2.0, 4.0, 8.0, 16.0]
+    assert len(stored(db)) == 3
+    assert run(world(), db, afresh=False) == 0 and stored(db) == EXPECTED
+
+
+def test_a_server_error_on_the_token_request_is_asked_for_again_too(db, capsys):
+    fake = world()
+    fake.before = lambda index, request: 503 if index < 2 else None
+    assert run(fake, db) == 0 and stored(db) == EXPECTED
+    down = world()
+    down.before = lambda index, request: 503
+    assert run(down, db) == 1 and len(down.log) == 4
+    assert capsys.readouterr().err == "stopped: token request failed with HTTP 503\n"
+
+
 def test_the_http_library_logs_nothing_during_a_run_and_is_left_as_it_was(db, caplog):
-    """httpx logs every request URL at INFO, and a profile lookup's URL holds a handle."""
+    """httpx logs every request URL at INFO, and a request's URL can hold a handle."""
     logging.getLogger("httpx").setLevel(logging.INFO)  # as an application that wants request logs would set it
     try:
         fake, during = world(), []
@@ -1201,7 +893,7 @@ def test_the_http_library_logs_nothing_during_a_run_and_is_left_as_it_was(db, ca
         logging.getLogger("httpx").setLevel(logging.NOTSET)
 
 
-def test_pages_stop_at_the_depth_limit(db, monkeypatch):
+def test_pages_stop_at_the_depth_limit(db, tmp_path, monkeypatch):
     fake = world()
     assert run(fake, db) == 0
     browse = [dict(request.url.params) for _, request, _ in fake.log if request.url.path == BROWSE_PATH]
@@ -1215,8 +907,8 @@ def test_pages_stop_at_the_depth_limit(db, monkeypatch):
     )
     monkeypatch.setattr(discover, "PAGES_PER_TAG", 1)
     shallow = world()
-    assert run(shallow, db) == 0
-    assert len(shallow.paths(BROWSE_PATH)) == len(discover.NICHE_TAGS)
+    assert run(shallow, tmp_path / "another" / "pipeline.sqlite") == 0
+    assert shallow.browsed() == [(tag, 0) for tag in discover.NICHE_TAGS]
 
 
 def test_paging_follows_next_offset_from_the_response(db):
@@ -1249,7 +941,10 @@ def test_paging_stops_unless_the_response_gives_a_usable_next_page(db, paging):
     fake.page_patch[("conceptart", 0)] = paging
     assert run(fake, db) == 0
     assert fake.offsets("conceptart") == [0]
-    assert len(fake.paths(BROWSE_PATH)) == len(discover.NICHE_TAGS)  # and it went on to the other tags
+    assert len(fake.browsed()) == len(discover.NICHE_TAGS)  # and it went on to the other tags
+    again = world()  # and the tag is noted as having no more: the saved pass is not carried on into it
+    assert run(again, db, afresh=False) == 0 and again.log == []
+    assert ("conceptart", None, 1) in [row[:3] for row in all_rows(db, "browsed")]
 
 
 @pytest.mark.parametrize("stuck", [40, 0])  # the same page again, or backwards
@@ -1275,7 +970,6 @@ def test_paging_never_goes_past_offset_50000(db):
         (0, 307, "https://fake-elsewhere.example/oauth2/token", "token request"),  # would re-post the credentials
         (3, 302, "https://fake-elsewhere.example/browse", "browse"),  # would carry the token off site
         (3, 302, "/api/v1/oauth2/placebo", "browse"),
-        (FIRST_LOOKUP + 1, 301, f"/api/v1/oauth2/user/profile/{BRAVO}", "profile lookup"),
     ],
 )
 def test_redirects_are_not_followed(db, capsys, index, status, target, reason):
@@ -1285,35 +979,6 @@ def test_redirects_are_not_followed(db, capsys, index, status, target, reason):
     assert len(fake.log) == index + 1  # nothing was sent after the redirect: not to its target, not anywhere
     assert {request.url.host for _, request, _ in fake.log} == {"www.deviantart.com"}
     assert capsys.readouterr().err == f"stopped: {reason} failed with HTTP {status}\n"
-
-
-def test_429_backs_off_exponentially_then_carries_on(db, capsys):
-    fake = world()
-    fake.before = lambda index, request: 429 if index in (3, 4, 5) else None
-    assert run(fake, db) == 0
-    assert [status for _, _, status in fake.log[3:7]] == [429, 429, 429, 200]
-    assert len({str(request.url) for _, request, _ in fake.log[3:7]}) == 1  # the same request, retried
-    assert fake.gaps()[2:7] == [1.0, 2.0, 4.0, 8.0, 1.0]  # the gaps before requests 3 to 7
-    assert len(fake.log) == BASE_REQUESTS + 3
-    assert stored(db) == EXPECTED
-    assert capsys.readouterr().out == EXPECTED_STDOUT  # nothing counted twice
-
-
-@pytest.mark.parametrize("first_429", [0, 4, FIRST_LOOKUP + 2])  # the token, a browse page, the third profile lookup
-def test_repeated_429_stops_the_run_cleanly(db, capsys, first_429):
-    fake = world()
-    fake.before = lambda index, request: 429 if index >= first_429 else None
-    assert run(fake, db) == 1
-    out, err = capsys.readouterr()
-    assert err == f"stopped: rate limited: {discover.MAX_429} HTTP 429 responses in a row\n"
-    assert len(fake.log) == first_429 + discover.MAX_429  # it gave up, and sent nothing afterwards
-    refused = fake.log[first_429:]
-    assert {status for _, _, status in refused} == {429}
-    assert len({str(request.url) for _, request, _ in refused}) == 1
-    assert fake.gaps()[first_429:] == [2.0, 4.0, 8.0, 16.0, 32.0]
-    assert min(fake.gaps(), default=1.0) >= discover.MIN_INTERVAL
-    assert stored(db) == (EXPECTED[:1] if first_429 > FIRST_LOOKUP else [])  # what was stored before the stop is kept
-    assert out.count("\n") == len(EXPECTED_STDOUT.splitlines()) and "FAKE" not in out + err
 
 
 def test_401_refreshes_the_token_once_and_carries_on(db):
@@ -1333,7 +998,7 @@ def test_401_refreshes_the_token_once_and_carries_on(db):
     assert refused.headers["authorization"] == "Bearer FAKE-TOKEN-1"
     assert retried.headers["authorization"] == "Bearer FAKE-TOKEN-2"
     assert len(fake.log) == BASE_REQUESTS + 2
-    assert min(fake.gaps()) >= discover.MIN_INTERVAL
+    assert set(fake.gaps()) == {discover.BASE_INTERVAL}  # a 401 is an answer: it does not slow the pace
     assert stored(db) == EXPECTED
 
 
@@ -1356,69 +1021,6 @@ def test_a_second_401_stops_the_run_instead_of_looping(db, capsys):
     assert all_rows(db) == []
 
 
-def test_profile_lookups_refused_with_401_stop_the_run_at_the_first_one(db, capsys):
-    """If a client_credentials token turns out not to open profiles, the run stops there. No workaround."""
-    fake = world()
-
-    def refuse_profiles(index, request):
-        return 401 if request.url.path.startswith(PROFILE_PATH) else None
-
-    fake.before = refuse_profiles
-    assert run(fake, db) == 1
-    assert [(request.url.path, status) for _, request, status in fake.log[FIRST_LOOKUP:]] == [
-        (PROFILE_PATH + HOTEL, 401),
-        (TOKEN_PATH, 200),
-        (PROFILE_PATH + HOTEL, 401),
-    ]
-    assert capsys.readouterr().err == "stopped: profile lookup failed with HTTP 401\n"
-    assert all_rows(db) == []
-
-
-@pytest.mark.parametrize("status", [400, 403, 404, 410, 418, 451])
-def test_a_profile_answered_with_any_4xx_is_skipped_and_the_run_goes_on(db, capsys, status):
-    """The docs declare a profile's errors as 4XX. One suspended account must not stop every run at the same place."""
-    fake = world()
-    fake.before = lambda index, request: status if request.url.path == PROFILE_PATH + ALPHA else None
-    assert run(fake, db) == 0
-    out, err = capsys.readouterr()
-    assert err == ""
-    assert "profiles unavailable: 2\n" in out  # HOTEL, which has no profile, and ALPHA
-    assert stored(db) == without("da:zz-fake-alpha")
-    assert len(fake.log) == BASE_REQUESTS  # every other candidate was still looked up
-
-
-@pytest.mark.parametrize("status", [204, 302, 500, 503])
-def test_any_other_answer_to_a_profile_lookup_stops_the_run(db, capsys, status):
-    fake = world()
-    fake.before = lambda index, request: status if request.url.path == PROFILE_PATH + ALPHA else None
-    assert run(fake, db) == 1
-    assert capsys.readouterr().err == f"stopped: profile lookup failed with HTTP {status}\n"
-    asked = len(discover.OUTAGE_WAITS) if status >= 500 else 1  # a 5XX is asked for again; nothing else is
-    assert fake.looked_up() == [HOTEL] + [ALPHA] * asked
-    assert all_rows(db) == []
-
-
-@pytest.mark.parametrize("path", [BROWSE_PATH, PROFILE_PATH + ALPHA])
-def test_a_server_error_that_passes_does_not_end_the_run(db, capsys, monkeypatch, path):
-    """A run browses for half an hour before it stores anyone, so one 5XX is asked for again after a wait."""
-    waits: list[float] = []
-    monkeypatch.setattr(time, "sleep", waits.append)
-    fake, failed = world(), []
-
-    def twice(index, request):  # the first two requests for this path get a 503; the third is answered
-        if request.url.path == path and len(failed) < 2:
-            failed.append(index)
-            return 503
-        return None
-
-    fake.before = twice
-    assert discover.discover(CLIENT_ID, CLIENT_SECRET, max_artists=200, db=db, transport=fake.transport) == 0
-    assert capsys.readouterr().err == "" and stored(db) == EXPECTED
-    assert len(fake.log) == BASE_REQUESTS + 2 and [wait for wait in waits if wait > 1] == [2.0, 4.0]
-    assert discover.SERVER_WAITS == (2.0, 4.0, 8.0, None)
-    assert discover.OUTAGE_WAITS == (2.0, 4.0, 8.0, 60.0, 300.0, 600.0, None)  # an outage of minutes is waited out
-
-
 def test_wrong_credentials_stop_the_run_without_printing_them(db, capsys):
     fake = world()
     status = discover.discover("FAKE-WRONG-ID", "FAKE-WRONG-SECRET", max_artists=5, db=db, transport=fake.transport)
@@ -1429,14 +1031,14 @@ def test_wrong_credentials_stop_the_run_without_printing_them(db, capsys):
     assert "FAKE" not in out + err
 
 
-def test_every_request_sends_the_user_agent_and_keeps_secrets_out_of_urls(db):
-    plain, refreshed, limited = world(), world(), world()
+def test_every_request_sends_the_user_agent_accepts_compression_and_keeps_secrets_out_of_urls(db):
+    plain, refreshed, slowed = world(), world(), world()
     refreshed.before = lambda index, request: refreshed.valid.clear() if index == 5 else None
-    limited.before = lambda index, request: 429 if index in (0, 2, 9) else None
-    for fake in (plain, refreshed, limited):
+    slowed.before = lambda index, request: {0: 429, 2: 429, 9: 503}.get(index)
+    for fake in (plain, refreshed, slowed):
         assert run(fake, db) == 0
         assert len(fake.log) >= BASE_REQUESTS
-        for _, request, _ in fake.log:
+        for _, request, _ in fake.log:  # the first asking and every asking again
             assert request.headers["user-agent"] == config.USER_AGENT
             assert "gzip" in request.headers["accept-encoding"]  # the docs reject clients without compression
             assert request.url.host == "www.deviantart.com" and request.url.scheme == "https"
@@ -1448,6 +1050,57 @@ def test_every_request_sends_the_user_agent_and_keeps_secrets_out_of_urls(db):
     assert config.CONTACT_URL in config.USER_AGENT
 
 
+# --- 5: a long run is not a black box ---
+
+
+def test_a_run_says_where_it_is_in_a_file_while_it_runs_and_the_file_goes_when_it_ends(db, capfd):
+    """Four hours of a run that was answered nothing but 429 could not be told from one that was browsing, or
+    stuck. Before every request, the first asking and every asking again, the file says where the run is."""
+    fake, said = world(), []
+    told = config.CACHE_DIR / "discover.status"
+
+    def before(index, request):
+        said.append(told.read_text(encoding="utf-8"))
+        return 429 if index in (5, 6) else None
+
+    fake.before = before
+    assert run(fake, db) == 0
+    assert len(said) == BASE_REQUESTS + 2 and not told.exists()  # one that is there is a run in progress
+    assert capfd.readouterr().err == ""  # and nothing of it is on standard error
+    for text in said:
+        when, *lines = text.splitlines()
+        assert datetime.now(UTC) - datetime.fromisoformat(when) < timedelta(minutes=1)
+        assert [line.rsplit(": ", 1)[0] for line in lines] == list(discover._COUNTS)  # the summary's own lines
+        assert all(re.fullmatch(r"[A-Za-z ,()>=0-9-]+: \d+", line) for line in lines)  # counts only
+        assert "fake" not in text.lower() and "http" not in text.lower()
+    assert "pages fetched: 0\n" in said[0] and "requests to the API: 0\n" in said[0]
+    assert (
+        "pages fetched: 4\n" in said[5] and "artists stored: 3\n" in said[5] and "requests to the API: 5\n" in said[5]
+    )
+    now = "interval between requests to the API now, in seconds"  # browsing, or waiting: this is how to tell
+    assert [int(re.search(f"{now}: (\\d+)", text)[1]) for text in said[5:9]] == [2, 4, 8, 8]
+    assert "rate limit answers from the API: 2\n" in said[7] and "pages fetched: 4\n" in said[7]
+
+
+def test_a_status_file_that_cannot_be_written_or_deleted_does_not_end_a_run(db, monkeypatch):
+    def locked(*args, **kwargs):
+        raise PermissionError("FAKE-LOCKED")
+
+    monkeypatch.setattr(pathlib.Path, "write_text", locked)
+    monkeypatch.setattr(pathlib.Path, "unlink", locked)
+    assert run(world(), db) == 0 and stored(db) == EXPECTED
+
+
+def test_the_status_command_shows_where_a_run_says_it_is(tmp_path):
+    assert not any("is running" in line for line in gpu.status())
+    discover.tell("discover", {"pages fetched": 412, "artists stored": 1200})
+    lines = gpu.status()
+    at = next(index for index, line in enumerate(lines) if line.startswith("discover is running, or was killed. As of"))
+    assert lines[at + 1 : at + 3] == ["  pages fetched: 412", "  artists stored: 1200"]
+    discover.tell("discover")
+    assert not any("is running" in line for line in gpu.status())
+
+
 # --- 6: mature deviations do not count ---
 
 
@@ -1456,8 +1109,8 @@ def test_mature_deviations_do_not_count_toward_niche_hits(db):
     assert run(fake, db) == 0
     hits = {name: n for _, name, _, _, n in stored(db)}
     assert hits[DELTA] == 3  # 3 clean + 2 mature
-    assert ECHO not in fake.looked_up()  # 2 clean + 5 mature never reaches the threshold
-    assert CHARLIE not in fake.looked_up()  # 2 clean
+    assert ECHO not in hits  # 2 clean + 5 mature never reaches the threshold
+    assert CHARLIE not in hits  # 2 clean
 
 
 def test_malformed_entries_are_skipped_and_the_run_goes_on(db, capsys):
@@ -1474,16 +1127,10 @@ def test_malformed_entries_are_skipped_and_the_run_goes_on(db, capsys):
         {"deviationid": "FAKE-ID-4", "is_mature": False, "author": {"username": ["zz-fake-junk"]}},
     ]
     good = [deviation(n, "zz-fake-good") for n in (1, 2, 3)]
-    listy = [deviation(n, "zz-fake-listy") for n in (4, 5, 6)]
-    profiles = {"zz-fake-good": profile("zz-fake-good", "https://zz-fake-good.art"), "zz-fake-listy": ["FAKE-LIST"]}
-    fake = FakeDA({"gameart": junk * 3 + good + listy}, profiles)
+    fake = FakeDA({"gameart": junk * 3 + good})
     assert run(fake, db) == 0
-    assert fake.looked_up() == ["zz-fake-good", "zz-fake-listy"]  # zz-fake-junk never became a candidate
-    # The profile that came back as a list names no website, so that artist is stored with no link.
-    assert [(name, links, hits) for _, name, _, links, hits in stored(db)] == [
-        ("zz-fake-good", ["https://zz-fake-good.art/"], 3),
-        ("zz-fake-listy", [], 3),
-    ]
+    assert [(name, links, hits) for _, name, _, links, hits in stored(db)] == [("zz-fake-good", [], 3)]
+    assert len(all_rows(db, "counted")) == 3  # zz-fake-junk never became a candidate, or a row
     assert capsys.readouterr().err == ""
 
 
@@ -1492,13 +1139,10 @@ def test_three_works_only_count_when_none_is_mature(db):
     mixed = [deviation(n, "zz-fake-mixed", mature=n == 6) for n in (4, 5, 6)]
     unlabeled = [deviation(n, "zz-fake-unlabeled") for n in (7, 8, 9)]
     del unlabeled[0]["is_mature"]  # no label is not "not mature"
-    names = ("zz-fake-clean", "zz-fake-mixed", "zz-fake-unlabeled")
-    fake = FakeDA(
-        {"gameart": clean + mixed + unlabeled}, {name: profile(name, f"https://{name}.art") for name in names}
-    )
+    fake = FakeDA({"gameart": clean + mixed + unlabeled})
     assert run(fake, db) == 0
-    assert fake.looked_up() == ["zz-fake-clean"]
     assert [(name, hits) for _, name, _, _, hits in stored(db)] == [("zz-fake-clean", 3)]
+    assert "mixed" not in everything_on_disk(db) and "unlabeled" not in everything_on_disk(db)
 
 
 # --- the command line ---
