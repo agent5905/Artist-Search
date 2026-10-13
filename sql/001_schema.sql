@@ -115,6 +115,8 @@ create table if not exists public.works (
   description text, -- null until the work is analyzed
   tags text[] not null default '{}',
   position int not null default 0,
+  width int, -- the image's size in pixels, so the site can lay it out uncropped; null when not known
+  height int,
   -- What makes a work the same work on the next load. A DeviantArt thumbnail URL carries a signed token
   -- that changes, so there it is the deviation page.
   key text generated always as (case when source = 'deviantart' then page_url else image_url end) stored
@@ -173,40 +175,12 @@ create table if not exists public.removed (
   removed_at timestamptz not null default now()
 );
 
--- A database made by the previous version of this file: bring it up to the tables above.
-drop index if exists public.artists_da_username_idx; -- replaced by the unique index on da_key
-drop index if exists public.artists_site_host_idx; -- replaced by the unique index on site_key
-alter table public.artists drop column if exists links; -- a site and a handle are all an artist is known by
-alter table public.artists
-  add column if not exists site_domain text,
-  add column if not exists da_key text generated always as (public.key_hash('da:' || lower(da_username))) stored,
-  add column if not exists site_key text generated always as (public.key_hash('site:' || site_domain)) stored;
-drop function if exists public.clean_links(jsonb);
-drop function if exists public.site_host(text);
-drop table if exists public.removal_proofs; -- the proof code is derived now, not stored
-do $$
-begin
-  if exists (
-    select 1 from pg_attribute
-    where attrelid = 'public.removal_requests'::regclass and attname = 'id' and not attisdropped
-  ) then
-    -- One row per request became one row per artist: keep each artist's first request.
-    delete from public.removal_requests newer using public.removal_requests older
-    where older.artist_slug = newer.artist_slug and (older.created_at, older.id) < (newer.created_at, newer.id);
-    alter table public.removal_requests drop constraint removal_requests_pkey;
-    alter table public.removal_requests drop column id;
-    alter table public.removal_requests rename column created_at to first_at;
-    alter table public.removal_requests drop constraint if exists removal_requests_sizes;
-    update public.removal_requests set note = left(note, 300);
-  end if;
-end
-$$;
-alter table public.removal_requests
-  add column if not exists last_at timestamptz not null default now(),
-  add column if not exists requests bigint not null default 1;
--- Style vectors stay on the owner's machine now: the database holds only artist_neighbors.
-alter table public.works drop column if exists style_embedding;
-drop table if exists public.artist_styles;
+-- A database made by the previous version of this file: bring it up to the tables above. The
+-- database holds real artists now, so a step here only ever adds; the steps that took earlier
+-- versions apart are gone, and nothing in this file deletes, rewrites or drops a row.
+alter table public.works
+  add column if not exists width int,
+  add column if not exists height int;
 
 -- Search reads every artist's row, and after a big write each page of them has to come back into
 -- memory before the public's 3 s run out. So the row keeps only what search reads (the keyword
@@ -253,6 +227,9 @@ begin
       ('works', 'works_sizes',
        'check (length(title) <= 200 and length(description) <= 2000 and public.short_list(tags, 40, 60))'),
       ('works', 'works_source_known', $$check (source in ('deviantart', 'site'))$$),
+      -- An image's size is two whole numbers of pixels, given together or not at all.
+      ('works', 'works_dimensions',
+       'check ((width is null) = (height is null) and width between 1 and 100000 and height between 1 and 100000)'),
       ('works', 'works_one_per_key', 'unique (artist_id, key)'),
       ('removal_requests', 'removal_requests_pkey', 'primary key (artist_slug)'),
       ('removal_requests', 'removal_requests_short', 'check (length(artist_slug) <= 80 and length(note) <= 300)'),

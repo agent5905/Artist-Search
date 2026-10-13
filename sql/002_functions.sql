@@ -4,16 +4,8 @@
 -- owner, which is how the public role reads tables it has no access to. Every one that returns
 -- artists leaves out hidden ones and removed ones, and returns each as one JSON card (see artist_card).
 
--- Functions of the previous version whose arguments changed or that are no longer used.
-drop function if exists public.search_artists(text, extensions.halfvec, text[], text[], boolean, int, int);
-drop function if exists public.refresh_style_centroids();
-drop function if exists public.refresh_style_centroids(text[]); -- style is ranked on the owner's machine now
-drop function if exists public.artist_ids();
-drop function if exists public.barring_keys(text, text, jsonb);
-drop function if exists public.is_barred(text, text, jsonb);
-drop trigger if exists works_skip_unchanged on public.works;
-drop function if exists public.skip_unchanged();
-drop function if exists public.removal_keys(text, text); -- now artist_keys, by handle and site domain
+-- A function of the previous version whose arguments changed.
+drop function if exists public.artist_card(bigint, int); -- it takes the search's words as well now
 
 -- What a removal remembers of an artist without keeping their name (hard rule 7): the hashes of
 -- 'da:<lowercased handle>' and 'site:<registrable domain>'. The same keys as pipeline/store.py, so
@@ -169,8 +161,15 @@ as $$
 $$;
 
 -- What every public function returns for an artist: the card. Each work names its source, so the
--- site can credit a DeviantArt thumbnail and link back. p_work_limit null means every work.
-create or replace function public.artist_card(p_artist_id bigint, p_work_limit int default 4) returns jsonb
+-- site can credit a DeviantArt thumbnail and link back, and its size in pixels when that is known
+-- (width and height, both null otherwise). p_work_limit null means every work.
+-- The works come in the artist's own order (position), unless p_matching is given: search_artists
+-- passes the words searched for, and then the works that say those words of themselves come first,
+-- the best match first (the tags count most, then the title, then the description), and the rest
+-- follow in the artist's order. So a card found for "creature design" leads with the creatures.
+create or replace function public.artist_card(
+  p_artist_id bigint, p_work_limit int default 4, p_matching tsquery default null
+) returns jsonb
 language sql stable set search_path = ''
 as $$
   select jsonb_build_object(
@@ -179,11 +178,28 @@ as $$
     'works', (
       select coalesce(
         jsonb_agg(jsonb_build_object(
-          'image_url', w.image_url, 'page_url', w.page_url, 'title', w.title, 'source', w.source
-        ) order by w.position, w.id),
+          'image_url', w.image_url, 'page_url', w.page_url, 'title', w.title, 'source', w.source,
+          'width', w.width, 'height', w.height
+        ) order by w.fit desc, w.position, w.id),
         '[]')
       from (
-        select * from public.works where artist_id = a.id order by position, id limit p_work_limit
+        -- No words: the first works by position, and no others are read.
+        (select works.*, 0::real as fit
+         from public.works
+         where p_matching is null and artist_id = a.id
+         order by position, id limit p_work_limit)
+        union all
+        -- ponytail: with words, every work of the artist is weighed on the spot (about ten a card).
+        -- Ceiling: artists with hundreds of works; then store the work's tsvector in a generated column.
+        (select works.*,
+                ts_rank(
+                  setweight(to_tsvector('english', array_to_string(tags, ' ')), 'A')
+                  || setweight(to_tsvector('english', coalesce(title, '')), 'B')
+                  || setweight(to_tsvector('english', coalesce(description, '')), 'C'),
+                  p_matching) as fit
+         from public.works
+         where p_matching is not null and artist_id = a.id
+         order by fit desc, position, id limit p_work_limit)
       ) w
     ))
   from public.artists a
@@ -327,8 +343,9 @@ as $$
     order by ranked.score desc, ranked.name, ranked.id
     limit least(greatest(coalesce(p_limit, 24), 1), 100) offset greatest(coalesce(p_offset, 0), 0)
   )
-  select public.artist_card(page.id, 4)
-  from page
+  -- Each card leads with the works that match the words searched for, if there are any.
+  select public.artist_card(page.id, 4, case when numnode(query.tsq) > 0 then query.tsq end)
+  from page, query
   order by page.score desc, page.name, page.id
 $$;
 
@@ -337,7 +354,10 @@ $$;
 -- exactly the listed rows whose two artists are both in the database: what they had at any other rank
 -- is deleted, and a row that already holds the same values is not rewritten. A row naming an artist
 -- who is not in the database (removed, or never loaded) is skipped. Returns how many were skipped.
--- An artist named in no row keeps the neighbours they have.
+-- An artist named in no row keeps the neighbours they have. To leave an artist with none, send one
+-- row for them that names no neighbour: {"artist_slug": ..., "neighbor_slug": null, "rank": null,
+-- "score": null}. It writes nothing, so what the artist had is deleted, and it is counted with the
+-- skipped rows: a caller that sends such rows takes their number off the answer.
 create or replace function public.replace_neighbors(p_rows jsonb) returns int
 language sql set search_path = ''
 as $$
@@ -547,7 +567,7 @@ revoke all on function
   public.removed_after_insert(),
   public.works_before_write(),
   public.artist_ids(text[]),
-  public.artist_card(bigint, int),
+  public.artist_card(bigint, int, tsquery),
   public.query_embedding(real[]),
   public.search_artists(text, real[], text[], text[], boolean, int, int),
   public.replace_neighbors(jsonb),
@@ -581,7 +601,7 @@ grant execute on function
   public.artist_keys(text, text),
   public.delete_removed(text[]),
   public.artist_ids(text[]),
-  public.artist_card(bigint, int),
+  public.artist_card(bigint, int, tsquery),
   public.query_embedding(real[]),
   public.search_artists(text, real[], text[], text[], boolean, int, int),
   public.replace_neighbors(jsonb),

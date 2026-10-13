@@ -3,8 +3,10 @@
     uv run pytest tests/test_db.py --basetemp=.pytest_tmp_db
     RUN_SCALE=1 uv run pytest tests/test_db.py --basetemp=.pytest_tmp_db -s -k full_scale
 
-These run against the real Supabase project. Every artist they write has a slug starting with
-zz-test-, and the module fixture deletes them before and after, pass or fail.
+These run against the real Supabase project, which holds real artists. Every artist they write has
+a slug starting with zz-test-, the module fixture deletes those before and after, pass or fail, and no
+statement here writes to, or deletes, any other artist's rows. The full-scale test refuses to run
+while the project holds real artists.
 """
 
 import hashlib
@@ -209,6 +211,19 @@ def thumbnail(name: str, position: int, token: str = "A") -> str:
     )
 
 
+# What a few works say of themselves, for the search that puts matching works first on a card. The
+# word is in no artist's own text and near no real word, so it changes nobody's place in a ranking.
+MARK = "zzqxvorn"
+ABOUT: dict[tuple[str, int], dict[str, Any]] = {
+    ("alpha", 8): {"tags": [MARK, "ink"]},  # in the tags, which count most
+    ("alpha", 6): {"description": f"a study of a {MARK}"},  # in the description, which counts least
+    ("alpha", 3): {"description": MARK},  # the same match as the one above: they keep the artist's order
+    ("beta", 1): {"title": f"{MARK} beta"},
+}
+UNMEASURED = {"dana"}  # whose works come without a size
+WORK_FIELDS = {"image_url", "page_url", "title", "source", "width", "height"}  # what a card says of a work
+
+
 def works_of(name: str, count: int, **owner: Any) -> list[dict[str, Any]]:
     """An artist's works, each with `owner` added: artist_slug for db.load, artist_id for db.upsert."""
     # In reverse display order, so anything sorted by id instead of position would fail.
@@ -226,7 +241,12 @@ def works_of(name: str, count: int, **owner: Any) -> list[dict[str, Any]]:
                 f"https://zz-test-{name}.invalid/thumb/{position}.jpg" if own_site else thumbnail(name, position)
             ),
             "title": f"{name} {position}",
+            "description": None,
+            "tags": [],
             "position": position,
+            "width": None if name in UNMEASURED else 300 + position,
+            "height": None if name in UNMEASURED else 200,
+            **ABOUT.get((name, position), {}),
         }
         for position in reversed(range(count))
     ]
@@ -442,12 +462,12 @@ def test_a_column_a_load_does_not_send_is_left_as_it_was():
         assert db.load([again, new], [work], []) == 0
         rows = db.sql("""
             select a.name, a.tagline, a.hidden, a.top_tags,
-                   (select jsonb_agg(jsonb_build_array(w.position, w.tags, w.title)) from public.works w
-                    where w.artist_id = a.id) as works
+                   (select jsonb_agg(jsonb_build_array(w.position, w.tags, w.title, w.width, w.height))
+                    from public.works w where w.artist_id = a.id) as works
             from public.artists a where a.slug in ('zz-test-partial', 'zz-test-minimal') order by a.slug
         """)
         assert rows == [
-            {"name": "Minimal", "tagline": None, "hidden": False, "top_tags": [], "works": [[0, [], None]]},
+            {"name": "Minimal", "tagline": None, "hidden": False, "top_tags": [], "works": [[0, [], None, None, None]]},
             {"name": "Partial again", "tagline": "kept", "hidden": True, "top_tags": [], "works": None},
         ]
     finally:
@@ -488,7 +508,7 @@ def test_search_by_keyword_only():
     # Alpha has the word in its name and profile, beta in its profile, gamma nowhere.
     assert search(q=WORD) == ["zz-test-alpha", "zz-test-beta"]
     assert search(q=f"{WORD} armor painterly", p_mediums=[MEDIUM]) == ["zz-test-alpha", "zz-test-beta"]
-    assert search(q="zzqxnothing") == []
+    assert search(q="zzqxwvkj") == []
 
 
 def test_search_by_keyword_and_embedding():
@@ -578,7 +598,7 @@ def test_search_survives_odd_input():
 
 def test_search_reads_only_the_start_of_a_long_query():
     # A 20,000-word query used to end in HTTP 500. Now only its first 200 characters are parsed.
-    filler = "qqxfiller "  # ten characters
+    filler = "qqxzvwkjh "  # ten characters, and near no word anybody uses
     assert search(q=filler * 20_000) == []
     assert search(q=f"{WORD} " + filler * 2_000) == ["zz-test-alpha", "zz-test-beta"]
     assert search(q=filler * 19 + WORD) == ["zz-test-alpha", "zz-test-beta"]  # the word ends at character 199
@@ -610,10 +630,13 @@ def test_cards_and_the_profile_page():
         "page_url": "https://zz-test-alpha.invalid/work/0",
         "title": "alpha 0",
         "source": "site",  # each work says where it is shown, so a DeviantArt thumbnail can be credited
+        "width": 300,  # and how large the image is, so the site can lay it out without cropping
+        "height": 200,
     }
     [similar, *_] = db.rpc("similar_artists", {"p_slug": "zz-test-alpha"})
     assert set(similar) == set(card)  # the same card from every function
     assert {work["source"] for work in similar["works"]} == {"deviantart"}
+    assert all(set(work) == WORK_FIELDS for shown in (card, similar) for work in shown["works"])
 
     [profile] = db.rpc("get_artist", {"p_slug": "zz-test-alpha"})
     assert set(profile) == set(card) | {"top_tags", "site_url", "deviantart_url"}
@@ -621,8 +644,37 @@ def test_cards_and_the_profile_page():
     assert profile["site_url"] == "https://www.zz-test-alpha.invalid/"
     assert profile["deviantart_url"] == "https://www.deviantart.com/zz-test-alpha"
     assert [work["title"] for work in profile["works"]] == [f"alpha {n}" for n in range(11)]
+    assert all(set(work) == WORK_FIELDS for work in profile["works"])
+    assert [(work["width"], work["height"]) for work in profile["works"]] == [(300 + n, 200) for n in range(11)]
+    [unmeasured] = db.rpc("get_artist", {"p_slug": "zz-test-dana"})
+    assert {(work["width"], work["height"]) for work in unmeasured["works"]} == {(None, None)}  # not known: null
     assert db.rpc("get_artist", {"p_slug": "zz-test-hidden"}) == []
     assert db.rpc("get_artist", {"p_slug": "zz-test-nobody"}) == []
+
+
+def test_a_card_leads_with_the_works_that_match_the_words():
+    def cards(**args: Any) -> dict[str, list[str]]:
+        found = db.rpc("search_artists", {"q": "", "p_mediums": [MEDIUM], **args})
+        return {card["slug"]: [work["title"] for work in card["works"]] for card in found}
+
+    in_order = ["alpha 0", "alpha 1", "alpha 2", "alpha 3"]
+    matching = ["alpha 8", "alpha 3", "alpha 6", "alpha 0"]
+    # The artists are found by one word. The other is said by three of alpha's works and one of beta's:
+    # alpha's card leads with the work tagged with it, then the two that describe it in the artist's own
+    # order, then the first of the rest. Still four works.
+    found = cards(q=f"{WORD} {MARK}")
+    assert found["zz-test-alpha"] == matching
+    assert found["zz-test-beta"] == [f"{MARK} beta", "beta 0"]  # a title counts too
+    # An artist found by meaning alone still shows the works that match the words.
+    by_meaning = cards(q=MARK, q_embedding=QUERY)
+    assert list(by_meaning) == ["zz-test-beta", "zz-test-gamma", "zz-test-alpha"]
+    assert by_meaning["zz-test-alpha"] == matching and by_meaning["zz-test-gamma"] == ["gamma 0"]
+    # Words no work says, no words, a stop word, an embedding without words: the artist's own order.
+    for args in ({"q": WORD}, {}, {"q": "the"}, {"q_embedding": QUERY}, {"q": WORD, "q_embedding": QUERY}):
+        assert cards(**args)["zz-test-alpha"] == in_order, args
+    # Similar artists and the profile page are not searches: the artist's own order, always.
+    [as_neighbour] = db.rpc("similar_artists", {"p_slug": "zz-test-beta"})
+    assert [work["title"] for work in as_neighbour["works"]] == in_order
 
 
 # 4. similar_artists: the stored neighbours, in the stored order.
@@ -635,6 +687,12 @@ join public.artists b on b.id = n.neighbor_id
 where a.slug = 'zz-test-alpha'
 order by n.rank
 """
+
+
+def stored(name: str) -> int:
+    """How many neighbour rows an artist has."""
+    count = "select count(*)::int as n from public.artist_neighbors n join public.artists a on a.id = n.artist_id"
+    return db.sql(f"{count} where a.slug = 'zz-test-{name}'")[0]["n"]
 
 
 def test_similar_artists_reads_the_stored_order():
@@ -669,10 +727,24 @@ def test_a_load_that_changes_neighbours_leaves_no_stale_row(seeded):
         ]
         assert similar("alpha") == ["zz-test-delta", "zz-test-beta"]
         assert similar("beta") == ["zz-test-alpha"]  # an artist the load did not list keeps theirs
-        # A list of which nothing can be written still replaces what was there: beta has no neighbours now.
-        nothing = [neighbor("beta", "nobody", 1, 0.5), neighbor("nobody", "beta", 1, 0.5)]
-        assert db.load([], [], nothing) == 2
-        assert similar("beta") == []
+        # To leave an artist with no neighbours, the push stage sends one row for them that names none.
+        # It is counted with the skipped rows, and among other artists' rows it clears only its own artist.
+        none = {"artist_slug": "zz-test-beta", "neighbor_slug": None, "rank": None, "score": None}
+        assert db.load([], [], [none, *changed]) == 1
+        assert stored("beta") == 0 and similar("beta") == []
+        assert similar("alpha") == ["zz-test-delta", "zz-test-beta"]
+
+        def replace(*rows: dict[str, Any]) -> int:
+            return db.rpc("replace_neighbors", {"p_rows": list(rows)}, "secret")
+
+        # Sent again, or for an artist nobody knows, it is no error.
+        assert replace(none, {**none, "artist_slug": "zz-test-nobody"}) == 2
+        # Next to real rows for the same artist, those are written and it changes nothing.
+        assert replace(none, neighbor("beta", "alpha", 1, 0.5)) == 1
+        assert stored("beta") == 1 and similar("beta") == ["zz-test-alpha"]
+        # A list of which nothing can be written replaces what was there just the same.
+        assert replace(neighbor("beta", "nobody", 1, 0.5), neighbor("nobody", "beta", 1, 0.5)) == 2
+        assert stored("beta") == 0 and similar("beta") == []
     finally:
         seed()
     assert similar("alpha") == ALPHA_SIMILAR and similar("beta") == ["zz-test-alpha"]
@@ -1254,6 +1326,7 @@ BAD_ARTISTS = [
     ("a top tag of 61 characters", {"top_tags": ["t" * 61]}, OWN_WORDS),
 ]
 URLS, SIZES, DA_HOSTS, OWN_SITE = "works_urls_clean", "works_sizes", "works_deviantart_hosts", "on that site"
+PIXELS = "works_dimensions"
 DA_PAGE = "https://www.deviantart.com/zz-test-alpha/art/Zz-Test-99-900000099"
 ON_DA = {"source": "deviantart", "page_url": DA_PAGE, "image_url": thumbnail("alpha", 99)}
 BAD_WORKS = [
@@ -1298,6 +1371,12 @@ BAD_WORKS = [
     ("41 tags", {"tags": [f"t{n}" for n in range(41)]}, SIZES),
     ("a tag of 61 characters", {"tags": ["t" * 61]}, SIZES),
     ("a source that is neither", {"source": "artstation"}, "works_source_known"),
+    ("a width with no height", {"width": 300}, PIXELS),
+    ("a height with no width", {"height": 200}, PIXELS),
+    ("a width of zero", {"width": 0, "height": 200}, PIXELS),
+    ("a negative height", {"width": 300, "height": -1}, PIXELS),
+    ("a width of 100,001", {"width": 100_001, "height": 200}, PIXELS),
+    ("a width that is not a whole number", {"width": 300.5, "height": 200}, "integer"),
     ("a style vector", {"style_embedding": "[0.5,0.5]"}, "style_embedding"),  # the column is gone: vectors stay home
 ]
 
@@ -1352,6 +1431,7 @@ def test_longest_clean_values_are_accepted(seeded):
     work = {**GOOD_WORK, "artist_id": seeded["zz-test-alpha"]}
     work["image_url"] = "https://img.zz-test-alpha.invalid/".ljust(2048, "a")
     work |= {"title": "t" * 200, "description": "d" * 2000, "tags": ["t" * 60] * 40}
+    work |= {"width": 100_000, "height": 1}
     try:
         assert db.upsert("artists", [longest], "slug", "slug") == [{"slug": "zz-test-long"}]
         assert len(db.upsert("works", [work], "artist_id,key", "id")) == 1
@@ -1473,6 +1553,11 @@ select (select count(*) from public.artists where slug like 'zz-test-bulk-%')::i
 """
 
 
+def real_artists() -> int:
+    """How many artists the project holds that are not these tests' own."""
+    return db.sql("select count(*)::int as n from public.artists where slug not like 'zz-test-%'")[0]["n"]
+
+
 def random_vector(numbers: random.Random, size: int) -> str:
     return "[" + ",".join(f"{numbers.uniform(-0.5, 0.5):.4f}" for _ in range(size)) + "]"
 
@@ -1528,6 +1613,11 @@ def server_ms(query: str) -> list[float]:
 
 @pytest.mark.skipif(os.environ.get("RUN_SCALE") != "1", reason="set RUN_SCALE=1 to load 3,000 artists and 30,000 works")
 def test_full_scale_fits_the_budget_and_the_public_timeout():
+    if real_artists():
+        pytest.skip(
+            "this project holds real artists: the full-scale test puts 3,000 synthetic ones in front of "
+            "visitors and locks the tables to compact them, so it runs only against a project with none"
+        )
     limit = PUBLIC_TIMEOUT_MS / 1000
     numbers = random.Random(5)
     embedding = [round(numbers.uniform(-0.5, 0.5), 4) for _ in range(1024)]

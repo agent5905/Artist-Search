@@ -122,7 +122,8 @@ def load(artists: list[dict[str, Any]], works: list[dict[str, Any]], neighbors: 
     "site_url" with "site_domain" (both or neither), "tagline", "top_tags", "search_text", "profile",
     "specialties", "mediums", "open_for_work", "profile_embedding" and "hidden" are optional.
     A work names its artist by "artist_slug" and needs "source" ('deviantart' or 'site'), "page_url"
-    and "image_url"; "title", "description", "tags" and "position" are optional.
+    and "image_url"; "title", "description", "tags", "position" and the image's size in pixels,
+    "width" with "height" (both or neither), are optional.
     A neighbour is {"artist_slug", "neighbor_slug", "rank", "score"}, rank 1 the nearest.
     Within one call every artist needs the same keys, and so does every work.
 
@@ -130,6 +131,8 @@ def load(artists: list[dict[str, Any]], works: list[dict[str, Any]], neighbors: 
     time every artist they can name is in the database: each artist named as an "artist_slug" has all
     their previous neighbours replaced, and an artist named in no row keeps theirs. A neighbour row
     naming an artist who is not in the database (removed, or never loaded) is skipped and counted.
+    To leave an artist with no neighbours, send one row for them with None as "neighbor_slug",
+    "rank" and "score": it too is counted as skipped, so take the number of those off the answer.
     A work is written only with its artist: one whose artist is not in `artists`, or whose artist the
     database skipped (a removed artist), is left out.
 
