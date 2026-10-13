@@ -1335,15 +1335,20 @@ def test_a_file_that_cannot_be_deleted_does_not_keep_the_rest_of_the_purge_from_
     assert library.artist_keys() == [BRAVO] and files(tmp_path) == [f"cache/images/{ID3}.jpg", "cache/pipeline.sqlite"]
 
 
-def test_an_account_under_a_new_handle_is_linked_to_the_old_one_and_nothing_of_either_is_deleted(tmp_path):
-    """Round 5. The same user id under a new handle is still noticed, by its hash. It is written down as a mark on
-    the old key and a link to the new one, so that a removal of either finds both; nothing is purged for it."""
+def test_an_account_under_a_new_handle_is_linked_to_the_keys_its_caller_names_and_nothing_is_deleted(tmp_path):
+    """The same user id under a new handle is written down as a mark on the old key and a link to the new one, so
+    that a removal of either finds both. Round 6: only for the keys the caller names. An id the API answered with
+    is not enough: one wrong id once tied two artists together, and a removal of one took the other."""
     renamed = "da:zz-fake-renamed"
     two_artists()
     library.save_image(ID4, "image/jpeg", JPEG)
     page = "https://www.deviantart.com/zz-fake-renamed/art/FAKE"
     works = [fields(ID2, page_url=page), fields(ID4, page_url=page)]
-    assert keep(renamed, works, tagline="FAKE-TAGLINE-RENAMED", user_id="FAKE-USERID-zz-fake-alpha") == (0, 0)
+    same_id = {"tagline": "FAKE-TAGLINE-RENAMED", "user_id": "FAKE-USERID-zz-fake-alpha"}
+    assert keep(renamed, works, **same_id) == (1, 0)  # not linked: ID2 is ALPHA's, and is not taken from them
+    assert library.artist_marks() == {} and library.same_account(renamed) == library.same_account(ALPHA) == []
+    assert library.holders("FAKE-USERID-zz-fake-alpha") == [ALPHA, renamed] and library.holders(None) == []
+    assert keep(renamed, works, old_keys=[ALPHA], **same_id) == (0, 0)
     assert [row["artist_key"] for row in rows("profiles")] == [ALPHA, BRAVO, renamed]
     assert [(row["artist_key"], row["deviation_id"], row["image_file"]) for row in rows("works")] == [
         (ALPHA, ID1, f"{ID1}.jpg"),
@@ -1356,13 +1361,15 @@ def test_an_account_under_a_new_handle_is_linked_to_the_old_one_and_nothing_of_e
     assert marks.keys() == {ALPHA} and marks[ALPHA][0] == library.RENAMED == "renamed" and marks[ALPHA][2] == renamed
     assert library.same_account(ALPHA) == [renamed] and library.same_account(renamed) == [ALPHA]
     assert library.same_account(BRAVO) == [] and library.same_account("da:zz-fake-nobody") == []
-    library.mark_artist(ALPHA, "account gone")  # of the old handle the API now says: no such user. The link stays.
+    library.mark_artist(ALPHA, "account gone")  # of the old handle the API says again: no such user. The link stays.
     assert library.artist_marks()[ALPHA][0] == library.RENAMED and library.same_account(renamed) == [ALPHA]
-    raw("DELETE FROM artist_marks")  # two keys an earlier version left with one hash and no mark are one account
-    assert library.same_account(ALPHA) == [renamed] and library.same_account(renamed) == [ALPHA]
-    keep(renamed, works, user_id="FAKE-USERID-zz-fake-alpha")
-    raw("UPDATE profiles SET user_hash = NULL")  # and the mark alone ties the two as well, either way
-    assert library.same_account(ALPHA) == [renamed] and library.same_account(renamed) == [ALPHA]
+    # Nor is the link dropped, or the hash that is kept replaced, when the old key is stored again under another id.
+    keep(ALPHA, tagline="FAKE-TAGLINE-NEWCOMER", user_id="FAKE-USERID-SOMEBODY-NEW")
+    assert library.same_account(renamed) == [ALPHA] and library.account_hash(ALPHA) == account(
+        "FAKE-USERID-zz-fake-alpha"
+    )
+    with pytest.raises(ValueError):
+        keep(renamed, old_keys=["zz-fake-alpha"])
     library.purge(renamed)
     assert library.artist_marks() == {} and library.same_account(ALPHA) == []  # a mark that names a purged key goes
 
@@ -1390,17 +1397,122 @@ def account(user_id, spelling="uid"):
     return hashlib.sha256(f"{spelling}:{user_id}".encode()).hexdigest()
 
 
-def test_a_profile_from_before_the_hash_was_respelled_is_still_linked_to_the_account():
-    """The second version hashed 'da-user:<id>'. A row it wrote is still known for the account it is."""
+def test_a_profile_from_before_the_hash_was_respelled_is_still_known_for_the_account_it_is():
+    """The second version hashed 'da-user:<id>'. A row it wrote is found for the account all the same, and keeps
+    the hash it has."""
     two_artists()
-    raw(
-        "UPDATE profiles SET user_hash = ? WHERE artist_key = ?", account("FAKE-USERID-zz-fake-alpha", "da-user"), ALPHA
-    )
-    keep("da:zz-fake-renamed", user_id="FAKE-USERID-zz-fake-alpha")
-    assert library.same_account("da:zz-fake-renamed") == [ALPHA] and library.same_account(ALPHA) == [
-        "da:zz-fake-renamed"
+    old = account("FAKE-USERID-zz-fake-alpha", "da-user")
+    raw("UPDATE profiles SET user_hash = ? WHERE artist_key = ?", old, ALPHA)
+    assert library.holders("FAKE-USERID-zz-fake-alpha") == [ALPHA] and library.holders("FAKE-USERID-zz-fake-bravo") == [
+        BRAVO
     ]
-    assert len(rows("profiles")) == 3 and len(rows("works")) == 3
+    keep(ALPHA, user_id="FAKE-USERID-zz-fake-alpha")
+    assert library.account_hash(ALPHA) == old and len(rows("works")) == 3
+
+
+def test_the_size_of_a_works_thumbnail_is_kept_when_both_numbers_are_given_and_stays_when_they_are_not():
+    """For the site, which cropped every work to one shape because nothing said what shape it has."""
+    keep(ALPHA, [fields(ID1, thumb_size=(300, 200)), fields(ID2, thumb_size=[640, 480]), fields(ID3)])
+    assert library.thumb_sizes() == {ID1: (300, 200), ID2: (640, 480)}
+    for nothing in (
+        None,
+        (300,),
+        (300, None),
+        ("300", "200"),
+        (300.0, 200.0),
+        (True, True),
+        (300, True),
+        (True, 200),
+        (0, 200),
+        (-1, 5),
+        "FAKE",
+    ):
+        keep(ALPHA, [fields(ID1, thumb_size=nothing), fields(ID3, thumb_size=nothing)])
+        assert library.thumb_sizes() == {ID1: (300, 200), ID2: (640, 480)}  # both or neither, and what is kept stays
+    keep(ALPHA, [fields(ID1, thumb_size=(150, 100))])
+    assert library.thumb_sizes()[ID1] == (150, 100)
+    library.purge(ALPHA)
+    assert library.thumb_sizes() == {} and rows("work_sizes") == []
+
+
+def test_what_an_entry_does_not_give_for_a_kept_work_stays_as_it_is_kept():
+    work(title="FAKE-TITLE-KEPT", published="1700000000")
+    kept = rows("works")[0]
+    for title in (None, 7, ["FAKE"]):
+        keep(ALPHA, [fields(title=title, thumb_url=None, published=None)])
+        assert {**rows("works")[0], "fetched_at": None} == {**kept, "fetched_at": None}
+    keep(ALPHA, [fields(title="", published="FAKE")])  # an empty title is the artist's word: there is none now
+    assert rows("works")[0]["title"] is None and rows("works")[0]["published_at"] == kept["published_at"]
+    with pytest.raises(ValueError):  # and a work that is not kept is not taken without a thumbnail
+        keep(BRAVO, [fields(ID2, thumb_url=None)])
+    assert len(rows("works")) == 1 and len(rows("profiles")) == 1
+
+
+def test_rows_about_nobody_who_is_kept_are_swept_from_every_table_and_nobody_else_loses_a_row():
+    """The critic's finding: a row another stage writes about a removed artist or their work after the purge
+    stayed forever. An artist who is only not collected yet, or collected and not listed, loses nothing."""
+    other_stages()  # ALPHA and BRAVO are kept, with rows in tables of other stages
+    listed, removed, nobody = "da:zz-fake-listed", "da:zz-fake-removed", "da:zz-fake-nobody"
+    for handle in ("zz-fake-listed", "zz-fake-removed"):
+        assert store.upsert_artist(handle, f"https://www.deviantart.com/{handle}", [], 3)
+    store.mark_removed("zz-fake-removed")
+    with closing(sqlite3.connect(config.LOCAL_DB)) as conn, conn:
+        for key in (listed, removed, nobody):
+            conn.execute("INSERT INTO fake_summaries VALUES (?, 'FAKE-SUMMARY')", (key,))
+            conn.execute("INSERT INTO fake_both VALUES (?, ?, 'FAKE-NOTE')", (key, ID1))
+        conn.execute("INSERT INTO fake_tags VALUES (?, 'fake-model-a', 'FAKE-RESULT')", (ID4,))  # no such work
+    for key in (listed, removed, nobody):
+        library.note_skip(key)
+    library.mark_works(ALPHA, {ID1: "mature"})
+    # Kept and not listed, by a profile alone or by a work alone: theirs to keep until a removal purges them.
+    alone = ["da:zz-fake-profile-only", "da:zz-fake-work-only"]
+    keep(alone[0], tagline="FAKE-TAGLINE")
+    keep(alone[1], [fields("00000000-0000-4000-A000-000000000005")])
+    raw("DELETE FROM profiles WHERE artist_key = ?", alone[1])
+    for key in alone:
+        raw("INSERT INTO fake_summaries VALUES (?, 'FAKE-SUMMARY')", key)
+    before = (rows("profiles"), rows("works"), rows("fake_unrelated"), rows("work_marks"))
+    library.drop_orphan_rows()
+    assert left("fake_summaries", "artist_key") == [ALPHA, BRAVO, listed, *alone]
+    assert left("fake_both", "artist_key") == [ALPHA, BRAVO, listed] and left("fake_tags", "deviation_id") == [
+        ID1,
+        ID2,
+        ID3,
+    ]
+    assert [row["artist_key"] for row in rows("skipped")] == [listed]
+    assert (rows("profiles"), rows("works"), rows("fake_unrelated"), rows("work_marks")) == before
+    assert b"zz-fake-removed" not in database_bytes() and b"zz-fake-nobody" not in database_bytes()
+    raw("INSERT INTO fake_summaries VALUES (?, 'FAKE-SUMMARY')", nobody)  # and a purge sweeps as well
+    library.purge(BRAVO)
+    assert left("fake_summaries", "artist_key") == [ALPHA, listed, *alone]
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "call_5550199000_by_zzfake_d1a2b3c-350t.jpg",
+        "whatsapp_5550199_by_zzfake_d1a2b3c-350t.jpg",
+        "visit_zz-fake-alpha.art_by_zzfake_d1a2b3c-350t.jpg",
+        "FAKE-call-555-0199.jpg",
+    ],
+)
+def test_an_image_address_whose_last_part_carries_what_a_title_may_not_is_refused(name):
+    """The critic's finding: under a clean title, a thumbnail path ending like these was stored. The last part of
+    the path is "<title>_by_<artist>_<id>-<size>.jpg": the title in it is held to the title's rule."""
+    address = f"https://images-wixmp-zzcdn.wixmp.com/f/FAKE/v1/fill/w_300,h_400,q_70,strp/{name}?{SIGNED}"
+    with pytest.raises(library.ContactInTitle):
+        library.image_address(address)
+    with pytest.raises(ValueError):
+        keep(ALPHA, [fields(thumb_url=address)])
+    assert rows("works") == []
+    for fine in (
+        "fake_title_2019_2023_by_zzfake_d1a2b3c4d5e6-350t.jpg",
+        "fake_call_of_the_wild_by_zzfake_d9876543-414w-2x.jpg",
+    ):
+        ordinary = f"https://images-wixmp-zzcdn.wixmp.com/f/FAKE/v1/fill/w_300,h_400,q_70,strp/{fine}?{SIGNED}"
+        assert (
+            library.image_address(ordinary) == ordinary
+        )  # the artist's handle and DeviantArt's own numbers are not it
 
 
 def test_a_removed_account_is_known_by_its_hash_on_the_stores_removal_list():
@@ -1577,7 +1689,7 @@ def other_stages():
             conn.execute("INSERT INTO fake_tags VALUES (?, 'fake-model-b', 'FAKE-RESULT')", (work_id,))
             conn.execute('INSERT INTO "fake vectors" VALUES (?, ?)', (work_id, b"FAKE-VECTOR"))
             conn.execute("INSERT INTO fake_both VALUES (?, ?, 'FAKE-NOTE')", (key, work_id))
-            conn.execute('INSERT INTO "fake ""quoted"" one" VALUES (?, ?)', (work_id, "FAKE-NOT-A-KEY"))
+            conn.execute('INSERT INTO "fake ""quoted"" one" VALUES (?, ?)', (work_id, key))
             conn.execute("INSERT INTO fake_unrelated VALUES (?, 'FAKE-NOTE')", (f"FAKE-ROW-{work_id[-1]}",))
         conn.execute("INSERT INTO fake_summaries VALUES (?, 'FAKE-SUMMARY'), (?, 'FAKE-SUMMARY')", (ALPHA, BRAVO))
 

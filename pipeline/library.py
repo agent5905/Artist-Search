@@ -90,6 +90,13 @@ CREATE TABLE IF NOT EXISTS artist_marks (
     marked_at TEXT NOT NULL CHECK (marked_at GLOB '{_TIMESTAMP}'),
     same_as TEXT                     -- for 'renamed': the key the same account is kept under now
 ) STRICT;
+-- The size of the thumbnail a work's row names, as the API gave it: what a page needs to lay the work out
+-- without cropping it. In a table of its own, so that the works table other stages read is as it was.
+CREATE TABLE IF NOT EXISTS work_sizes (
+    deviation_id TEXT PRIMARY KEY,
+    width INTEGER NOT NULL CHECK (width > 0),
+    height INTEGER NOT NULL CHECK (height > 0)
+) STRICT;
 """
 # A profiles table from an earlier version of this module (see _upgrade). It is rebuilt with the artists it
 # lists and when each was fetched, and nothing else: what it held was kept under looser rules, some of it in the
@@ -327,6 +334,11 @@ def image_address(value: object) -> str:
     probe = _settle(path, percent=True)
     if probe is None or "@" in probe or _LINK.search(probe):
         raise ContactInTitle("contact details in an image address")
+    # Its last part is "<title>_by_<artist>_<id>-<size>.jpg". The title in it is held to the whole of the rule.
+    last = probe.rpartition("/")[2]
+    named = last.rpartition("_by_")[0] if "_by_" in last else last.rpartition(".")[0]
+    if _contact(named):
+        raise ContactInTitle("contact details in an image address")
     return str(url)
 
 
@@ -358,12 +370,21 @@ def published_at(value: object) -> str | None:
 
 
 def checked_work(
-    work_id: object, *, page_url: object, title: object, tags: object, thumb_url: object, published: object
-) -> tuple[str, str, str | None, str, str, str | None]:
+    work_id: object,
+    *,
+    page_url: object,
+    title: object,
+    tags: object,
+    thumb_url: object,
+    published: object,
+    thumb_size: object = None,
+) -> tuple[str, str, str | None, str, str | None, str | None]:
     """One work's values as they are stored: id, page, title, tags as JSON, thumbnail, time published.
 
     ValueError for an id that is not a UUID or an address that is not acceptable, and its subclass ContactInTitle
-    for a title that holds contact details. A tag that is not acceptable is left out, and the work is still good.
+    for a title or an address that holds contact details. A tag that is not acceptable is left out, and the work
+    is still good. A thumbnail given as None is no thumbnail given: store_artist() keeps the one it has, and
+    takes no work without one. `thumb_size` is read by store_artist() (see _size).
     """
     title_kept, tags_kept = _title(title), json.dumps(_tags(tags))
     return (
@@ -371,9 +392,17 @@ def checked_work(
         page_address(page_url),
         title_kept,
         tags_kept,
-        image_address(thumb_url),
+        None if thumb_url is None else image_address(thumb_url),
         published_at(published),
     )
+
+
+def _size(value: object) -> tuple[int, int] | None:
+    """A thumbnail's width and height: two whole numbers above nothing, or None. Both or neither."""
+    if not isinstance(value, list | tuple) or len(value) != 2:
+        return None
+    width, height = value
+    return (width, height) if type(width) is int and type(height) is int and width > 0 and height > 0 else None
 
 
 def _key(artist_key: object) -> str:
@@ -497,69 +526,88 @@ def store_artist(
     website: object,
     works: Iterable[Mapping[str, Any]],
     marks: Mapping[str, str | None] | None = None,
+    old_keys: Iterable[str] = (),
     db: pathlib.Path | str | None = None,
 ) -> tuple[int, int]:
     """Add to what is kept about one artist and bring it up to date, in one transaction. Nothing is deleted.
 
     The profile is these four public fields and nothing else. A field is brought up to date when it is given as
     a text, an empty one included: that is the artist's word. Given as anything else, nothing was said about
-    it, and what is kept stays. So does the account hash when no `user_id` is given.
+    it, and what is kept stays. The account hash is written once and never replaced: whose account a handle is
+    does not change, and the caller turns away an answer that says otherwise (see holders).
 
     `works` are keyword arguments for checked_work(). Each is added, or brought up to date with the time, and
-    its row names the work's cached image when there is one. A work that is kept and is not among them is left
-    as it is: its fetched_at is when it was last seen and still qualified. A work kept under another artist's
-    key is not taken from them.
+    its row names the work's cached image when there is one. For a work that is kept, a title that is not given
+    as a text, a publish time or a thumbnail that is not given, and a size that is not given all stay as they
+    are kept. A work that is kept and is not among `works` is left as it is: its fetched_at is when it was last
+    seen and still qualified. A work kept under another artist's key is not taken from them.
 
     `marks` is what this turn learned about the artist's other kept works (see _mark_works). The artist's own
-    mark goes: their profile was read and stored. A key under which the same `user_id` is kept is this account
-    under the handle it had before; it is marked RENAMED and linked to this one, so that a removal of either
-    finds both (hard rule 7, see same_account). The artist is no longer one that was passed over.
+    mark goes, unless it is the RENAMED mark that ties this key to another. `old_keys` are the keys this
+    account was kept under before it took this handle: each is marked RENAMED and linked to this one, so that
+    a removal of either finds both (hard rule 7, see same_account). The artist is no longer one that was
+    passed over.
 
-    Returns two counts: works whose row the database refused or that belong to somebody else (the work is then
-    not kept), and kept works that are now marked.
+    Returns two counts: works that were not kept (the database refused the row, or the work is kept for somebody
+    else), and kept works that are now marked.
 
-    ValueError, and nothing stored, when a work is not acceptable. sqlite3.IntegrityError, and nothing changed,
-    when the database refuses the profile row itself.
+    ValueError, and nothing stored, when a work is not acceptable, or is new and has no thumbnail.
+    sqlite3.IntegrityError, and nothing changed, when the database refuses the profile row itself.
     """
     key = _key(artist_key)
-    user_hash = account(user_id)
     given = (tagline, specialty, level, website)
     checked = (_text(tagline, 200), _choice(specialty), _choice(level), _website(website))
+    works = list(works)
     rows = [checked_work(**work) for work in works]
+    old_keys = [_key(other) for other in old_keys]
     with _open(db) as conn:
         _upgrade(conn)
         fields = "SELECT tagline, specialty, level, website, user_hash FROM profiles WHERE artist_key = ?"
         *before, old_hash = conn.execute(fields, (key,)).fetchone() or (None, None, None, None, None)
         said = [new if isinstance(value, str) else old for value, new, old in zip(given, checked, before, strict=True)]
-        user_hash = user_hash or old_hash
         # Every column is named, here and below: a row written by position lands in the wrong columns the day
         # the table changes.
         conn.execute(
             "INSERT OR REPLACE INTO profiles (artist_key, tagline, specialty, level, website, fetched_at, user_hash) "
             "VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (key, *said, store._now(), user_hash),
+            (key, *said, store._now(), old_hash or account(user_id)),
         )
         conn.execute("DELETE FROM skipped WHERE artist_key = ?", (key,))
-        conn.execute("DELETE FROM artist_marks WHERE artist_key = ?", (key,))
-        same_account = "SELECT artist_key FROM profiles WHERE user_hash IN (?, ?) AND artist_key != ?"
-        others = [other for (other,) in conn.execute(same_account, (user_hash, account(user_id, "da-user"), key))]
-        for other in others:
+        conn.execute("DELETE FROM artist_marks WHERE artist_key = ? AND same_as IS NULL", (key,))
+        for other in old_keys:
             conn.execute(
                 "INSERT OR REPLACE INTO artist_marks (artist_key, reason, marked_at, same_as) VALUES (?, ?, ?, ?)",
                 (other, RENAMED, store._now(), key),
             )
+        mine = {
+            key,
+            *(other for (other,) in conn.execute("SELECT artist_key FROM artist_marks WHERE same_as = ?", (key,))),
+        }
         stored = set()
-        for work_id, *rest in rows:
-            owner = conn.execute("SELECT artist_key FROM works WHERE deviation_id = ?", (work_id,)).fetchone()
-            if owner and owner[0] not in (key, *others):
+        for (work_id, page, title, tags, thumb, published), work in zip(rows, works, strict=True):
+            kept = conn.execute(
+                "SELECT artist_key, title, thumb_url, published_at FROM works WHERE deviation_id = ?", (work_id,)
+            ).fetchone()
+            if kept and kept[0] not in mine:
                 continue
+            if kept:  # what the entry does not give stays as it is kept: a missing field is not an empty one
+                title = title if isinstance(work.get("title"), str) else kept[1]
+                thumb, published = thumb or kept[2], published or kept[3]
+            if thumb is None:
+                raise ValueError("a new work with no thumbnail")
             try:
                 conn.execute(
                     "INSERT OR REPLACE INTO works (deviation_id, artist_key, page_url, title, tags, thumb_url, "
                     "published_at, image_file, fetched_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    (work_id, key, *rest, _cached_name(work_id), store._now()),
+                    (work_id, key, page, title, tags, thumb, published, _cached_name(work_id), store._now()),
                 )
                 conn.execute("DELETE FROM work_marks WHERE deviation_id = ?", (work_id,))  # stored: it qualifies
+                size = _size(work.get("thumb_size"))
+                if size:
+                    conn.execute(
+                        "INSERT OR REPLACE INTO work_sizes (deviation_id, width, height) VALUES (?, ?, ?)",
+                        (work_id, *size),
+                    )
                 stored.add(work_id)
             except sqlite3.IntegrityError:  # SQLite undoes that one statement; the transaction and the artist go on
                 pass
@@ -613,20 +661,42 @@ def work_marks(db: pathlib.Path | str | None = None) -> dict[str, tuple[str, str
 
 
 def same_account(artist_key: str, db: pathlib.Path | str | None = None) -> list[str]:
-    """The other keys this artist's account is kept under: linked by a RENAMED mark either way, or carrying the
-    same account hash. A removal of one is a removal of all (hard rule 7)."""
+    """The other keys this artist's account is kept under: linked by a RENAMED mark, either way. A removal of
+    one is a removal of all (hard rule 7). Only a mark links two keys, and store_artist() makes one only for
+    the keys its caller names: an id the API answered with once is not enough to take anybody with a removal."""
     key = _key(artist_key)
     query = (
         "SELECT same_as FROM artist_marks WHERE artist_key = :key AND same_as IS NOT NULL "
-        "UNION SELECT artist_key FROM artist_marks WHERE same_as = :key "
-        "UNION SELECT other.artist_key FROM profiles AS mine JOIN profiles AS other USING (user_hash) "
-        "WHERE mine.artist_key = :key"
+        "UNION SELECT artist_key FROM artist_marks WHERE same_as = :key"
     )
     with _open(db) as conn:
-        try:
-            return sorted({other for (other,) in conn.execute(query, {"key": key})} - {key})
-        except sqlite3.OperationalError:  # a profiles table from the first version, which kept no hash
-            return []
+        return sorted({other for (other,) in conn.execute(query, {"key": key})} - {key})
+
+
+def holders(user_id: object, db: pathlib.Path | str | None = None) -> list[str]:
+    """The keys under which the account with this API user id is kept, by its hash in either spelling."""
+    with _open(db) as conn:
+        rows = conn.execute(
+            "SELECT artist_key FROM profiles WHERE user_hash IN (?, ?) ORDER BY 1",
+            (account(user_id), account(user_id, "da-user")),
+        )
+        return [key for (key,) in rows]
+
+
+def work_ids(artist_key: str, db: pathlib.Path | str | None = None) -> set[str]:
+    """The ids of the works kept under this key."""
+    with _open(db) as conn:
+        return {
+            work_id for (work_id,) in conn.execute("SELECT deviation_id FROM works WHERE artist_key = ?", (artist_key,))
+        }
+
+
+def thumb_sizes(db: pathlib.Path | str | None = None) -> dict[str, tuple[int, int]]:
+    """For every kept work whose thumbnail's size the API gave: deviation id -> (width, height), in pixels.
+    For whoever lays the works out on a page: the thumbnail need not be cropped to one shape."""
+    with _open(db) as conn:
+        rows = conn.execute("SELECT deviation_id, width, height FROM work_sizes")
+        return {work_id: (width, height) for work_id, width, height in rows}
 
 
 def cached_image(work_id: str, db: pathlib.Path | str | None = None) -> bool:
@@ -675,6 +745,7 @@ def purge(artist_key: str, db: pathlib.Path | str | None = None) -> None:
     key = _key(artist_key)
     with _open(db) as conn:
         stuck = _forget(conn, key)
+        _sweep_rows(conn)
     shutil.rmtree(review_dir(), ignore_errors=True)
     if stuck or review_dir().exists():
         raise OSError("a cached file could not be deleted")
@@ -692,14 +763,37 @@ def note_skip(artist_key: str, db: pathlib.Path | str | None = None) -> None:
         )
 
 
-def drop_stale_skips(db: pathlib.Path | str | None = None) -> None:
-    """Delete the note about every handle that is no longer in the store's artists table.
+def _sweep_rows(conn: sqlite3.Connection) -> None:
+    """Delete, in every table of the file whichever stage made it, the rows that are about nobody who is kept.
 
-    Nobody will ask about such a handle again, so the note serves nothing, and it names somebody: an artist who
-    was removed, or the handle an account had before it was renamed and then removed (hard rule 7).
+    A row by deviation_id goes when no such work is kept. A row by artist_key goes when the artist is neither
+    listed by the store nor kept here, which is what a removed and purged artist is. The works and the profiles
+    themselves are not touched: they go by purge(), with their files. So an artist who is not removed loses
+    nothing, whether they are collected yet or only listed.
     """
+    having = (
+        "SELECT m.name FROM sqlite_master AS m JOIN pragma_table_info(m.name) AS c "
+        "WHERE m.type = 'table' AND lower(c.name) = ? AND m.name NOT IN ('works', 'profiles')"
+    )
+    known = (
+        "SELECT 1 FROM artists WHERE key = :key UNION ALL SELECT 1 FROM profiles WHERE artist_key = :key "
+        "UNION ALL SELECT 1 FROM works WHERE artist_key = :key"
+    )
+    for (table,) in conn.execute(having, ("deviation_id",)).fetchall():
+        quoted = table.replace('"', '""')
+        conn.execute(f'DELETE FROM "{quoted}" WHERE deviation_id NOT IN (SELECT deviation_id FROM works)')
+    for (table,) in conn.execute(having, ("artist_key",)).fetchall():
+        quoted = table.replace('"', '""')
+        for (key,) in conn.execute(f'SELECT DISTINCT artist_key FROM "{quoted}"').fetchall():
+            if not conn.execute(known, {"key": key}).fetchone():
+                conn.execute(f'DELETE FROM "{quoted}" WHERE artist_key IS ?', (key,))
+
+
+def drop_orphan_rows(db: pathlib.Path | str | None = None) -> None:
+    """Hard rule 7, for rows that came late: another stage may write about a removed artist or their work after
+    the purge. Run at both ends of every collect run, and by purge() itself (see _sweep_rows)."""
     with _open(db) as conn:
-        conn.execute("DELETE FROM skipped WHERE artist_key NOT IN (SELECT key FROM artists)")
+        _sweep_rows(conn)
 
 
 def last_attempts(db: pathlib.Path | str | None = None) -> dict[str, str]:
