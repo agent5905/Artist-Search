@@ -8,7 +8,7 @@ import hashlib
 import json
 import sqlite3
 from contextlib import closing
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
@@ -631,6 +631,52 @@ def test_a_domain_two_old_rows_share_is_not_a_candidate(db):
     old_rows(db, ("zz-fake-old-a", "https://zz-fake-old.art/"), ("zz-fake-old-b", "https://www.zz-fake-old.art/"))
     old_rows(db, ("zz-fake-old-c", "https://zz-fake-old-c.art/"))
     assert [key for key, _ in store.own_site_candidates(db)] == ["da:zz-fake-new", "da:zz-fake-old-c"]
+
+
+# --- what the collect stage and discovery ask of the rows (round 8) ---
+
+
+def test_an_own_site_the_collect_stage_keeps_is_written_into_the_row_where_a_removal_of_it_looks(db):
+    """The critic's finding: discovery saw no site, the artist added one, and a rerun kept it with the profile
+    only. The removal of that site then returned 0 and deleted nobody."""
+    add(db, username="zz-fake-late", links=())
+    add(db, username="zz-fake-other", links=("https://zz-fake-other.art/",))
+    assert store.keep_own_site("ZZ-Fake-Late", "https://zz-fake-late.art/", db) is True
+    assert [json.loads(row[3]) for row in rows(db)] == [["https://zz-fake-late.art/"], ["https://zz-fake-other.art/"]]
+    assert [key for key, _ in store.own_site_candidates(db)] == ["da:zz-fake-late", "da:zz-fake-other"]
+    profile_on_a_platform = "https://www.artstation.com/zz-fake-late"
+    for no_own_site in (
+        None,
+        "",
+        "FAKE",
+        profile_on_a_platform,
+        "https://zz-fake-b.art/folio",
+        "https://shop.zz-fake-b.art/",
+    ):
+        assert store.keep_own_site("zz-fake-late", no_own_site, db) is False
+    assert store.keep_own_site("zz-fake-nobody", "https://zz-fake-nobody.art/", db) is False  # no row, and none is made
+    assert [json.loads(row[3]) for row in rows(db)] == [["https://zz-fake-late.art/"], ["https://zz-fake-other.art/"]]
+    assert store.mark_removed("site:zz-fake-late.art", db) == 1 and store.is_removed("da:zz-fake-late", db)
+    # A removed site is written into nobody's row, and nothing into the row of somebody who is removed.
+    assert store.keep_own_site("zz-fake-other", "https://www.zz-fake-late.art/", db) is False
+    assert store.keep_own_site("zz-fake-late", "https://zz-fake-late-new.art/", db) is False
+    assert [(row[0], json.loads(row[3])) for row in rows(db)] == [("da:zz-fake-other", ["https://zz-fake-other.art/"])]
+    with pytest.raises(ValueError):
+        store.keep_own_site("zz fake", "https://zz-fake-late.art/", db)
+
+
+def test_the_artists_stored_since_a_time_are_those_whose_row_was_first_stored_then_or_later(db):
+    add(db, username="zz-fake-old")
+    add(db, username="zz-fake-new", links=())
+    with closing(sqlite3.connect(db)) as conn, conn:
+        conn.execute("UPDATE artists SET discovered_at = '2020-01-01T00:00:00+00:00' WHERE key = 'da:zz-fake-old'")
+    now = datetime.now(UTC)
+    assert store.stored_since(now - timedelta(days=1), db) == {"da:zz-fake-new"}
+    assert store.stored_since(datetime(2020, 1, 1, tzinfo=UTC), db) == {"da:zz-fake-new", "da:zz-fake-old"}
+    assert store.stored_since(datetime(2020, 1, 1, 0, 0, 1, tzinfo=UTC), db) == {"da:zz-fake-new"}
+    assert store.stored_since(now + timedelta(days=1), db) == set()
+    add(db, username="zz-fake-old", hits=9)  # a refresh is not a first storing: see the function's own note
+    assert store.stored_since(now - timedelta(days=1), db) == {"da:zz-fake-new"}
 
 
 # --- the list for the collect stage ---

@@ -17,7 +17,12 @@ again before each artist and each download; and the sweep of cached files that n
     account gone, a profile that names a removed site) is marked with the reason and the time. Later stages
     read the marks (library.work_marks, library.artist_marks) and decide what is published.
   - A removal reaches the artist it names, under every handle of their account, and nobody else: what a
-    profile answers about a site never puts anybody on the removal list.
+    profile answers about a site never puts anybody on the removal list. An own site that is kept for an
+    artist is written into the store's row too, which is where the removal of a site looks.
+  - Nothing that is kept is replaced by nothing. An answer that is empty, or that the library's rules refuse,
+    leaves what is kept, and for a refused one the artist or the work is marked.
+  - An image that could not be had counts, whatever the host answered: MAX_REFUSALS works in a row stop the
+    run, and an artist none of whose images was served is passed over, not stored as one with no works.
   - A 200 is believed only in its documented shape. Anything else is the API failing for that artist: nothing
     stored changes, it is counted, and MAX_FAILURES of them in a row stop the run.
   - No verdict is reached on information that is missing: a work is marked only for what its entry says.
@@ -51,10 +56,10 @@ MAX_WORKS = 10  # works kept per artist, each run
 # among their 24 newest gets fewer. Follow next_offset if too many artists come up short.
 GALLERY_LIMIT = 24
 IMAGE_INTERVAL = 0.5  # seconds waited before every image download: two a second at most
-SERVER_RETRIES = 3  # times a 5XX answer, or an image host's 429, is asked for again. The API docs suggest three.
-_WAITS = (*(2.0**attempt for attempt in range(1, SERVER_RETRIES + 1)), None)  # 2, 4 and 8 seconds, then no more
+_WAITS = discover.SERVER_WAITS  # 2, 4 and 8 seconds, then no more: one schedule for the API and the image host
+SERVER_RETRIES = len(_WAITS) - 1  # times a 5XX answer, or an image host's 429, is asked for again
 MAX_FAILURES = 5  # artists failing one after another before the run gives up: by then it is the API, not them
-MAX_REFUSALS = 3  # works in a row, whoever's, that the image host refuses, retries and all, before the run stops
+MAX_REFUSALS = 3  # works in a row, whoever's, whose image could not be had, whatever was answered, before the run stops
 NOT_IMAGE_KEYS = frozenset(("videos", "flash", "text_content", "excerpt"))  # what a film or a text carries
 
 PROCESSED = "artists processed"
@@ -75,6 +80,8 @@ REMOVED = "skipped artists (removed)"
 RENAMED = "skipped artists (a removed account under a new handle)"
 UNAVAILABLE = "marked artists (account suspended, inactive or gone)"
 LISTS_REMOVED = "marked artists (their profile names a removed site)"
+ANSWER_REFUSED = "marked artists (an answer not kept, and what was kept stays)"
+NO_IMAGE = "skipped artists (none of their images was served)"
 MARKED = "marked works (stored, and no longer qualifying)"
 MALFORMED = "skipped works (malformed entry)"
 NOT_OWN = "skipped works (another author's)"
@@ -88,7 +95,8 @@ IMAGE_WRONG_TYPE = "skipped works (image not an accepted type)"
 IMAGE_TOO_LARGE = "skipped works (image over the size cap)"
 _COUNTS = (
     *(PROCESSED, PROFILES, WORKS, DOWNLOADED, CACHED, PURGED, ORPHANS, UNDELETED, BAD_KEY),
-    *(NOT_STORED, ROW_REFUSED, FAILED, API_FAILED, BAD_NAME, REMOVED, RENAMED, UNAVAILABLE, LISTS_REMOVED, MARKED),
+    *(NOT_STORED, ROW_REFUSED, FAILED, API_FAILED, BAD_NAME, REMOVED, RENAMED, NO_IMAGE),
+    *(UNAVAILABLE, LISTS_REMOVED, ANSWER_REFUSED, MARKED),
     *(MALFORMED, NOT_OWN, NOT_IMAGE, MATURE, NO_METADATA, TITLE),
     *(IMAGE_FAILED, IMAGE_LIMITED, IMAGE_WRONG_TYPE, IMAGE_TOO_LARGE),
 )
@@ -138,16 +146,8 @@ def _why_not(entry: dict[str, Any], username: str) -> tuple[str, bool] | None:
 
 
 def _get(api: discover._Api, path: str, **params: str | int) -> httpx.Response:
-    """api.get(), with a 5XX answer asked for again up to SERVER_RETRIES times, each after twice as long a wait.
-
-    The docs say a 500 is worth retrying up to three times. What comes back after that is the caller's to judge.
-    """
-    for wait in _WAITS:
-        response = api.get(path, **params)
-        if response.status_code < 500 or wait is None:
-            break
-        time.sleep(wait)  # on top of the second discover._Api leaves before every request
-    return response
+    """api.get(), with a 5XX answer asked for again up to SERVER_RETRIES times: discover's loop, used by both."""
+    return discover.patient_get(api, path, **params)
 
 
 def _body(response: httpx.Response, what: str, *lists: str) -> dict[str, Any]:
@@ -381,6 +381,7 @@ def _collect_artist(
     clean.sort(key=lambda work: library.published_at(work[1].get("published_time")) or "", reverse=True)
     kept_before = library.work_ids(key, db)
     kept: list[dict[str, Any]] = []
+    unserved = 0  # works of this turn whose image could not be had
     for work_id, entry, tags in clean:  # newest first
         if len(kept) == MAX_WORKS:
             marks.setdefault(work_id, None)  # seen and still good, though not among the newest this time
@@ -417,27 +418,34 @@ def _collect_artist(
             if store.is_removed(key, db):  # hard rule 7: asked again before every download
                 break
             fetched = _fetch_image(http, preview)
-            if isinstance(fetched, str):  # this work is not kept, and the next one is tried
+            if not isinstance(fetched, str):
+                try:
+                    library.save_image(work_id, *fetched)
+                except ValueError:  # the bytes do not begin the way the declared type does
+                    fetched = IMAGE_WRONG_TYPE
+            if isinstance(fetched, str):  # no image to keep, whatever was answered: the next work is tried
                 counts[fetched] += 1
-                refused[0] = refused[0] + 1 if fetched == IMAGE_LIMITED else 0
+                unserved += 1
+                refused[0] += 1
                 if refused[0] == MAX_REFUSALS:  # by now it is the host, or us it is refusing, and not these images
                     raise discover.Stop("the image host is failing or rate limiting")
                 continue
             refused[0] = 0
-            try:
-                library.save_image(work_id, *fetched)
-            except ValueError:  # the bytes do not begin the way the declared type does
-                counts[IMAGE_WRONG_TYPE] += 1
-                continue
             counts[DOWNLOADED] += 1
         kept.append(work)
     if store.is_removed(key, db):  # and once more before anything is written. What was downloaded is swept up.
         _remove(key, counts, db, user_id)
         counts[REMOVED] += 1
         return
+    if unserved and not kept:
+        # Not one image of theirs was served. That is the image host's word and says nothing about them, so
+        # they are not stored as an artist with no works: they are passed over, and nothing kept changes.
+        library.note_skip(key, db)
+        counts[NO_IMAGE] += 1
+        return
     try:
         # One transaction for the whole artist: the profile, these works, and the marks on the others.
-        not_stored, marked_works = library.store_artist(
+        not_stored, marked_works, refused_fields = library.store_artist(
             key,
             user_id=user_id,
             tagline=profile.get("tagline"),
@@ -457,8 +465,17 @@ def _collect_artist(
         return
     counts[ROW_REFUSED] += not_stored
     counts[MARKED] += marked_works
+    counts[ANSWER_REFUSED] += bool(refused_fields)
     counts[PROFILES] += 1
     counts[WORKS] += len(kept) - not_stored
+    # The website that is kept now, whichever answer gave it. On a removed site, the mark the store just took
+    # off goes back on. A site of their own is written into the store's row, where a removal of it looks.
+    site = library.website(key, db)
+    if store.record_listing(username, store.hosts_in(site), db):
+        library.mark_artist(key, LISTED, db)
+        counts[LISTS_REMOVED] += 1
+    else:
+        store.keep_own_site(username, site, db)
 
 
 def _where(exc: Exception) -> str:

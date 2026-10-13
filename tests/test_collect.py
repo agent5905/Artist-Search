@@ -69,8 +69,10 @@ skipped artists (the API failed for them): 0
 skipped artists (unreadable handle): 0
 skipped artists (removed): 0
 skipped artists (a removed account under a new handle): 0
+skipped artists (none of their images was served): 0
 marked artists (account suspended, inactive or gone): 2
 marked artists (their profile names a removed site): 0
+marked artists (an answer not kept, and what was kept stays): 0
 marked works (stored, and no longer qualifying): 0
 skipped works (malformed entry): 0
 skipped works (another author's): 0
@@ -1377,8 +1379,52 @@ def test_a_refreshed_profile_is_brought_up_to_date_where_the_answer_says_somethi
     assert without_time(rows("profiles")) == [kept_as]
     world.profiles[ALPHA] = profile(ALPHA, tagline="", artist_level=" ", artist_specialty="None", website="")
     assert run(world) == 0 and without_time(rows("profiles")) == [kept_as]
-    world.profiles[ALPHA]["website"] = "https://wa.me/15550109999"  # what our own rules refuse is dropped all the same
-    assert run(world) == 0 and without_time(rows("profiles")) == [{**kept_as, "website": None}]
+
+
+REFUSED_ANSWERS = {  # an answer that says something, and that the library's rules refuse: the critic's four
+    "a tagline that names a domain": {"tagline": "FAKE-TAGLINE see zz-fake-alpha.art"},
+    "a website that is none": {"website": "N/A"},
+    "a level of seven digits": {"artist_level": "5550199"},
+    "a specialty with an address in it": {"artist_specialty": "FAKE write to zz.fake@mail.invalid"},
+    "a title that is a run of a hundred letters": {"title": "F" * 100},
+}
+
+
+@pytest.mark.parametrize("case", REFUSED_ANSWERS)
+def test_an_answer_the_rules_refuse_leaves_what_is_kept_and_marks_the_artist_or_the_work(case, capsys):
+    """Round 8: each of these replaced the kept value with nothing, and the run exited 0 with nothing counted. Now
+    it is treated as a kept work's title always was: what is kept stays, and the artist or the work is marked,
+    so that the push stage holds them back and the owner sees it. The mark goes when the answer can be kept."""
+    answer = dict(REFUSED_ANSWERS[case])
+    world = solo(2)
+    assert run(world) == 0
+    before = (without_time(rows("profiles")), [{**row, "fetched_at": None} for row in rows("works")])
+    world.galleries[ALPHA][0]["title"] = answer.pop("title", "FAKE-TITLE-1")
+    world.profiles[ALPHA].update(answer)
+    for _ in range(2):
+        counts = counts_of(world, capsys)
+        assert (without_time(rows("profiles")), [{**row, "fetched_at": None} for row in rows("works")]) == before
+        if answer:
+            assert artist_marks() == {key(ALPHA): "answer refused"} and work_marks() == {}
+            assert (counts[collect.ANSWER_REFUSED], counts[collect.MARKED]) == (1, 0)
+        else:
+            assert work_marks() == {1: "answer refused"} and artist_marks() == {}
+            assert (counts[collect.ANSWER_REFUSED], counts[collect.MARKED]) == (0, 1)
+        assert counts[collect.PROFILES] == 1 and counts[collect.WORKS] == 2
+    world.galleries[ALPHA][0]["title"] = "FAKE-TITLE-NEW"
+    world.profiles[ALPHA] = profile(ALPHA, tagline="FAKE-TAGLINE-NEW")
+    counts = counts_of(world, capsys)
+    assert artist_marks() == work_marks() == {} and counts[collect.ANSWER_REFUSED] == counts[collect.MARKED] == 0
+    assert (rows("profiles")[0]["tagline"], rows("works")[0]["title"]) == ("FAKE-TAGLINE-NEW", "FAKE-TITLE-NEW")
+
+
+def test_an_answer_the_rules_refuse_for_an_artist_of_whom_nothing_is_kept_is_left_out_and_nobody_is_marked(capsys):
+    world = solo(1, tagline="FAKE-TAGLINE see zz-fake-alpha.art", website="N/A", artist_level="5550199")
+    world.galleries[ALPHA][0]["title"] = "F" * 100
+    counts = counts_of(world, capsys)
+    assert without_time(rows("profiles")) == [{**profile_row(ALPHA, None), "tagline": None, "level": None}]
+    assert rows("works")[0]["title"] is None and artist_marks() == work_marks() == {}
+    assert counts[collect.ANSWER_REFUSED] == counts[collect.MARKED] == 0
 
 
 def test_max_artists_bounds_a_run_and_the_next_run_takes_up_where_it_stopped(capsys):
@@ -1605,6 +1651,49 @@ def test_one_website_answered_for_every_profile_and_then_one_removal_takes_only_
     assert not any(store.is_removed(name) for name in names[1:]) and artist_marks() == {}
     assert not store.is_removed("zz-fake-shared.art") and len(raw("SELECT * FROM removed")) == 2  # handle and account
     assert counts_of(world, capsys)[collect.PROFILES] == 5 and stored()[0] == others  # and the run after it
+
+
+def test_an_own_site_kept_with_the_profile_is_in_the_stores_row_too_and_its_removal_reaches_the_artist(capsys):
+    """Round 8, with honest data: discovery saw no site, the artist added one, and a rerun kept it with the profile
+    only. Removing the site then returned 0. She was marked and not purged, and once she changed the field she
+    was stored again with no mark and not barred. One place holds an artist's own site now: the store's row."""
+    world = solo(2)  # stored by discovery with no link
+    world.artist(BRAVO)
+    world.work(BRAVO, 21)
+    assert run(world) == 0 and store.own_site_candidates() == []
+    world.profiles[ALPHA]["website"] = "https://www.zz-fake-alpha.art"  # she adds a site of her own
+    assert run(world) == 0 and rows("profiles", ALPHA)[0]["website"] == "https://www.zz-fake-alpha.art/"
+    assert store.own_site_candidates() == [(key(ALPHA), "https://www.zz-fake-alpha.art/")]  # the row has it too
+    assert store.mark_removed("site:zz-fake-alpha.art") == 1  # and so the removal finds her
+    world.profiles[ALPHA]["website"] = ""  # whatever she does with the field afterwards
+    seen = len(world.log)
+    counts = counts_of(world, capsys)
+    assert counts[collect.PURGED] == 1 and library.artist_keys() == [key(BRAVO)] and cached() == image_files([21])
+    assert store.is_removed(ALPHA) and library.account_removed(f"FAKE-USERID-{ALPHA}")
+    assert not [request for request in world.since(seen) if "alpha" in str(request.url).lower()]
+    assert b"zz-fake-alpha" not in config.LOCAL_DB.read_bytes()
+
+
+def test_the_mark_stays_for_as_long_as_the_website_that_is_kept_is_on_a_removed_site(capsys):
+    """Round 8. A profile an earlier version kept, whose own site the store's row does not have, and the site
+    removed before her next turn: no removal found her. Whatever she answers next, the website that is kept is
+    still the removed one until an answer replaces it, and for that long she stays marked and held back."""
+    world = solo(2, website="https://zz-fake-alpha.art/")
+    assert run(world) == 0
+    raw("UPDATE artists SET links = '[]'")  # as the earlier version left it: the site is with the profile only
+    assert store.mark_removed("site:zz-fake-alpha.art") == 0
+    was = stored()
+    for website in ("https://zz-fake-alpha.art/", "", "N/A"):  # it names the site, says nothing, is refused
+        world.profiles[ALPHA]["website"] = website
+        counts = counts_of(world, capsys)
+        assert counts[collect.LISTS_REMOVED] == 1 and artist_marks() == {key(ALPHA): "lists a removed site"}
+        assert stored() == was and rows("profiles", ALPHA)[0]["website"] == "https://zz-fake-alpha.art/"
+        assert raw("SELECT links FROM artists") == [("[]",)]  # a removed site is written into nobody's row
+        assert not store.is_removed(ALPHA)
+    world.profiles[ALPHA]["website"] = "https://zz-fake-alpha-new.art"  # an answer with another site of her own
+    counts = counts_of(world, capsys)
+    assert counts[collect.LISTS_REMOVED] == 0 and artist_marks() == {} and kept(ALPHA) == [2, 1]
+    assert raw("SELECT links FROM artists") == [('["https://zz-fake-alpha-new.art/"]',)]
 
 
 def test_every_profile_naming_a_removed_site_in_one_run_purges_nobody_and_marks_them(capsys):
@@ -2228,14 +2317,45 @@ def test_an_image_host_that_keeps_refusing_stops_the_run_with_the_artist_noted_a
     assert run(world) == 0 and kept(ALPHA) == ALPHA_KEPT and cached() == image_files(ALPHA_KEPT + BRAVO_KEPT)
 
 
-def test_refusals_with_any_other_answer_between_them_do_not_stop_the_run(capsys):
-    """Refused, refused, served; refused, refused, not found; refused: five refusals, and never three running."""
+def test_refusals_with_an_image_served_between_them_do_not_stop_the_run(capsys):
+    """Refused, refused, served; not found, refused, served; refused: five works without an image, and never
+    three running. Only an image that is served and kept starts the count again."""
     world = base()
-    world.detours.append(limited(12, 11, 9, 8, 6))
-    del world.images[preview_path(7)]
+    world.detours.append(limited(12, 11, 8, 6))
+    del world.images[preview_path(9)]
     counts = counts_of(world, capsys, expect_status=1)
-    assert counts[collect.IMAGE_LIMITED] == 5 and counts[collect.IMAGE_FAILED] == 1 and counts[collect.PROFILES] == 3
-    assert kept(ALPHA) == [10, 5, 4, 3, 2, 1] and kept(BRAVO) == BRAVO_KEPT
+    assert counts[collect.IMAGE_LIMITED] == 4 and counts[collect.IMAGE_FAILED] == 1 and counts[collect.PROFILES] == 3
+    assert kept(ALPHA) == [10, 7, 5, 4, 3, 2, 1] and kept(BRAVO) == BRAVO_KEPT
+
+
+NOT_AN_IMAGE = {  # what an image host can answer every request with that is neither an image nor a 429 or a 5XX
+    "forbidden": lambda: httpx.Response(403, text="FAKE-FORBIDDEN"),
+    "not found": lambda: httpx.Response(404, text="FAKE-NOT-FOUND"),
+    "a redirect": lambda: httpx.Response(302, headers={"location": "https://zz-fake-evil.invalid/FAKE.jpg"}),
+    "an html page": lambda: httpx.Response(200, headers={"content-type": "text/html"}, text="<html>FAKE</html>"),
+    "an empty body": lambda: httpx.Response(200, headers={"content-type": "image/jpeg"}, content=b""),
+    "a page labelled as a jpeg": lambda: httpx.Response(200, headers={"content-type": "image/jpeg"}, content=b"<html>"),
+}
+
+
+@pytest.mark.parametrize("answer", NOT_AN_IMAGE)
+def test_an_image_host_that_serves_no_image_stops_the_run_whatever_it_answers_instead(answer, capsys, tmp_path):
+    """Round 8: only a 429, a 5XX or no answer counted. With twelve artists of two works each and every image
+    answered 403, all 24 were asked for, the run exited 0 with nothing on stderr, and twelve profiles were stored
+    with no works. A signed address that has expired looks just like that. Every work whose image could not be
+    had counts now, and nobody is stored as an artist with no works because of it."""
+    world, names = two_works_each(10)
+    world.detours.append(lambda request: NOT_AN_IMAGE[answer]() if request.url.host == CDN_HOST else None)
+    assert run(world) == 1
+    captured = capsys.readouterr()
+    assert captured.err == "stopped: the image host is failing or rate limiting\n"
+    counts = summary(captured.out)
+    assert len(world.requests("images")) == collect.MAX_REFUSALS == 3 and world.asked_about(names[2]) == []
+    assert counts[collect.NO_IMAGE] == 1 and counts[collect.PROFILES] == counts[collect.WORKS] == 0
+    assert library.artist_keys() == [] and files(tmp_path) == ["cache/pipeline.sqlite"]
+    assert sorted(library.last_attempts()) == [key(names[0]), key(names[1])]  # both passed over: taken last next time
+    world.detours.clear()
+    assert run(world) == 0 and len(library.artist_keys()) == len(cached()) // 2 == 10  # and the next run has it all
 
 
 def two_works_each(count):
@@ -2260,12 +2380,10 @@ def test_an_image_host_that_refuses_everybody_stops_the_run_though_no_artist_has
     counts = summary(captured.out)
     assert counts[collect.IMAGE_LIMITED] == collect.MAX_REFUSALS == 3 and counts[collect.PROCESSED] == 2
     assert len(world.requests("images")) == 3 * (1 + collect.SERVER_RETRIES) and world.asked_about(names[2]) == []
-    # The first artist was stored, with no works. The second, whose first work was the third refused, is noted
-    # as passed over, so that the next run does not begin with them.
-    assert library.artist_keys() == [key(names[0])] and sorted(library.last_attempts()) == [
-        key(names[0]),
-        key(names[1]),
-    ]
+    # Neither is stored: of the first no image was served, and the third work refused was the second's. Both are
+    # noted as passed over, so that the next run does not begin with them.
+    assert library.artist_keys() == [] and counts[collect.NO_IMAGE] == 1
+    assert sorted(library.last_attempts()) == [key(names[0]), key(names[1])]
     world.detours.clear()
     seen = len(world.log)
     assert run(world, max_artists=1) == 0
@@ -2277,8 +2395,10 @@ def test_refusals_count_across_artists_only_while_nothing_is_served_between_them
     world, names = two_works_each(4)
     world.detours.append(limited(1, 11, 3, 13))
     counts = counts_of(world, capsys, expect_status=1)
-    assert counts[collect.IMAGE_LIMITED] == 4 and counts[collect.PROFILES] == counts[collect.PROCESSED] == 4
+    assert counts[collect.IMAGE_LIMITED] == 4 and counts[collect.PROCESSED] == 4
+    assert counts[collect.PROFILES] == counts[collect.NO_IMAGE] == 2  # who got no image is passed over, not stored
     assert [kept(name) for name in names] == [[], [12, 2], [], [14, 4]]
+    assert library.artist_keys() == [key(names[1]), key(names[3])]
 
 
 def test_an_image_served_from_the_apis_own_host_waits_the_apis_interval():
@@ -3058,7 +3178,7 @@ def test_stdout_is_counts_and_nothing_else(capsys):
     world = base()
     assert run(world) == 0
     out = capsys.readouterr().out
-    assert summary(out) and len(out.splitlines()) == len(collect._COUNTS) == 29
+    assert summary(out) and len(out.splitlines()) == len(collect._COUNTS) == 31
     assert not re.search(r"FAKE|zz-fake|https?:|deviantart|wixmp|[0-9A-F]{8}-", out, re.IGNORECASE)
     for word in ("artists processed", "profiles stored", "works stored", "images downloaded", "skipped"):
         assert word in out

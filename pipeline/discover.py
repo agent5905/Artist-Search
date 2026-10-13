@@ -25,6 +25,7 @@ import time
 import traceback
 from collections import Counter
 from collections.abc import Iterator
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import httpx
@@ -35,16 +36,28 @@ ENV_NAMES = ("DEVIANT_ART_ID", "DEVIANT_ART_SECRET")  # the client id and secret
 TOKEN_URL = "https://www.deviantart.com/oauth2/token"
 API_URL = "https://www.deviantart.com/api/v1/oauth2"
 PROFILE_URL = "https://www.deviantart.com/{}"
-NICHE_TAGS = ("conceptart", "characterdesign", "characterconcept", "creaturedesign", "gameart", "environmentconcept")
+# Tags that are specific to concept and character art for games. No broad one (digitalart, fantasy): it would
+# let in anybody. The owner needs 2,000 public artists, and about one collected artist in three is held back
+# later, so a run has to find some 3,500; the first six tags at 40 pages found about 400.
+NICHE_TAGS = (
+    *("conceptart", "characterdesign", "characterconcept", "creaturedesign", "gameart", "environmentconcept"),
+    *("creatureconcept", "environmentdesign", "propdesign", "weapondesign", "mechdesign", "vehicledesign"),
+    *("characterart", "monsterdesign", "armordesign", "costumedesign", "visualdevelopment", "gameconceptart"),
+)
 MIN_HITS = 3  # deviations under the niche tags before an author counts as a niche artist
 PAGE_SIZE = 50  # the documented maximum for browse/tags
 MAX_OFFSET = 50000  # the documented maximum for browse/tags
-# ponytail: fixed browse depth, 6 tags x 40 pages x 50 = 12,000 deviations a run (4 minutes).
-# Raise it, or make it a flag, if a live run finds too few artists.
-PAGES_PER_TAG = 40
+# ponytail: fixed browse depth, 18 tags x 120 pages x 50 = 108,000 deviations a run at most: 2,160 requests,
+# which is 36 minutes before the first profile is read. Nothing is stored until then, so a run stopped while
+# it browses starts again from nothing. Store the hits per tag if that ever costs a night.
+PAGES_PER_TAG = 120
+STORED_LATELY = timedelta(days=1)  # an artist stored this lately is not looked up again: a rerun after a stop is fast
 MIN_INTERVAL = 1.0  # seconds between any two requests
 MAX_429 = 6  # HTTP 429s in a row on one request before the run stops. The wait doubles each time: 1 to 32 seconds.
-# The summary adds up: candidates = skipped (removed) + profiles unavailable + not reached + artists stored.
+SERVER_WAITS = (2.0, 4.0, 8.0, None)  # seconds before a 5XX answer is asked for again. The API docs suggest three.
+# The summary adds up: candidates = skipped (removed) + skipped (stored lately) + profiles unavailable
+# + not reached + artists stored.
+LATELY = "skipped (stored within the last day)"
 NOT_REACHED = "not reached (--max-artists)"
 # Every stored artist falls under exactly one of these five: they have an own-site link, or this is why not.
 # Only the count is kept. An own site is optional (owner decision 7): an artist is stored either way.
@@ -60,6 +73,7 @@ _COUNTS = (
     "authors seen",
     f"candidates (>= {MIN_HITS} hits)",
     "skipped (removed)",
+    LATELY,
     "profiles unavailable",
     NOT_REACHED,
     "profiles fetched",
@@ -116,6 +130,18 @@ class _Api:
             self._new_token()
             response = self._authorized_get(path, params)
         return response
+
+
+def patient_get(api: _Api, path: str, **params: str | int) -> httpx.Response:
+    """api.get(), with a 5XX answer asked for again after each of SERVER_WAITS. What comes back after that is the
+    caller's to judge. A run browses for half an hour before it stores anything, so one bad answer must not end it.
+    """
+    for wait in SERVER_WAITS:
+        response = api.get(path, **params)
+        if response.status_code < 500 or wait is None:
+            break
+        time.sleep(wait)  # on top of the second _Api leaves before every request
+    return response
 
 
 def _website(website: object) -> httpx.URL | None:
@@ -183,7 +209,7 @@ def _run(api: _Api, counts: dict[str, int], max_artists: int, db: pathlib.Path |
     for tag in NICHE_TAGS:
         offset = 0
         for _ in range(PAGES_PER_TAG):
-            response = api.get("/browse/tags", tag=tag, offset=offset, limit=PAGE_SIZE)
+            response = patient_get(api, "/browse/tags", tag=tag, offset=offset, limit=PAGE_SIZE)
             if response.status_code != 200:
                 raise Stop(f"browse failed with HTTP {response.status_code}")
             page = response.json()
@@ -216,6 +242,9 @@ def _run(api: _Api, counts: dict[str, int], max_artists: int, db: pathlib.Path |
 
     candidates = sorted((key for key, n in hits.items() if n >= MIN_HITS), key=lambda key: (-hits[key], key))
     counts[f"candidates (>= {MIN_HITS} hits)"] = len(candidates)
+    # Every artist is stored as soon as their profile is read, so a run that is stopped keeps what it has, and
+    # the run after it does not read again the profiles of those it stored.
+    lately = store.stored_since(datetime.now(UTC) - STORED_LATELY, db)
     for position, key in enumerate(candidates):
         if counts["artists stored"] >= max_artists:
             counts[NOT_REACHED] = len(candidates) - position
@@ -224,7 +253,10 @@ def _run(api: _Api, counts: dict[str, int], max_artists: int, db: pathlib.Path |
         if store.is_removed(store.artist_key(username), db):  # hard rule 7: skipped without a lookup
             counts["skipped (removed)"] += 1
             continue
-        response = api.get(f"/user/profile/{username}")
+        if store.artist_key(username) in lately:
+            counts[LATELY] += 1
+            continue
+        response = patient_get(api, f"/user/profile/{username}")
         status = response.status_code
         # The docs give 4XX for a profile that cannot be shown (suspended, inactive, gone). One such account
         # must not end the run. 401 means our token, and 429 never gets here.

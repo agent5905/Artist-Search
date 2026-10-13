@@ -339,6 +339,34 @@ def upsert_artist(
     return True
 
 
+def keep_own_site(username: str, website: str | None, db: pathlib.Path | str | None = None) -> bool:
+    """Write the front page of an artist's own site into their row, as their one link. True when a row changed.
+
+    For the collect stage, which reads a profile after discovery did and may keep a site discovery never saw.
+    One place then says whose site is whose, and a removal of the site finds the artist (see _remove). Nothing
+    is changed unless the website is an own site (crawl.is_own_site is the rule), the artist has a row, and
+    neither they nor the site are on the removal list.
+    """
+    key = artist_key(username)
+    if not website or not crawl.is_own_site(website):
+        return False
+    with _open(db) as conn:
+        if _removed(conn, [key, *_link_keys([website])]):
+            return False
+        return conn.execute("UPDATE artists SET links = ? WHERE key = ?", (json.dumps([website]), key)).rowcount == 1
+
+
+def stored_since(since: datetime, db: pathlib.Path | str | None = None) -> set[str]:
+    """The keys of the artists whose row was first stored at this time or later.
+
+    ponytail: discovered_at is set once, so an artist stored on an earlier day never counts, however lately
+    their row was refreshed. Keep the time of the last refresh too if that is what makes a rerun slow.
+    """
+    at = since.astimezone(UTC).isoformat(timespec="seconds")
+    with _open(db) as conn:
+        return {key for (key,) in conn.execute("SELECT key FROM artists WHERE discovered_at >= ?", (at,))}
+
+
 def all_artists(db: pathlib.Path | str | None = None) -> list[tuple[str, str, str]]:
     """Every stored artist who is not on the removal list, as (key, da_username, da_profile_url), in key order.
 

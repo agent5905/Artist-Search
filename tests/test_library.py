@@ -254,7 +254,7 @@ def test_storing_an_artist_rebuilds_a_table_from_an_earlier_version(earlier):
     earlier_database(earlier)
     raw(BY_POSITION, *first_version_row(ALPHA, "https://wa.me/15550109999"))
     raw(BY_POSITION, *first_version_row(BRAVO, "https://zz-fake-bravo.art/"))
-    assert keep("da:zz-fake-charlie", tagline="FAKE-TAGLINE-NEW", user_id="FAKE-USERID") == (0, 0)
+    assert keep("da:zz-fake-charlie", tagline="FAKE-TAGLINE-NEW", user_id="FAKE-USERID") == (0, 0, 0)
 
     made = raw("SELECT sql FROM sqlite_master WHERE name = 'profiles'")[0][0]
     assert "bio" not in made and "CHECK" in made and "STRICT" in made
@@ -269,7 +269,7 @@ def test_storing_an_artist_rebuilds_a_table_from_an_earlier_version(earlier):
     for gone in (b"FAKE-BIO-TEXT", b"FAKE-TAGLINE call", b"wa.me", b"15550109999", b"zz.fake@mail", b"data:image"):
         assert gone not in stored, gone
     assert b"zz-fake-bravo.art" not in stored
-    assert keep(ALPHA, [fields()], tagline="FAKE-TAGLINE-ALPHA") == (0, 0)  # and it is rebuilt once, not every time
+    assert keep(ALPHA, [fields()], tagline="FAKE-TAGLINE-ALPHA") == (0, 0, 0)  # and it is rebuilt once, not every time
     assert rows("profiles")[2]["tagline"] == "FAKE-TAGLINE-NEW" and len(rows("works")) == 4  # and nothing is dropped
 
 
@@ -321,7 +321,7 @@ def test_a_work_row_the_database_refuses_is_left_out_and_the_rest_of_the_artist_
     refuse("works", "deviation_id", ID2)
     library.save_image(ID4, "image/jpeg", JPEG)
     before = rows("works")[1]
-    assert keep(ALPHA, [fields(ID1), fields(ID2), fields(ID4)], tagline="FAKE-TAGLINE-NEW") == (1, 0)
+    assert keep(ALPHA, [fields(ID1), fields(ID2), fields(ID4)], tagline="FAKE-TAGLINE-NEW") == (1, 0, 0)
     assert [(row["artist_key"], row["deviation_id"]) for row in rows("works")] == [
         (ALPHA, ID1),
         (ALPHA, ID2),
@@ -343,7 +343,7 @@ def test_a_profile_row_the_database_refuses_leaves_the_artist_exactly_as_they_we
     with pytest.raises(sqlite3.IntegrityError):
         keep(ALPHA, [fields(ID4)], tagline="FAKE-TAGLINE-NEW")
     assert (rows("profiles"), rows("works"), files(tmp_path)) == before
-    assert keep(BRAVO, [fields(ID3)], tagline="FAKE-TAGLINE-NEW") == (0, 0)  # and the next artist is stored as usual
+    assert keep(BRAVO, [fields(ID3)], tagline="FAKE-TAGLINE-NEW") == (0, 0, 0)  # and the next artist is stored as usual
 
 
 # --- storing ---
@@ -374,10 +374,39 @@ def test_storing_a_profile_twice_keeps_one_row_and_brings_up_to_date_what_was_sa
         assert {name: again[name] for name in stored if name != "fetched_at"} == {
             name: stored[name] for name in stored if name != "fetched_at"
         }
-    # What these rules refuse is dropped all the same: that is our rule, and not the API's word.
-    assert profile(tagline="FAKE write to zz.fake@mail.invalid")["tagline"] is None
-    assert profile(website="https://wa.me/15550109999")["website"] is None
-    assert profile(level="FAKE call 555 0199")["level"] is None and profile()["specialty"] == "FAKE-SPECIALTY"
+    assert library.artist_marks() == {} and library.website(ALPHA) == "https://zz-fake-alpha.art/"
+    # Round 8. An answer these rules refuse blanked what was kept, and the run exited 0: a tagline that names a
+    # domain, a website answered "N/A", a level of seven digits. What is kept stays, and the artist is marked
+    # for it, the way a kept work is when its new title is not acceptable.
+    kept = {name: stored[name] for name in stored if name != "fetched_at"}
+    refused = {"tagline": "FAKE see zz-fake-alpha.art", "website": "N/A", "level": "5550199"}
+    refused["specialty"] = "FAKE write to zz.fake@mail.invalid"
+    for name, answer in refused.items():
+        assert keep(ALPHA, **{name: answer}) == (0, 0, 1)
+        assert {name: rows("profiles")[0][name] for name in kept} == kept
+        assert library.artist_marks()[ALPHA][0] == library.REFUSED == "answer refused"
+        assert keep(ALPHA) == (0, 0, 0) and library.artist_marks() == {}  # and the mark goes with the answer
+    assert keep(ALPHA, **refused) == (0, 0, 4)
+    # With nothing kept there is nothing to hold on to: the field stays empty, and nobody is marked for that.
+    assert keep(BRAVO, **refused) == (0, 0, 0) and library.artist_marks().keys() == {ALPHA}
+    assert [rows("profiles")[1][name] for name in refused] == [None] * 4
+    assert library.website(BRAVO) is None and library.website("da:zz-fake-nobody") is None
+
+
+def test_a_kept_value_that_todays_rules_refuse_goes_and_nobody_is_marked_for_it():
+    """Round 8, and counted in the real store: 62 websites and 4 taglines kept on 2026-10-12 under an earlier,
+    looser rule, which today's rule refuses. Answered again as they are, each would be an answer refused over a
+    kept value, and 66 artists would be marked and held back for a rule of ours, not for anything they said."""
+    profile(
+        tagline="FAKE-TAGLINE-OLD", specialty="FAKE-SPECIALTY", website="https://zz-fake-alpha.art", user_id="FAKE-1"
+    )
+    looser = {"website": "https://www.facebook.com/zzfake/about", "tagline": "FAKE see zz-fake-alpha.art"}
+    for answer in (looser, {}, {"website": "", "tagline": None}):  # the same again, nothing, or an empty answer
+        raw("UPDATE profiles SET website = ?, tagline = ?", *looser.values())  # as the earlier version kept them
+        assert keep(ALPHA, **answer) == (0, 0, 0)
+        again = rows("profiles")[0]
+        assert (again["website"], again["tagline"], again["specialty"]) == (None, None, "FAKE-SPECIALTY")
+        assert library.artist_marks() == {}
 
 
 def test_storing_a_work_twice_keeps_one_row_that_names_its_cached_image():
@@ -413,7 +442,7 @@ def test_storing_an_artist_again_adds_and_brings_up_to_date_and_deletes_nothing(
     keep(ALPHA, [fields(ID1), fields(ID2)], tagline="FAKE-TAGLINE")
     keep(BRAVO, [fields(ID3)])
     before = {row["deviation_id"]: row for row in rows("works")}
-    assert keep(ALPHA, [fields(ID2, title="FAKE-TITLE-NEW"), fields(ID4)]) == (0, 0)
+    assert keep(ALPHA, [fields(ID2, title="FAKE-TITLE-NEW"), fields(ID4)]) == (0, 0, 0)
     after = {row["deviation_id"]: row for row in rows("works")}
     assert sorted(after) == [ID1, ID2, ID3, ID4]
     assert after[ID1] == before[ID1] and after[ID3] == before[ID3]  # not in the answer: as they were kept
@@ -426,13 +455,13 @@ def test_storing_an_artist_again_adds_and_brings_up_to_date_and_deletes_nothing(
         None,
     ]
     assert files(tmp_path) == [*(f"cache/images/{work_id}.jpg" for work_id in (ID1, ID2, ID3)), "cache/pipeline.sqlite"]
-    assert keep(ALPHA, []) == (0, 0) and len(rows("works")) == 4 and len(rows("profiles")) == 2  # an empty answer
+    assert keep(ALPHA, []) == (0, 0, 0) and len(rows("works")) == 4 and len(rows("profiles")) == 2  # an empty answer
 
 
 def test_a_work_kept_under_another_artists_key_is_not_taken_from_them():
     two_artists()
     before = rows("works")
-    assert keep(ALPHA, [fields(ID1), fields(ID3)]) == (1, 0)  # ID3 is kept for BRAVO
+    assert keep(ALPHA, [fields(ID1), fields(ID3)]) == (1, 0, 0)  # ID3 is kept for BRAVO
     assert [(row["artist_key"], row["deviation_id"]) for row in rows("works")] == [
         (ALPHA, ID1),
         (ALPHA, ID2),
@@ -457,7 +486,7 @@ def test_rows_are_written_by_column_name_not_by_position():
     library.save_image(ID1, "image/jpeg", JPEG)
     given = {"tagline": "FAKE-TAGLINE", "specialty": "FAKE-SPECIALTY", "level": "FAKE-LEVEL"}
     profile_fields = {**given, "website": "https://zz-fake-alpha.art", "user_id": "FAKE-USERID"}
-    assert keep(ALPHA, [fields(published="1700000000")], **profile_fields) == (0, 0)
+    assert keep(ALPHA, [fields(published="1700000000")], **profile_fields) == (0, 0, 0)
     stored = rows("profiles")[0]
     assert {name: stored[name] for name in ("artist_key", *given, "website")} == {
         "artist_key": ALPHA,
@@ -864,7 +893,7 @@ def test_each_listed_host_keeps_a_profile_and_nothing_that_is_not_one(domain):
         f"https://zz-fake-{domain}/zzfake",  # a name that only ends like it
         f"https://{domain}.zz-fake-evil.invalid/zzfake",
     ):
-        assert profile(website=address)["website"] is None, address
+        assert profile(BRAVO, website=address)["website"] is None, address  # of whom no website is kept
     assert b"zzfake" not in database_bytes()
 
 
@@ -1391,10 +1420,10 @@ def test_an_account_under_a_new_handle_is_linked_to_the_keys_its_caller_names_an
     page = "https://www.deviantart.com/zz-fake-renamed/art/FAKE"
     works = [fields(ID2, page_url=page), fields(ID4, page_url=page)]
     same_id = {"tagline": "FAKE-TAGLINE-RENAMED", "user_id": "FAKE-USERID-zz-fake-alpha"}
-    assert keep(renamed, works, **same_id) == (1, 0)  # not linked: ID2 is ALPHA's, and is not taken from them
+    assert keep(renamed, works, **same_id) == (1, 0, 0)  # not linked: ID2 is ALPHA's, and is not taken from them
     assert library.artist_marks() == {} and library.same_account(renamed) == library.same_account(ALPHA) == []
     assert library.holders("FAKE-USERID-zz-fake-alpha") == [ALPHA, renamed] and library.holders(None) == []
-    assert keep(renamed, works, old_keys=[ALPHA], **same_id) == (0, 0)
+    assert keep(renamed, works, old_keys=[ALPHA], **same_id) == (0, 0, 0)
     assert [row["artist_key"] for row in rows("profiles")] == [ALPHA, BRAVO, renamed]
     assert [(row["artist_key"], row["deviation_id"], row["image_file"]) for row in rows("works")] == [
         (ALPHA, ID1, f"{ID1}.jpg"),
@@ -1490,11 +1519,21 @@ def test_what_an_entry_does_not_give_for_a_kept_work_stays_as_it_is_kept():
         assert {**rows("works")[0], "fetched_at": None} == {**kept, "fetched_at": None}
     keep(ALPHA, [fields(title="", published="FAKE", tags=["fakenew"])])
     assert {**rows("works")[0], "fetched_at": None} == {**kept, "fetched_at": None, "tags": '["fakenew"]'}
-    keep(ALPHA, [fields(title=EMBEDDED, tags=["not a tag name"])])  # what the rules here refuse is dropped all the same
-    assert (rows("works")[0]["title"], rows("works")[0]["tags"]) == (None, "[]")
+    # Round 8. A title that is a 100-letter run blanked the kept one, and so did tags these rules refuse. What is
+    # kept stays, and the work is marked for it.
+    kept = rows("works")[0]
+    for refused in ({"title": EMBEDDED}, {"title": "F" * 100}, {"tags": ["not a tag name", 7]}):
+        assert keep(ALPHA, [fields(**{"title": "", "tags": [], "published": None, **refused})]) == (0, 1, 0)
+        assert {**rows("works")[0], "fetched_at": None} == {**kept, "fetched_at": None}
+        assert {work_id: mark[0] for work_id, mark in library.work_marks().items()} == {ID1: library.REFUSED}
+    assert keep(ALPHA, [fields(title="FAKE-TITLE-NEWER", tags=["fakenewer", "not a tag name"])]) == (0, 0, 0)
+    assert (rows("works")[0]["title"], rows("works")[0]["tags"]) == ("FAKE-TITLE-NEWER", '["fakenewer"]')
+    assert library.work_marks() == {}  # an answer that can be kept is taken, and the mark goes
+    assert keep(ALPHA, [fields(ID2, title=EMBEDDED, tags=["not a tag name"])]) == (0, 0, 0)  # a new work: no mark
+    assert (rows("works")[1]["title"], rows("works")[1]["tags"]) == (None, "[]")
     with pytest.raises(ValueError):  # and a work that is not kept is not taken without a thumbnail
-        keep(BRAVO, [fields(ID2, thumb_url=None)])
-    assert len(rows("works")) == 1 and len(rows("profiles")) == 1
+        keep(BRAVO, [fields(ID3, thumb_url=None)])
+    assert len(rows("works")) == 2 and len(rows("profiles")) == 1
 
 
 def test_rows_about_nobody_who_is_kept_are_swept_from_every_table_and_nobody_else_loses_a_row():
@@ -1656,7 +1695,7 @@ def test_a_kept_work_that_no_longer_qualifies_is_marked_and_stays(monkeypatch):
     marks = library.work_marks()
     assert marks.keys() == {ID1} and marks[ID1][0] == "mature" and marks[ID1][1].endswith("+00:00")
     assert rows("works") == before and len(rows("profiles")) == 2  # nothing about the work itself changes
-    assert keep(ALPHA, [fields(ID2)], marks={ID1: "tagged AI-made", ID2: "mature"}) == (0, 1)
+    assert keep(ALPHA, [fields(ID2)], marks={ID1: "tagged AI-made", ID2: "mature"}) == (0, 1, 0)
     assert library.work_marks().keys() == {ID1} and library.work_marks()[ID1][0] == "tagged AI-made"  # ID2 was stored
     assert library.mark_works(ALPHA, {ID2: "mature"}) == 1 and library.work_marks().keys() == {ID1, ID2}
     seen = rows("works")[1]["fetched_at"]

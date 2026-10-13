@@ -71,12 +71,13 @@ EXPECTED = [
 ]
 OWN_SITES = [(key, links[0]) for key, _, _, links, _ in EXPECTED if links]  # what the crawl stage is offered
 EXPECTED_STDOUT = """\
-pages fetched: 7
+pages fetched: 19
 deviations counted: 94
 mature skipped: 7
 authors seen: 71
 candidates (>= 3 hits): 9
 skipped (removed): 0
+skipped (stored within the last day): 0
 profiles unavailable: 1
 not reached (--max-artists): 0
 profiles fetched: 8
@@ -87,8 +88,11 @@ of those, website on a listed platform or DeviantArt: 3
 of those, website on another domain, not a bare front page: 1
 of those, website names no public host: 0
 """
-BASE_REQUESTS = 17  # 1 token + 7 browse pages + 9 profile lookups
-# The base world's requests in order: 0 token, 1-7 browse, then lookups 8 HOTEL (400), 9 ALPHA, 10 BRAVO, 11 DELTA...
+# The base world's requests in order: 0 token, 1-19 browse (two pages of the first tag, one of each of the other
+# 17), then the lookups: HOTEL (400), ALPHA, BRAVO, DELTA...
+FIRST_LOOKUP = 20
+BASE_REQUESTS = FIRST_LOOKUP + 9  # 1 token + 19 browse pages + 9 profile lookups
+LONG_AGO = "2020-01-01T00:00:00+00:00"
 
 
 def without(*keys):
@@ -275,7 +279,12 @@ def small_world(websites):
     return FakeDA({"gameart": works}, profiles), names
 
 
-def run(fake, db, max_artists=200):
+def run(fake, db, max_artists=200, same_day=False):
+    """One run. Unless it is to be on the same day as the run before, every row there is has been there long:
+    an artist stored within the last day is not looked up again, and most tests here are about the lookup."""
+    if db.exists() and not same_day:
+        with closing(sqlite3.connect(db)) as conn, conn:
+            conn.execute("UPDATE artists SET discovered_at = ?", (LONG_AGO,))
     with mock.patch.object(time, "sleep", fake.sleep):
         return discover.discover(CLIENT_ID, CLIENT_SECRET, max_artists=max_artists, db=db, transport=fake.transport)
 
@@ -760,6 +769,42 @@ def test_max_artists_caps_what_one_run_stores(db, capsys):
     assert summary(capsys.readouterr().out)[discover.NOT_REACHED] == 4
 
 
+def test_a_run_that_is_stopped_keeps_what_it_stored_and_the_run_after_it_does_not_look_them_up_again(db, capsys):
+    """Round 8: a run now reads some 3,500 profiles, a second apart. Each artist is stored as their profile is
+    read, and one stored within the last day is not read again, so a run after a stop goes on where it stopped."""
+    stopped = world()
+    stopped.before = lambda index, request: 503 if request.url.path == PROFILE_PATH + FOXTROT else None
+    assert run(stopped, db) == 1  # at the fifth lookup
+    assert capsys.readouterr().err == "stopped: profile lookup failed with HTTP 503\n"
+    assert stored(db) == EXPECTED[:3]  # ALPHA, BRAVO and DELTA
+    again = world()
+    assert run(again, db, same_day=True) == 0
+    assert again.looked_up() == [HOTEL, FOXTROT, GOLF, INDIA, JULIET, KILO]  # HOTEL has no profile, so no row
+    counts = summary(capsys.readouterr().out)
+    assert stored(db) == EXPECTED and (counts[discover.LATELY], counts["artists stored"]) == (3, 5)
+    parts = ("skipped (removed)", discover.LATELY, "profiles unavailable", discover.NOT_REACHED, "artists stored")
+    assert sum(counts[part] for part in parts) == counts["candidates (>= 3 hits)"] == 9  # the summary still adds up
+    a_day_later = world()
+    assert run(a_day_later, db) == 0 and len(a_day_later.looked_up()) == 9  # and then everybody is read again
+    assert discover.STORED_LATELY.total_seconds() == 24 * 3600
+
+
+def test_the_niche_is_eighteen_tags_each_browsed_a_hundred_and_twenty_pages_deep(db):
+    """Round 8: six tags at 40 pages found about 400 artists, and the owner needs some 3,500 found. The tags are
+    specific to concept and character art for games: a broad one would let in anybody."""
+    first_six = ("conceptart", "characterdesign", "characterconcept", "creaturedesign", "gameart", "environmentconcept")
+    assert discover.NICHE_TAGS[:6] == first_six
+    assert len(discover.NICHE_TAGS) == len(set(discover.NICHE_TAGS)) == 18 and discover.PAGES_PER_TAG == 120
+    assert all(re.fullmatch(r"[a-z]{7,20}", tag) for tag in discover.NICHE_TAGS)
+    assert not {"digitalart", "fantasy", "art", "drawing", "illustration", "fanart"} & set(discover.NICHE_TAGS)
+    assert discover.PAGES_PER_TAG * discover.PAGE_SIZE <= discover.MAX_OFFSET
+    fake = FakeDA({discover.NICHE_TAGS[-1]: [deviation(n, ALPHA) for n in range(1, 201)]}, {ALPHA: profile(ALPHA, "")})
+    fake.page_size = 1  # 200 pages of one work each under the last tag: 120 of them are read, and no more
+    assert run(fake, db) == 0
+    assert fake.offsets(discover.NICHE_TAGS[-1]) == list(range(120))
+    assert stored(db) == [expected_row(ALPHA, [], 120)]
+
+
 # --- 4: removed artists are skipped and never re-added (hard rule 7) ---
 
 
@@ -883,14 +928,14 @@ def test_a_profile_that_names_a_removed_site_in_a_link_of_any_shape_is_not_store
     word: an artist who is not stored is not stored on it, and one who is stays exactly as they were."""
     if stored_before:
         assert run(world({DELTA: "https://zz-fake-delta-old.art"}), db) == 0
-    before = all_rows(db)
+    before = stored(db)
     store.mark_removed("site:zz-fake-delta.co.uk", db)
     fake = world({DELTA: website})
     capsys.readouterr()
     assert run(fake, db) == 0
     assert DELTA in fake.looked_up()
     assert "skipped (removed): 1\n" in capsys.readouterr().out
-    assert [row for row in all_rows(db) if row[1] == DELTA] == [row for row in before if row[1] == DELTA]
+    assert [row for row in stored(db) if row[1] == DELTA] == [row for row in before if row[1] == DELTA]
     assert len(all_rows(db)) == len(EXPECTED) - (not stored_before)
     assert not store.is_removed(f"da:{DELTA}", db)
     with closing(sqlite3.connect(db)) as conn:
@@ -1230,7 +1275,7 @@ def test_paging_never_goes_past_offset_50000(db):
         (0, 307, "https://fake-elsewhere.example/oauth2/token", "token request"),  # would re-post the credentials
         (3, 302, "https://fake-elsewhere.example/browse", "browse"),  # would carry the token off site
         (3, 302, "/api/v1/oauth2/placebo", "browse"),
-        (9, 301, f"/api/v1/oauth2/user/profile/{BRAVO}", "profile lookup"),
+        (FIRST_LOOKUP + 1, 301, f"/api/v1/oauth2/user/profile/{BRAVO}", "profile lookup"),
     ],
 )
 def test_redirects_are_not_followed(db, capsys, index, status, target, reason):
@@ -1254,7 +1299,7 @@ def test_429_backs_off_exponentially_then_carries_on(db, capsys):
     assert capsys.readouterr().out == EXPECTED_STDOUT  # nothing counted twice
 
 
-@pytest.mark.parametrize("first_429", [0, 4, 10])  # the token request, a browse page, the third profile lookup
+@pytest.mark.parametrize("first_429", [0, 4, FIRST_LOOKUP + 2])  # the token, a browse page, the third profile lookup
 def test_repeated_429_stops_the_run_cleanly(db, capsys, first_429):
     fake = world()
     fake.before = lambda index, request: 429 if index >= first_429 else None
@@ -1267,7 +1312,7 @@ def test_repeated_429_stops_the_run_cleanly(db, capsys, first_429):
     assert len({str(request.url) for _, request, _ in refused}) == 1
     assert fake.gaps()[first_429:] == [2.0, 4.0, 8.0, 16.0, 32.0]
     assert min(fake.gaps(), default=1.0) >= discover.MIN_INTERVAL
-    assert stored(db) == (EXPECTED[:1] if first_429 == 10 else [])  # what was stored before the stop is kept
+    assert stored(db) == (EXPECTED[:1] if first_429 > FIRST_LOOKUP else [])  # what was stored before the stop is kept
     assert out.count("\n") == len(EXPECTED_STDOUT.splitlines()) and "FAKE" not in out + err
 
 
@@ -1320,7 +1365,7 @@ def test_profile_lookups_refused_with_401_stop_the_run_at_the_first_one(db, caps
 
     fake.before = refuse_profiles
     assert run(fake, db) == 1
-    assert [(request.url.path, status) for _, request, status in fake.log[8:]] == [
+    assert [(request.url.path, status) for _, request, status in fake.log[FIRST_LOOKUP:]] == [
         (PROFILE_PATH + HOTEL, 401),
         (TOKEN_PATH, 200),
         (PROFILE_PATH + HOTEL, 401),
@@ -1348,8 +1393,29 @@ def test_any_other_answer_to_a_profile_lookup_stops_the_run(db, capsys, status):
     fake.before = lambda index, request: status if request.url.path == PROFILE_PATH + ALPHA else None
     assert run(fake, db) == 1
     assert capsys.readouterr().err == f"stopped: profile lookup failed with HTTP {status}\n"
-    assert fake.looked_up() == [HOTEL, ALPHA]
+    asked = len(discover.SERVER_WAITS) if status >= 500 else 1  # a 5XX is asked for again; nothing else is
+    assert fake.looked_up() == [HOTEL] + [ALPHA] * asked
     assert all_rows(db) == []
+
+
+@pytest.mark.parametrize("path", [BROWSE_PATH, PROFILE_PATH + ALPHA])
+def test_a_server_error_that_passes_does_not_end_the_run(db, capsys, monkeypatch, path):
+    """A run browses for half an hour before it stores anyone, so one 5XX is asked for again after a wait."""
+    waits: list[float] = []
+    monkeypatch.setattr(time, "sleep", waits.append)
+    fake, failed = world(), []
+
+    def twice(index, request):  # the first two requests for this path get a 503; the third is answered
+        if request.url.path == path and len(failed) < 2:
+            failed.append(index)
+            return 503
+        return None
+
+    fake.before = twice
+    assert discover.discover(CLIENT_ID, CLIENT_SECRET, max_artists=200, db=db, transport=fake.transport) == 0
+    assert capsys.readouterr().err == "" and stored(db) == EXPECTED
+    assert len(fake.log) == BASE_REQUESTS + 2 and [wait for wait in waits if wait > 1] == [2.0, 4.0]
+    assert discover.SERVER_WAITS == (2.0, 4.0, 8.0, None)
 
 
 def test_wrong_credentials_stop_the_run_without_printing_them(db, capsys):

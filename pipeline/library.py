@@ -86,7 +86,7 @@ CREATE TABLE IF NOT EXISTS work_marks (
 ) STRICT;
 CREATE TABLE IF NOT EXISTS artist_marks (
     artist_key TEXT PRIMARY KEY,
-    reason TEXT NOT NULL,            -- 'account gone', 'lists a removed site', 'mostly AI-made' or 'renamed'
+    reason TEXT NOT NULL,            -- 'account gone', 'lists a removed site', 'answer refused' or 'renamed'
     marked_at TEXT NOT NULL CHECK (marked_at GLOB '{_TIMESTAMP}'),
     same_as TEXT                     -- for 'renamed': the key the same account is kept under now
 ) STRICT;
@@ -148,6 +148,9 @@ _THUMBNAIL = re.compile(
     r"(?:/v1/[a-z]{1,12}/[a-z0-9_,]{1,60}/[a-z0-9_]{1,200}-[0-9a-z]{1,12}\.[a-z]{3,4})?(?:\?.*)?"
 )
 RENAMED = "renamed"  # the mark on the key an account was kept under before it took another handle
+# The mark on an artist or a work of which something stayed as it was kept because the answer for it is one the
+# rules here refuse. What is kept may be out of date, so a later stage holds the artist or the work back.
+REFUSED = "answer refused"
 _MARKUP = re.compile(r"<[^<>]*>")
 # Characters that show nothing and are not in Unicode's "other" categories, which _settle removes wholesale:
 # the grapheme joiner, the Hangul and Khmer fillers, the Mongolian and the general variation selectors, blank braille.
@@ -553,19 +556,23 @@ def store_artist(
     marks: Mapping[str, str | None] | None = None,
     old_keys: Iterable[str] = (),
     db: pathlib.Path | str | None = None,
-) -> tuple[int, int]:
-    """Add to what is kept about one artist and bring it up to date, in one transaction. Nothing is deleted.
+) -> tuple[int, int, int]:
+    """Add to what is kept about one artist and bring it up to date, in one transaction. Nothing is deleted, and
+    nothing that is kept is ever replaced by nothing.
 
     The profile is these four public fields and nothing else. A field is brought up to date when the answer
-    says something in it (see _unsaid). Given empty, or as anything but a text, nothing was said, and what is
-    kept stays. A text that the rules here refuse is dropped: that is our rule, and not the API's word. The
-    account hash is written once and never replaced: whose account a handle is does not change, and the caller
-    turns away an answer that says otherwise (see holders).
+    gives something for it that can be kept. Given empty, or as anything but a text, nothing was said (see
+    _unsaid), and what is kept stays. Given as a text the rules here refuse, what is kept stays as well, and the
+    artist is marked REFUSED: the same as a kept work whose new title is not acceptable. Only a kept value that
+    these rules themselves refuse today goes, with no mark. The account hash is written once and never
+    replaced: whose account a handle is does not change, and the caller turns away an answer that says
+    otherwise (see holders).
 
     `works` are keyword arguments for checked_work(). Each is added, or brought up to date with the time, and
     its row names the work's cached image when there is one. For a work that is kept, a title or a tag list
     that is empty or not given, a publish time or a thumbnail that is not given, and a size that is not given
-    all stay as they are kept. A work that is kept and is not among `works` is left as it is: its fetched_at is
+    all stay as they are kept. So does a title, or every tag of a list, that the rules here refuse, and then
+    the work is marked REFUSED. A work that is kept and is not among `works` is left as it is: its fetched_at is
     when it was last seen and still qualified. A work kept under another artist's key is not taken from them.
 
     `marks` is what this turn learned about the artist's other kept works (see _mark_works). The artist's own
@@ -574,26 +581,32 @@ def store_artist(
     a removal of either finds both (hard rule 7, see same_account). The artist is no longer one that was
     passed over.
 
-    Returns two counts: works that were not kept (the database refused the row, or the work is kept for somebody
-    else), and kept works that are now marked.
+    Returns three counts: works that were not kept (the database refused the row, or the work is kept for
+    somebody else), kept works that are now marked, and profile fields that stayed as they were kept because
+    the answer for them was refused.
 
     ValueError, and nothing stored, when a work is not acceptable, or is new and has no thumbnail.
     sqlite3.IntegrityError, and nothing changed, when the database refuses the profile row itself.
     """
     key = _key(artist_key)
     given = (tagline, specialty, level, website)
-    checked = (_text(tagline, 200), _choice(specialty), _choice(level), _website(website))
+    checks = (lambda value: _text(value, 200), _choice, _choice, _website)
+    checked = [check(value) for check, value in zip(checks, given, strict=True)]
     works = list(works)
     rows = [checked_work(**work) for work in works]
     old_keys = [_key(other) for other in old_keys]
     with _open(db) as conn:
         _upgrade(conn)
         fields = "SELECT tagline, specialty, level, website, user_hash FROM profiles WHERE artist_key = ?"
-        *before, old_hash = conn.execute(fields, (key,)).fetchone() or (None, None, None, None, None)
-        said = [  # tagline, specialty, level, website: the two in the middle have a word for "not given"
-            old if _unsaid(value, unset) else new
+        *was, old_hash = conn.execute(fields, (key,)).fetchone() or (None, None, None, None, None)
+        # What is kept is held to today's rules too. A value an earlier version kept and these rules refuse is
+        # not kept any longer, and nobody is marked for that: it is our rule, and no answer of the API's.
+        before = [old if old and check(old) else None for check, old in zip(checks, was, strict=True)]
+        said = [old if new is None else new for new, old in zip(checked, before, strict=True)]
+        refused = sum(  # tagline, specialty, level, website: the two in the middle have a word for "not given"
+            new is None and old is not None and not _unsaid(value, unset)
             for value, unset, new, old in zip(given, ("", "None", "None", ""), checked, before, strict=True)
-        ]
+        )
         # Every column is named, here and below: a row written by position lands in the wrong columns the day
         # the table changes.
         conn.execute(
@@ -603,6 +616,11 @@ def store_artist(
         )
         conn.execute("DELETE FROM skipped WHERE artist_key = ?", (key,))
         conn.execute("DELETE FROM artist_marks WHERE artist_key = ? AND same_as IS NULL", (key,))
+        if refused:  # OR IGNORE: a RENAMED mark is still there, and stays
+            conn.execute(
+                "INSERT OR IGNORE INTO artist_marks (artist_key, reason, marked_at) VALUES (?, ?, ?)",
+                (key, REFUSED, store._now()),
+            )
         for other in old_keys:
             conn.execute(
                 "INSERT OR REPLACE INTO artist_marks (artist_key, reason, marked_at, same_as) VALUES (?, ?, ?, ?)",
@@ -613,16 +631,20 @@ def store_artist(
             *(other for (other,) in conn.execute("SELECT artist_key FROM artist_marks WHERE same_as = ?", (key,))),
         }
         stored = set()
+        # Kept works of which a field stayed as it was kept because the answer for it was refused.
+        held: dict[str, str | None] = {}
         for (work_id, page, title, tags, thumb, published), work in zip(rows, works, strict=True):
             kept = conn.execute(
                 "SELECT artist_key, title, thumb_url, published_at, tags FROM works WHERE deviation_id = ?", (work_id,)
             ).fetchone()
             if kept and kept[0] not in mine:
                 continue
-            if kept:  # what the entry does not give, or gives empty, stays as it is kept
-                title = kept[1] if _unsaid(work.get("title")) else title
+            title_refused = tags_refused = False
+            if kept:  # what the entry does not give, gives empty, or gives and is refused, stays as it is kept
+                title_refused = title is None and kept[1] is not None and not _unsaid(work.get("title"))
+                tags_refused = tags == "[]" != kept[4] and isinstance(work.get("tags"), list) and bool(work["tags"])
+                title, tags = title or kept[1], kept[4] if tags == "[]" else tags
                 thumb, published = thumb or kept[2], published or kept[3]
-                tags = tags if isinstance(work.get("tags"), list) and work["tags"] else kept[4]
             if thumb is None:
                 raise ValueError("a new work with no thumbnail")
             try:
@@ -639,12 +661,13 @@ def store_artist(
                         (work_id, *size),
                     )
                 stored.add(work_id)
+                if title_refused or tags_refused:
+                    held[work_id] = REFUSED
             except sqlite3.IntegrityError:  # SQLite undoes that one statement; the transaction and the artist go on
                 pass
-        marked = _mark_works(
-            conn, key, {work_id: reason for work_id, reason in (marks or {}).items() if work_id not in stored}
-        )
-    return len({row[0] for row in rows} - stored), marked
+        others = {work_id: reason for work_id, reason in (marks or {}).items() if work_id not in stored}
+        marked = _mark_works(conn, key, {**others, **held})
+    return len({row[0] for row in rows} - stored), marked, refused
 
 
 def mark_works(artist_key: str, marks: Mapping[str, str | None], db: pathlib.Path | str | None = None) -> int:
@@ -672,9 +695,9 @@ def mark_artist(artist_key: str, reason: str, db: pathlib.Path | str | None = No
 def artist_marks(db: pathlib.Path | str | None = None) -> dict[str, tuple[str, str, str | None]]:
     """Every marked artist: key -> (reason, when, and for RENAMED the key the account goes by now).
 
-    A marked artist is one whose account the API called gone, whose profile names a removed site, whose works
-    look mostly AI-made, or whose account took another handle. Their rows are all still here. Whether they are
-    published is for a later stage.
+    A marked artist is one whose account the API called gone, whose profile names a removed site, whose answer
+    for a profile field was refused while an older one is kept (REFUSED), or whose account took another handle.
+    Their rows are all still here. Whether they are published is for a later stage.
     """
     with _open(db) as conn:
         rows = conn.execute("SELECT artist_key, reason, marked_at, same_as FROM artist_marks")
@@ -683,9 +706,9 @@ def artist_marks(db: pathlib.Path | str | None = None) -> dict[str, tuple[str, s
 
 def work_marks(db: pathlib.Path | str | None = None) -> dict[str, tuple[str, str]]:
     """Every marked work: deviation id -> (reason, when). A marked work is kept and no longer qualifies: its
-    entry said it is mature, not a public image, another author's, tagged AI-made, or its title holds contact
-    details. Whether it is published is for a later stage; so is a work whose fetched_at is older than its
-    artist's, which was missing from their latest answer."""
+    entry said it is mature, not a public image, another author's, its title holds contact details, or its new
+    title or tags were refused while older ones are kept (REFUSED). Whether it is published is for a later
+    stage; so is a work whose fetched_at is older than its artist's, which was missing from their latest answer."""
     with _open(db) as conn:
         rows = conn.execute("SELECT deviation_id, reason, marked_at FROM work_marks")
         return {work_id: (reason, marked_at) for work_id, reason, marked_at in rows}
@@ -712,6 +735,14 @@ def holders(user_id: object, db: pathlib.Path | str | None = None) -> list[str]:
             (account(user_id), account(user_id, "da-user")),
         )
         return [key for (key,) in rows]
+
+
+def website(artist_key: str, db: pathlib.Path | str | None = None) -> str | None:
+    """The website kept for an artist, when there is one: whichever answer it was that gave it."""
+    key = _key(artist_key)
+    with _open(db) as conn:
+        row = conn.execute("SELECT website FROM profiles WHERE artist_key = ?", (key,)).fetchone()
+    return row[0] if row else None
 
 
 def work_ids(artist_key: str, db: pathlib.Path | str | None = None) -> set[str]:
