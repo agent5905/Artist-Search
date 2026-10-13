@@ -95,6 +95,15 @@ uv run python -m pipeline.push --dry-run
 uv run python -m pipeline.push
 ```
 
+The analysis stages take days on one GPU at full scale, so a small worker runs them in turns and can be paused. A pause loses nothing: each stage saves every work as it finishes it and holds before its next request to a model.
+
+```bash
+uv run python scripts/gpu.py start     # run the GPU stages in the background, over and over
+uv run python scripts/gpu.py status    # what is done, what is left, and the pace
+uv run python scripts/gpu.py pause     # free the GPU; models are unloaded
+uv run python scripts/gpu.py resume    # carry on from where it held
+```
+
 The site:
 
 ```bash

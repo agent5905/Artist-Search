@@ -4,12 +4,11 @@
 
 ## Waiting on the owner
 
-Nothing is blocking. Four things to weigh when convenient; each has a default in place:
+Nothing is blocking. Three things to weigh when convenient; each has a default in place:
 
 1. **When is collect good enough?** It has failed seven critics, each on narrower cases, and the seventh said it would run this code on the real data. Default: fix that critic's three findings, then run and scale without another full critic round, and record the remaining limits (Round 10).
 2. **How strict should the content filter be?** Default in place: works rated suggestive or explicit are held back, and an artist is held back when 30% or more of their works are. The profile critic still found 2 of 20 artists it judged unsuitable for a studio-facing site, so the count is being tightened to include sexualised framing and dress.
-3. **Tagging time at scale.** Checked tags take about 9 seconds a work, so 30,000 works is roughly 75 hours of local GPU time. Fine as a multi-night job; say so if it is not.
-4. **Brief slow-downs during a data load.** Default: the site retries a failed call once, and loads run at quiet hours. The last three test runs had no failed visitor calls.
+3. **Brief slow-downs during a data load.** Default: the site retries a failed call once, and loads run at quiet hours. The last three test runs had no failed visitor calls.
 
 The first public deployment will be asked for separately when the site reaches its preview stage.
 
@@ -26,6 +25,7 @@ Made 2026-10-11, after the DeviantArt terms were read.
 7. **Full AI pipeline on DeviantArt works (2026-10-12).** The lead read Terms of Service section 24 as barring any use of labeled content as input to a trained model, which covers the Analyze step, and stopped to ask. The owner reads the section as aimed at training and image generation, neither of which this project does, and accepts the risk of going ahead. So: DeviantArt works are tagged, described and embedded by local models, profiles are written from them, and critics may view them. This supersedes decisions 1 and 5 and the "no DeviantArt content near a model" part of decision 2. Still in force: no training, no generation, no rehosting, local image cache only, verified removal, rate limits, and AI opt-outs honored on artists' own sites.
 8. **A/B references (2026-10-12, default).** With critics able to view DeviantArt content, pieces 5 and 6 return to the spec's bars: DeviantArt's own search and "more like this". The reference is captured from the public website, not through the API, because the API License bars using the API for benchmarking. This supersedes decision 3.
 9. **Cloudflare (2026-10-12).** The owner replaced the API token; it verifies, and Pages, Workers and Workers AI are reachable. The Pages project name `artist-search` is approved. Approving the name is not approval to deploy.
+10. **GPU time (2026-10-13).** Several days of full GPU use for tagging is fine. The owner needs to be able to pause the work, see its status and start it again, to use the PC in between. Built the same day: `scripts/gpu.py` with `status`, `pause`, `resume`, `start` and `stop`. Tried for real: a pause took the GPU from 23 GB in use to 4 GB within 25 seconds and held; a resume carried on with the same work.
 
 ## The plan
 
@@ -606,3 +606,5 @@ Nothing was lost. A consistent backup of the local store was taken first.
 **Running now:** the wide discovery (18 tags, 120 pages each, then about 3,500 profile lookups), tagging of the 650 new works, and profiles round 6. Collection of the new artists follows discovery and will take most of a day.
 
 **Pipeline counts:** artists discovered 472, collected 472, works 5,034, artists public 119, works public 1,130. **Database:** 16.8 MB of 400 MB.
+
+**Added the same day: pausing the GPU work.** The owner confirmed that days of GPU time are fine, provided the work can be paused. `uv run python scripts/gpu.py pause` frees the GPU, `resume` carries on, `status` shows what is done, what is left and the pace, and `start` begins the background worker again after a reboot. Every stage holds before its next request to a model while paused, whoever started it, so nothing is lost. Collection and discovery do not use the GPU and keep running.
