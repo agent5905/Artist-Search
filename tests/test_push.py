@@ -40,7 +40,10 @@ ARTIST_FIELDS = {
     *("slug", "name", "da_username", "site_url", "site_domain", "tagline", "top_tags", "search_text"),
     *("profile", "specialties", "mediums", "open_for_work", "profile_embedding"),
 }
-WORK_FIELDS = {"artist_slug", "source", "page_url", "image_url", "title", "description", "tags", "position"}
+WORK_FIELDS = {
+    *("artist_slug", "source", "page_url", "image_url", "title", "description", "tags", "position"),
+    *("width", "height"),
+}
 NEIGHBOUR_FIELDS = {"artist_slug", "neighbor_slug", "rank", "score"}
 COUNTS = [
     "artists_sent",
@@ -195,7 +198,17 @@ def style_vector(angle, n):
 
 
 def artist(
-    handle, count=5, *, profile="written", tagline_contact="no", website=None, links=None, angle=0.0, edits=None
+    handle,
+    count=5,
+    *,
+    profile="written",
+    tagline_contact="no",
+    website=None,
+    links=None,
+    angle=0.0,
+    edits=None,
+    user=None,
+    sheet=None,
 ):
     """Collect, tag, rate and profile one invented artist, and return their works, the most recent first.
 
@@ -203,6 +216,8 @@ def artist(
     verified tags), "explicit" or "not_artwork": True, "declared" (AI: "yes", "unclear", None for not read),
     "contact" ("yes", None for not read), "rating" ("suggestive", "explicit", None for not rated), "thumb".
     profile: "written", "excluded" (the profile stage ruled them out) or None (no row there yet).
+    user: the handle whose account this is, when it is an account that took another handle.
+    sheet: (pictures on the sheet the profile stage looked at, how many of them it counted as unsuitable).
     Everything about the artist carries their handle, with or without its hyphens, so it can be looked for.
     """
     key, word = store.artist_key(handle), squashed(handle)
@@ -249,7 +264,8 @@ def artist(
         )
         texts = texts if profile == "excluded" else (*texts, vector)
         reason = "nothing_clear" if profile == "excluded" else None
-        rows.append(("artist_profiles", (key, "FAKE-BASIS", reason, json.dumps(FACTS), "[]", *texts, AT)))
+        facts = FACTS | ({"sheet": {"pictures": sheet[0], "unsuitable": sheet[1]}} if sheet else {})
+        rows.append(("artist_profiles", (key, "FAKE-BASIS", reason, json.dumps(facts), "[]", *texts, AT)))
 
     own_site = bool(website) and crawl.is_own_site(website)
     assert store.upsert_artist(
@@ -257,7 +273,7 @@ def artist(
     )
     library.store_artist(
         key,
-        user_id=f"FAKE-USER-{handle}",
+        user_id=f"FAKE-USER-{user or handle}",
         tagline=f"FAKE-TAGLINE {handle}",
         specialty="FAKE-SPECIALTY",
         level="Professional",
@@ -516,7 +532,7 @@ def test_an_artist_left_out_appears_nowhere_in_what_is_sent_not_even_as_a_neighb
 
 
 def test_the_thresholds_are_the_named_ones(fake):
-    assert (push.MIN_WORKS, push.ADULT_PERCENT, push.NEIGHBOURS) == (4, 30, 24)
+    assert (push.MIN_WORKS, push.MAX_WORKS, push.ADULT_PERCENT, push.NEIGHBOURS) == (4, 10, 30, 24)
     assert (push.DELETE_PERCENT, push.DELETE_FLOOR, push.TEST_SLUG) == (10, 5, "zz-")
     # Exactly 4 works that may go, with 2 of 7 rated works suggestive (28.6 percent) and 3 not rated at all: sent.
     edits = {0: {"rating": "suggestive"}, 1: {"rating": "explicit"}, 2: {"rating": None}}
@@ -629,6 +645,8 @@ def test_the_rows_are_exactly_these(fake):
         "description": works[0]["description"],
         "tags": ["digital painting", "character", "fantasy", "realistic", "painterly", "portrait or bust"],
         "position": 0,
+        "width": None,  # the library keeps no size yet: both keys, and no number
+        "height": None,
     }
     assert [(row["artist_slug"], row["neighbor_slug"], row["rank"]) for row in neighbours if row["rank"] == 1] == [
         (ALPHA, BRAVO, 1),
@@ -940,6 +958,201 @@ def test_a_dry_run_writes_nothing_to_the_database_and_prints_the_same_counts(fak
         "artists_sent_without_neighbours": 1,
         "artists_deleted_from_database": 1,
     }
+
+
+# What the collect stage marks, and what it no longer deletes (round 3).
+
+WORK_MARKS = {  # the collect stage's words for a work that no longer qualifies -> the count line
+    "mature": "works_held_marked_mature",
+    "tagged AI-made": "works_held_marked_tagged_ai_made",
+    "not a public image": "works_held_marked_not_a_public_image",
+    "another author's": "works_held_marked_another_author_s",
+    "contact details": "works_held_marked_contact_details",
+    "FAKE reason of a later round": "works_held_marked_fake_reason_of_a_later_round",
+}
+
+
+@pytest.mark.parametrize("reason", WORK_MARKS)
+def test_a_marked_work_is_not_sent_and_is_counted_under_its_mark(fake, reason):
+    works = artist(ALPHA, 8, angle=0.0)
+    artist(BRAVO, angle=0.3)
+    artist(CHARLIE, angle=0.6)
+    first = push.run(False)
+    assert first["works_sent"] == 8 + 5 + 5 and not any("marked" in name for name in first)
+
+    assert library.mark_works(f"da:{ALPHA}", {works[2]["id"]: reason}) == 1  # as the collect stage does
+    counts = push.run(False)
+
+    assert counts[WORK_MARKS[reason]] == 1 and counts["works_sent"] == 7 + 5 + 5
+    assert [name for name in counts if "marked" in name] == [WORK_MARKS[reason]]
+    assert list(counts).index(WORK_MARKS[reason]) == list(counts).index("works_held_over_limit") + 1
+    assert counts["works_deleted_from_database"] == 1
+    mine = [row for row in fake.loads[-1][1] if row["artist_slug"] == ALPHA]
+    assert [row["page_url"] for row in mine] == [work["page"] for n, work in enumerate(works) if n != 2]
+    assert [row["position"] for row in mine] == list(range(7))
+    # Not in the last load, in its search_text or top_tags, nor left in the database from the load before.
+    assert not any(text in json.dumps(fake.loads[-1]).lower() for text in of_work(works[2]))
+    assert not any(text in fake.held() for text in of_work(works[2]))
+
+    library.mark_works(f"da:{ALPHA}", {works[2]["id"]: None})  # seen again, and it qualifies: the mark is gone
+    again = push.run(False)
+    assert again["works_sent"] == 8 + 5 + 5 and not any("marked" in name for name in again)
+
+
+ARTIST_MARKS = {
+    "account gone": "artists_held_marked_account_gone",
+    "mostly AI-made": "artists_held_marked_mostly_ai_made",
+}
+
+
+@pytest.mark.parametrize("reason", ARTIST_MARKS)
+def test_a_marked_artist_is_not_sent_not_even_as_a_neighbour_and_is_counted_under_their_mark(fake, reason):
+    artist(ALPHA, angle=0.0)
+    artist(BRAVO, angle=0.001, website=f"https://{BRAVO}.art/")  # the nearest in style to ALPHA
+    artist(CHARLIE, angle=0.5)
+    push.run(False)
+    assert BRAVO in fake.held()
+
+    library.mark_artist(f"da:{BRAVO}", reason)  # as the collect stage does: nothing of theirs is deleted here
+    counts = push.run(False)
+
+    assert library.artist_keys() == [f"da:{ALPHA}", f"da:{BRAVO}", f"da:{CHARLIE}"]
+    assert counts[ARTIST_MARKS[reason]] == 1 and counts["artists_sent"] == 2
+    assert [name for name in counts if "marked" in name] == [ARTIST_MARKS[reason]]
+    assert list(counts).index(ARTIST_MARKS[reason]) == list(counts).index("artists_held_slug_unusable") + 1
+    assert counts["works_held_artist_held_back"] == 5 and counts["artists_deleted_from_database"] == 1
+    assert not any(word in json.dumps(fake.loads[-1]).lower() for word in of_artist(BRAVO))
+    assert not any(
+        word in fake.held() for word in of_artist(BRAVO)
+    )  # their row, their works, their place as a neighbour
+    assert [(row["artist_slug"], row["neighbor_slug"]) for row in fake.loads[-1][2]] == [
+        (ALPHA, CHARLIE),
+        (CHARLIE, ALPHA),
+    ]
+
+
+def test_the_handle_an_account_had_before_is_not_sent_once_it_is_kept_under_the_new_one(fake):
+    artist(ALPHA, angle=0.0)
+    artist(BRAVO, angle=0.2)
+    push.run(False)
+    artist(CHARLIE, angle=0.21, user=BRAVO)  # the same account under another handle: the old key is marked renamed
+    assert library.artist_marks()[f"da:{BRAVO}"][::2] == ("renamed", f"da:{CHARLIE}")
+    counts = push.run(False)
+    assert counts["artists_held_marked_renamed"] == 1 and sorted(sent_artists(fake)) == [ALPHA, CHARLIE]
+    assert not any(word in fake.held() for word in of_artist(BRAVO))
+
+
+def test_a_work_that_was_not_in_the_artists_latest_answer_is_not_sent(fake):
+    works = artist(ALPHA, 8)
+    artist(BRAVO)
+    push.run(False)
+    assert fake.held().count("fake-page-yy-fake-alpha") == 8
+    # The artist took one down. The collect stage stored them again since: the others were seen then, this one
+    # was not, and nothing is deleted or marked for it. All there is to go on is when it was last seen.
+    with closing(sqlite3.connect(config.LOCAL_DB)) as conn, conn:
+        conn.execute(
+            "UPDATE works SET fetched_at = '2026-01-01T00:00:00+00:00' WHERE deviation_id = ?", (works[1]["id"],)
+        )
+    assert library.work_marks() == {}
+
+    counts = push.run(False)
+
+    assert counts["works_held_not_seen_lately"] == 1 and counts["works_sent"] == 7 + 5
+    assert counts["works_deleted_from_database"] == 1
+    assert not any(text in json.dumps(fake.loads[-1]).lower() for text in of_work(works[1]))
+    assert not any(text in fake.held() for text in of_work(works[1]))
+    assert [row["position"] for row in fake.loads[-1][1] if row["artist_slug"] == ALPHA] == list(range(7))
+
+
+def test_at_most_the_ten_most_recently_published_works_that_may_go_are_sent(fake):
+    works = artist(
+        ALPHA, 14, edits={0: {"rating": None}, 3: {"contact": "yes"}}
+    )  # the newest and one more are held back
+    artist(BRAVO, 13)
+    counts = push.run(False)
+
+    sent = [row for row in fake.loads[-1][1] if row["artist_slug"] == ALPHA]
+    assert [row["page_url"] for row in sent] == [works[n]["page"] for n in (1, 2, 4, 5, 6, 7, 8, 9, 10, 11)]
+    assert [row["position"] for row in sent] == list(range(10))
+    assert len([row for row in fake.loads[-1][1] if row["artist_slug"] == BRAVO]) == 10
+    assert counts["works_sent"] == 20 and counts["works_held_over_limit"] == 2 + 3
+    assert counts["works_held_not_rated"] == counts["works_held_contact_in_words"] == 1
+    # The older ones feed nothing either: not search_text, not top_tags.
+    row = sent_artists(fake)[ALPHA]
+    for left in (works[12], works[13]):
+        assert not any(text in fake.sent() for text in of_work(left))
+        assert left["title"] not in row["search_text"] and left["tags"][0] not in row["search_text"]
+    own = [works[n]["tags"][0] for n in (1, 2, 4, 5, 6, 7, 8, 9, 10, 11)]
+    assert sorted(row["top_tags"]) == sorted([f"zzall{squashed(ALPHA)}", *own])
+
+
+# An adult portfolio, by the profile stage's count over the artist's sheet (round 3).
+
+
+def sheets(monkeypatch, counted):
+    """Make the profile stage hand over these counts: artist key -> (pictures on the sheet, unsuitable ones), or
+    the fields to set. An artist not named has neither field, like a profile made before the count existed."""
+    real = profiles.profiles
+
+    def handed_over(db=None):
+        rows = [{name: value for name, value in row.items() if "pictures" not in name} for row in real(db)]
+        for row in rows:
+            fields = counted.get(row["artist_key"], {})
+            row |= fields if isinstance(fields, dict) else {"pictures": fields[0], "unsuitable_pictures": fields[1]}
+        return rows
+
+    monkeypatch.setattr(profiles, "profiles", handed_over)
+
+
+@pytest.mark.parametrize(
+    ("counted", "goes"),
+    [
+        ((10, 7), False),  # the artist a critic found: every work rated safe, most of the sheet pin-ups
+        ((10, 3), False),  # 30 percent
+        ((10, 2), True),
+        ((7, 2), True),  # 28.6 percent
+        ((3, 1), False),
+        ((10, 0), True),
+        ((0, 0), True),  # an empty sheet says nothing
+        ({}, True),  # a profile from before the count: no field at all
+        ({"pictures": None, "unsuitable_pictures": None}, True),
+        ({"pictures": 10}, True),
+    ],
+)
+def test_an_artist_whose_sheet_is_mostly_unsuitable_is_left_out_though_every_work_is_rated_safe(
+    fake, monkeypatch, counted, goes
+):
+    artist(ALPHA, angle=0.0)
+    artist(BRAVO, 10, angle=0.001)  # every one of their works is rated safe, and they are the nearest to ALPHA
+    artist(CHARLIE, angle=0.5)
+    sheets(monkeypatch, {f"da:{BRAVO}": counted, f"da:{ALPHA}": (10, 0)})
+
+    counts = push.run(False)
+
+    assert counts["artists_held_adult_portfolio"] == (0 if goes else 1)
+    assert sorted(sent_artists(fake)) == ([ALPHA, BRAVO, CHARLIE] if goes else [ALPHA, CHARLIE])
+    if not goes:
+        assert counts["works_held_artist_held_back"] == 10
+        assert not any(word in fake.sent() for word in of_artist(BRAVO))
+        assert {row["neighbor_slug"] for row in fake.loads[-1][2]} == {ALPHA, CHARLIE}
+
+
+def test_either_measure_of_an_adult_portfolio_is_enough(fake, monkeypatch):
+    artist(ALPHA, 10, edits={n: {"rating": "suggestive"} for n in (0, 1, 2)})  # by the ratings; a clean sheet
+    artist(BRAVO, 10)  # by the sheet; every rating safe
+    artist(CHARLIE, 10, edits={n: {"rating": "suggestive"} for n in (0, 1)})  # 2 of 10 by each: by neither
+    sheets(monkeypatch, {f"da:{ALPHA}": (10, 0), f"da:{BRAVO}": (10, 3), f"da:{CHARLIE}": (10, 2)})
+    counts = push.run(False)
+    assert sorted(sent_artists(fake)) == [CHARLIE] and counts["artists_held_adult_portfolio"] == 2
+
+
+def test_the_profile_stage_hands_over_the_two_numbers_this_stage_reads(fake):
+    artist(ALPHA, sheet=(10, 7))
+    row = profiles.profiles()[0]
+    if "unsuitable_pictures" not in row:
+        pytest.skip("pipeline/profiles.py does not count the unsuitable pictures of a sheet yet")
+    assert (row["pictures"], row["unsuitable_pictures"]) == (10, 7)
+    assert push.run(False)["artists_held_adult_portfolio"] == 1 and fake.loads[-1][0] == []
 
 
 # What stops a run (round 2).

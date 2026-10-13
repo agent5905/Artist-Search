@@ -23,6 +23,10 @@ Three things stop a run before step 3 writes anything, each with a message and a
     `--allow-delete N` lets one run go ahead. Artists on the removal list are not counted: step 1 is never
     held up by this.
 
+The collect stage deletes nothing on DeviantArt's say-so: it leaves a mark, or lets a work's last sighting grow
+old. What that means for the public is decided here (see build): nothing marked is sent, and neither is a work
+that was not in its artist's latest answer.
+
 Hard rule 1: a work is sent as two addresses, its page on DeviantArt and DeviantArt's own thumbnail, and words.
 No image, no file name and no deviation id is ever put in a row.
 Hard rule 6: an artist's own words (a title, their tags, a tagline) are sent only when the tagging stage read
@@ -47,7 +51,10 @@ from urllib.parse import urlsplit
 from pipeline import config, crawl, db, library, profiles, store, style, tagging
 
 MIN_WORKS = 4  # publishable works: an artist with fewer is not sent
-ADULT_PERCENT = 30  # of an artist's rated works: at this share rated suggestive or explicit, the artist is left out
+MAX_WORKS = 10  # works sent for an artist: the most recently published of those that may go
+# Of an artist's rated works, the share rated suggestive or explicit; and of the pictures on the sheet the profile
+# stage looked at, the share it counted as sexualised or gory. At this share of either, the artist is left out.
+ADULT_PERCENT = 30
 SAFE_RATING = "safe"  # the only rating a work is sent with
 ADULT_RATINGS = ("suggestive", "explicit")
 NEIGHBOURS = 24  # similar artists sent for each artist: as many as similar_artists ever returns
@@ -58,12 +65,13 @@ STYLE_MODEL, STYLE_RULE = "csd", "local"  # round 7's blind test chose them
 TOP_TAGS = 12  # of the artist's own tags, the most used
 MAX_SEARCH_TEXT = 4000  # sql/001_schema.sql: artists_own_words_sizes
 
+# Besides these, one reason for each mark the collect stage has left: "marked_<its reason>" (see _marked).
 ARTIST_REASONS = (
     *("not_profiled", "profile_excluded", "site_removed", "adult_portfolio", "too_few_works", "slug_unusable"),
 )
 WORK_REASONS = (
-    *("not_tagged", "not_artwork", "explicit", "declared_ai", "contact_in_words", "words_not_read"),
-    *("not_rated", "suggestive", "bad_address", "artist_held_back"),
+    *("not_seen_lately", "not_tagged", "not_artwork", "explicit", "declared_ai", "contact_in_words"),
+    *("words_not_read", "not_rated", "suggestive", "bad_address", "artist_held_back", "over_limit"),
 )
 
 REMOVED_SQL = "select key_hash from public.removed"
@@ -160,6 +168,17 @@ def _held(result: dict[str, Any] | None) -> str | None:
     return None
 
 
+def _marked(reason: str) -> str:
+    """The reason a marked work or artist is held back: "marked_" and the collect stage's own words for it, as
+    one word. Whatever it marks, and whatever it comes to call it, is held back and counted under that name."""
+    return "marked_" + "_".join(re.findall(r"[a-z0-9]+", reason.lower()))
+
+
+def _too_many(part: int, whole: int) -> bool:
+    """True when `part` is ADULT_PERCENT or more of a `whole` that is not nothing."""
+    return whole > 0 and 100 * part >= ADULT_PERCENT * whole
+
+
 def _reader(local: pathlib.Path | str | None) -> contextlib.closing[sqlite3.Connection]:
     """A connection to the local file that cannot write."""
     path = pathlib.Path(local or config.LOCAL_DB).resolve()
@@ -175,34 +194,44 @@ def _removed_here(local: pathlib.Path | str | None) -> set[str]:
 
 def _collected(
     local: pathlib.Path | str | None,
-) -> tuple[dict[str, list[tuple[Any, ...]]], dict[str, tuple[str | None, str | None]]]:
+) -> tuple[dict[str, list[tuple[Any, ...]]], dict[str, tuple[str | None, str | None, str]]]:
     """What the library holds, read through a connection that cannot write.
 
-    Each artist's works, the most recent first, as (deviation id, page, title, the artist's tags as JSON,
-    thumbnail); and each artist's (tagline, website).
+    Each artist's works, the most recently published first, as (deviation id, page, title, the artist's tags as
+    JSON, thumbnail, when it was last seen and still qualified); and each artist's (tagline, website, when their
+    profile was last stored).
     ponytail: the library has no reader for these columns, so they are selected here. Move it there when it has.
     """
     works: dict[str, list[tuple[Any, ...]]] = {}
     with _reader(local) as conn:
         for key, *work in conn.execute(
-            "SELECT artist_key, deviation_id, page_url, title, tags, thumb_url FROM works "
+            "SELECT artist_key, deviation_id, page_url, title, tags, thumb_url, fetched_at FROM works "
             "ORDER BY artist_key, published_at IS NULL, published_at DESC, deviation_id"
         ):
             works.setdefault(key, []).append(tuple(work))
-        rows = conn.execute("SELECT artist_key, tagline, website FROM profiles").fetchall()
-    return works, {key: (tagline, website) for key, tagline, website in rows}
+        rows = conn.execute("SELECT artist_key, tagline, website, fetched_at FROM profiles").fetchall()
+    return works, {key: (tagline, website, stored) for key, tagline, website, stored in rows}
 
 
 def build(local: pathlib.Path | str | None = None) -> tuple[Rows, Rows, Rows, Counter[str]]:
     """The rows for db.load (artists, works, neighbours) and the count of what was held back, by reason.
 
-    An artist goes when the store lists them, pipeline/profiles.py gave them a profile, fewer than
-    ADULT_PERCENT of their rated works are rated suggestive or explicit, and MIN_WORKS of their works may be
-    sent (see _held). Everything in an artist's row that comes from their works comes from the works that are
-    sent, and a neighbour is always an artist who is sent too. An artist who goes and has no neighbour gets one
-    row that names no neighbour (see the end of this function). Reads the local stores and changes nothing.
+    An artist goes when the store lists them, the collect stage has left no mark on them, pipeline/profiles.py
+    gave them a profile, their portfolio is not an adult one (ADULT_PERCENT, of their rated works or of the
+    pictures on their sheet, whichever says so), and MIN_WORKS of their works may be sent.
+
+    A work may be sent when the collect stage has left no mark on it, it was in the artist's latest answer from
+    DeviantArt, and it passes _held. The collect stage deletes nothing any more: a work it finds mature, AI-made,
+    somebody else's or no longer public stays here with a mark, and a work the artist has taken down stays with
+    the time it was last seen, which is before their profile was last stored. Of the works that may be sent,
+    the MAX_WORKS most recently published are.
+
+    Everything in an artist's row that comes from their works comes from the works that are sent, and a
+    neighbour is always an artist who is sent too. An artist who goes and has no neighbour gets one row that
+    names no neighbour (see the end of this function). Reads the local stores and changes nothing.
     """
     listed = {key: username for key, username, _ in store.all_artists(local)}
+    marked_artists, marked_works = library.artist_marks(local), library.work_marks(local)
     written = {row["artist_key"]: row for row in profiles.profiles(local)}
     excluded = profiles.excluded(local)
     # The description is the verified set's own, checked against the image by the verifier.
@@ -217,25 +246,35 @@ def build(local: pathlib.Path | str | None = None) -> tuple[Rows, Rows, Rows, Co
     for key in sorted(listed.keys() & (works_of.keys() | fields.keys())):
         ready: list[tuple[str, str, str | None, list[str], dict[str, Any]]] = []  # page, thumbnail, title, tags, result
         ratings: list[str] = []
-        for work_id, page, title, own_tags, thumb in works_of.get(key, []):
+        tagline, website, stored = fields.get(key, (None, None, ""))
+        for work_id, page, title, own_tags, thumb, seen in works_of.get(key, []):
             result = results.get(work_id)
             if result and result.get("rating") in tagging.RATINGS:
                 ratings.append(result["rating"])
             reason, address = _held(result), _addresses(page, thumb, listed[key])
+            if work_id in marked_works:
+                reason = _marked(marked_works[work_id][0])
+            elif seen < stored:  # not in the answer their profile was last stored with: taken down, as far as is known
+                reason = "not_seen_lately"
             # A page is one work in the database: a second work with the same page is not sent.
             if result is None or reason or address is None or address[0] in {page_url for page_url, *_ in ready}:
                 counts[f"works_held_{reason or 'bad_address'}"] += 1
             else:
                 ready.append((*address, title, [tag for tag in json.loads(own_tags) if isinstance(tag, str)], result))
-        tagline, website = fields.get(key, (None, None))
         site_url, site_domain = _own_site(website)
         slug = _slug(listed[key])
         why = None
-        if key not in written:
+        if key in marked_artists:
+            why = _marked(marked_artists[key][0])
+        elif key not in written:
             why = "profile_excluded" if key in excluded else "not_profiled"
         elif site_url and store.is_removed(site_url, local):  # a removed site the store's own links did not show
             why = "site_removed"
-        elif 100 * sum(rating in ADULT_RATINGS for rating in ratings) >= ADULT_PERCENT * max(len(ratings), 1):
+        # By either measure: the rating each work was given, or the profile stage's count over the artist's sheet
+        # (a profile made before it counted has neither number, and is judged on the ratings alone).
+        elif _too_many(sum(rating in ADULT_RATINGS for rating in ratings), len(ratings)) or _too_many(
+            written[key].get("unsuitable_pictures") or 0, written[key].get("pictures") or 0
+        ):
             why = "adult_portfolio"
         elif len(ready) < MIN_WORKS:
             why = "too_few_works"
@@ -246,6 +285,8 @@ def build(local: pathlib.Path | str | None = None) -> tuple[Rows, Rows, Rows, Co
             counts[f"artists_held_{why}"] += 1
             counts["works_held_artist_held_back"] += len(ready)
             continue
+        counts["works_held_over_limit"] += len(ready[MAX_WORKS:])
+        ready = ready[:MAX_WORKS]  # the most recently published: that is the order they were read in
         slugs[key] = slug
         profile = written[key]
         used = Counter(tag for _, _, _, own, _ in ready for tag in set(own))
@@ -286,6 +327,11 @@ def build(local: pathlib.Path | str | None = None) -> tuple[Rows, Rows, Rows, Co
                     "description": result["description"],
                     "tags": [tag for tag in dict.fromkeys(verified) if tag != "unclear"],
                     "position": position,
+                    # ponytail: the library keeps no size for a thumbnail, so there is none to send. Every work
+                    # carries both keys all the same: the database wants one shape a load. Fill them from the
+                    # library when it has them (both or neither, whole numbers of pixels).
+                    "width": None,
+                    "height": None,
                 }
             )
     # One site is one artist's in the database (a unique index). A domain two of them give is neither's.
@@ -329,7 +375,8 @@ def _removed_sql(key_hashes: set[str]) -> str:
 def run(dry_run: bool, allow_delete: int | None = None, local: pathlib.Path | str | None = None) -> dict[str, int]:
     """One push, or with `dry_run` everything but the writes to the database. Returns counts only.
 
-    artists_sent and works_sent, each with what was held back by reason (ARTIST_REASONS, WORK_REASONS);
+    artists_sent and works_sent, each with what was held back by reason (ARTIST_REASONS, WORK_REASONS, and a
+    line for each mark of the collect stage that held something back: "..._held_marked_<its reason>");
     neighbours_sent, artists_sent_without_neighbours, and neighbours_skipped_by_database (what db.load said
     the database would not take: a row that names an artist it does not have); artists_deleted_from_database
     and works_deleted_from_database (rows it had that are no longer sent); removed_artists_deleted_from_database
@@ -382,11 +429,17 @@ def run(dry_run: bool, allow_delete: int | None = None, local: pathlib.Path | st
     have_works = [row for row in there if row["work_id"] is not None and row["slug"] in slugs]  # of artists who stay
     gone_works = {int(row["work_id"]) for row in have_works if (row["slug"], row["page_url"]) not in sent}
     empty = sum(row["neighbor_slug"] is None for row in neighbours)
+
+    def held_back(kind: str, reasons: tuple[str, ...]) -> dict[str, int]:
+        """A line for every reason there always is, then one for each mark that held something back this run."""
+        marks = sorted(name for name in held if name.startswith(f"{kind}_held_marked_"))
+        return {name: held[name] for name in (*(f"{kind}_held_{reason}" for reason in reasons), *marks)}
+
     counts = (
         {"artists_sent": len(artists)}
-        | {f"artists_held_{reason}": held[f"artists_held_{reason}"] for reason in ARTIST_REASONS}
+        | held_back("artists", ARTIST_REASONS)
         | {"works_sent": len(works)}
-        | {f"works_held_{reason}": held[f"works_held_{reason}"] for reason in WORK_REASONS}
+        | held_back("works", WORK_REASONS)
         | {
             "neighbours_sent": len(neighbours) - empty,
             "artists_sent_without_neighbours": empty,
