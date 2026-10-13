@@ -61,6 +61,7 @@ def main() -> int:
                 "B": pair[1][1],
                 "open_for_work": row["open_for_work"],
                 "open_evidence": row["open_evidence"],
+                "own_tags": row.get("own_tags"),  # the artist's tags behind any own-word claim
             }
         )
         answer.append({"n": n, "artist": row["artist"], "A": pair[0][0], "B": pair[1][0]})

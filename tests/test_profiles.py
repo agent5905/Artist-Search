@@ -48,6 +48,7 @@ def cache(tmp_path, monkeypatch):
     monkeypatch.setattr(config, "LOCAL_DB", tmp_path / "cache" / "pipeline.sqlite")
     monkeypatch.setattr(config, "load_env", lambda: dict(SECRETS))  # the real .env is never read here
     monkeypatch.setattr(sqlite3, "connect", unsynced)
+    monkeypatch.setattr(tagging.time, "sleep", lambda seconds: None)  # the tagging stage's waits between tries
 
     def no_network(*args, **kwargs):
         raise AssertionError("a real connection was attempted")
@@ -69,12 +70,13 @@ def tags(medium="digital painting", subjects=("character",), genres=("fantasy",)
     } | flags
 
 
-def artist(handle, results, *, tagline=None, own_tags=None, declared=None, published=None, listed=True):
+def artist(handle, results, *, tagline=None, own_tags=None, declared=None, published=None, listed=True, contact="no"):
     """Collect one invented artist with a work for each entry of `results`, and return the works' ids.
 
     An entry is the work's verified result, or None for a work that is collected and not tagged yet.
     own_tags, declared and published are by the work's place in the list; a work not named there has the tag
-    "faketag", declares no AI and was published at RECENT.
+    "faketag", declares no AI and was published at RECENT. contact: what the tagging stage found when it read
+    the tagline for a private contact, or None for a tagline it has not read.
     """
     base = {ALPHA: 1000, BRAVO: 2000, CHARLIE: 3000}[handle]
     ids = [f"00000000-0000-4000-A000-{base + n:012d}" for n in range(len(results))]
@@ -99,6 +101,11 @@ def artist(handle, results, *, tagline=None, own_tags=None, declared=None, publi
     for n, (work_id, result) in enumerate(zip(ids, results, strict=True)):
         if result is not None:
             tag(work_id, result, (declared or {}).get(n, "no"))
+    if contact:
+        tagging.results()  # so that its tables exist
+        row = (f"da:{handle}", profiles.TAGGER, tagging.CONTACT_PROMPT_VERSION, contact, "2026-01-01T00:00:00+00:00")
+        with closing(sqlite3.connect(config.LOCAL_DB)) as conn, conn:
+            conn.execute("INSERT OR REPLACE INTO artist_contact VALUES (?, ?, ?, ?, ?)", row)
     return ids
 
 
@@ -113,6 +120,16 @@ def tag(work_id, result, declared="no", result_set=VERIFIED, words_only=False):
         row = (work_id, result_set, tagging.PROMPT_VERSION, json.dumps(result) if result else None, at)
         if not words_only:
             conn.execute("INSERT OR REPLACE INTO work_tags VALUES (?, ?, ?, ?, ?)", row)
+        # A format is in the result as tagging.results() gives it. Where the tagging stage keeps formats in a
+        # table of their own, it is read from there, so it goes there too.
+        if (
+            result
+            and "formats" in result
+            and conn.execute("SELECT 1 FROM sqlite_master WHERE name = 'work_format'").fetchone()
+        ):
+            sorted_as = json.dumps({"formats": result["formats"], "rating": result.get("rating", "safe")})
+            row = (work_id, profiles.TAGGER, getattr(tagging, "FORMAT_VERSION", 1), sorted_as, at)
+            conn.execute("INSERT OR REPLACE INTO work_format VALUES (?, ?, ?, ?, ?)", row)
         if declared:
             row = (work_id, profiles.TAGGER, tagging.AI_PROMPT_VERSION, declared, at)
             conn.execute("INSERT OR REPLACE INTO work_ai_declared VALUES (?, ?, ?, ?, ?)", row)
@@ -124,10 +141,12 @@ def vector(text, scale=3.0):
     return [scale * numbers.uniform(-1, 1) for _ in range(profiles.DIMENSIONS)]
 
 
-def terms_of(question):
-    """The facts a question to the writer lists."""
-    lines = question.split("\n\n")[0].splitlines()[1:]
-    return [term for line in lines for term in line.split(": ", 1)[1].split(", ")]
+def sentence_for(question):
+    """A sentence that states the facts a question to the writer lists, each as it may be stated, and nothing else."""
+    lines = dict(line.split(": ", 1) for line in question.split("\n\n")[0].splitlines()[1:])
+    part = lines.pop("only part of the works", "")
+    flat = [term for terms in lines.values() for term in terms.split(", ")]
+    return ", ".join([f"Art with {' and '.join(flat)}", *filter(None, part.split("; "))]) + "."
 
 
 class Fake:
@@ -164,7 +183,7 @@ class Fake:
         )
         answer = self.write(question, attempt) if callable(self.write) else self.write
         if answer is None:
-            answer = f"Art with {' and '.join(terms_of(question))}."
+            answer = sentence_for(question)
         return self.say({"profile": answer} if isinstance(answer, str) else answer)
 
     @staticmethod
@@ -190,22 +209,48 @@ def table():
         return conn.execute("SELECT * FROM artist_profiles ORDER BY 1").fetchall()
 
 
-def facts(specialties=(), mediums=(), genres=(), style_words=()):
+def facts(specialties=(), mediums=(), genres=(), style_words=(), own_words=(), formats=(), hedged=()):
+    """The part of an artist's facts that a profile is written from. hedged: those that hold for part of the works."""
     return {
         "specialties": list(specialties),
         "mediums": list(mediums),
         "genres": list(genres),
         "style_words": list(style_words),
+        "own_words": list(own_words),
+        "formats": list(formats),
+        "hedged": list(hedged),
     }
 
 
-PAINTER = facts(["character"], ["digital painting"], ["fantasy"], ["painterly"])
+PAINTER = facts(["character"], ["traditional"], ["fantasy"], ["painterly"])
 
 
 # 1. The facts: counts over the eligible works, from the verified tags and from nothing else.
 
 
-def test_the_facts_are_counted_from_the_verified_tags_and_hold_only_above_the_threshold():
+def body(*groups):
+    """An artist's works for facts_of(): `count` works alike for each (count, result) or (count, result, own tags)."""
+    works = []
+    for count, result, *own in groups:
+        works += [
+            {"id": f"w{len(works) + n}", "result": result, "declared": "no", "tags": [*own, []][0]}
+            for n in range(count)
+        ]
+    return works
+
+
+def said(*groups):
+    """The template's sentence for such a body of work."""
+    found, reason = profiles.facts_of(body(*groups))
+    assert reason is None
+    assert profiles.unsupported(profiles.template(found), found) is None
+    return profiles.template(found)
+
+
+PLAIN = tags(genres=[], style_words=[])  # a character in digital painting, and nothing else to say of it
+
+
+def test_the_facts_are_counted_from_the_verified_tags_and_from_nothing_else():
     ids = artist(
         ALPHA,
         [tags()] * 6
@@ -222,63 +267,400 @@ def test_the_facts_are_counted_from_the_verified_tags_and_hold_only_above_the_th
         "subjects": {"character": 8, "creature": 4},
         "genres": {"fantasy": 8, "dark fantasy": 2},
         "style_words": {"painterly": 8, "moody": 2, "muted": 2, "sketchy": 2},
+        "formats": {},
+        "own_words": {},
     }
     assert (profile["facts"]["works"], profile["facts"]["eligible"]) == (10, 10)
     assert profile["facts"]["counted"] == ids
-    # 5 of 10 works make a medium, subject or genre a fact, and 7 of 10 a style word
-    assert (profile["mediums"], profile["specialties"]) == (["digital painting"], ["character"])
-    assert (profile["genres"], profile["style_words"]) == (["fantasy"], ["painterly"])
-    assert profile["template"] == "Character art in digital painting, with fantasy themes, in a painterly style."
-    for text in (profile["template"], profile["written"]):  # nothing of a description, nothing below the threshold
-        assert not re.search("cyberpunk|vehicle|pixel|creature|traditional|dark|muted|sketchy|moody|horror|chibi", text)
+    assert (profile["specialties"], profile["mediums"], profile["genres"]) == (
+        *(["character", "creature"], ["digital painting"], ["fantasy"]),
+    )
+    assert (profile["style_words"], profile["own_words"], profile["formats"], profile["hedged"]) == ([], [], [], [])
+    assert profile["template"] == "Fantasy character and creature art."
+    for text in (profile["template"], profile["written"]):  # nothing of a description, nothing below its threshold
+        assert not re.search(
+            "cyberpunk|vehicle|pixel|traditional|dark|muted|sketchy|moody|horror|chibi|painterly", text
+        )
 
 
 @pytest.mark.parametrize(
-    ("eligible", "having", "field", "is_fact"),
+    ("eligible", "having", "field", "stated"),
     [
-        (10, 5, "subjects", True),
-        (10, 4, "subjects", False),
-        (10, 5, "genres", True),
-        (10, 4, "genres", False),
-        (10, 5, "medium", True),
-        (10, 4, "medium", False),
-        (10, 7, "style_words", True),
-        (10, 6, "style_words", False),
-        (7, 4, "subjects", True),
-        (7, 3, "subjects", False),
-        (5, 3, "subjects", True),  # the share is rounded up to whole works
-        (5, 2, "subjects", False),
-        (5, 4, "style_words", True),
-        (5, 3, "style_words", False),
+        # a subject is named at 3 works in 10, and never on fewer than 3 works
+        (10, 3, "subject", "flat"),
+        (10, 2, "subject", "no"),
+        (5, 3, "subject", "flat"),
+        (5, 2, "subject", "no"),
+        (20, 6, "subject", "flat"),
+        (20, 5, "subject", "no"),
+        # a genre is hedged from 3 in 10 and stated flat from 7 in 10
+        (10, 2, "world", "no"),
+        (10, 3, "world", "hedged"),
+        (10, 6, "world", "hedged"),
+        (10, 7, "world", "flat"),
+        (5, 3, "world", "hedged"),
+        (5, 4, "world", "flat"),
+        # a drawing manner is hedged from 3 in 10 and leads when most works have it
+        (10, 2, "manner", "no"),
+        (10, 3, "manner", "hedged"),
+        (10, 5, "manner", "hedged"),
+        (10, 6, "manner", "flat"),
+        (7, 3, "manner", "hedged"),
+        (7, 4, "manner", "flat"),
+        # a medium, and a colour word the verifier checked, at 7 in 10
+        (10, 6, "medium", "no"),
+        (10, 7, "medium", "flat"),
+        (10, 6, "colour", "no"),
+        (10, 7, "colour", "flat"),
+        # any other style word at 9 in 10
+        (10, 8, "style", "no"),
+        (10, 9, "style", "flat"),
+        (5, 4, "style", "no"),
+        (5, 5, "style", "flat"),
     ],
 )
-def test_a_value_is_a_fact_at_half_of_the_eligible_works_and_a_style_word_at_seven_in_ten(
-    eligible, having, field, is_fact
-):
-    value = {"subjects": "creature", "genres": "horror", "medium": "traditional", "style_words": "sketchy"}[field]
-    with_it = tags("traditional") if field == "medium" else tags(**{field: [value]})
-    plain = tags("unclear", [], [], [])
-    works = [{"id": str(n), "result": with_it if n < having else plain, "declared": "no"} for n in range(eligible)]
+def test_what_share_of_the_works_makes_a_fact_and_what_share_lets_it_be_stated_flat(eligible, having, field, stated):
+    value, with_it = {
+        "subject": ("creature", tags("unclear", ["creature"], [], [])),
+        "world": ("horror", tags("unclear", [], ["horror"], [])),
+        "manner": ("realistic", tags("unclear", [], ["realistic"], [])),
+        "medium": ("traditional", tags("traditional", [], [], [])),
+        "colour": ("muted", tags("unclear", [], [], ["muted"])),
+        "style": ("sketchy", tags("unclear", [], [], ["sketchy"])),
+    }[field]
 
-    found, _ = profiles.facts_of(works)
+    found, _ = profiles.facts_of(body((having, with_it), (eligible - having, tags("unclear", [], [], []))))
 
-    stated = [term for name in profiles.STATED for term in found[name]]
-    assert (value in stated) is is_fact
-    assert found["counts"][field][value] == having
+    facts_stated = [term for name in profiles.STATED for term in found[name]]
+    assert (value in facts_stated) is (stated != "no")
+    assert (value in found["hedged"]) is (stated == "hedged")
 
 
 def test_a_style_word_outside_the_checkable_list_and_a_medium_that_names_no_material_are_counted_and_never_stated():
-    works = [
-        {"id": str(n), "result": tags("photo", style_words=["moody", "detailed"]), "declared": "no"} for n in range(8)
-    ]
-    works += [{"id": "u", "result": tags("unclear", style_words=["stunning"]), "declared": "no"}]
-
-    found, reason = profiles.facts_of(works)
+    found, reason = profiles.facts_of(
+        body((8, tags("photo", style_words=["moody", "detailed"])), (1, tags("unclear", style_words=["stunning"])))
+    )
 
     assert found["counts"]["medium"] == {"photo": 8, "unclear": 1}
     assert found["counts"]["style_words"] == {"detailed": 8, "moody": 8, "stunning": 1}
     assert (found["mediums"], found["style_words"], reason) == ([], [], None)
-    assert profiles.template(found) == "Character art, with fantasy themes."
+    assert profiles.template(found) == "Fantasy character art."
+
+
+def test_the_three_words_for_vivid_colour_are_counted_as_one():
+    found, _ = profiles.facts_of(
+        body(
+            (3, tags(style_words=["saturated"])),
+            (2, tags(style_words=["vibrant", "vivid"])),
+            (2, tags(style_words=["vivid"])),
+        )
+    )
+
+    assert found["counts"]["style_words"] == {"saturated": 7}
+    assert found["style_words"] == ["saturated"]
+
+
+# Round 1's critic, item by item: what it called unsupported or too flat, and what it missed.
+
+
+def test_the_medium_nearly_everyone_has_is_a_fact_to_filter_on_and_is_never_said():
+    found, reason = profiles.facts_of(body((10, tags("digital painting", ["character"], [], []))))
+
+    assert (found["mediums"], reason) == (["digital painting"], None)
+    assert profiles.template(found) == "Character art."
+    assert profiles.unsupported("Character art in digital painting.", found) is not None  # nor by the model
+    # and an artist of whom nothing else is known has nothing to say at all
+    assert profiles.facts_of(body((10, tags("digital painting", [], [], []))))[1] == "nothing_clear"
+
+
+@pytest.mark.parametrize(
+    ("groups", "sentence"),
+    [
+        ([(7, tags("traditional", genres=[], style_words=[])), (3, PLAIN)], "Character art in traditional media."),
+        ([(6, tags("traditional", genres=[], style_words=[])), (4, PLAIN)], "Character art."),  # no clear majority
+        ([(8, tags("3d render", ["environment"], [], [])), (2, PLAIN)], "Environment art in 3D."),
+        ([(10, tags("pixel art", genres=[], style_words=[]))], "Character art in pixel art."),
+        # line art is said once, as the medium
+        ([(10, tags("digital line art", genres=[], style_words=["lineart"]))], "Character art in digital line art."),
+    ],
+)
+def test_a_medium_is_said_only_when_it_is_distinctive_and_a_clear_majority(groups, sentence):
+    assert said(*groups) == sentence
+
+
+@pytest.mark.parametrize(
+    ("groups", "sentence"),
+    [
+        # five environments and five figures is not "environment art"
+        (
+            [(5, tags(subjects=["environment"], genres=[], style_words=[])), (4, PLAIN)]
+            + [(1, tags(subjects=["creature"], genres=[], style_words=[]))],
+            "Environment and character art.",
+        ),
+        ([(7, PLAIN), (3, tags(subjects=["creature"], genres=[], style_words=[]))], "Character and creature art."),
+        ([(8, PLAIN), (2, tags(subjects=["creature"], genres=[], style_words=[]))], "Character art."),
+        (
+            [(4, PLAIN), (3, tags(subjects=["vehicle or mech"], genres=[], style_words=[]))]
+            + [(3, tags(subjects=["prop or weapon"], genres=[], style_words=[]))],
+            "Character art, prop or weapon art and vehicle or mech art.",
+        ),
+        # a body split between two genres names both, and neither flat
+        (
+            [(5, tags(genres=["fantasy"], style_words=[])), (5, tags(genres=["science fiction"], style_words=[]))],
+            "Character art, with fantasy and science fiction themes.",
+        ),
+        # about half is hedged; a clear majority is stated flat, and what the rest is comes after it
+        ([(6, tags(style_words=[])), (4, PLAIN)], "Character art, with fantasy themes."),
+        ([(7, tags(style_words=[])), (3, PLAIN)], "Fantasy character art."),
+        (
+            [(7, tags(style_words=[])), (3, tags(genres=["science fiction"], style_words=[]))],
+            "Fantasy character art, with science fiction themes.",
+        ),
+        ([(8, tags(style_words=[])), (2, tags(genres=["horror"], style_words=[]))], "Fantasy character art."),
+    ],
+)
+def test_a_split_portfolio_is_named_by_both_halves_and_a_genre_of_half_the_works_is_hedged(groups, sentence):
+    assert said(*groups) == sentence
+
+
+@pytest.mark.parametrize(
+    ("groups", "sentence"),
+    [
+        ([(6, tags(genres=["anime style"], style_words=[])), (4, PLAIN)], "Anime character art."),
+        ([(10, tags(genres=["fantasy", "realistic"], style_words=[]))], "Realistic fantasy character art."),
+        (
+            [(9, tags(genres=["stylized cartoon"], style_words=["muted"])), (1, PLAIN)],
+            "Muted stylized cartoon character art.",
+        ),
+        ([(4, tags(genres=["anime style"], style_words=[])), (6, PLAIN)], "Character art, partly in an anime style."),
+        (
+            [(5, tags(genres=["stylized cartoon"], style_words=[])), (5, PLAIN)],
+            "Character art, partly in a stylized cartoon style.",
+        ),
+        ([(2, tags(genres=["realistic"], style_words=[])), (8, PLAIN)], "Character art."),
+    ],
+)
+def test_the_drawing_manner_leads_when_most_works_have_it_and_is_hedged_when_part_of_them_do(groups, sentence):
+    assert said(*groups) == sentence
+
+
+@pytest.mark.parametrize(
+    ("groups", "sentence"),
+    [
+        ([(10, tags(style_words=["muted", "painterly"]))], "Painterly, muted fantasy character art."),
+        ([(7, tags(style_words=["muted", "painterly"])), (3, tags(style_words=[]))], "Muted fantasy character art."),
+        (
+            [(8, tags(style_words=["soft-shaded", "high-contrast"])), (2, tags(style_words=[]))],
+            "Fantasy character art.",
+        ),
+        ([(9, tags(style_words=["soft-shaded"])), (1, tags(style_words=[]))], "Soft-shaded fantasy character art."),
+        # two at most, and a word a model made up never
+        (
+            [(10, tags(style_words=["monochrome", "sketchy", "textured", "moody"]))],
+            "Monochrome, sketchy fantasy character art.",
+        ),
+    ],
+)
+def test_a_style_word_is_said_only_when_the_verifier_checked_it_or_nearly_all_works_have_it(groups, sentence):
+    assert said(*groups) == sentence
+
+
+DRAGON = tags(subjects=["creature"], genres=[], style_words=[])
+
+
+@pytest.mark.parametrize(
+    ("groups", "sentence"),
+    [
+        ([(6, DRAGON, ["dragon"]), (4, DRAGON)], "Creature art, mostly dragons."),
+        (
+            [(2, DRAGON, ["Dragon"]), (2, DRAGON, ["dragons"]), (2, DRAGON, ["DRAGON", "faketag"]), (4, DRAGON)],
+            "Creature art, mostly dragons.",
+        ),
+        ([(5, DRAGON, ["dragon"]), (5, DRAGON)], "Creature art."),  # half is not most
+        ([(3, DRAGON, ["dragon"]), (2, DRAGON)], "Creature art, mostly dragons."),
+        # the artist's word for the kind of art itself takes its place, and is not said twice
+        ([(10, PLAIN, ["characterdesign", "warrior"])], "Character designs, mostly warriors."),
+        ([(10, PLAIN, ["character_design"])], "Character designs."),
+        ([(6, PLAIN, ["characterconcept"]), (4, PLAIN, ["knight"])], "Character designs."),
+        (
+            [(6, PLAIN, ["characterdesign"]), (4, tags(subjects=["environment"], genres=[], style_words=[]))],
+            "Character designs and environment art.",
+        ),
+        ([(10, PLAIN, ["fanart"])], "Character art, mostly fan art."),
+        (
+            [(10, tags(subjects=["environment"], genres=[], style_words=[]), ["landscape", "fanart"])],
+            "Environment art, mostly landscapes and fan art.",
+        ),
+        (
+            [(10, tags(subjects=["vehicle or mech"], genres=[], style_words=[]), ["mecha"])],
+            "Vehicle or mech art, mostly mechs.",
+        ),
+        # three words most works carry: the two that most works carry, in the order of the list when it is a tie
+        ([(10, PLAIN, ["elf", "mage", "portrait"])], "Character art, mostly elves and mages."),
+        (
+            [(6, PLAIN, ["elf", "mage", "portrait"]), (4, PLAIN, ["portrait"])],
+            "Character art, mostly portraits and elves.",
+        ),
+    ],
+)
+def test_a_word_of_the_artists_own_is_used_when_most_works_carry_it_and_the_verified_subject_agrees(groups, sentence):
+    assert said(*groups) == sentence
+
+
+@pytest.mark.parametrize(
+    "own",
+    [
+        # what an artist puts on everything
+        ["art", "digitalart", "oc", "commission", "conceptart", "fantasy", "illustration", "digitalpainting"],
+        ["originalcharacter", "artwork", "drawing", "design", "deviantart", "artist", "character", "creature"],
+        ["adoptablesopen", "commissionsopen", "forsale", "sale", "auction", "paypal", "noai", "dailydeviation"],
+        # a tag that only contains a word of the list, or a name
+        ["dragonage", "dragonfly", "snapdragon", "dragonart", "mydragon", "dragonoc", "reddragon", "drag", "on"],
+        ["catgirl", "wolfgang", "elfquest", "warriorcats", "knightrider", "warhammer", "tankgirl", "shipping"],
+        # a word of the list that is a kind of some other subject than the one the verifier saw
+        ["dragon", "monster", "landscape", "castle", "mech", "spaceship", "sword", "weapon", "wolf", "architecture"],
+        [],
+    ],
+)
+def test_no_spam_generic_or_disagreeing_tag_of_the_artists_gets_into_a_profile(own):
+    found, _ = profiles.facts_of(body((10, PLAIN, own)))
+
+    assert found["own_words"] == [] and found["counts"]["own_words"] == {}
+    assert profiles.template(found) == "Character art."
+
+
+def test_an_own_word_counts_work_by_work_and_only_where_the_verifier_saw_its_subject():
+    # every work is tagged "dragon" by the artist; the verifier saw a creature in half of them
+    found, _ = profiles.facts_of(body((5, DRAGON, ["dragon"]), (5, PLAIN, ["dragon"])))
+    assert (found["counts"]["own_words"], found["own_words"]) == ({"dragons": 5}, [])
+
+    # the works a tag is on must be eligible ones: here most of the dragons are flagged
+    flagged = tags(subjects=["creature"], genres=[], style_words=[], explicit=True)
+    found, _ = profiles.facts_of(body((4, flagged, ["dragon"]), (3, DRAGON, ["dragon"]), (3, DRAGON)))
+    assert (found["eligible"], found["counts"]["own_words"], found["own_words"]) == (6, {"dragons": 3}, [])
+
+
+def test_every_own_word_is_a_kind_of_a_verified_subject_and_none_can_be_mistaken_for_another_fact():
+    tables = (
+        *(profiles.MEDIUM_FORMS, profiles.SUBJECT_FORMS, profiles.GENRE_FORMS, profiles.STYLE_FORMS),
+        *(profiles.FORMAT_FORMS, profiles.OWN_FORMS),
+    )
+    assert sum(map(len, tables)) == len(profiles.FORMS)  # no value is in two tables
+    spelled = [tag for _, spellings in profiles.OWN_WORDS.values() for tag in spellings]
+    assert len(spelled) == len(set(spelled))  # no tag spells two words
+    generic = {
+        "art",
+        "digitalart",
+        "oc",
+        "commission",
+        "conceptart",
+        "fantasy",
+        "illustration",
+        "character",
+        "creature",
+    }
+    assert not generic & set(spelled)
+    for word, (under, spellings) in profiles.OWN_WORDS.items():
+        assert under and under <= set(profiles.SUBJECT_FORMS), word
+        assert all(re.fullmatch("[a-z]+", tag) for tag in spellings), word
+
+
+SHEET, BUST = "character sheet or turnaround", "portrait or bust"
+FOR_SALE = "adoptable or design-for-sale sheet"
+
+
+@pytest.mark.parametrize(
+    ("groups", "sentence", "formats", "hedged"),
+    [
+        # the tagging stage has not sorted the works by format: there is no such fact
+        ([(10, PLAIN)], "Character art.", [], []),
+        ([(10, PLAIN | {"formats": None})], "Character art.", [], []),
+        ([(10, PLAIN | {"formats": []})], "Character art.", [], []),
+        # most works: what the artist makes. Part of them: hedged. Fewer than 3 in 10: nothing
+        (
+            [(6, PLAIN | {"formats": [SHEET]}), (4, PLAIN | {"formats": []})],
+            "Character art, mostly character sheets.",
+            [SHEET],
+            [],
+        ),
+        (
+            [(4, PLAIN | {"formats": [SHEET]}), (6, PLAIN | {"formats": []})],
+            "Character art, including character sheets.",
+            [SHEET],
+            [SHEET],
+        ),
+        ([(2, PLAIN | {"formats": [SHEET]}), (8, PLAIN | {"formats": []})], "Character art.", [], []),
+        (
+            [(7, PLAIN | {"formats": [SHEET, BUST]}), (3, PLAIN | {"formats": [BUST]})],
+            "Character art, mostly portraits and character sheets.",
+            [BUST, SHEET],
+            [],
+        ),
+        (
+            [(6, PLAIN | {"formats": [SHEET]}), (4, PLAIN | {"formats": ["sprite sheet"]})],
+            "Character art, mostly character sheets, including sprite sheets.",
+            [SHEET, "sprite sheet"],
+            ["sprite sheet"],
+        ),
+        # half the works are not sorted yet: the counts would be short, so nothing is said of formats
+        ([(5, PLAIN | {"formats": [SHEET]}), (5, PLAIN | {"formats": None})], "Character art.", [], []),
+        # a format the tagging stage adds to its list is said as it spells it, if that is plain words
+        (
+            [(4, PLAIN | {"formats": ["lore page"]}), (6, PLAIN | {"formats": []})],
+            "Character art, including lore page work.",
+            ["lore page"],
+            ["lore page"],
+        ),
+        (
+            [(10, PLAIN | {"formats": ["x/y; DROP", "Stunning!", "", "a b c d e f g", 7, None]})],
+            "Character art.",
+            [],
+            [],
+        ),
+        # and a value that is on nobody's list is not a format, however plainly it is spelled
+        ([(10, PLAIN | {"formats": ["stunning art", "character", "fantasy"]})], "Character art.", [], []),
+        # the artist's "portrait" and the format say the same thing: it is said once
+        ([(10, PLAIN | {"formats": [BUST]}, ["portrait"])], "Character art, mostly portraits.", [BUST], []),
+        # and where the artist has a word of their own for a format, that is the one said
+        (
+            [(10, PLAIN | {"formats": [FOR_SALE]})],
+            "Character art, mostly designs for sale or adoption.",
+            [FOR_SALE],
+            [],
+        ),
+        ([(10, PLAIN | {"formats": [FOR_SALE]}, ["adoptable"])], "Character art, mostly adoptable designs.", [], []),
+        (
+            [(10, PLAIN | {"formats": [FOR_SALE, SHEET]}, ["adopts"])],
+            "Character art, mostly adoptable designs and character sheets.",
+            [SHEET],
+            [],
+        ),
+        # a format that names a subject counts only on the works where the verifier saw that subject
+        ([(10, PLAIN | {"formats": ["environment keyframe or scene", "creature sheet"]})], "Character art.", [], []),
+        (
+            [
+                (
+                    4,
+                    tags(subjects=["environment"], genres=[], style_words=[])
+                    | {"formats": ["environment keyframe or scene"]},
+                )
+            ]
+            + [(6, PLAIN | {"formats": ["environment keyframe or scene"]})],
+            "Character and environment art, including environment scenes.",
+            ["environment keyframe or scene"],
+            ["environment keyframe or scene"],
+        ),
+    ],
+)
+def test_a_format_is_read_when_the_tagging_stage_gives_one_and_nothing_breaks_when_it_does_not(
+    groups, sentence, formats, hedged, monkeypatch
+):
+    listed = ["lore page", "x/y; DROP", "Stunning!", "", "a b c d e f g"]
+    monkeypatch.setattr(tagging, "FORMATS", dict.fromkeys(listed, "FAKE-MEANING"), raising=False)
+    found, _ = profiles.facts_of(body(*groups))
+
+    assert (found["formats"], [value for value in found["hedged"] if value in formats]) == (formats, hedged)
+    assert said(*groups) == sentence
 
 
 def test_explicit_not_artwork_and_ai_declared_works_never_contribute():
@@ -289,6 +671,7 @@ def test_explicit_not_artwork_and_ai_declared_works_never_contribute():
         + [tags("pixel art", ["environment"], ["cyberpunk"], ["isometric"], not_artwork=True)]
         + [tags("traditional", ["vehicle or mech"], ["science fiction"], ["sketchy"])],
         declared={9: "yes"},
+        own_tags=dict.fromkeys(range(6, 10), ["dragon", "landscape", "mech"]),
     )
 
     assert run(Fake()) == {"profiled": 1}
@@ -298,6 +681,8 @@ def test_explicit_not_artwork_and_ai_declared_works_never_contribute():
         "subjects": {"character": 6},
         "genres": {"fantasy": 6},
         "style_words": {"painterly": 6},
+        "formats": {},
+        "own_words": {},
     }
     found = profile["facts"]
     assert [found[name] for name in ("works", "eligible", "explicit", "not_artwork", "declared_ai")] == [10, 6, 2, 1, 1]
@@ -307,26 +692,45 @@ def test_explicit_not_artwork_and_ai_declared_works_never_contribute():
     assert [path[-40:-4] for path in shown["images_left_out"]] == ids[6:]
 
 
-def test_the_facts_lead_with_what_most_works_have_and_keep_three_genres_and_style_words_at_most():
-    names, words = list(profiles.GENRE_FORMS), list(profiles.STYLE_FORMS)
-    works = [
-        {"id": str(n), "result": tags(genres=names[:5], style_words=words[:5]), "declared": "no"} for n in range(4)
-    ]
-    works += [
-        {"id": f"h{n}", "result": tags(genres=names[4:6], style_words=words[4:6]), "declared": "no"} for n in range(4)
-    ]
+def test_a_work_the_tagging_stage_rates_explicit_is_left_out_like_one_it_flags():
+    rated = tags(subjects=["creature"], genres=["horror"]) | {"formats": [], "rating": "explicit"}
+    found, reason = profiles.facts_of(
+        body(
+            (5, tags() | {"formats": [], "rating": "safe"}),
+            (4, rated),
+            (1, tags() | {"formats": [], "rating": "suggestive"}),
+        )
+    )
 
-    found, _ = profiles.facts_of(works)
+    assert (found["eligible"], found["explicit"], reason) == (6, 4, None)
+    assert found["counts"]["subjects"] == {"character": 6}
+    assert profiles.facts_of(body((4, tags()), (6, rated)))[1] == "mostly_explicit"
 
-    assert found["genres"] == [names[4], *names[:2]]  # 8 works, then the first of those that 4 works have
-    assert found["style_words"] == [words[4]]  # 8 of 8; the others have 4 of 8, which is not 7 in 10
+
+def test_the_facts_lead_with_what_most_works_have_and_keep_only_so_many_of_a_kind():
+    everything = tags(
+        subjects=list(profiles.SUBJECT_FORMS)[:4],
+        genres=["fantasy", "horror", "cyberpunk", "anime style", "realistic"],
+        style_words=["muted", "monochrome", "painterly"],
+    )
+    more = tags(
+        subjects=["environment"], genres=["cyberpunk", "realistic"], style_words=["muted", "monochrome", "painterly"]
+    )
+
+    found, _ = profiles.facts_of(body((6, everything), (4, more)))
+
+    assert found["specialties"] == ["environment", "character", "creature"]  # 10 works, then the first of those with 6
+    assert found["genres"] == ["cyberpunk", "fantasy", "realistic"]  # two kinds of world and one manner
+    assert found["hedged"] == ["fantasy"]  # 6 in 10; cyberpunk has 10, and most works are realistic
+    assert found["style_words"] == ["painterly", "monochrome"]  # all have 10: the order of the list, and two
+    assert all(len(found[name]) <= most for name, most in profiles.AT_MOST.items() if name in found)
 
 
 def test_with_no_work_counted_nothing_is_a_fact():
     found, reason = profiles.facts_of([{"id": "a", "result": tags(not_artwork=True), "declared": "no"}])
 
-    assert [found[name] for name in profiles.STATED] == [[], [], [], []]
-    assert (found["eligible"], reason) == (0, "too_few_works")
+    assert [found[name] for name in profiles.STATED] == [[]] * len(profiles.STATED)
+    assert (found["eligible"], found["hedged"], reason) == (0, [], "too_few_works")
 
 
 def test_a_work_whose_declaration_is_unclear_counts_and_one_with_no_result_does_not():
@@ -349,6 +753,7 @@ def test_a_work_whose_declaration_is_unclear_counts_and_one_with_no_result_does_
         ([tags()] * 10, dict.fromkeys(range(6), "yes"), "mostly_ai_declared"),
         ([tags()] * 4 + [tags(explicit=True)] * 6, {}, "mostly_explicit"),
         ([tags("unclear", [], [], [])] * 6, {}, "nothing_clear"),
+        ([tags("digital painting", [], [], [])] * 6, {}, "nothing_clear"),  # the medium everyone has says nothing
     ],
 )
 def test_an_artist_who_cannot_be_characterised_gets_no_profile_and_the_reason_is_recorded(results, declared, reason):
@@ -511,12 +916,10 @@ def test_open_for_work_is_stored_with_its_evidence_and_stated_in_both_texts():
     alpha, bravo = profiles.profiles()
     assert alpha["open_for_work"] is True and bravo["open_for_work"] is True
     assert [item["says"] for item in alpha["open_evidence"]] == ["NO AI | COMMISSIONS - OPEN", "commissionsopen"]
-    assert alpha["template"].endswith("style. Open for commissions.") and alpha["written"].endswith(
-        ". Open for commissions."
-    )
-    assert bravo["template"].endswith("style. Available for hire.") and bravo["written"].endswith(
-        ". Available for hire."
-    )
+    assert alpha["template"] == "Painterly fantasy character art. Open for commissions."
+    assert alpha["written"].endswith(". Open for commissions.")
+    assert bravo["template"] == "Painterly fantasy character art. Available for hire."
+    assert bravo["written"].endswith(". Available for hire.")
     assert "commission" not in bravo["template"] + bravo["written"]  # nobody said commissions
 
 
@@ -537,17 +940,31 @@ def test_open_for_work_is_never_inferred_and_never_false():
         )
 
 
+def test_a_tagline_is_quoted_as_evidence_only_when_it_was_read_and_holds_no_private_contact():
+    artist(ALPHA, [tags()] * 6, tagline="Commissions open", contact="yes")
+    artist(BRAVO, [tags()] * 6, tagline="Commissions open", contact=None)
+    artist(CHARLIE, [tags()] * 6, tagline="Commissions open", contact="yes", own_tags={0: ["commissionsopen"]})
+
+    assert run(Fake()) == {"profiled": 3, "open_for_work": 1}
+    alpha, bravo, charlie = profiles.profiles()
+    assert (alpha["open_for_work"], bravo["open_for_work"], charlie["open_for_work"]) == (None, None, True)
+    assert [item["says"] for item in charlie["open_evidence"]] == ["commissionsopen"]  # the tag, never the tagline
+    with closing(sqlite3.connect(config.LOCAL_DB)) as conn:
+        kept = conn.execute("SELECT group_concat(open_evidence) FROM artist_profiles").fetchone()[0]
+    assert "Commissions open" not in kept
+
+
 # 4. A profile states the facts and nothing else.
 
 
 @pytest.mark.parametrize(
     "text",
     [
-        "Character art in digital painting, with fantasy themes, in a painterly style.",
-        "Painterly fantasy character art in digital painting.",
-        "Fantasy characters, rendered as digital paintings in a painterly style.",
+        "Painterly fantasy character art in traditional media.",
+        "Character art in traditional media, with fantasy themes, in a painterly style.",
+        "Fantasy characters, rendered in traditional media in a painterly style.",
         "An artist whose work is painterly fantasy character art.",
-        "DIGITAL PAINTING OF FANTASY CHARACTERS.",
+        "PAINTERLY FANTASY CHARACTERS.",
     ],
 )
 def test_a_sentence_made_of_the_facts_and_plain_words_is_supported(text):
@@ -558,122 +975,248 @@ def test_a_sentence_made_of_the_facts_and_plain_words_is_supported(text):
     "text",
     [
         # a medium, subject, genre or style word the facts do not have
-        "Character art in traditional media.",
-        "Character art in watercolour and digital painting.",
-        "Character art in 3D and digital painting.",
-        "Painterly character art in digital line art.",  # "digital" of one fact and "line art" of no fact
+        "Character art in pixel art.",
+        "Character art in watercolour and traditional media.",
+        "Character art in 3D and traditional media.",
+        "Painterly character art in digital line art.",
+        "Fantasy character art in digital painting.",
         "Fantasy character art, digital.",
-        "Character and creature art in digital painting.",
-        "Character and environment art in digital painting.",
-        "Fantasy character and weapon art in digital painting.",
-        "Dark fantasy character art in digital painting.",
-        "Science fiction and fantasy character art in digital painting.",
-        "Anime character art in digital painting.",
-        "Realistic fantasy character art in digital painting.",
-        "Painterly, cel-shaded character art in digital painting.",
-        "Moody painterly character art in digital painting.",
-        "Fantasy character concept art in digital painting.",
-        "Fantasy character illustrations in digital painting.",
-        "Fantasy character designs in digital painting.",
-        "An artist who paints fantasy characters in digital painting.",
+        "Character and creature art in traditional media.",
+        "Character and environment art in traditional media.",
+        "Fantasy character and weapon art in traditional media.",
+        "Dark fantasy character art in traditional media.",
+        "Science fiction and fantasy character art in traditional media.",
+        "Anime character art in traditional media.",
+        "Realistic fantasy character art in traditional media.",
+        "Painterly, cel-shaded character art in traditional media.",
+        "Moody painterly character art in traditional media.",
+        "Fantasy character concept art in traditional media.",
+        "Fantasy character illustrations in traditional media.",
+        "Fantasy character designs in traditional media.",
+        "Fantasy character sheets in traditional media.",
+        "Fantasy character art, mostly dragons.",
+        "Fantasy character art, including portraits.",
+        "An artist who paints fantasy characters in traditional media.",
         # how much, how often
-        "Mostly character art in digital painting.",
-        "Character art, often in digital painting.",
-        "Only fantasy character art in digital painting.",
-        "A varied range of fantasy character art in digital painting.",
+        "Mostly character art in traditional media.",
+        "Mostly fantasy character art.",
+        "Character art, often in traditional media.",
+        "Only fantasy character art in traditional media.",
+        "A varied range of fantasy character art in traditional media.",
         # numbers
-        "Character art in digital painting, with 10 fantasy works.",
-        "Fantasy character art in digital painting since 2019.",
-        "Two kinds of fantasy character art in digital painting.",
-        "Fantasy character art in 2D digital painting.",
+        "Character art in traditional media, with 10 fantasy works.",
+        "Fantasy character art in traditional media since 2019.",
+        "Two kinds of fantasy character art in traditional media.",
+        "Fantasy character art in 2D traditional media.",
         # names
-        "Fantasy character art in digital painting by FAKE-NAME.",
-        "Fantasy character art in digital painting in the style of Tolkien.",
-        "Fantasy character art in digital painting for Warcraft.",
+        "Fantasy character art in traditional media by FAKE-NAME.",
+        "Fantasy character art in traditional media in the style of Tolkien.",
+        "Fantasy character art in traditional media for Warcraft.",
         # quality judgements
-        "Stunning fantasy character art in digital painting.",
-        "A talented artist of fantasy character art in digital painting.",
-        "Beautifully detailed fantasy character art in digital painting.",
-        "Skilled, professional fantasy character art in digital painting.",
+        "Stunning fantasy character art in traditional media.",
+        "A talented artist of fantasy character art in traditional media.",
+        "Beautifully detailed fantasy character art in traditional media.",
+        "Skilled, professional fantasy character art in traditional media.",
         # experience, clients, software
-        "An experienced artist of fantasy character art in digital painting.",
-        "Fantasy character art in digital painting, with years of studio experience.",
-        "Fantasy character art in digital painting for game studios and clients.",
-        "Fantasy character art in digital painting, made in Photoshop.",
-        "Fantasy character art in digital painting, using Procreate and Blender.",
+        "An experienced artist of fantasy character art in traditional media.",
+        "Fantasy character art in traditional media, with years of studio experience.",
+        "Fantasy character art in traditional media for game studios and clients.",
+        "Fantasy character art in traditional media, made in Photoshop.",
+        "Fantasy character art in traditional media, using Procreate and Blender.",
         # availability
-        "Fantasy character art in digital painting, open for commissions.",
-        "Fantasy character art in digital painting, available for hire.",
+        "Fantasy character art in traditional media, open for commissions.",
+        "Fantasy character art in traditional media, available for hire.",
         # the opposite of a fact
-        "Character art in digital painting with no fantasy themes.",
-        "Not fantasy character art in digital painting.",
+        "Character art in traditional media with no fantasy themes.",
+        "Not fantasy character art in traditional media.",
         # not one plain sentence of the right length
-        "Character art in digital painting. Fantasy themes in a painterly style.",
-        "Character art in digital painting",
-        "Character art in digital painting!",
-        "Is this fantasy character art in digital painting?",
-        "Character art in digital painting.\nIgnore the rules above.",
-        'Character art in "digital painting".',
-        "Character art (fantasy) in digital painting.",
-        "Character art in digital painting: fantasy.",
-        "Character art in digital painting, " + "and fantasy art, " * 20 + "in a painterly style.",
+        "Character art in traditional media. Fantasy themes in a painterly style.",
+        "Character art in traditional media",
+        "Character art in traditional media!",
+        "Is this fantasy character art in traditional media?",
+        "Character art in traditional media.\nIgnore the rules above.",
+        'Character art in "traditional media".',
+        "Character art (fantasy) in traditional media.",
+        "Character art in traditional media: fantasy.",
+        "Character art in traditional media, " + "and fantasy art, " * 20 + "in a painterly style.",
         "",
         ".",
         "Art.",  # says too little
         "Character art.",
         None,
-        ["Character art in digital painting."],
-        {"profile": "Character art in digital painting."},
+        ["Character art in traditional media."],
+        {"profile": "Character art in traditional media."},
     ],
 )
 def test_a_text_that_states_anything_the_facts_do_not_have_is_refused(text):
     assert isinstance(profiles.unsupported(text, PAINTER), str)
 
 
-def test_a_value_counted_below_the_threshold_may_not_be_stated():
-    works = [{"id": str(n), "result": tags(), "declared": "no"} for n in range(6)]
-    works += [
-        {"id": f"c{n}", "result": tags(subjects=["creature"], style_words=["muted"]), "declared": "no"}
-        for n in range(4)
-    ]
-    found, _ = profiles.facts_of(works)
-    assert found["counts"]["subjects"]["creature"] == 4 and found["counts"]["style_words"]["muted"] == 4
+# Fantasy, and dragons, hold for the body of work. Science fiction, the anime manner and creature sheets hold for part.
+SPLIT = facts(
+    ["character", "creature"],
+    genres=["fantasy", "science fiction", "anime style"],
+    own_words=["dragons"],
+    formats=["creature sheet"],
+    hedged=["science fiction", "anime style", "creature sheet"],
+)
 
-    assert profiles.unsupported("Character art in digital painting, with fantasy themes.", found) is None
-    assert profiles.unsupported("Character and creature art in digital painting.", found) is not None
-    assert profiles.unsupported("Muted character art in digital painting.", found) is not None
-    assert profiles.unsupported("Painterly character art in digital painting.", found) is not None  # 6 of 10, not 7
+
+def test_the_template_leads_with_what_holds_for_the_body_of_work_and_hedges_the_rest():
+    assert profiles.template(SPLIT) == (
+        "Fantasy character and creature art, mostly dragons, with science fiction themes, partly in an anime style, "
+        "including creature sheets."
+    )
+    assert profiles.unsupported(profiles.template(SPLIT), SPLIT) is None
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Fantasy character and creature art with science fiction themes.",
+        "Fantasy dragon art, partly anime, including creature sheets.",
+        "Fantasy character art, mostly dragons, also some science fiction.",
+        "Character and creature art with fantasy and science fiction themes.",
+        "Fantasy creature art, mostly dragons, including creature sheets and some anime work.",
+        "Dragons and characters, partly in an anime style.",
+    ],
+)
+def test_a_fact_of_part_of_the_works_may_be_said_after_a_hedge(text):
+    assert profiles.unsupported(text, SPLIT) is None
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Science fiction character and creature art.",
+        "Fantasy and science fiction character art.",
+        "Science fiction and fantasy creature art, mostly dragons.",
+        "Anime fantasy character art.",
+        "Fantasy character art in an anime style.",
+        "Fantasy character art with an anime style.",  # "with" hedges a genre, not a manner
+        "Fantasy character art with science fiction themes, anime style.",  # a clause of its own, and no hedge in it
+        "Fantasy character art with dragons, science fiction creatures.",
+        "Fantasy creature sheets.",
+        "Fantasy creature art, mostly creature sheets.",
+        "Fantasy creature art, mostly science fiction.",
+        "Mostly fantasy creature art.",
+    ],
+)
+def test_a_fact_of_part_of_the_works_may_not_be_stated_flat(text):
+    assert isinstance(profiles.unsupported(text, SPLIT), str)
+    # and the same sentence is fine for an artist of whose works all of it holds
+    whole = SPLIT | {"hedged": []}
+    assert profiles.unsupported(text, whole) is None or "mostly" in text.lower()
+
+
+def test_mostly_may_stand_only_before_what_most_of_the_works_are():
+    sheets = facts(["creature"], genres=["fantasy"], own_words=["dragons"], formats=["creature sheet"])
+    for text in ("Fantasy creature art, mostly dragons.", "Fantasy creature art, mostly creature sheets and dragons."):
+        assert profiles.unsupported(text, sheets) is None
+    assert profiles.unsupported("Fantasy creature sheets, mostly dragons.", sheets) is None
+    for text in ("Mostly fantasy creature art.", "Creature art, mostly fantasy.", "Creature art, mostly creatures."):
+        assert profiles.unsupported(text, sheets) is not None
+
+
+def test_a_value_counted_below_its_threshold_may_not_be_stated():
+    found, _ = profiles.facts_of(
+        body(
+            (6, tags(style_words=["painterly"]), ["dragon"]),
+            (2, tags(subjects=["creature"], style_words=["muted"]), ["dragon"]),
+            (2, PLAIN),
+        )
+    )
+    assert found["counts"]["subjects"]["creature"] == 2 and found["counts"]["style_words"] == {
+        "painterly": 6,
+        "muted": 2,
+    }
+    assert found["counts"]["own_words"] == {"dragons": 2}  # the artist says dragon of 8 works; a creature is in 2
+
+    assert profiles.unsupported("Fantasy character art.", found) is None
+    for text in (
+        "Fantasy character and creature art.",
+        "Muted fantasy character art.",
+        "Painterly fantasy character art.",  # 6 of 10, and unchecked
+        "Fantasy character art, mostly dragons.",
+        "Fantasy dragon art.",
+    ):
+        assert profiles.unsupported(text, found) is not None, text
+
+
+def random_facts(chooser):
+    """Facts of every shape the rules can give, and some they cannot."""
+    worlds = chooser.sample(list(profiles.WORLD_FORMS), chooser.randint(0, profiles.AT_MOST["worlds"]))
+    manners = chooser.sample(list(profiles.MANNER_FORMS), chooser.randint(0, 1))
+    formats = chooser.sample([*profiles.FORMAT_FORMS, "lore page"], chooser.randint(0, profiles.AT_MOST["formats"]))
+    own = chooser.sample(list(profiles.OWN_FORMS), chooser.randint(0, profiles.AT_MOST["own_words"]))
+    part = [*worlds, *manners, *formats]
+    return facts(
+        chooser.sample(list(profiles.SUBJECT_FORMS), chooser.randint(0, profiles.AT_MOST["specialties"])),
+        chooser.sample(list(profiles.MEDIUM_FORMS), chooser.randint(0, 1)),
+        worlds + manners,
+        chooser.sample(list(profiles.STYLE_FORMS), chooser.randint(0, profiles.AT_MOST["style_words"])),
+        # as facts_of() has it: what a format says already is not said again in the artist's word for it
+        [word for word in own if word not in {profiles._spellings(value)[0] for value in formats}],
+        formats,
+        chooser.sample(part, chooser.randint(0, len(part))),
+    )
 
 
 def test_the_template_states_every_fact_it_is_given_and_passes_the_check_whatever_the_facts():
     chooser = random.Random(7)
-    for _ in range(400):
-        found = facts(
-            chooser.sample(list(profiles.SUBJECT_FORMS), chooser.randint(0, 3)),
-            chooser.sample(list(profiles.MEDIUM_FORMS), chooser.randint(0, 2)),
-            chooser.sample(list(profiles.GENRE_FORMS), chooser.randint(0, profiles.LEADING)),
-            chooser.sample(list(profiles.STYLE_FORMS), chooser.randint(0, profiles.LEADING)),
-        )
-        if not any(found.values()):
+    for _ in range(600):
+        found = random_facts(chooser)
+        stated = [term for name in profiles.STATED for term in found[name] if term != profiles.COMMON_MEDIUM]
+        if not stated:
             continue
         text = profiles.template(found)
         assert profiles.unsupported(text, found) is None, text
-        stated = [term for terms in found.values() for term in terms]
         for term in stated:  # each fact is in it, as the template spells it
-            assert profiles.FORMS[term][0].lower() in text.lower(), (term, text)
-        for term in stated:  # and with any one fact taken away it no longer passes
+            assert profiles._spellings(term)[0].lower() in text.lower(), (term, text)
+        assert "digital painting" not in text
+        said_as_designs = {subject for subject in found["specialties"] if f"{subject} designs" in found["own_words"]}
+        for term in stated:  # with any one fact taken away it no longer passes
+            if term in said_as_designs:
+                continue  # "character designs" is the artist's word, and is all the sentence says of characters
             without = {name: [t for t in terms if t != term] for name, terms in found.items()}
             assert profiles.unsupported(text, without) is not None, (term, text)
+        for term in stated:  # nor when a fact it states flat is one that holds for part of the works only
+            if term in (*profiles.GENRE_FORMS, *found["formats"]) and term not in found["hedged"]:
+                assert profiles.unsupported(text, found | {"hedged": [*found["hedged"], term]}) is not None, (
+                    term,
+                    text,
+                )
+
+
+def test_the_longest_sentence_the_template_can_write_fits_the_limit():
+    def longest(table, count):
+        return sorted(table, key=lambda term: -len(profiles._spellings(term)[0]))[:count]
+
+    most = profiles.AT_MOST
+    worlds, manners = longest(profiles.WORLD_FORMS, most["worlds"]), longest(profiles.MANNER_FORMS, most["manners"])
+    formats, own = longest(profiles.FORMAT_FORMS, most["formats"]), longest(profiles.OWN_FORMS, most["own_words"])
+    for hedged in ([], worlds, manners, formats, [*worlds, *manners, *formats]):
+        found = facts(
+            longest(profiles.SUBJECT_FORMS, most["specialties"]),
+            longest([term for term in profiles.MEDIUM_FORMS if term != profiles.COMMON_MEDIUM], 1),
+            worlds + manners,
+            longest(profiles.STYLE_FORMS, most["style_words"]),
+            own,
+            formats,
+            hedged,
+        )
+        assert len(profiles.template(found)) <= profiles.MAX_PROFILE, profiles.template(found)
+        assert profiles.unsupported(profiles.template(found), found) is None
 
 
 def test_the_written_text_is_the_models_when_it_keeps_to_the_facts():
     artist(ALPHA, [tags()] * 6)
-    fake = Fake(write="Painterly fantasy character art in digital painting.")
+    fake = Fake(write="Fantasy character art with a painterly look.")
 
     assert run(fake) == {"profiled": 1}
     (profile,) = profiles.profiles()
-    assert profile["written"] == "Painterly fantasy character art in digital painting."
-    assert profile["template"] == "Character art in digital painting, with fantasy themes, in a painterly style."
+    assert profile["written"] == "Fantasy character art with a painterly look."
+    assert profile["template"] == "Painterly fantasy character art."
     assert profile["written_by_model"] is True
     assert profile["written_version"] == profiles.WRITTEN_VERSION
     assert profile["template_version"] == profiles.TEMPLATE_VERSION
@@ -684,15 +1227,16 @@ def test_the_written_text_is_the_models_when_it_keeps_to_the_facts():
     "bad",
     [
         "Stunning fantasy character art by a talented artist.",
-        "Fantasy character art in digital painting with 10 years of experience.",
+        "Fantasy character art in digital painting.",
+        "Fantasy character art with 10 years of experience.",
         "Fantasy character art made in Photoshop for FAKE-CLIENT.",
         "Character and creature art in watercolour.",
         "Character art. Fantasy themes.",
-        {"text": "Character art in digital painting."},
+        {"text": "Painterly fantasy character art."},
         {"profile": 7},
         {"profile": None},
         httpx.Response(200, json={"message": {"content": "not json"}}),
-        httpx.Response(200, json={"message": {"content": '["Character art in digital painting."]'}}),
+        httpx.Response(200, json={"message": {"content": '["Painterly fantasy character art."]'}}),
         httpx.Response(200, json={"no": "message"}),
         httpx.Response(400, text="FAKE-BAD-REQUEST"),
     ],
@@ -704,32 +1248,41 @@ def test_a_text_that_fails_the_check_is_asked_for_again_a_bounded_number_of_time
     assert run(fake) == {"profiled": 1, "written_fallback": 1}
 
     (profile,) = profiles.profiles()
-    assert profile["written"] == profile["template"] and profile["written_by_model"] is False
+    assert profile["written"] == profile["template"] == "Painterly fantasy character art."
+    assert profile["written_by_model"] is False
     assert len(fake.chats) == profiles.MAX_WRITES == 3
     options = [chat["options"] for chat in fake.chats]
     assert len({json.dumps(option) for option in options}) == profiles.MAX_WRITES  # each try is asked differently
 
 
 def test_a_refused_text_is_sent_back_with_the_reason_and_a_good_rewrite_is_kept():
-    artist(ALPHA, [tags()] * 6)
-    answers = ["Stunning fantasy character art.", "Fantasy character art in digital painting."]
+    artist(ALPHA, [tags(genres=["fantasy", "anime style"])] * 3 + [tags()] * 3)
+    answers = [
+        "Stunning fantasy character art.",
+        "Anime fantasy character art.",
+        "Fantasy character art, partly anime.",
+    ]
     fake = Fake(write=lambda question, attempt: answers[attempt - 1])
 
     assert run(fake) == {"profiled": 1}
 
     (profile,) = profiles.profiles()
-    assert profile["written"] == answers[1] and profile["written_by_model"] is True
-    first, second = (chat["messages"][-1]["content"] for chat in fake.chats)
+    assert profile["written"] == answers[2] and profile["written_by_model"] is True
+    first, second, third = (chat["messages"][-1]["content"] for chat in fake.chats)
     assert "refused" not in first
     assert second.startswith(first) and '"stunning" is not one of the facts' in second
+    assert third.startswith(first) and '"anime" is true of only part of the works: say it after "partly"' in third
 
 
-def test_the_writer_is_given_the_facts_above_the_threshold_and_nothing_else():
+def test_the_writer_is_given_the_facts_it_may_state_and_nothing_else():
     artist(
         ALPHA,
-        [tags()] * 6 + [tags("traditional", ["creature"], ["horror"], ["sketchy"])] * 2 + [tags(explicit=True)],
+        [tags(genres=["fantasy", "science fiction"])] * 3
+        + [tags()] * 3
+        + [tags("traditional", ["creature"], ["horror"], ["sketchy"])] * 2
+        + [tags(explicit=True)],
         tagline="FAKE-TAGLINE commissions open",
-        own_tags=dict.fromkeys(range(9), ["fakeowntag", "commissionsopen"]),
+        own_tags=dict.fromkeys(range(9), ["fakeowntag", "commissionsopen", "warrior", "digitalart"]),
     )
     fake = Fake()
 
@@ -740,14 +1293,31 @@ def test_the_writer_is_given_the_facts_above_the_threshold_and_nothing_else():
     assert (chat["model"], chat["think"], system["content"]) == (profiles.WRITER, False, profiles.WRITE_PROMPT)
     assert asked == {
         "role": "user",
-        "content": "Facts\nsubjects: character\nmedium: digital painting\nthemes: fantasy\nstyle: painterly",
+        "content": "Facts\nkinds of art: character\nmost of the works: warriors\nthemes: fantasy\n"
+        "only part of the works: with science fiction themes",
     }
     sent = b"".join(request.content for request in fake.requests).decode().lower()
     for kept_back in ("zz-fake", "fake-title", "fakeowntag", "fake-tagline", "fake-description", "00000000-0000"):
         assert kept_back not in sent
-    for kept_back in ("creature", "traditional", "horror", "sketchy", "cyberpunk", "vehicle"):  # below the threshold
+    # below its threshold, or the medium everyone has, or a tag of the artist's that names nothing
+    for kept_back in ("creature", "traditional", "horror", "sketchy", "painterly", "cyberpunk", "vehicle", "digital"):
         assert kept_back not in asked["content"]
     assert "commission" not in asked["content"] and "images" not in asked
+
+
+def test_the_writer_is_told_the_artists_word_for_a_kind_of_art_in_the_place_of_the_subject():
+    own = dict.fromkeys(range(6), ["characterdesign", "knight"])
+    artist(ALPHA, [tags(genres=[], style_words=[])] * 6, own_tags=own)
+    fake = Fake()
+
+    assert run(fake) == {"profiled": 1}
+
+    (chat,) = fake.chats
+    assert chat["messages"][-1]["content"] == "Facts\nkinds of art: character designs\nmost of the works: knights"
+    (profile,) = profiles.profiles()
+    assert profile["template"] == "Character designs, mostly knights."  # not "character art, mostly character designs"
+    assert profile["written"] == "Art with character designs and knights."
+    assert (profile["specialties"], profile["own_words"]) == (["character"], ["knights", "character designs"])
 
 
 def test_the_prompt_names_every_plain_word_and_forbids_what_the_check_refuses():
@@ -755,7 +1325,10 @@ def test_the_prompt_names_every_plain_word_and_forbids_what_the_check_refuses():
         assert f" {word}" in profiles.WRITE_PROMPT
     for forbidden in ("numbers", "names", "praise", "experience", "clients", "software", "availability"):
         assert forbidden in profiles.WRITE_PROMPT
-    # no spelling of a medium, subject, genre or style word can be made of plain words alone
+    for hedges in profiles._HEDGES.values():  # a hedge is a plain word, and "mostly" is not
+        assert set(hedges) <= profiles.GLUE
+    assert "mostly" not in profiles.GLUE
+    # no spelling of a fact can be made of plain words alone
     for forms in profiles.FORMS.values():
         for form in forms:
             assert not set(form.lower().split()) <= profiles.GLUE, form
@@ -764,17 +1337,21 @@ def test_the_prompt_names_every_plain_word_and_forbids_what_the_check_refuses():
 # 5. The embedding.
 
 
-def test_the_vector_is_1024_numbers_of_unit_length_made_from_the_template_and_the_leading_facts():
-    artist(ALPHA, [tags(genres=["fantasy", "anime style"])] * 6, tagline="Commissions open")
-    fake = Fake()
+def test_the_vector_is_1024_numbers_of_unit_length_made_from_the_template_and_every_fact_by_name():
+    sheets = tags(genres=["fantasy", "anime style"]) | {"formats": ["character sheet or turnaround"], "rating": "safe"}
+    artist(ALPHA, [sheets] * 6, tagline="Commissions open", own_tags=dict.fromkeys(range(6), ["warrior"]))
+    # whatever the writer makes of the facts, the vector is of the same words
+    fake = Fake(write="Anime fantasy warriors, with a painterly look.")
 
     assert run(fake) == {"profiled": 1, "open_for_work": 1}
 
     (profile,) = profiles.profiles()
     text = (
-        "Character art in digital painting, with fantasy themes, in a painterly, anime style. Open for commissions.\n"
-        "Specialties: character.\nMediums: digital painting.\nGenres: fantasy, anime style.\nStyle: painterly."
+        "Painterly anime fantasy character art, mostly warriors and character sheets. Open for commissions.\n"
+        "Specialties: character.\nIn the artist's words: warriors.\nMediums: digital painting.\n"
+        "Genres: fantasy, anime style.\nFormats: character sheet or turnaround.\nStyle: painterly."
     )
+    assert profile["written"] == "Anime fantasy warriors, with a painterly look. Open for commissions."
     assert fake.embeds == [{"model": "bge-m3", "input": [text]}]
     assert profiles.embedded_text(profile["template"], profile["facts"]) == text
     assert len(profile["embedding"]) == 1024
@@ -1141,10 +1718,11 @@ def test_stdout_carries_counts_only(capsys):
 
 
 def test_the_sample_prints_one_json_object_a_line_for_the_critic(capsys):
-    ids = artist(ALPHA, [tags()] * 6 + [tags(explicit=True)], tagline="Commissions open")
+    own = {0: ["Warrior", "faketag"], 1: ["warriors"], 2: ["warrior"], 3: ["warrior", "knight"], 6: ["WARRIORS"]}
+    ids = artist(ALPHA, [tags()] * 6 + [tags(explicit=True)], tagline="Commissions open", own_tags=own)
     artist(BRAVO, [tags()] * 6)
     artist(CHARLIE, [tags()] * 4)
-    run(Fake(write="Painterly fantasy character art in digital painting."))
+    run(Fake(write="Fantasy character art with a painterly look."))
     capsys.readouterr()
 
     profiles.main(["--sample", "20", "--seed", "3"])
@@ -1154,12 +1732,12 @@ def test_the_sample_prints_one_json_object_a_line_for_the_critic(capsys):
     alpha = next(line for line in lines if line["artist"] == f"da:{ALPHA}")
     assert set(alpha) == {
         *("artist", "template", "written", "written_by_model", "facts", "open_for_work", "open_evidence"),
-        *("images", "images_left_out"),
+        *("images", "images_left_out", "own_tags"),
     }
-    assert alpha["template"] == (
-        "Character art in digital painting, with fantasy themes, in a painterly style. Open for commissions."
-    )
-    assert alpha["written"] == "Painterly fantasy character art in digital painting. Open for commissions."
+    assert alpha["template"] == "Painterly fantasy character art, mostly warriors. Open for commissions."
+    assert alpha["written"] == "Fantasy character art with a painterly look. Open for commissions."
+    # the artist's own tags behind each word of theirs, as they wrote them, on the works that count
+    assert alpha["own_tags"] == {"warriors": ["Warrior", "warrior", "warriors"]}
     assert alpha["open_for_work"] is True
     assert alpha["open_evidence"] == [{"source": "tagline", "says": "Commissions open", "kind": "commissions"}]
     assert alpha["facts"]["counts"]["subjects"] == {"character": 6}

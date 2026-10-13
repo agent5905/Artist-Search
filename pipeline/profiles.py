@@ -8,17 +8,24 @@ An artist is profiled once every collected work of theirs with a cached image ha
 result set "<model>+<model>" of pipeline/tagging.py, at its current prompt version) and a reading of its own
 title and tags. Until then the artist waits, and has no row here.
 
-The facts are counts over the artist's eligible works: analyzed, not flagged explicit, not flagged not_artwork,
-not declared AI-made. Only the verified tags are counted, never the descriptions. A medium, subject or genre is
-a fact, which a profile may state and search may filter on, when at least CLEAR_PERCENT of the eligible works
-have it: with MIN_WORKS of those, never fewer than three works. A style word needs STYLE_PERCENT and must be one
-of STYLE_FORMS: style words are free text that the verifier mostly does not check.
+The facts are counts over the artist's eligible works: analyzed, not flagged or rated explicit, not flagged
+not_artwork, not declared AI-made. Only the verified tags are counted, never the descriptions. What a profile
+may state is a share of those works, and never rests on fewer than MIN_SUPPORT of them:
+  - a subject at PART_PERCENT, so that both halves of a split portfolio are named;
+  - a genre at PART_PERCENT, hedged ("with fantasy themes") until it reaches CLEAR_PERCENT;
+  - a drawing manner at PART_PERCENT, hedged ("partly in an anime style") until most works have it;
+  - a format, once the tagging stage has sorted every eligible work by format, on the manner's terms. One that
+    names a subject ("environment keyframe or scene") counts on a work only where the verified subject agrees;
+  - a medium at CLEAR_PERCENT, and the text leaves out "digital painting", which nearly every artist has;
+  - a colour word the verifier checked at CLEAR_PERCENT, any other style word at NEARLY_ALL_PERCENT;
+  - a word of the artist's own (OWN_WORDS) when most works carry it as a tag and their verified subject agrees.
+"Most" is more than half.
 
 Open for work is True only on the artist's own words (see open_evidence), and otherwise unknown. Never False.
 
-Two texts are kept for the blind critic to choose between: "template", built by code, and "written", composed
-by the local language model from the stated facts alone and then held to them by unsupported(). A text that
-fails is asked for again MAX_WRITES times in all, then the template stands in for it.
+Two texts are kept: "written", composed by the local language model from the stated facts alone and then held
+to them by unsupported(), which round 1's blind critic preferred 16 to 2; and "template", built by code, which
+stands in when the model's text fails MAX_WRITES times, and which the vector is made from.
 
 One table, artist_profiles, in the local SQLite file. Hard rule 7: a row is written only for an artist the
 store still lists, rows of artists it no longer lists go at the start of every run, and no read returns one.
@@ -56,14 +63,16 @@ DIMENSIONS = 1024  # sql/001_schema.sql: artists.profile_embedding is halfvec(10
 QUERIES = config.ROOT / "eval" / "queries.jsonl"
 
 MIN_WORKS = 5  # eligible works; with fewer an artist cannot be characterised
-CLEAR_PERCENT = 50  # of the eligible works: a medium, subject or genre that at least this share has is a fact
-STYLE_PERCENT = 70  # the same for a style word
-LEADING = 3  # genres and style words kept, at most
+MIN_SUPPORT = 3  # works: nothing is stated on fewer, whatever share they are
+PART_PERCENT = 30  # of the eligible works: a subject is named; a genre, manner or format is stated with a hedge
+CLEAR_PERCENT = 70  # a genre is stated flat; a medium or a verified colour word is a fact
+NEARLY_ALL_PERCENT = 90  # any other style word is a fact
+AT_MOST = {"specialties": 3, "worlds": 2, "manners": 1, "own_words": 2, "formats": 2, "style_words": 2}
 RECENT_DAYS = 180  # a work's own tags say something about commissions for this long
-MAX_PROFILE = 240  # characters of a profile's one sentence
+MAX_PROFILE = 340  # characters of a profile's one sentence; the longest the template can write is 321
 MAX_WRITES = 3  # times the model is asked for one artist's sentence
-TEMPLATE_VERSION = 1  # bump when template() would say something else
-WRITTEN_VERSION = 1  # bump when WRITE_PROMPT, GLUE or unsupported() changes
+TEMPLATE_VERSION = 2  # bump when template() would say something else
+WRITTEN_VERSION = 3  # bump when WRITE_PROMPT, GLUE or unsupported() changes
 
 # Every value a profile may state, and the spellings it may state it in. The first is the template's.
 # "photo" and "unclear" are not here: neither says what the art is made with. Nor is "digital" on its own: with
@@ -75,6 +84,7 @@ MEDIUM_FORMS = {
     "pixel art": ("pixel art",),
     "traditional": ("traditional media", "traditional art", "traditional"),
 }
+COMMON_MEDIUM = "digital painting"  # a fact and a search filter like the others, and never worth a word of the text
 # The tag "prop or weapon" does not say which, so neither does a profile. A weapon is a prop; a prop need not
 # be a weapon.
 SUBJECT_FORMS = {
@@ -118,19 +128,145 @@ STYLE_FORMS = {
     "isometric": ("isometric",),
     "low-poly": ("low-poly", "low poly"),
 }
+# The three the verifier checks, by picking a colour for the image itself: each word that says it -> the one counted.
+COLOUR_WORDS = dict.fromkeys(("saturated", "vibrant", "vivid"), "saturated") | {
+    "muted": "muted",
+    "monochrome": "monochrome",
+}
+# How a format of the tagging stage is said. A format it adds later is said as it spells it (see _spellings).
+FORMAT_FORMS = {
+    "character sheet or turnaround": ("character sheets", "character sheet", "character sheets or turnarounds"),
+    "creature sheet": ("creature sheets", "creature sheet"),
+    "expression or pose sheet": ("expression or pose sheets", "expression or pose sheet"),
+    "environment keyframe or scene": ("environment scenes", "environment scene", "environment keyframes or scenes"),
+    "concept sketches or thumbnails": ("concept sketches", "concept sketches or thumbnails"),
+    "card or splash illustration": ("card or splash illustrations", "card or splash illustration"),
+    "portrait or bust": ("portraits", "portrait", "portraits or busts"),
+    "adoptable or design-for-sale sheet": ("designs for sale or adoption", "designs for adoption or sale"),
+    "comic page or panel sequence": ("comic pages or panel sequences", "comic page or panel sequence"),
+    "icons or interface elements": ("icons or interface elements",),
+    "sprite sheet": ("sprite sheets", "sprite sheet"),
+    "colour keys or mood studies": ("colour keys or mood studies", "color keys or mood studies"),
+}
+# A format that names a subject counts on a work only when the verifier gave the work that subject, as a word of
+# the artist's own does: the format is one model's pick, and a figure in a room is not an "environment scene".
+FORMAT_OF = {
+    "character sheet or turnaround": "character",
+    "expression or pose sheet": "character",
+    "portrait or bust": "character",
+    "creature sheet": "creature",
+    "environment keyframe or scene": "environment",
+    "icons or interface elements": "interface or icons",
+}
+SAID_BY_THE_ARTIST = {"adoptable or design-for-sale sheet": "adoptable designs"}  # one of OWN_WORDS: see facts_of
+_FORMAT = re.compile(r"[a-z]+(?:[ -][a-z]+){0,5}")  # what a format this module has never heard of must look like
+
+
+def _is_format(value: object, subjects: list[str]) -> bool:
+    """True for a format this module knows how to say, or a plainly spelled one of the tagging stage's own list,
+    on a work whose verified subjects bear it out."""
+    if not isinstance(value, str) or not (value in FORMAT_FORMS or value in getattr(tagging, "FORMATS", ())):
+        return False
+    return bool(_FORMAT.fullmatch(value)) and FORMAT_OF.get(value) in (None, *subjects)
+
+
+# Words of the artist's own. Each names a kind of a verified subject: (the subjects, one, many, and the other
+# spellings of the tag; "character design" is the tag "characterdesign" or "characterdesigns" without being told).
+# A tag counts on a work only when the verifier gave that work one of those subjects, and the word is stated only
+# when that is so for most of the artist's works: their "dragon" under a verified "creature".
+# Nothing gets in that is not here, so no tag an artist puts on everything can: "art", "digitalart", "oc",
+# "commission", "fantasy", "conceptart". Nor a tag that only contains a word: "dragonage", "catgirl".
+# ponytail: a hand list, and what is not on it is never said, however plainly an artist says it. The upgrade is to
+# ask the language model whether a tag most works carry names a kind of the verified subject, and to hold its
+# answer to the tags themselves.
+_ANY = tuple(SUBJECT_FORMS)
+_OWN = (
+    (("creature",), "dragon", "dragons", ""),
+    (("creature",), "monster", "monsters", ""),
+    (("creature",), "beast", "beasts", ""),
+    (("creature",), "dinosaur", "dinosaurs", ""),
+    (("creature",), "animal", "animals", ""),
+    (("creature",), "wolf", "wolves", ""),
+    (("creature",), "horse", "horses", ""),
+    (("creature",), "bird", "birds", ""),
+    (("creature",), "cat", "cats", ""),
+    (("creature",), "dog", "dogs", ""),
+    (("creature",), "creature design", "creature designs", "creatureconcept creatureconcepts creatureconceptart"),
+    (("character",), "warrior", "warriors", ""),
+    (("character",), "knight", "knights", ""),
+    (("character",), "elf", "elves", ""),
+    (("character",), "mage", "mages", ""),
+    (("character",), "wizard", "wizards", ""),
+    (("character",), "witch", "witches", ""),
+    (("character",), "angel", "angels", ""),
+    (("character",), "assassin", "assassins", ""),
+    (("character",), "soldier", "soldiers", ""),
+    (("character",), "samurai", "samurai", ""),
+    (("character",), "pirate", "pirates", ""),
+    (("character",), "vampire", "vampires", ""),
+    (("character",), "portrait", "portraits", ""),
+    (("character",), "character design", "character designs", "characterconcept characterconcepts characterconceptart"),
+    (
+        ("character",),
+        "character sheet",
+        "character sheets",
+        "referencesheet refsheet characterreference characterturnaround",
+    ),
+    (("character", "creature"), "demon", "demons", ""),
+    (("character", "creature"), "alien", "aliens", ""),
+    (("character", "creature"), "anthro character", "anthro characters", "anthro furry"),
+    (("character", "creature"), "adoptable design", "adoptable designs", "adoptable adoptables adopt adopts"),
+    (("character", "creature", "vehicle or mech"), "robot", "robots", ""),
+    (("environment",), "landscape", "landscapes", ""),
+    (("environment",), "cityscape", "cityscapes", ""),
+    (("environment",), "castle", "castles", ""),
+    (("environment",), "interior", "interiors", ""),
+    (("environment",), "architecture", "architecture", ""),
+    (("environment",), "environment design", "environment designs", "environmentconcept environmentconceptart"),
+    (("environment",), "matte painting", "matte paintings", ""),
+    (("prop or weapon",), "weapon", "weapons", ""),
+    (("prop or weapon",), "sword", "swords", ""),
+    (("prop or weapon",), "gun", "guns", ""),
+    (("prop or weapon",), "weapon design", "weapon designs", ""),
+    (("prop or weapon",), "prop design", "prop designs", ""),
+    (("character", "prop or weapon"), "armour", "armour", "armor armors armours"),
+    (("vehicle or mech",), "mech", "mechs", "mecha mechas"),
+    (("vehicle or mech",), "spaceship", "spaceships", "starship starships"),
+    (("vehicle or mech",), "tank", "tanks", ""),
+    (("vehicle or mech",), "ship", "ships", ""),
+    (("vehicle or mech",), "vehicle design", "vehicle designs", ""),
+    (("vehicle or mech",), "mech design", "mech designs", "mechadesign"),
+    (_ANY, "fan art", "fan art", "fanarts"),
+)
+# many -> (the verified subjects it is a kind of, every spelling of the tag with "_" and "-" taken out)
+OWN_WORDS = {
+    many: (frozenset(under), frozenset({one.replace(" ", ""), many.replace(" ", ""), *more.split()}))
+    for under, one, many, more in _OWN
+}
+OWN_FORMS = {many: (many, one) for _, one, many, _ in _OWN}
+
 GENRE_FORMS = WORLD_FORMS | MANNER_FORMS
-FORMS = MEDIUM_FORMS | SUBJECT_FORMS | GENRE_FORMS | STYLE_FORMS
-STATED = ("specialties", "mediums", "genres", "style_words")  # the fields of the facts a profile may state
+FORMS = MEDIUM_FORMS | SUBJECT_FORMS | GENRE_FORMS | STYLE_FORMS | FORMAT_FORMS | OWN_FORMS
+# The fields of the facts whose values a profile may state, in the order the vector's text lists them.
+STATED = ("specialties", "own_words", "mediums", "genres", "formats", "style_words")
 _PAIRED = ("prop or weapon", "vehicle or mech", "interface or icons")  # each said on its own: "prop or weapon art"
+# A fact that holds for part of the works may only be said after one of these, in the same clause: the first is
+# the template's. "With" is a hedge for a genre ("with fantasy themes") and none for a manner or a format.
+_HEDGES = {
+    "worlds": ("with", "partly", "some", "including", "also"),
+    "manners": ("partly", "some", "including", "also"),
+    "formats": ("including", "partly", "some", "also"),
+}
 
 # The only words a written profile may use besides the facts. None of them says what the art is, what it is
-# made with, how much of it there is, or how good it is: no "paints", "concept", "illustration", "mostly".
+# made with or how good it is, and the three that say how much of it ("partly", "some", "including") can only
+# say less: no "paints", "concept", "illustration", "mostly".
 GLUE = frozenset(
     "a an the and or with in of for on as to by across plus alongside both also that which who whose their its is "
     "are art artist artwork artworks work works working piece pieces image images style styles styled look looks "
     "theme themes themed subject subjects medium media focus focused focusing focuses mix mixes mixing combining "
     "combines done made rendered rendering featuring features colour color colours colors tone tones palette "
-    "palettes shading".split()
+    "palettes shading partly some including".split()
 )
 
 WRITE_PROMPT = f"""You write one sentence for a search index of artists. It says what kind of art an artist makes, \
@@ -139,17 +275,25 @@ may say only what the facts say.
 
 Rules
 - Use the facts as they are given, word for word. You need not use every one. Add no fact of your own.
-- One sentence in plain language that ends with a full stop, {MAX_PROFILE} characters at most. Do not name or \
-address anyone. Write it the way a directory of artists would, short and natural, with the style and theme words \
-before the kind of art where that reads well. From "subjects: environment / medium: 3D / themes: science fiction \
-/ style: low-poly" a good sentence is "Low-poly science fiction environments in 3D." From "subjects: creature, \
-character / medium: traditional media / themes: horror / manner: realistic" a good one is "Realistic horror \
-creature and character art in traditional media."
+- One sentence in plain language that ends with a full stop, {MAX_PROFILE} characters at most, and much shorter \
+when the facts are few. Do not name or address anyone. Write it the way a directory of artists would, short and \
+natural, with the style, manner and theme words before the kind of art.
+- The kinds of art are listed as they are to be said: "character" is character art, and "character designs" is \
+that, not "character art".
+- A fact under "most of the works" is said as "mostly dragons", or put in the place of the kind of art: \
+"dragon art".
+- A fact under "only part of the works" is true of some works and not of the rest. Say it only as it is listed, \
+after its "with", "partly" or "including", and never before the kind of art.
+- From "kinds of art: environment / medium: 3D / themes: science fiction / style: saturated" a good sentence \
+is "Saturated science fiction environments in 3D." From "kinds of art: creature designs, character / most of \
+the works: dragons / manner: realistic / only part of the works: with horror themes; including creature sheets" \
+a good one is "Realistic creature designs and character art, mostly dragons, with horror themes, including \
+creature sheets."
 - Besides the facts, use only these plain words: {" ".join(sorted(GLUE))}.
 - So: no numbers. No names of people, studios, games, films or software. No praise or judgement (stunning, \
 talented, skilled, detailed, unique). Nothing about experience, career, clients, tools, prices or availability. \
-No word for how much or how often (mostly, often, sometimes, only, varied). No "concept", "illustration", \
-"design", "painting" or "drawing" unless the facts have that word.
+No word of your own for how much or how often (mainly, often, sometimes, only, varied). No "concept", \
+"illustration", "design", "painting" or "drawing" unless the facts have that word.
 
 Answer with one JSON object with one field, profile."""
 _WRITTEN = {"type": "object", "properties": {"profile": {"type": "string"}}, "required": ["profile"]}
@@ -200,59 +344,110 @@ def _transact[T](db: pathlib.Path | str | None, work: Callable[[sqlite3.Connecti
     return tagging._transact(db, with_table)
 
 
-def _leading(counts: Counter[str], need: int, order: Iterable[str]) -> list[str]:
-    """The values of `order` that at least `need` works have, the one with most works first."""
-    return sorted((value for value in order if counts[value] >= need), key=lambda value: -counts[value])
+def _plain(tag: str) -> str:
+    """An artist's tag as it is compared: lowercase, with its "_" and "-" taken out."""
+    return re.sub(r"[_-]", "", tag.lower())
+
+
+def _leading(counts: Counter[str], need: int, order: Iterable[str], at_most: int) -> list[str]:
+    """The `at_most` values of `order` that most works have, of those at least `need` works have."""
+    return sorted((value for value in order if counts[value] >= need), key=lambda value: -counts[value])[:at_most]
 
 
 def facts_of(works: list[dict[str, Any]]) -> tuple[dict[str, Any], str | None]:
     """The facts about one artist, and why they get no profile (one of REASONS) or None.
 
-    `works` has one entry per collected work: its id, its verified `result` (None when it has none) and what
-    its own title and tags `declared` about AI. A work counts when it has a result and is not explicit, not
-    not_artwork and not declared AI-made. Each counted work adds one to its medium and to each of its
-    subjects, genres and style words; its description is never read.
+    `works` has one entry per collected work: its id, its verified `result` (None when it has none), what its
+    own title and tags `declared` about AI, and the artist's own `tags` on it. A work counts when it has a
+    result and is not explicit (flagged, or rated so), not not_artwork and not declared AI-made. Each counted
+    work adds one to its medium and to each of its subjects, genres, style words and formats, and to each of
+    OWN_WORDS that one of its tags spells and one of its verified subjects bears out. Its description is never
+    read. The module's docstring says which of those counts make a fact; `hedged` lists the facts that hold
+    for part of the works only, and may not be stated flat.
     """
+
+    def explicit(result: dict[str, Any]) -> bool:
+        return result["explicit"] or result.get("rating") == "explicit"
+
+    analyzed = [work["result"] for work in works if work["result"]]
     counted = [
         work
         for work in works
         if work["result"]
         and work["declared"] != "yes"
-        and not work["result"]["explicit"]
+        and not explicit(work["result"])
         and not work["result"]["not_artwork"]
     ]
-    counts: dict[str, Counter[str]] = {field: Counter() for field in ("medium", "subjects", "genres", "style_words")}
+    fields = ("medium", "subjects", "genres", "style_words", "formats", "own_words")
+    counts: dict[str, Counter[str]] = {field: Counter() for field in fields}
     for work in counted:
-        counts["medium"][work["result"]["medium"]] += 1
-        for field in ("subjects", "genres", "style_words"):
-            counts[field].update(set(work["result"][field]))
-    # the share rounded up to whole works, and one at least: with no work counted, nothing is a fact
-    need, need_style = (max(1, -(-len(counted) * percent // 100)) for percent in (CLEAR_PERCENT, STYLE_PERCENT))
-    analyzed = [work["result"] for work in works if work["result"]]
-    ai, explicit = sum(work["declared"] == "yes" for work in works), sum(result["explicit"] for result in analyzed)
+        result = work["result"]
+        tags = {_plain(tag) for tag in work.get("tags", ())}
+        counts["medium"][result["medium"]] += 1
+        counts["subjects"].update(set(result["subjects"]))
+        counts["genres"].update(set(result["genres"]))
+        counts["style_words"].update({COLOUR_WORDS.get(word, word) for word in result["style_words"]})
+        counts["formats"].update(
+            {value for value in result.get("formats") or () if _is_format(value, result["subjects"])}
+        )
+        counts["own_words"].update(
+            word for word, (under, spelled) in OWN_WORDS.items() if tags & spelled and under & set(result["subjects"])
+        )
+    part, clear, nearly_all = (
+        max(MIN_SUPPORT, -(-len(counted) * percent // 100))
+        for percent in (PART_PERCENT, CLEAR_PERCENT, NEARLY_ALL_PERCENT)
+    )
+    most = max(MIN_SUPPORT, len(counted) // 2 + 1)
+    worlds = _leading(counts["genres"], part, WORLD_FORMS, AT_MOST["worlds"])
+    manners = _leading(counts["genres"], part, MANNER_FORMS, AT_MOST["manners"])
+    # A format is a fact only once every counted work has been sorted by format: until then the counts are short.
+    formats = []
+    if all(work["result"].get("formats") is not None for work in counted):
+        formats = _leading(counts["formats"], part, sorted(counts["formats"]), AT_MOST["formats"])
+    # One thing is said once. "Portraits" the format is the tag "portrait": the format stays. "Adoptable designs" is
+    # the artist's word for what its format can only call designs for sale or adoption: the artist's word stays.
+    said_already = {_spellings(value)[0] for value in formats}
+    own = [word for word in OWN_WORDS if word not in said_already]
+    own = _leading(counts["own_words"], most, own, AT_MOST["own_words"])
+    formats = [value for value in formats if SAID_BY_THE_ARTIST.get(value) not in own]
+    mediums = _leading(counts["medium"], clear, MEDIUM_FORMS, 1)
+    styles = Counter(
+        {
+            word: count
+            for word, count in counts["style_words"].items()
+            if count >= (clear if word in COLOUR_WORDS.values() else nearly_all)
+            and (word, *mediums) != ("lineart", "digital line art")  # said once, as the medium
+        }
+    )
+    ai, explicits = sum(work["declared"] == "yes" for work in works), sum(map(explicit, analyzed))
     facts = {
         "works": len(works),
         "eligible": len(counted),
         "declared_ai": ai,
-        "explicit": explicit,
+        "explicit": explicits,
         "not_artwork": sum(result["not_artwork"] for result in analyzed),
         "counted": sorted(work["id"] for work in counted),
         "counts": {
             field: dict(sorted(counter.items(), key=lambda item: (-item[1], item[0])))
             for field, counter in counts.items()
         },
-        "mediums": _leading(counts["medium"], need, MEDIUM_FORMS),
-        "specialties": _leading(counts["subjects"], need, SUBJECT_FORMS),
-        "genres": _leading(counts["genres"], need, GENRE_FORMS)[:LEADING],
-        "style_words": _leading(counts["style_words"], need_style, STYLE_FORMS)[:LEADING],
+        "specialties": _leading(counts["subjects"], part, SUBJECT_FORMS, AT_MOST["specialties"]),
+        "own_words": own,
+        "mediums": mediums,
+        "genres": worlds + manners,
+        "formats": formats,
+        "style_words": _leading(styles, 1, STYLE_FORMS, AT_MOST["style_words"]),
+        "hedged": [world for world in worlds if counts["genres"][world] < clear]
+        + [manner for manner in manners if counts["genres"][manner] < most]
+        + [value for value in formats if counts["formats"][value] < most],
     }
     if 2 * ai > len(works):
         return facts, "mostly_ai_declared"
-    if 2 * explicit > len(analyzed):
+    if 2 * explicits > len(analyzed):
         return facts, "mostly_explicit"
     if len(counted) < MIN_WORKS:
         return facts, "too_few_works"
-    return facts, None if any(facts[field] for field in STATED) else "nothing_clear"
+    return facts, None if _stated(facts) else "nothing_clear"
 
 
 def open_evidence(tagline: str | None, works: list[tuple[str, list[str], str | None]], now: datetime) -> list[dict]:
@@ -280,7 +475,7 @@ def open_evidence(tagline: str | None, works: list[tuple[str, list[str], str | N
         if not published or now - datetime.fromisoformat(published) > timedelta(days=RECENT_DAYS):
             continue
         for tag in tags:
-            word = re.sub(r"[_-]", "", tag.lower())
+            word = _plain(tag)
             if _CLOSED_TAG.search(word):
                 return []
             kind = "commissions" if _OPEN_TAG.fullmatch(word) else "hire" if _HIRE_TAG.fullmatch(word) else None
@@ -296,68 +491,128 @@ def _open_sentence(evidence: list[dict]) -> str:
     return " " + OPEN_SENTENCE["commissions" if any(item["kind"] == "commissions" for item in evidence) else "hire"]
 
 
+def _spellings(term: str) -> tuple[str, ...]:
+    """How a fact may be spelled, the template's way first. A format this module does not know is said as it is."""
+    return FORMS.get(term) or (f"{term} work", term)
+
+
+def _kind(term: str) -> str:
+    return "worlds" if term in WORLD_FORMS else "manners" if term in MANNER_FORMS else "formats"
+
+
+def _stated(facts: dict[str, Any]) -> dict[str, tuple[str, ...]]:
+    """Every fact a profile of these facts may state -> the words one of which must hedge it, none for a flat one."""
+    terms = (term for field in STATED for term in facts[field] if term != COMMON_MEDIUM)
+    return {term: _HEDGES[_kind(term)] if term in facts["hedged"] else () for term in terms}
+
+
 def _and(items: list[str]) -> str:
     return " and ".join(filter(None, [", ".join(items[:-1]), *items[-1:]]))
 
 
+def _kinds(facts: dict[str, Any]) -> tuple[list[str], list[str]]:
+    """The kinds of art a profile names, and what most of the works are, more closely than that.
+
+    A kind is a subject, as the tagging stage spells it, or the artist's own word for it: "character designs"
+    takes the place of "character", so that nothing reads "character art, mostly character designs". Most of
+    the works are what the artist's other words say, and a format that most works have.
+    """
+    mostly = facts["own_words"] + [_spellings(value)[0] for value in facts["formats"] if value not in facts["hedged"]]
+    designs = {subject: f"{_spellings(subject)[0]} designs" for subject in facts["specialties"]}
+    kinds = [designs[subject] if designs[subject] in mostly else subject for subject in facts["specialties"]]
+    return kinds, [word for word in mostly if word not in kinds]
+
+
+def _hedged(facts: dict[str, Any]) -> list[str]:
+    """The clauses that say what holds for part of the works, each begun by the hedge of its kind."""
+    said = {kind: [_spellings(term)[0] for term in facts["hedged"] if _kind(term) == kind] for kind in _HEDGES}
+    clauses = [f"with {_and(said['worlds'])} themes"] if said["worlds"] else []
+    clauses += [f"partly in {'an' if manner[0] in 'aeiou' else 'a'} {manner} style" for manner in said["manners"]]
+    return clauses + ([f"including {_and(said['formats'])}"] if said["formats"] else [])
+
+
 def template(facts: dict[str, Any]) -> str:
-    """One sentence that states every fact above the threshold and nothing else, the same way for every artist."""
-    said = {term: FORMS[term][0] for term in FORMS}
-    plain = [said[subject] for subject in facts["specialties"] if subject not in _PAIRED]
-    kinds = [f"{_and(plain)} art"] if plain else []
-    kinds += [f"{said[subject]} art" for subject in facts["specialties"] if subject in _PAIRED]
-    text = _and(kinds) or "artwork"
-    if facts["mediums"]:
-        text += f" in {_and([said[medium] for medium in facts['mediums']])}"
-    if worlds := [said[genre] for genre in facts["genres"] if genre in WORLD_FORMS]:
-        text += f", with {_and(worlds)} themes"
-    styles = [said[word] for word in facts["style_words"]] + [said[g] for g in facts["genres"] if g in MANNER_FORMS]
-    if styles:
-        text += f", in {'an' if styles[0][0] in 'aeiou' else 'a'} {', '.join(styles)} style"
+    """One sentence that states every fact these facts allow and nothing else, the same way for every artist:
+    what leads it is what holds for the body of work, and what holds for part of it comes after, hedged."""
+    said = {term: _spellings(term)[0] for term in _stated(facts)}
+    flat = [term for term in facts["genres"] if term not in facts["hedged"]]
+    kinds, mostly = _kinds(facts)
+    plain = [said[kind] for kind in kinds if kind in SUBJECT_FORMS and kind not in _PAIRED]
+    named = [kind for kind in kinds if kind not in SUBJECT_FORMS] + ([f"{_and(plain)} art"] if plain else [])
+    named += [f"{said[kind]} art" for kind in kinds if kind in _PAIRED]
+    lead = [", ".join(said[word] for word in facts["style_words"])]
+    lead += [said[manner] for manner in flat if manner in MANNER_FORMS]
+    lead += [_and([said[world] for world in flat if world in WORLD_FORMS]), _and(named) or "artwork"]
+    text = " ".join(filter(None, lead))
+    if media := [said[medium] for medium in facts["mediums"] if medium in said]:
+        text += f" in {_and(media)}"
+    if mostly:
+        text += f", mostly {_and(mostly)}"
+    text = ", ".join([text, *_hedged(facts)])
     return text[0].upper() + text[1:] + "."
 
 
 def unsupported(text: object, facts: dict[str, Any]) -> str | None:
     """Why this text may not be the profile of these facts. None when every word of it is supported.
 
-    It must be one sentence of MAX_PROFILE characters at most. Once every fact above the threshold is taken
-    out of it, in any spelling of FORMS, each word left must be one of GLUE. So anything else is refused,
-    whatever it is: a medium, subject, genre or style word the facts do not have, a number, a name, praise,
-    a claim about experience, clients, software or availability. And it must state two of the facts at least.
+    It must be one sentence of MAX_PROFILE characters at most. Once every fact it may state is taken out of
+    it, in any spelling of FORMS, each word left must be one of GLUE. So anything else is refused, whatever
+    it is: a medium, subject, genre, format or style word the facts do not have, a number, a name, praise, a
+    claim about experience, clients, software or availability. A fact that holds for part of the works must
+    come after a hedge in its own clause ("with", "partly", "including"). And two facts at least are stated.
 
     ponytail: each fact is checked on its own. "Painterly fantasy character art" passes when each of the three
     holds for its share of the works, whether or not the same works have all three, and nothing checks which
     fact a sentence leads with. Counting pairs of facts over the works is the upgrade, if a critic finds a
-    profile that joins what the works keep apart. The template keeps each kind of fact in a clause of its own.
+    profile that joins what the works keep apart.
     """
     if not isinstance(text, str) or len(text) > MAX_PROFILE:
         return f"it must be a text of {MAX_PROFILE} characters at most"
     if not re.fullmatch(r"[^.!?\n]*\w[^.!?\n]*\.", text.strip()):
         return "it must be one sentence that ends with a full stop"
-    rest, terms, used = text.strip().lower()[:-1], [term for field in STATED for term in facts[field]], set()
-    spellings = sorted(((form.lower(), term) for term in terms for form in FORMS[term]), key=lambda pair: -len(pair[0]))
-    for form, term in spellings:  # the longest first: "dark fantasy" before "fantasy"
-        rest, times = re.subn(rf"(?<![\w-]){re.escape(form)}(?![\w-])", " , ", rest)
-        if times:
+    whole, stated, used = text.strip().lower()[:-1], _stated(facts), set()
+    spellings = [(form.lower(), term) for term in stated for form in _spellings(term)]
+    # "mostly" is no plain word: it may stand only before what most of the works are. A format that part of them
+    # are is refused below all the same, for want of a hedge.
+    most = {*facts["own_words"], *facts["formats"]}
+    spellings += [(f"mostly {form}", term) for form, term in spellings if term in most]
+    rest = whole
+    for form, term in sorted(spellings, key=lambda pair: -len(pair[0])):  # the longest first: "dark fantasy"
+        said = re.compile(rf"(?<![\w-]){re.escape(form)}(?![\w-])")
+        for found in said.finditer(rest):
+            clause = whole[
+                max(whole.rfind(",", 0, found.start()), whole.rfind(";", 0, found.start())) + 1 : found.start()
+            ]
+            if stated[term] and not re.search(rf"\b(?:{'|'.join(stated[term])})\b", clause):
+                return f'"{form}" is true of only part of the works: say it after "{stated[term][0]}", never flat'
             used.add(term)
+        rest = said.sub(lambda found: " " * len(found.group()), rest)  # the same length: places stay where they were
     for word in re.findall(r"[^\s,;]+", rest):
         if word not in GLUE:
             return f'"{word}" is not one of the facts and not one of the plain words allowed'
-    return None if len(used) >= min(2, len(terms)) else "it must state at least two of the facts"
+    # "character designs" states two facts: the artist's word, and the subject it is a kind of
+    used |= {subject for subject in facts["specialties"] if f"{_spellings(subject)[0]} designs" in used}
+    return None if len(used) >= min(2, len(stated)) else "it must state at least two of the facts"
 
 
 def _question(facts: dict[str, Any]) -> str:
-    """All the model is told about an artist: the facts above the threshold, as the template would spell them."""
+    """All the model is told about an artist: the facts a profile may state, as the template would spell them."""
+    stated = _stated(facts)
+    kinds, mostly = _kinds(facts)
+
+    def flat(terms: Iterable[str]) -> str:
+        return ", ".join(_spellings(term)[0] for term in terms if term in stated and not stated[term])
+
     said = {
-        "subjects": facts["specialties"],
-        "medium": facts["mediums"],
-        "themes": [genre for genre in facts["genres"] if genre in WORLD_FORMS],
-        "manner": [genre for genre in facts["genres"] if genre in MANNER_FORMS],
-        "style": facts["style_words"],
+        "kinds of art": flat(kinds),
+        "most of the works": ", ".join(mostly),
+        "medium": flat(facts["mediums"]),
+        "manner": flat(term for term in facts["genres"] if term in MANNER_FORMS),
+        "themes": flat(term for term in facts["genres"] if term in WORLD_FORMS),
+        "style": flat(facts["style_words"]),
+        "only part of the works": "; ".join(_hedged(facts)),
     }
-    return "Facts" + "".join(
-        f"\n{name}: {', '.join(FORMS[term][0] for term in terms)}" for name, terms in said.items() if terms
-    )
+    return "Facts" + "".join(f"\n{name}: {terms}" for name, terms in said.items() if terms)
 
 
 def _written(client: httpx.Client, facts: dict[str, Any]) -> str | None:
@@ -401,8 +656,13 @@ def _embed(client: httpx.Client, texts: list[str]) -> list[list[float]]:
 
 
 def embedded_text(profile: str, facts: dict[str, Any]) -> str:
-    """What an artist's vector is made of: the profile, then the leading facts under the names search filters on."""
-    names = {"specialties": "Specialties", "mediums": "Mediums", "genres": "Genres", "style_words": "Style"}
+    """What an artist's vector is made of: the profile, then every fact by its name, as search filters on it.
+
+    The second part does not depend on how a sentence happens to be worded, and has what the sentence leaves
+    out: the medium everybody has, and each format as the tagging stage spells it.
+    """
+    names = {"specialties": "Specialties", "own_words": "In the artist's words", "mediums": "Mediums"}
+    names |= {"genres": "Genres", "formats": "Formats", "style_words": "Style"}
     return profile + "".join(f"\n{names[field]}: {', '.join(facts[field])}." for field in STATED if facts[field])
 
 
@@ -468,6 +728,8 @@ def run(
     with tagging._client(ollama_url, transport) as client:
         listed = _listed(db)
         results, declared = tagging.results(TAGGER, db=db, verifier=TAGGER), tagging.declared_ai(TAGGER, db)
+        # A tagline is quoted as evidence, so only one that was read and found to hold no private contact is used.
+        quotable = {key for key, answer in tagging.contacts(TAGGER, db).items() if answer == "no"}
         rows, taglines, tagged, stored = _transact(db, read)
         collected: dict[str, list[Any]] = {}
         for key, *work in rows:
@@ -481,15 +743,14 @@ def run(
                 counts["waiting_for_tags"] += 1
                 stale |= {key} & stored.keys()
                 continue
+            own = [(work_id, json.loads(tags), at) for work_id, _, tags, at in works]
             facts, reason = facts_of(
                 [
-                    {"id": work_id, "result": results.get(work_id), "declared": declared.get(work_id)}
-                    for work_id, *_ in works
+                    {"id": work_id, "result": results.get(work_id), "declared": declared.get(work_id), "tags": tags}
+                    for work_id, tags, _ in own
                 ]
             )
-            evidence = open_evidence(
-                taglines.get(key), [(work_id, json.loads(tags), at) for work_id, _, tags, at in works], now
-            )
+            evidence = open_evidence(taglines.get(key) if key in quotable else None, own, now)
             basis = hashlib.sha256(json.dumps([versions, facts, evidence], sort_keys=True).encode()).hexdigest()
             if stored.get(key) == basis:
                 counts["unchanged"] += 1
@@ -535,7 +796,8 @@ def profiles(db: pathlib.Path | str | None = None) -> list[dict[str, Any]]:
     """Every artist's profile, in key order, for the push stage. Never an excluded or a removed artist's.
 
     Each has artist_key, the two texts with their versions (and written_by_model: False when the written text
-    is the template again), the search filters mediums and specialties, the leading genres and style_words,
+    is the template again), the search filters mediums and specialties, the leading genres, formats,
+    style_words and own_words (the artist's own), hedged (which of those hold for part of the works only),
     open_for_work (True, or None for unknown) with its open_evidence, the facts with their counts, and the
     embedding as 1,024 numbers.
     """
@@ -553,7 +815,7 @@ def profiles(db: pathlib.Path | str | None = None) -> list[dict[str, Any]]:
                 "written": composed,
                 "written_version": composed_version,
                 "written_by_model": bool(by_model),
-                **{field: facts[field] for field in ("mediums", "specialties", "genres", "style_words")},
+                **{field: facts[field] for field in (*STATED, "hedged")},
                 "open_for_work": True if json.loads(evidence) else None,
                 "open_evidence": json.loads(evidence),
                 "facts": facts,
@@ -572,15 +834,21 @@ def sample(count: int, seed: int, db: pathlib.Path | str | None = None) -> list[
     """A random sample of the profiles for the critic, each with the paths of the artist's cached images.
 
     `images` are the works the facts were counted over; `images_left_out` are the artist's other cached works
-    (flagged or declared AI-made). The order is a hash of the seed and the artist, as in tagging.sample().
+    (flagged or declared AI-made). `own_tags` are, for each word of the artist's own that the profile uses, the
+    tags that say it, as the artist wrote them on those works: the support a claim has that no image shows.
+    The order is a hash of the seed and the artist, as in tagging.sample().
     """
     chosen = sorted(profiles(db), key=lambda row: hashlib.sha256(f"{seed}:{row['artist_key']}".encode()).digest())
-    query = "SELECT artist_key, deviation_id, image_file FROM works WHERE image_file IS NOT NULL ORDER BY 2"
-    cached = _transact(db, lambda conn: conn.execute(query).fetchall())
+    query = "SELECT artist_key, deviation_id, image_file, tags FROM works ORDER BY 2"
+    collected = _transact(db, lambda conn: conn.execute(query).fetchall())
     found = []
     for row in chosen[: max(count, 0)]:
         counted = set(row["facts"]["counted"])
-        images = [(work_id, name) for key, work_id, name in cached if key == row["artist_key"]]
+        works = [
+            (work_id, name, json.loads(tags)) for key, work_id, name, tags in collected if key == row["artist_key"]
+        ]
+        images = [(work_id, name) for work_id, name, _ in works if name]
+        written = {tag for work_id, _, tags in works if work_id in counted for tag in tags}
         found.append(
             {
                 "artist": row["artist_key"],
@@ -590,6 +858,10 @@ def sample(count: int, seed: int, db: pathlib.Path | str | None = None) -> list[
                 "facts": row["facts"],
                 "open_for_work": row["open_for_work"],
                 "open_evidence": row["open_evidence"],
+                "own_tags": {
+                    word: sorted(tag for tag in written if _plain(tag) in OWN_WORDS[word][1])
+                    for word in row["own_words"]
+                },
                 "images": [str(library.image_dir() / name) for work_id, name in images if work_id in counted],
                 "images_left_out": [
                     str(library.image_dir() / name) for work_id, name in images if work_id not in counted
