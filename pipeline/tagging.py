@@ -42,7 +42,7 @@ from typing import Any
 
 import httpx
 
-from pipeline import library, store
+from pipeline import config, library, store
 
 OLLAMA_URL = "http://127.0.0.1:11434"
 DEFAULT_MODEL = "qwen3.8:latest"  # round 1's blind critic preferred it to gemma4:26b, 17 works to 11
@@ -604,6 +604,7 @@ def _post(client: httpx.Client, path: str, body: dict[str, Any]) -> httpx.Respon
     Ollama's answer to an image it cannot decode, and the same bytes would get it again.
     """
     for wait in (*RETRY_AFTER, None):
+        config.wait_while_paused()  # before every try: a request sent while paused would load the model again
         try:
             response = client.post(path, json=body)
             if response.status_code != 400:
