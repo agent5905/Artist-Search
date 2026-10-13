@@ -21,6 +21,12 @@ a work or an artist that is kept is written beside it as a mark: see work_marks(
 later stage reads to decide what is published. A work's fetched_at is when it was last seen and still qualified.
 Every function that reads or writes the tables takes an optional `db` path; the default is config.LOCAL_DB. A
 work whose image_file is NULL has no cached image: the analysis stage must leave it alone.
+
+A reading is tied to what was read. Whatever a model makes of a work's image or of an artist's words is kept
+with fingerprint() of exactly what the model was given, and is used only while that is still the fingerprint of
+the image or the words as they are: otherwise it is as if it had never been made. For an image the rule is
+IMAGE, below, and every stage that keeps or reads a reading of an image goes through it; the tagging stage has
+the same for words. A store made before readings carried fingerprints is not opened at all (see _open).
 """
 
 import base64
@@ -36,7 +42,7 @@ import unicodedata
 from collections.abc import Iterable, Iterator, Mapping
 from datetime import UTC, datetime
 from typing import Any
-from urllib.parse import unquote
+from urllib.parse import unquote, urlsplit
 
 import httpx
 
@@ -97,7 +103,27 @@ CREATE TABLE IF NOT EXISTS work_sizes (
     width INTEGER NOT NULL CHECK (width > 0),
     height INTEGER NOT NULL CHECK (height > 0)
 ) STRICT;
+-- The image a work has in the cache: which file on DeviantArt it is an image of, and its own fingerprint. A
+-- work whose thumbnail has come to show another file has an image that is out of date until it is fetched again.
+CREATE TABLE IF NOT EXISTS work_images (
+    deviation_id TEXT PRIMARY KEY,
+    source TEXT NOT NULL,            -- own_file() of the thumbnail the work was stored with when it was fetched
+    fingerprint TEXT NOT NULL CHECK (length(fingerprint) = 64)  -- fingerprint() of the cached file's bytes
+) STRICT;
 """
+# The fingerprint of the image a work has now, for a query that names the work's row `w`. NULL, which equals
+# nothing, while the work has no cached image or the one it has is of a file its thumbnail no longer shows. A
+# reading of an image is current while its own fingerprint equals this, and no reader takes one that is not.
+IMAGE = (
+    "(SELECT i.fingerprint FROM work_images i "
+    "WHERE i.deviation_id = w.deviation_id AND i.source = own_file(w.thumb_url))"
+)
+SHAPE = 1  # the file's user_version once every reading in it carries a fingerprint
+UNMIGRATED = (
+    "this store was made before readings carried a fingerprint of what was read, and nothing was done to it. "
+    "Stop every stage that uses it, then run once: uv run python -m pipeline.tagging --migrate --backup PATH "
+    "(PATH: a copy of the store from before any words or thumbnails of works already read last changed)"
+)
 # A profiles table from an earlier version of this module (see _upgrade). It is rebuilt with the artists it
 # lists and when each was fetched, and nothing else: what it held was kept under looser rules, some of it in the
 # wrong column, and the next run fills in what still qualifies.
@@ -390,6 +416,26 @@ def is_thumbnail(value: object) -> bool:
     return isinstance(value, str) and bool(_THUMBNAIL.fullmatch(value))
 
 
+def own_file(address: object) -> str | None:
+    """The file an image address shows, whatever size it is cut to and whenever it was signed: DeviantArt's own
+    name for it, <id>-<uuid>.<type> (see _THUMBNAIL). Two addresses of one work show the same image when this
+    is the same, and an artist who puts another file under the work changes it. None for no address.
+
+    ponytail: an address of any other shape is known by its path up to the cut, because the other stages'
+    tests store works under short made-up addresses. All 5,126 thumbnails kept on 2026-10-13 have the name.
+    """
+    if not isinstance(address, str):
+        return None
+    path = urlsplit(address).path.partition("/v1/")[0]
+    name = path.rpartition("/")[2]
+    return name if _OWN_FILE.fullmatch(name) else path
+
+
+def fingerprint(given: bytes | str) -> str:
+    """What a reading is known by: the sha256 of exactly what the model was given, an image's bytes or a text."""
+    return hashlib.sha256(given if isinstance(given, bytes) else given.encode()).hexdigest()
+
+
 def _signature(query: str) -> bool:
     """True when a query is DeviantArt's signature and nothing else (see image_address)."""
     token = _IMAGE_TOKEN.fullmatch(query)
@@ -426,13 +472,14 @@ def checked_work(
     thumb_url: object,
     published: object,
     thumb_size: object = None,
+    fetched: object = None,
 ) -> tuple[str, str, str | None, str, str | None, str | None]:
     """One work's values as they are stored: id, page, title, tags as JSON, thumbnail, time published.
 
     ValueError for an id that is not a UUID or an address that is not acceptable, and its subclass ContactInTitle
     for a title or an address that holds contact details. A tag that is not acceptable is left out, and the work
     is still good. A thumbnail given as None is no thumbnail given: store_artist() keeps the one it has, and
-    takes no work without one. `thumb_size` is read by store_artist() (see _size).
+    takes no work without one. `thumb_size` and `fetched` are read by store_artist() (see _size, and there).
     """
     title_kept, tags_kept = _title(title), json.dumps(_tags(tags))
     return (
@@ -478,9 +525,18 @@ def _open(db: pathlib.Path | str | None) -> Iterator[sqlite3.Connection]:
     The tables are made when there are none, and a table that exists is never changed here. Other stages open
     the file through this for tables of their own, and one of them doing so is how an earlier version came to
     alter the profiles table under a collector that was still writing to it. Only store_artist() upgrades.
+
+    SystemExit, with UNMIGRATED and before anything is made or read, for a store that has works in it and not
+    the mark of SHAPE: its readings carry no fingerprints. Every stage opens the file through here, so none
+    half-works on such a store, and none changes its tables: the migration does, once, with every stage stopped.
     """
     with store._open(db) as conn:
+        if conn.execute("PRAGMA user_version").fetchone()[0] < SHAPE:
+            if conn.execute("SELECT 1 FROM sqlite_master WHERE name = 'works'").fetchone():
+                raise SystemExit(UNMIGRATED)
+            conn.execute(f"PRAGMA user_version = {SHAPE}")  # a store with no works yet is made in this shape
         conn.executescript(_SCHEMA)
+        conn.create_function("own_file", 1, own_file, deterministic=True)  # for IMAGE
         yield conn
 
 
@@ -496,10 +552,13 @@ def _upgrade(conn: sqlite3.Connection) -> None:
         conn.executescript(_UPGRADE)
 
 
-def _cached_name(work_id: str) -> str | None:
-    """The name of the work's file in the cache, when there is one."""
-    names = (work_id + extension for extension, _ in IMAGE_TYPES.values())
-    return next((name for name in names if (image_dir() / name).is_file()), None)
+def _cached_name(work_id: str, named: str | None = None) -> str | None:
+    """The name of the work's file in the cache, when there is one. Of two, the one its row does not name yet:
+    an image fetched again came in another type, and the file it replaces goes when no row names it any longer
+    (drop_orphans), which is after the new one is saved and named."""
+    names = [work_id + extension for extension, _ in IMAGE_TYPES.values()]
+    names = [name for name in names if (image_dir() / name).is_file()]
+    return next((name for name in names if name != named), named if named in names else None)
 
 
 def _delete(conn: sqlite3.Connection, column: str, value: str, but: str = "") -> None:
@@ -595,6 +654,12 @@ def store_artist(
     the work is marked REFUSED. A work that is kept and is not among `works` is left as it is: its fetched_at is
     when it was last seen and still qualified. A work kept under another artist's key is not taken from them.
 
+    A work's cached image is written down with its fingerprint as the image of the file its thumbnail shows
+    (see own_file) when the work is first stored with one. From then on only the caller's word, `fetched` set
+    to True in the work, that it has fetched the image again for this answer makes it the image of the
+    thumbnail stored now. A thumbnail that comes to show another file with no such word leaves the image out
+    of date: no reading of it is used, and nothing reads it, until it is fetched (see IMAGE).
+
     `marks` is what this turn learned about the artist's other kept works (see _mark_works). The artist's own
     mark goes, unless it is the RENAMED mark that ties this key to another. `old_keys` are the keys this
     account was kept under before it took this handle: each is marked RENAMED and linked to this one, so that
@@ -655,7 +720,8 @@ def store_artist(
         held: dict[str, str | None] = {}
         for (work_id, page, title, tags, thumb, published), work in zip(rows, works, strict=True):
             kept = conn.execute(
-                "SELECT artist_key, title, thumb_url, published_at, tags FROM works WHERE deviation_id = ?", (work_id,)
+                "SELECT artist_key, title, thumb_url, published_at, tags, image_file FROM works WHERE deviation_id = ?",
+                (work_id,),
             ).fetchone()
             if kept and kept[0] not in mine:
                 continue
@@ -667,13 +733,21 @@ def store_artist(
                 thumb, published = thumb or kept[2], published or kept[3]
             if thumb is None:
                 raise ValueError("a new work with no thumbnail")
+            name, fetched = _cached_name(work_id, kept[5] if kept else None), work.get("fetched") is True
             try:
                 conn.execute(
                     "INSERT OR REPLACE INTO works (deviation_id, artist_key, page_url, title, tags, thumb_url, "
                     "published_at, image_file, fetched_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    (work_id, key, page, title, tags, thumb, published, _cached_name(work_id), store._now()),
+                    (work_id, key, page, title, tags, thumb, published, name, store._now()),
                 )
                 conn.execute("DELETE FROM work_marks WHERE deviation_id = ?", (work_id,))  # stored: it qualifies
+                known = conn.execute("SELECT 1 FROM work_images WHERE deviation_id = ?", (work_id,)).fetchone()
+                if name and (fetched or not known):  # an image nobody says was fetched is of the file it was kept with
+                    shown = own_file(thumb if fetched or not kept else kept[2])
+                    conn.execute(
+                        "INSERT OR REPLACE INTO work_images (deviation_id, source, fingerprint) VALUES (?, ?, ?)",
+                        (work_id, shown, fingerprint((image_dir() / name).read_bytes())),
+                    )
                 size = _size(work.get("thumb_size"))
                 if size:
                     conn.execute(
@@ -781,12 +855,23 @@ def thumb_sizes(db: pathlib.Path | str | None = None) -> dict[str, tuple[int, in
         return {work_id: (width, height) for work_id, width, height in rows}
 
 
-def cached_image(work_id: str, db: pathlib.Path | str | None = None) -> bool:
-    """True when the work's row names a cached image and that file is there."""
+def cached_image(work_id: str, db: pathlib.Path | str | None = None, thumb: object = None) -> bool:
+    """True when the work's row names a cached image and that file is there. Given the thumbnail an answer now
+    gives for the work, also only when the image is of the file that thumbnail shows (see own_file): when the
+    artist has put another file under the work, the image has to be fetched again."""
     work_id = deviation_id(work_id)
+    query = "SELECT image_file, source FROM works LEFT JOIN work_images USING (deviation_id) WHERE deviation_id = ?"
     with _open(db) as conn:
-        row = conn.execute("SELECT image_file FROM works WHERE deviation_id = ?", (work_id,)).fetchone()
-    return bool(row and row[0] and (image_dir() / row[0]).is_file())
+        row = conn.execute(query, (work_id,)).fetchone()
+    there = bool(row and row[0] and (image_dir() / row[0]).is_file())
+    return there and (thumb is None or row[1] == own_file(thumb))
+
+
+def image_prints(db: pathlib.Path | str | None = None) -> dict[str, str]:
+    """The fingerprint of the image each work has now (see IMAGE), by deviation id. A work with no cached image,
+    or with one that is out of date, is not in it."""
+    with _open(db) as conn:
+        return dict(conn.execute(f"SELECT w.deviation_id, {IMAGE} FROM works w WHERE {IMAGE} IS NOT NULL"))
 
 
 def save_image(work_id: str, content_type: str, data: bytes) -> str:

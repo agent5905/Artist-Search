@@ -232,3 +232,6 @@ node_modules/
 .env.*
 !.env.example
 critic_probes_*/
+
+# Agent worktrees and local tool state
+.claude/

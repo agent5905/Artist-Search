@@ -21,6 +21,10 @@ again before each artist and each download; and the sweep of cached files that n
     artist is written into the store's row too, which is where the removal of a site looks.
   - Nothing that is kept is replaced by nothing. An answer that is empty, or that the library's rules refuse,
     leaves what is kept, and for a refused one the artist or the work is marked.
+  - A kept work whose thumbnail has come to show another file (library.own_file: not another size or
+    signature of the same one) has its image fetched again. The image that is kept goes only when the new one
+    is saved in its place; when the new one cannot be had, the work stays as it was kept, image and all. What
+    the analysis stages read from the old image is stale from then on, and they read the new one.
   - An image that could not be had counts, whatever the host answered: MAX_REFUSALS works in a row stop the
     run, and an artist none of whose images was served is passed over, not stored as one with no works.
   - A 200 is believed only in its documented shape. Anything else is the API failing for that artist: nothing
@@ -412,7 +416,9 @@ def _collect_artist(
         except ValueError:
             counts[MALFORMED] += 1
             continue
-        if library.cached_image(work_id, db):
+        # Cached, and of the file this entry's thumbnail shows. An artist who has put another file under the work
+        # has changed what there is to read: the image is fetched again, in the place of the one that is kept.
+        if library.cached_image(work_id, db, work["thumb_url"]):
             counts[CACHED] += 1
         else:
             if store.is_removed(key, db):  # hard rule 7: asked again before every download
@@ -432,6 +438,7 @@ def _collect_artist(
                 continue
             refused[0] = 0
             counts[DOWNLOADED] += 1
+            work["fetched"] = True  # the library's word that the image in the cache is this answer's
         kept.append(work)
     if store.is_removed(key, db):  # and once more before anything is written. What was downloaded is swept up.
         _remove(key, counts, db, user_id)

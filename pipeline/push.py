@@ -48,6 +48,12 @@ contact, or were not read, is not sent at all. And every text that is sent, whoe
 collect stage's plain rule as it goes (library.holds_contact): a description is a model's words about an image,
 and an image can show an address. A text that fails is left out, and a work whose title or description fails is
 not sent. The handle is the one text that is not asked: it is the name the artist is listed under.
+A reading is tied to what was read: every reader this stage builds from gives a reading only while it is of the
+words or the image as they are now (pipeline/library.py, pipeline/tagging.py). So a tagline, a title or tags
+that changed after they were read are words that were not read; a work whose image the artist replaced is not
+tagged and not rated until the new image is fetched and read, and its new thumbnail is not sent under the old
+one's rating; a style vector of the old image is none; and an artist whose profile was made from a reading that
+has since gone stale is held back (profile_out_of_date) until the profile rests on what the works are now.
 Stdout is one JSON object of counts. This stage keeps no table of its own, and writes to the local stores only
 through store.import_removed and library.purge.
 """
@@ -92,8 +98,8 @@ MAX_SEARCH_TEXT = 4000  # sql/001_schema.sql: artists_own_words_sizes
 
 # Besides these, one reason for each mark the collect stage has left: "marked_<its reason>" (see _marked).
 ARTIST_REASONS = (
-    *("not_profiled", "profile_excluded", "site_removed", "adult_portfolio", "not_all_rated", "too_few_works"),
-    "slug_unusable",
+    *("not_profiled", "profile_excluded", "profile_out_of_date", "site_removed", "adult_portfolio"),
+    *("not_all_rated", "too_few_works", "slug_unusable"),
 )
 WORK_REASONS = (
     *("not_seen_lately", "not_tagged", "not_artwork", "explicit", "declared_ai", "contact_in_words"),
@@ -224,9 +230,11 @@ def _too_many(part: int, whole: int) -> bool:
 
 
 def _reader(local: pathlib.Path | str | None) -> contextlib.closing[sqlite3.Connection]:
-    """A connection to the local file that cannot write."""
+    """A connection to the local file that cannot write. It knows own_file(), which library.IMAGE asks."""
     path = pathlib.Path(local or config.LOCAL_DB).resolve()
-    return contextlib.closing(sqlite3.connect(f"{path.as_uri()}?mode=ro", uri=True, timeout=60))
+    conn = sqlite3.connect(f"{path.as_uri()}?mode=ro", uri=True, timeout=60)
+    conn.create_function("own_file", 1, library.own_file, deterministic=True)
+    return contextlib.closing(conn)
 
 
 def _removed_here(local: pathlib.Path | str | None) -> set[str]:
@@ -243,7 +251,8 @@ def _collected(
 
     Each artist's works, the most recently published first, as (deviation id, page, title, the artist's tags as
     JSON, thumbnail, when it was last seen and still qualified, whether it has a cached image, its rating from
-    tagging.RATINGS or None); and each artist's (tagline, website, when their profile was last stored).
+    tagging.RATINGS or None); and each artist's (tagline, website, when their profile was last stored). A rating
+    is of one image: given to an image the work no longer shows (library.IMAGE), it is no rating.
     ponytail: the library has no reader for these columns, and the tagging stage has none for the rating of a
     work that has no tags, so they are selected here. Move it there when they have.
     """
@@ -253,6 +262,7 @@ def _collected(
             "SELECT w.artist_key, w.deviation_id, w.page_url, w.title, w.tags, w.thumb_url, w.fetched_at, "
             "w.image_file IS NOT NULL, f.result FROM works w LEFT JOIN work_format f "
             "ON f.deviation_id = w.deviation_id AND f.model = ? AND f.prompt_version = ? "
+            f"AND f.fingerprint = {library.IMAGE} "
             "ORDER BY w.artist_key, w.published_at IS NULL, w.published_at DESC, w.deviation_id",
             (profiles.TAGGER, tagging.FORMAT_VERSION),
         ):
@@ -345,6 +355,10 @@ def build(
         # A sentence the plain contact rule refuses is no profile to show: the artist waits for another.
         elif key not in written or library.holds_contact(written[key]["written"]):
             why = "profile_excluded" if key in excluded else "not_profiled"
+        # A profile made from a reading that has gone stale, or been made again, says what nobody has read of
+        # the work as it is now. The artist waits for the tagging stage, and then the profile stage, to catch up.
+        elif not written[key]["current"]:
+            why = "profile_out_of_date"
         # A removed site the store's own links did not show.
         elif site_url and (store.is_removed(site_url, local) or store.covers(removed, site_url)):
             why = "site_removed"

@@ -8,6 +8,7 @@ import base64
 import contextlib
 import json
 import re
+import shutil
 import socket
 import sqlite3
 from contextlib import closing
@@ -1275,3 +1276,293 @@ def test_a_database_another_stage_is_holding_is_waited_for(monkeypatch):
     opened.clear()
     with pytest.raises(sqlite3.OperationalError, match="locked"):
         tagging.results()
+
+
+# A reading is tied to what was read. Each of these is a sequence: read, change, run again.
+#
+# The first critic of the push stage: "Tagging keys 'no contact', 'not AI', the rating and the tags by work id or
+# artist key, once. Collect keeps bringing taglines, titles, tags and thumbnail addresses up to date."
+
+THUMB = "https://images-wixmp-zzfake.wixmp.com/f/FAKE-THUMB.jpg"
+ANOTHER = "https://images-wixmp-zzfake.wixmp.com/f/FAKE-ANOTHER-FILE.jpg"  # the file an artist puts in its place
+RATED = {"shows": "FAKE-LAYOUT", "format": "none of these", "also": "none of these"}
+
+
+def collected_again(*numbers, artist=ALPHA, tagline=None, titles=None, tags=None, thumbs=None, images=None):
+    """The collect stage's next turn for the artist: the same works, with what the artist has changed since.
+    images: the bytes of the file an artist put under a work, which the collector has fetched and says so."""
+    for n, data in (images or {}).items():
+        library.save_image(f"00000000-0000-4000-A000-{n:012d}", "image/jpeg", data)
+    rows = [
+        {
+            "work_id": f"00000000-0000-4000-A000-{n:012d}",
+            "page_url": f"https://www.deviantart.com/zz-fake-alpha/art/FAKE-TITLE-{n}",
+            "title": (titles or {}).get(n, f"FAKE-TITLE-{n}"),
+            "tags": (tags or {}).get(n, [f"faketag{n}"]),
+            "thumb_url": (thumbs or {}).get(n, THUMB),
+            "published": "1700000000",
+            "fetched": n in (images or {}),
+        }
+        for n in numbers
+    ]
+    library.store_artist(artist, user_id=None, tagline=tagline, specialty=None, level=None, website=None, works=rows)
+
+
+def asked(readings):
+    """The texts a fake was asked about, in order."""
+    return [chat["messages"][-1]["content"] for chat in readings]
+
+
+def test_a_tagline_that_changes_after_it_was_read_is_read_again():
+    (work_id,) = works(1, tagline="FAKE-TAGLINE one")
+    assert run(FakeOllama())["tagline_contact_no"] == 1 and tagging.contacts() == {ALPHA: "no", work_id: "no"}
+    said = "FAKE-TAGLINE two, message me on Discord fakepainter_77"
+    collected_again(1, tagline=said)
+    assert tagging.contacts() == {work_id: "no"}  # the "no" there is of other words: of these, nothing is known
+
+    again = FakeOllama(contact="yes")
+    counts = run(again)
+
+    assert counts["tagline_contact_yes"] == 1 and counts["contact_yes"] == counts["analyzed"] == 0
+    assert asked(again.contact_readings) == [f"Tagline: {said}"] and again.chats == again.readings == []
+    assert tagging.contacts() == {ALPHA: "yes", work_id: "no"}
+    assert stored("artist_contact") == [(ALPHA, tagging.DEFAULT_MODEL, tagging.CONTACT_PROMPT_VERSION, "yes")]
+    quiet = FakeOllama()
+    assert run(quiet)["tagline_contact_yes"] == 0 and quiet.requests == []  # and it is read once
+
+
+def test_a_title_or_tags_that_change_after_they_were_read_are_read_again_and_the_image_is_not():
+    one, two, three = works(1, 2, 3)
+    run(FakeOllama(), verifier="model-v")
+    before = tagging.results(verifier="model-v")
+    collected_again(1, 2, 3, titles={1: "FAKE-TITLE-1 telegram fakepainter"}, tags={2: ["faketag2", "fakediscord77"]})
+    now = tagging.results(verifier="model-v")
+    for work_id in (one, two):  # what the image was read as stands; what the old words were read as does not
+        assert now[work_id] == before[work_id] | {"declared_ai": None, "contact_in_text": None}
+    assert now[three] == before[three]
+    assert tagging.declared_ai() == {three: "no"} and tagging.contacts() == {ALPHA: "no", three: "no"}
+
+    again = FakeOllama(declared="yes", contact="yes")
+    counts = run(again, verifier="model-v")
+
+    assert (counts["declared_yes"], counts["contact_yes"], counts["analyzed"]) == (2, 2, 0)
+    assert again.chats == again.checks == again.rewrites == []  # no image was read again: about 9 seconds each
+    changed = ["Title: FAKE-TITLE-1 telegram fakepainter\nTags: faketag1"]
+    changed += ["Title: FAKE-TITLE-2\nTags: faketag2, fakediscord77"]
+    assert asked(again.readings) == asked(again.contact_readings) == changed
+    assert tagging.declared_ai() == {one: "yes", two: "yes", three: "no"}
+    assert tagging.contacts() == {ALPHA: "no", one: "yes", two: "yes", three: "no"}
+    assert len(stored("work_ai_declared")) == len(stored("work_contact")) == 3  # the new took the old one's place
+
+
+def test_an_image_the_artist_replaced_is_left_alone_until_it_is_fetched_and_is_read_again_then():
+    one, two = works(1, 2)
+    run(FakeOllama(), verifier="model-v")
+    formats_run(FakeOllama())
+    before = tagging.results(verifier="model-v")
+    assert before[one]["rating"] == "safe" and [row["deviation_id"] for row in tagging.sample(5, 1)] == [one, two]
+
+    collected_again(1, 2, thumbs={1: ANOTHER})  # the thumbnail shows another file now; the image is still the old one
+    assert tagging.results(verifier="model-v") == {two: before[two]} and list(tagging.results()) == [two]
+    assert [row["deviation_id"] for row in tagging.sample(5, 1, verifier="model-v")] == [two]
+    waiting = FakeOllama()
+    assert run(waiting, verifier="model-v")["analyzed"] == 0 and formats_run(waiting)["sorted"] == 0
+    assert waiting.requests == []  # nobody reads an image that is not what the work shows
+
+    collected_again(1, 2, thumbs={1: ANOTHER}, images={1: JPEG + b"101"})  # the collector has fetched the new file
+    again = FakeOllama({**GOOD, "description": "A green square."}, formatted=RATED | {"rating": "explicit"})
+    counts = run(again, verifier="model-v")
+
+    assert counts["analyzed"] == 1 and again.attempts == {101: 1} and {n for n, _, _ in again.checks} == {101}
+    assert tagging.results(verifier="model-v")[one]["rating"] is None  # "safe" was said of the other picture
+    assert formats_run(again)["sorted"] == 1 and again.sorts == [(101, tagging.DEFAULT_MODEL)]
+    assert again.readings == again.contact_readings == []  # the words did not change: their reading stands
+    after = tagging.results(verifier="model-v")
+    assert after[two] == before[two]  # an image that did not change keeps its reading
+    assert after[one] == before[one] | {"description": "A green square.", "rating": "explicit"}
+    assert len(stored()) == 4 and len(stored("work_format")) == 2  # the new rows took the old ones' place
+    quiet = FakeOllama()
+    assert run(quiet, verifier="model-v")["analyzed"] == 0 and formats_run(quiet)["sorted"] == 0
+    assert quiet.requests == []
+
+
+def test_a_change_that_lands_while_a_model_is_at_work_is_not_taken_for_read():
+    """A run reads the words when it begins and asks about them for hours. The fingerprint is of what was sent."""
+    (work_id,) = works(1, tagline="FAKE-TAGLINE one")
+    changes = {"titles": {1: "FAKE-TITLE-1 CHANGED"}}
+
+    def new_words(chat):  # the collector brings new words while a model reads the old ones
+        collected_again(1, tagline="FAKE-TAGLINE two", **changes)
+        return "no"
+
+    def new_image(n, attempt, chat):  # and another image while a model looks at the old one
+        collected_again(1, thumbs={1: ANOTHER}, images={1: JPEG + b"101"}, **changes)
+        return GOOD
+
+    first = FakeOllama(answer=new_image, declared=new_words)
+    assert run(first)["analyzed"] == 1 and first.attempts == {1: 1}
+    assert asked(first.readings) == ["Title: FAKE-TITLE-1\nTags: faketag1"]
+    assert asked(first.contact_readings) == ["Title: FAKE-TITLE-1\nTags: faketag1", "Tagline: FAKE-TAGLINE one"]
+    # Four answers were stored, and not one of them is about the work or the artist as they are now.
+    assert tagging.results() == tagging.declared_ai() == tagging.contacts() == {}
+
+    again = FakeOllama()
+    assert run(again)["analyzed"] == 1 and again.attempts == {101: 1}
+    assert asked(again.readings) == ["Title: FAKE-TITLE-1 CHANGED\nTags: faketag1"]
+    assert asked(again.contact_readings) == ["Title: FAKE-TITLE-1 CHANGED\nTags: faketag1", "Tagline: FAKE-TAGLINE two"]
+    assert tagging.results() == {work_id: KEPT | READ} and tagging.contacts() == {ALPHA: "no", work_id: "no"}
+
+
+def test_a_first_pass_of_another_image_is_not_what_the_verifier_checks():
+    """The verifier is given the first description and the image. Both must be of the same image."""
+    (work_id,) = works(1)
+    run(FakeOllama({**GOOD, "description": "A red circle."}), model="model-a")  # the first pass, and no verifier yet
+
+    class Meanwhile(FakeOllama):  # the image is replaced after the run has listed its works, before the check
+        def __call__(self, request):
+            if request.url.path == "/api/show":
+                collected_again(1, thumbs={1: ANOTHER}, images={1: JPEG + b"101"})
+            return super().__call__(request)
+
+    fake = Meanwhile()
+    assert run(fake, model="model-a", verifier="model-v")["analyzed"] == 0
+    assert fake.rewrites == fake.checks == []  # never the old description held against the new image
+    assert tagging.results("model-a", verifier="model-v") == {}
+    fake = FakeOllama({**GOOD, "description": "A green square."})
+    assert run(fake, model="model-a", verifier="model-v")["analyzed"] == 1
+    assert fake.rewrites == [(101, "A green square.", "model-v")]
+    assert tagging.results("model-a", verifier="model-v")[work_id]["description"] == "A green square."
+
+
+def test_a_description_two_models_agreed_on_is_of_one_image_and_is_agreed_again_for_another():
+    one, two = works(1, 2)
+    run(FakeOllama({**GOOD, "description": CHECKED}), model="model-a", verifier="model-v")
+    agreed_run(FakeOllama(second="A horned beast."), max_works=1, model="model-a", verifier="model-v")  # one only
+    variant = {"verifier": "model-v", "second": "model-g"}
+    assert list(tagging.results("model-a", **variant)) == [one]
+
+    replaced = {"thumbs": {1: ANOTHER, 2: f"{ANOTHER}-2.jpg"}, "images": {1: JPEG + b"101", 2: JPEG + b"102"}}
+    collected_again(1, 2, **replaced)
+    assert tagging.results("model-a", **variant) == {} and tagging.sample(5, 1, "model-a", **variant) == []
+    waiting = FakeOllama()  # no checked description of either new image yet: there is nothing to agree on
+    assert agreed_run(waiting, model="model-a", verifier="model-v")["agreed"] == 0 and waiting.requests == []
+    run(FakeOllama({**GOOD, "description": "A green square."}), model="model-a", verifier="model-v")
+    assert tagging.results("model-a", **variant) == {}  # what was agreed of the other picture is not this one's
+    fake = FakeOllama(second="A green square on a field.")
+    counts = agreed_run(fake, model="model-a", verifier="model-v")
+    assert (counts["described"], counts["agreed"]) == (2, 2) and fake.seconds == [(101, "model-g"), (102, "model-g")]
+    assert tagging.results("model-a", **variant)[one]["description"] == "A green square."
+    assert len(stored("work_second")) == len(stored("work_agreed")) == 2  # one each: the new took the old one's place
+
+
+# The store's shape, and the one command that changes it.
+
+
+def before_fingerprints():
+    """Take the store back to what every store was before readings carried fingerprints: no such column, no note
+    of which image a work has, and no mark."""
+    with closing(sqlite3.connect(config.LOCAL_DB)) as conn:
+        for table in tagging.TABLES:
+            conn.execute(f"ALTER TABLE {table} DROP COLUMN fingerprint")
+        conn.execute("DROP TABLE work_images")
+        conn.execute("PRAGMA user_version = 0")
+
+
+def raw(statement, *values, db=None):
+    with closing(sqlite3.connect(db or config.LOCAL_DB)) as conn, conn:
+        return conn.execute(statement, values).fetchall()
+
+
+def test_a_store_made_before_readings_carried_fingerprints_stops_every_command_before_a_model_is_asked(capsys):
+    works(1)
+    run(FakeOllama(), verifier="model-v")
+    before_fingerprints()
+    before, fake = config.LOCAL_DB.read_bytes(), FakeOllama()
+    transport = httpx.MockTransport(fake)
+    calls = [lambda: run(fake, verifier="model-v"), lambda: formats_run(fake), lambda: agreed_run(fake)]
+    calls += [tagging.results, tagging.contacts, tagging.declared_ai, lambda: tagging.sample(5, 1)]
+    calls += [lambda: tagging.main(["--max-works", "5"], transport), lambda: tagging.main(["--sample", "5"])]
+    for call in calls:
+        with pytest.raises(SystemExit) as stopped:
+            call()
+        assert "uv run python -m pipeline.tagging --migrate --backup" in str(stopped.value)
+    assert fake.requests == [] and config.LOCAL_DB.read_bytes() == before and capsys.readouterr().out == ""
+    with pytest.raises(SystemExit) as stopped:  # and by hand the migration takes nothing on trust
+        tagging.main(["--migrate"])
+    assert stopped.value.code == 2 and config.LOCAL_DB.read_bytes() == before
+
+
+def test_the_migration_gives_each_reading_the_fingerprint_of_what_it_read_and_assumes_none(tmp_path, capsys):
+    one, two, three, four = works(1, 2, 3, 4, tagline="FAKE-TAGLINE one")
+    new, again = works(5, 6, artist=BRAVO, tagline="FAKE-TAGLINE bravo")
+    run(FakeOllama(), verifier="model-v")
+    formats_run(FakeOllama())
+    was = tagging.results(verifier="model-v")
+    before_fingerprints()
+    backup = tmp_path / "before.sqlite"
+    shutil.copyfile(config.LOCAL_DB, backup)
+    # What was not there yet when the copy was taken: BRAVO and their works, and two of ALPHA's readings.
+    for table in ("works", *tagging.WORK_TABLES):
+        raw(f"DELETE FROM {table} WHERE deviation_id IN (?, ?)", new, again, db=backup)
+    raw("DELETE FROM profiles WHERE artist_key = ?", BRAVO, db=backup)
+    raw("DELETE FROM artist_contact WHERE artist_key = ?", BRAVO, db=backup)
+    raw("DELETE FROM work_contact WHERE deviation_id IN (?, ?)", one, four, db=backup)
+    # Then a collector of before brought words and a thumbnail up to date, and no reading knew.
+    raw("UPDATE works SET title = 'FAKE-TITLE-1 CHANGED' WHERE deviation_id = ?", one)
+    raw("""UPDATE works SET tags = '["faketag2", "fakenew"]' WHERE deviation_id = ?""", two)
+    raw("UPDATE works SET thumb_url = ? WHERE deviation_id = ?", ANOTHER, three)
+    raw("UPDATE works SET thumb_url = ? WHERE deviation_id = ?", f"{THUMB}?token=FAKE-SIGNED-AGAIN", four)
+    raw("UPDATE profiles SET tagline = 'FAKE-TAGLINE two' WHERE artist_key = ?", ALPHA)
+    # And one of the works the copy does not have was stored again after it was read: with what words, nobody knows.
+    raw("UPDATE works SET fetched_at = '2099-01-01T00:00:00+00:00' WHERE deviation_id = ?", again)
+
+    tagging.main(["--migrate", "--backup", str(backup)])
+
+    assert json.loads(capsys.readouterr().out) == {
+        "stores migrated": 1,
+        "images fingerprinted": 6,
+        # 6 works, each with a first pass, a checked one and a format; and the readings of words that are known
+        "readings fingerprinted": 18 + (5 + 4 + 2),
+        "readings stale: title changed": 1,  # what one's title was read to declare; its contact reading is below
+        "readings stale: tags changed": 2,
+        "readings stale: tagline changed": 1,
+        "readings left stale: nothing says which words they read": 1 + 2,
+        "works with a replaced image": 1,
+        "profiles tied to what they rest on": 0,
+    }
+    now = tagging.results(verifier="model-v")
+    assert list(now) == [one, two, four, new, again]  # three's image is out of date: its thumbnail shows another file
+    assert library.image_prints().keys() == {one, two, four, new, again}
+    for work_id in (one, two, again):  # the image's reading stands; of the words, nobody is known to have read them
+        assert now[work_id] == was[work_id] | {"declared_ai": None, "contact_in_text": None}
+    assert (now[four], now[new]) == (was[four], was[new])  # nothing changed, nothing to do again
+    # Of words, only those that are as they were read: not one's, not two's, and not ALPHA's tagline.
+    assert tagging.contacts() == {BRAVO: "no", three: "no", four: "no", new: "no"}
+    assert tagging.declared_ai() == {three: "no", four: "no", new: "no"}
+
+    settled = config.LOCAL_DB.read_bytes()
+    tagging.main(["--migrate", "--backup", str(backup)])  # again: nothing
+    assert json.loads(capsys.readouterr().out)["stores migrated"] == 0 and config.LOCAL_DB.read_bytes() == settled
+
+    fake = FakeOllama()  # and the stage runs on it, and asks only what is stale
+    counts = run(fake, verifier="model-v")
+    assert counts["analyzed"] == 0 and fake.chats == fake.checks == []
+    stale = ["Title: FAKE-TITLE-1 CHANGED\nTags: faketag1", "Title: FAKE-TITLE-2\nTags: faketag2, fakenew"]
+    stale += ["Title: FAKE-TITLE-6\nTags: faketag6"]
+    assert asked(fake.readings) == stale
+    assert asked(fake.contact_readings) == [stale[0], "Tagline: FAKE-TAGLINE two", *stale[1:]]
+
+
+def test_the_migration_is_all_or_nothing(tmp_path, monkeypatch):
+    works(1)
+    run(FakeOllama(), verifier="model-v")
+    before_fingerprints()
+    backup = tmp_path / "before.sqlite"
+    shutil.copyfile(config.LOCAL_DB, backup)
+    monkeypatch.setattr(tagging, "tagline_print", lambda tagline: 1 / 0)  # it fails near its end
+    with pytest.raises(ZeroDivisionError):
+        tagging.migrate(backup)
+    assert raw("PRAGMA user_version") == [(0,)] and raw("SELECT * FROM work_images") == []
+    assert all("fingerprint" not in column for table in tagging.TABLES for column in raw(f"PRAGMA table_info({table})"))
+    with pytest.raises(SystemExit):
+        tagging.results()  # still a store that nothing opens

@@ -191,9 +191,12 @@ def first_version_row(key, website):
 
 
 def earlier_database(profiles):
-    """A database with a profiles table of an earlier shape, and works kept under the first version's looser rules."""
+    """A database with a profiles table of an earlier shape, and works kept under the first version's looser rules.
+    It has the mark of the readings migration, which leaves these two tables as they are: without the mark
+    nothing opens it at all (see test_a_store_made_before_readings_carried_fingerprints_is_not_opened)."""
     config.LOCAL_DB.parent.mkdir(parents=True)
     with closing(sqlite3.connect(config.LOCAL_DB)) as conn, conn:
+        conn.execute(f"PRAGMA user_version = {library.SHAPE}")
         conn.execute(f"CREATE TABLE profiles ({profiles}) STRICT")
         conn.execute(
             "CREATE TABLE works (deviation_id TEXT PRIMARY KEY, artist_key TEXT NOT NULL, page_url TEXT NOT NULL, "
@@ -474,6 +477,7 @@ def test_rows_are_written_by_column_name_not_by_position():
     """The first version wrote profiles by position, which is how a changed table came to hold websites as
     fetch times. Here both tables have their columns in another order, and every value still lands in its own."""
     config.LOCAL_DB.parent.mkdir(parents=True)
+    raw(f"PRAGMA user_version = {library.SHAPE}")  # a store with works in it is opened only with this mark
     raw(
         "CREATE TABLE profiles (user_hash TEXT, fetched_at TEXT NOT NULL CHECK (fetched_at != ''), website TEXT, "
         "level TEXT, specialty TEXT, tagline TEXT, artist_key TEXT PRIMARY KEY) STRICT"
@@ -1883,3 +1887,119 @@ def test_holds_contact_is_the_plain_rule_a_title_is_held_to_for_any_text_a_later
     assert not any(library.holds_contact(text) for text in [*LEFT_FOR_ANALYSIS, *(given for given, _ in KEPT)])
     assert library.holds_contact("FAKE word " * 1001)  # too long to read, so not passed
     assert not any(library.holds_contact(value) for value in (None, 12345, ["FAKE"]))  # no text, nothing held
+
+
+# --- a reading is tied to what was read: which image a work has, and the store's shape ---
+
+FILE = "d00000a-00000000-0000-4000-a000-00000000000a.jpg"  # a file as DeviantArt names it: <id>-<uuid>.<type>
+OTHER_FILE = "d00000b-00000000-0000-4000-a000-00000000000b.jpg"  # what the artist puts in its place
+SIGNED_AGAIN = SIGNED.replace("CLAIMS-1", "CLAIMS-2")
+
+
+def shown(file=FILE, size=300, signed=SIGNED, host="images-wixmp-zzcdn", folder="f"):
+    """A thumbnail's address as DeviantArt makes it: the file, how it is cut, a name made of the title, a signature."""
+    cut = f"/v1/fit/w_{size},h_{size},q_70,strp/fake_title_by_zz_fake_d00000a-{size}w.jpg"
+    return f"https://{host}.wixmp.com/{folder}/00000000-0000-4000-a000-0000000000ff/{file}{cut}?{signed}"
+
+
+def test_own_file_is_the_file_an_address_shows_whatever_its_size_signature_or_host():
+    same = [shown(), shown(size=150), shown(signed=SIGNED_AGAIN), shown(host="images-wixmp-yy"), shown(folder="i")]
+    same += [shown().partition("/v1/")[0], shown().partition("?")[0]]
+    assert {library.own_file(address) for address in same} == {FILE}
+    assert all(library.is_thumbnail(address) for address in same)
+    assert library.own_file(shown(OTHER_FILE)) == OTHER_FILE
+    # An address of no such shape is known by its path up to the cut, and never by its signature.
+    assert library.own_file(THUMB) == library.own_file(THUMB.partition("?")[0]) == "/f/FAKE-THUMB-1.jpg"
+    assert library.own_file(None) is None and library.own_file(7) is None
+
+
+def test_fingerprint_is_the_sha256_of_what_was_given():
+    assert library.fingerprint(JPEG) == hashlib.sha256(JPEG).hexdigest() != library.fingerprint(PNG)
+    assert library.fingerprint("FAKE-TEXT é") == hashlib.sha256("FAKE-TEXT é".encode()).hexdigest()
+
+
+def test_a_work_first_stored_with_an_image_has_it_written_down_as_the_image_its_thumbnail_shows():
+    library.save_image(ID1, "image/jpeg", JPEG)
+    keep(ALPHA, [fields(thumb_url=shown()), fields(ID2, thumb_url=shown(OTHER_FILE))])  # ID2 has no cached image
+    assert rows("work_images") == [{"deviation_id": ID1, "source": FILE, "fingerprint": library.fingerprint(JPEG)}]
+    assert library.image_prints() == {ID1: library.fingerprint(JPEG)}
+    assert library.cached_image(ID1) and library.cached_image(ID1, thumb=shown(size=150))
+    assert not library.cached_image(ID1, thumb=shown(OTHER_FILE)) and not library.cached_image(ID2)
+
+
+def test_a_thumbnail_signed_again_or_cut_to_another_size_leaves_the_image_as_it_is():
+    library.save_image(ID1, "image/jpeg", JPEG)
+    keep(ALPHA, [fields(thumb_url=shown())])
+    before = rows("work_images")
+    keep(ALPHA, [fields(thumb_url=shown(size=150, signed=SIGNED_AGAIN, folder="i"))])
+    assert rows("works")[0]["thumb_url"] == shown(size=150, signed=SIGNED_AGAIN, folder="i")
+    assert rows("work_images") == before and library.image_prints() == {ID1: library.fingerprint(JPEG)}
+
+
+def test_a_thumbnail_that_comes_to_show_another_file_leaves_the_image_out_of_date_until_it_is_fetched():
+    """The critic's third counterexample, at its root: the address is brought up to date and the image is not."""
+    library.save_image(ID1, "image/jpeg", JPEG)
+    keep(ALPHA, [fields(thumb_url=shown())])
+    keep(ALPHA, [fields(thumb_url=shown(OTHER_FILE))])  # the answer names another file, and nobody fetched it
+    assert rows("works")[0]["thumb_url"] == shown(OTHER_FILE) and rows("work_images")[0]["source"] == FILE
+    assert library.image_prints() == {}  # out of date: no reading of it is current, and nothing reads it
+    assert library.cached_image(ID1) and not library.cached_image(ID1, thumb=shown(OTHER_FILE))
+    keep(ALPHA, [fields(thumb_url=shown())])  # the artist puts the first file back: the image is that one's
+    assert library.image_prints() == {ID1: library.fingerprint(JPEG)}
+
+    keep(ALPHA, [fields(thumb_url=shown(OTHER_FILE))])
+    another = JPEG + b"FAKE-ANOTHER-PICTURE"
+    library.save_image(ID1, "image/jpeg", another)  # the collect stage fetches it,
+    keep(ALPHA, [fields(thumb_url=shown(OTHER_FILE), fetched=True)])  # and says so
+    assert rows("work_images") == [
+        {"deviation_id": ID1, "source": OTHER_FILE, "fingerprint": library.fingerprint(another)}
+    ]
+    assert library.image_prints() == {ID1: library.fingerprint(another)}
+    assert library.cached_image(ID1, thumb=shown(OTHER_FILE))
+
+
+def test_an_image_fetched_again_in_another_type_is_named_and_the_old_file_goes_only_after_that(tmp_path):
+    library.save_image(ID1, "image/jpeg", JPEG)
+    keep(ALPHA, [fields(thumb_url=shown())])
+    library.save_image(ID1, "image/png", PNG)  # the new file is a PNG: both are in the cache, the row names the old
+    assert files(tmp_path / "cache" / "images") == [f"{ID1}.jpg", f"{ID1}.png"]
+    assert rows("works")[0]["image_file"] == f"{ID1}.jpg" and library.image_prints()[ID1] == library.fingerprint(JPEG)
+    keep(ALPHA, [fields(thumb_url=shown(OTHER_FILE), fetched=True)])
+    assert rows("works")[0]["image_file"] == f"{ID1}.png" and library.image_prints()[ID1] == library.fingerprint(PNG)
+    assert library.drop_orphans() == (1, 0) and files(tmp_path / "cache" / "images") == [f"{ID1}.png"]
+    keep(ALPHA, [fields(thumb_url=shown(OTHER_FILE))])  # and a later turn that fetches nothing keeps naming it
+    assert rows("works")[0]["image_file"] == f"{ID1}.png"
+
+
+def test_a_purge_takes_the_note_of_which_image_a_work_has():
+    library.save_image(ID1, "image/jpeg", JPEG)
+    keep(ALPHA, [fields(thumb_url=shown())])
+    library.purge(ALPHA)
+    assert rows("work_images") == [] and library.image_prints() == {}
+
+
+def test_a_store_made_before_readings_carried_fingerprints_is_not_opened(tmp_path):
+    """Every stage opens the file through library._open(). A store with works in it and without the mark of the
+    migration stops each of them at once, with the command to run, and not a byte of it is changed."""
+    library.save_image(ID1, "image/jpeg", JPEG)
+    keep(ALPHA, [fields()])
+    raw("DROP TABLE work_images")
+    raw("PRAGMA user_version = 0")  # as every store was before the migration
+    before = database_bytes()
+    calls = [library.artist_keys, library.work_marks, library.image_prints, lambda: library.cached_image(ID1)]
+    calls += [lambda: keep(ALPHA, [fields()]), lambda: library.purge(ALPHA), library.drop_orphan_rows]
+    for call in calls:
+        with pytest.raises(SystemExit) as stopped:
+            call()
+        assert "uv run python -m pipeline.tagging --migrate --backup" in str(stopped.value)
+    assert database_bytes() == before and files(tmp_path / "cache" / "images") == [f"{ID1}.jpg"]
+
+
+def test_a_new_store_is_made_in_the_shape_of_today_and_one_with_no_works_yet_is_opened(tmp_path):
+    assert store.upsert_artist("zz-fake-alpha", "https://www.deviantart.com/zz-fake-alpha", [], 1)  # discovery's
+    assert raw("PRAGMA user_version") == [(0,)] and library.artist_keys() == []
+    assert raw("PRAGMA user_version") == [(library.SHAPE,)]
+    other = tmp_path / "elsewhere" / "other.sqlite"
+    assert library.artist_keys(other) == []
+    with closing(sqlite3.connect(other)) as conn:
+        assert conn.execute("PRAGMA user_version").fetchone() == (library.SHAPE,)

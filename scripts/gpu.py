@@ -26,7 +26,7 @@ from datetime import UTC, datetime, timedelta
 import httpx
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
-from pipeline import config, profiles, tagging  # noqa: E402
+from pipeline import config, library, profiles, tagging  # noqa: E402
 
 TURN = 100  # works a stage takes on in one turn: a quarter of an hour of tagging before the next stage has its turn
 IDLE = 300  # seconds the worker sleeps when a whole round changed nothing
@@ -39,15 +39,19 @@ STAGES = {
 _ALL = "SELECT count(*) FROM works w WHERE w.image_file IS NOT NULL"
 _ARTISTS = "SELECT count(DISTINCT artist_key) FROM works"
 # What each stage has done, of the works with an image or of the artists. Where its rows are timed, the query
-# takes :since, and counts what was done after it.
+# takes :since, and counts what was done after it. A reading of an image the work no longer shows is not done:
+# library.IMAGE is the rule, as in the stages themselves.
+_PROFILED = "artists profiled, or left out for a reason"
 _DONE = {
     "style vectors": "SELECT count(*) FROM works w JOIN style_vectors v USING (deviation_id) "
-    "WHERE w.image_file IS NOT NULL AND v.model = 'csd' AND v.vector IS NOT NULL",
+    f"WHERE w.image_file IS NOT NULL AND v.model = 'csd' AND v.vector IS NOT NULL AND v.fingerprint = {library.IMAGE}",
     "tagged and checked": "SELECT count(*) FROM works w JOIN work_tags t USING (deviation_id) WHERE "
-    "w.image_file IS NOT NULL AND t.model = :set AND t.prompt_version = :tags AND t.analyzed_at > :since",
+    "w.image_file IS NOT NULL AND t.model = :set AND t.prompt_version = :tags AND t.analyzed_at > :since "
+    f"AND t.fingerprint = {library.IMAGE}",
     "sorted by format": "SELECT count(*) FROM works w JOIN work_format f USING (deviation_id) WHERE "
-    "w.image_file IS NOT NULL AND f.model = :model AND f.prompt_version = :formats AND f.asked_at > :since",
-    "artists profiled, or left out for a reason": "SELECT count(*) FROM artist_profiles WHERE made_at > :since",
+    "w.image_file IS NOT NULL AND f.model = :model AND f.prompt_version = :formats AND f.asked_at > :since "
+    f"AND f.fingerprint = {library.IMAGE}",
+    _PROFILED: "SELECT count(*) FROM artist_profiles WHERE made_at > :since",
 }
 
 
@@ -57,7 +61,8 @@ def _file(name: str) -> pathlib.Path:
 
 def counts(since: str = "") -> dict[str, int]:
     """How much is collected and how much of it each stage has done; with `since`, what it did after that time.
-    A store or a table that no stage has made yet counts as nothing."""
+    A store or a table that no stage has made yet counts as nothing. SystemExit, with the command to run, for a
+    store whose readings carry no fingerprints yet: nothing in it can be called done."""
     names = {
         "set": tagging.result_set(profiles.TAGGER, profiles.TAGGER),
         "tags": tagging.PROMPT_VERSION,
@@ -70,13 +75,19 @@ def counts(since: str = "") -> dict[str, int]:
         return dict.fromkeys(("works", "artists", *_DONE), 0)
     conn = sqlite3.connect(f"file:{config.LOCAL_DB.as_posix()}?mode=ro", uri=True, timeout=60)
     try:
+        conn.create_function("own_file", 1, library.own_file, deterministic=True)
         for label, query in {"works": _ALL, "artists": _ARTISTS, **_DONE}.items():
             try:
                 found[label] = int(conn.execute(query, names).fetchone()[0])
             except sqlite3.OperationalError:
                 found[label] = 0
+        unmigrated = found["works"] and conn.execute("PRAGMA user_version").fetchone()[0] < library.SHAPE
     finally:
         conn.close()
+    if unmigrated:
+        raise SystemExit(library.UNMIGRATED)
+    if found[_PROFILED] and not since:  # a row made from a reading that has gone stale is to be made again
+        found[_PROFILED] = len(profiles.current())
     return found
 
 
