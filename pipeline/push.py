@@ -2,14 +2,26 @@
 
     uv run python -m pipeline.push --dry-run     everything but the writes to the database
     uv run python -m pipeline.push
+    uv run python -m pipeline.push --allow-delete N     let this one run delete up to N artists, and N works
 
 In this order, and the order is the point:
-  1. Removal (hard rule 7). The key hashes in the database's `removed` table go to store.import_removed, so a
-     removal made through the site reaches this machine, and everything kept here about an artist the store no
-     longer lists is purged. When any of that fails the run stops: nothing is built and nothing is sent.
+  1. Removal (hard rule 7), in both directions. The key hashes in the database's `removed` table go to
+     store.import_removed, so a removal made through the site reaches this machine, and everything kept here
+     about an artist the store no longer lists is purged. Then every hash on the store's list that the
+     database's list lacks is added to it, so a removal made here outlives this machine, and the artists the
+     list bars are deleted from the database. When any of that fails the run stops: nothing is built.
   2. The rows are built (see build) from what is left, and only from artists the store still lists.
   3. The database is brought to exactly those rows: an artist or a work it has that is not among them is
      deleted, then db.load writes the rest. So an artist who stops qualifying leaves on the next run.
+
+Three things stop a run before step 3 writes anything, each with a message and a status that is not zero:
+  - the database holds a slug that begins "zz-". Those are another builder's test rows, and this stage would
+    delete them. It is the first thing looked at, before anything is done here or there;
+  - the local library has no artists. An empty or a new file is no reason to empty the database;
+  - more would be deleted than a run is believed about: more than DELETE_PERCENT of what the database holds,
+    and more than DELETE_FLOOR. A changed prompt version or a half-finished analysis looks just like that.
+    `--allow-delete N` lets one run go ahead. Artists on the removal list are not counted: step 1 is never
+    held up by this.
 
 Hard rule 1: a work is sent as two addresses, its page on DeviantArt and DeviantArt's own thumbnail, and words.
 No image, no file name and no deviation id is ever put in a row.
@@ -39,23 +51,30 @@ ADULT_PERCENT = 30  # of an artist's rated works: at this share rated suggestive
 SAFE_RATING = "safe"  # the only rating a work is sent with
 ADULT_RATINGS = ("suggestive", "explicit")
 NEIGHBOURS = 24  # similar artists sent for each artist: as many as similar_artists ever returns
+DELETE_PERCENT = 10  # of the artists, or of the works, the database holds: more than this going at once is not believed
+DELETE_FLOOR = 5  # deletions of each kind that a run may always make, however little the database holds
+TEST_SLUG = "zz-"  # how the other builders' test rows begin. Never sent, and a database that has one is left alone
 STYLE_MODEL, STYLE_RULE = "csd", "local"  # round 7's blind test chose them
 TOP_TAGS = 12  # of the artist's own tags, the most used
 MAX_SEARCH_TEXT = 4000  # sql/001_schema.sql: artists_own_words_sizes
 
-ARTIST_REASONS = ("not_profiled", "profile_excluded", "site_removed", "adult_portfolio", "too_few_works", "slug_taken")
+ARTIST_REASONS = (
+    *("not_profiled", "profile_excluded", "site_removed", "adult_portfolio", "too_few_works", "slug_unusable"),
+)
 WORK_REASONS = (
     *("not_tagged", "not_artwork", "explicit", "declared_ai", "contact_in_words", "words_not_read"),
     *("not_rated", "suggestive", "bad_address", "artist_held_back"),
 )
 
 REMOVED_SQL = "select key_hash from public.removed"
-# Every artist the database has, and every work: what a run compares its rows with.
-# ponytail: one answer with a row a work, about 5 MB at 30,000 works. Page it by artist id if that is refused.
+# Every artist the database has, with the two hashes its removal list knows them by, and every work: what a run
+# compares its rows with.
+# ponytail: one answer with a row a work, about 8 MB at 30,000 works. Page it by artist id if that is refused.
 LISTING_SQL = (
-    "select a.id as artist_id, a.slug, w.id as work_id, w.page_url "
+    "select a.id as artist_id, a.slug, a.da_key, a.site_key, w.id as work_id, w.page_url "
     "from public.artists a left join public.works w on w.artist_id = a.id"
 )
+_SHA256 = re.compile(r"[0-9a-f]{64}")
 # sql/001_schema.sql: clean_url. A row the database would refuse fails the whole batch it is in, so an address
 # that would not pass is held back here.
 _CLEAN_URL = re.compile(
@@ -65,6 +84,15 @@ _CLEAN_URL = re.compile(
 )
 
 Rows = list[dict[str, Any]]
+
+
+class Stop(Exception):
+    """A run that was stopped on purpose. The message is for the operator; `counts` is what the run had counted,
+    when it got that far."""
+
+    def __init__(self, why: str, counts: dict[str, int] | None = None) -> None:
+        super().__init__(why)
+        self.counts = counts
 
 
 def _clean(url: str) -> bool:
@@ -132,6 +160,19 @@ def _held(result: dict[str, Any] | None) -> str | None:
     return None
 
 
+def _reader(local: pathlib.Path | str | None) -> contextlib.closing[sqlite3.Connection]:
+    """A connection to the local file that cannot write."""
+    path = pathlib.Path(local or config.LOCAL_DB).resolve()
+    return contextlib.closing(sqlite3.connect(f"{path.as_uri()}?mode=ro", uri=True, timeout=60))
+
+
+def _removed_here(local: pathlib.Path | str | None) -> set[str]:
+    """Every key hash on the store's removal list: artists, their sites, and the accounts the collect stage adds.
+    ponytail: the store has no reader for its list, so it is selected here. Move it there when it has."""
+    with _reader(local) as conn:
+        return {key_hash for (key_hash,) in conn.execute("SELECT key_hash FROM removed")}
+
+
 def _collected(
     local: pathlib.Path | str | None,
 ) -> tuple[dict[str, list[tuple[Any, ...]]], dict[str, tuple[str | None, str | None]]]:
@@ -141,9 +182,8 @@ def _collected(
     thumbnail); and each artist's (tagline, website).
     ponytail: the library has no reader for these columns, so they are selected here. Move it there when it has.
     """
-    path = pathlib.Path(local or config.LOCAL_DB).resolve()
     works: dict[str, list[tuple[Any, ...]]] = {}
-    with contextlib.closing(sqlite3.connect(f"{path.as_uri()}?mode=ro", uri=True, timeout=60)) as conn:
+    with _reader(local) as conn:
         for key, *work in conn.execute(
             "SELECT artist_key, deviation_id, page_url, title, tags, thumb_url FROM works "
             "ORDER BY artist_key, published_at IS NULL, published_at DESC, deviation_id"
@@ -159,7 +199,8 @@ def build(local: pathlib.Path | str | None = None) -> tuple[Rows, Rows, Rows, Co
     An artist goes when the store lists them, pipeline/profiles.py gave them a profile, fewer than
     ADULT_PERCENT of their rated works are rated suggestive or explicit, and MIN_WORKS of their works may be
     sent (see _held). Everything in an artist's row that comes from their works comes from the works that are
-    sent, and a neighbour is always an artist who is sent too. Reads the local stores and changes nothing.
+    sent, and a neighbour is always an artist who is sent too. An artist who goes and has no neighbour gets one
+    row that names no neighbour (see the end of this function). Reads the local stores and changes nothing.
     """
     listed = {key: username for key, username, _ in store.all_artists(local)}
     written = {row["artist_key"]: row for row in profiles.profiles(local)}
@@ -198,8 +239,9 @@ def build(local: pathlib.Path | str | None = None) -> tuple[Rows, Rows, Rows, Co
             why = "adult_portfolio"
         elif len(ready) < MIN_WORKS:
             why = "too_few_works"
-        elif not slug or slug in slugs.values():  # two handles that differ only in what a slug cannot hold
-            why = "slug_taken"
+        # No slug at all, the slug of a test row (see TEST_SLUG), or one that another handle has already made.
+        elif not slug or slug.startswith(TEST_SLUG) or slug in slugs.values():
+            why = "slug_unusable"
         if why:
             counts[f"artists_held_{why}"] += 1
             counts["works_held_artist_held_back"] += len(ready)
@@ -251,18 +293,23 @@ def build(local: pathlib.Path | str | None = None) -> tuple[Rows, Rows, Rows, Co
     for row in artists:
         if domains[row["site_domain"]] > 1:
             row["site_url"] = row["site_domain"] = None
+    # One pass, with the artists who go as the whole pool. What comes back is still held to that pool here: this
+    # is the last place an artist who was left out could get into a row.
+    near = style.all_neighbors(STYLE_MODEL, NEIGHBOURS, STYLE_RULE, set(slugs), local)
     neighbours: Rows = []
     for key, slug in slugs.items():
-        # Everybody is asked for, then those who do not go are taken out: asking for 24 would leave fewer.
-        # ponytail: style.neighbors scores every pair of artists on every call (0.2 s at 4,400 works, about
-        # 10 s at 30,000), so this loop is that times the artists sent. It needs a call in pipeline/style.py
-        # that gives the whole table at once.
-        near = style.neighbors(key, STYLE_MODEL, len(listed), STYLE_RULE, local)
-        going = [(slugs[other], score) for other, score in near if other in slugs and math.isfinite(score)]
+        going = [
+            (slugs[other], score)
+            for other, score in near.get(key, [])
+            if other in slugs and other != key and math.isfinite(score)
+        ]
+        # replace_neighbors (sql/002_functions.sql) leaves an artist it gets no row for with the neighbours they
+        # had. It has no way to be told "none", but a row that names the artist and no neighbour does it: the row
+        # is skipped, and every rank it did not write for that artist is deleted. db.load counts it as skipped.
         neighbours += [
             {"artist_slug": slug, "neighbor_slug": other, "rank": rank, "score": round(score, 4)}
             for rank, (other, score) in enumerate(going[:NEIGHBOURS], start=1)
-        ]
+        ] or [{"artist_slug": slug, "neighbor_slug": None, "rank": None, "score": None}]
     return artists, works, neighbours, counts
 
 
@@ -270,16 +317,38 @@ def _delete_sql(table: str, ids: set[int]) -> str:
     return f"delete from public.{table} where id in ({', '.join(map(str, sorted(ids)))})"
 
 
-def run(dry_run: bool, local: pathlib.Path | str | None = None) -> dict[str, int]:
+def _removed_sql(key_hashes: set[str]) -> str:
+    """The statement that puts key hashes on the database's removal list. ValueError unless every one is a sha256
+    hex digest, because they go into the statement as they are."""
+    if not all(_SHA256.fullmatch(key_hash) for key_hash in key_hashes):
+        raise ValueError("the local removal list holds something that is not a sha256 hex digest")
+    values = ", ".join(f"('{key_hash}')" for key_hash in sorted(key_hashes))
+    return f"insert into public.removed (key_hash) values {values} on conflict (key_hash) do nothing"
+
+
+def run(dry_run: bool, allow_delete: int | None = None, local: pathlib.Path | str | None = None) -> dict[str, int]:
     """One push, or with `dry_run` everything but the writes to the database. Returns counts only.
 
-    artists_sent and works_sent, each with what was held back by reason (ARTIST_REASONS, WORK_REASONS),
-    neighbours_sent, artists_removed_from_database and works_removed_from_database (rows the database had
-    that are no longer sent), removals_applied_here (artists the imported removal list deleted from the store)
-    and artists_purged_here. RuntimeError when the database fails, ValueError or OSError when the removal
-    cannot be done here: whichever comes, nothing after it is done.
+    artists_sent and works_sent, each with what was held back by reason (ARTIST_REASONS, WORK_REASONS);
+    neighbours_sent, artists_sent_without_neighbours, and neighbours_skipped_by_database (what db.load said
+    the database would not take: a row that names an artist it does not have); artists_deleted_from_database
+    and works_deleted_from_database (rows it had that are no longer sent); removed_artists_deleted_from_database
+    and removals_added_to_database (artists the removal list bars, and key hashes the database's list lacked);
+    removals_applied_here (artists the imported list deleted from the store) and artists_purged_here.
+
+    Stop, and nothing more is done, in the three cases the module's docstring names; when too much would be
+    deleted it carries the counts. `allow_delete` is how many artists, and how many works, this one run may
+    delete instead. RuntimeError when the database fails, ValueError or OSError when the removal cannot be done
+    here: whichever comes, nothing after it is done.
     """
-    applied = store.import_removed([row["key_hash"] for row in db.sql(REMOVED_SQL)], local)
+    there = db.sql(LISTING_SQL)
+    if any(str(row["slug"]).startswith(TEST_SLUG) for row in there):
+        raise Stop(
+            f'the database holds test rows (slugs that begin "{TEST_SLUG}"): another builder\'s tests are using '
+            "it, and a push would delete them. Nothing was done. Run it again when they have finished."
+        )
+    remote = {row["key_hash"] for row in db.sql(REMOVED_SQL)}
+    applied = store.import_removed(remote, local)
     listed = {key for key, _, _ in store.all_artists(local)}
     purged = 0
     for key in library.artist_keys(local):
@@ -290,44 +359,86 @@ def run(dry_run: bool, local: pathlib.Path | str | None = None) -> dict[str, int
                 store.import_removed([account], local)
             library.purge(key, local)
             purged += 1
+    # The other direction. The store's list now holds the database's and whatever was removed on this machine:
+    # what the database's list lacks is added, so that another machine, or this file made again, hears of it.
+    # The artists the list bars go now, whatever happens further down: the database deletes them itself when
+    # their hash arrives, and one it had to leave (a load held the row) is deleted here by id.
+    here = _removed_here(local)
+    unlisted = here - remote
+    barred = {int(row["artist_id"]) for row in there if here & {row["da_key"], row["site_key"]}}
+    if not dry_run and (unlisted or barred):
+        removal = ([_removed_sql(unlisted)] if unlisted else []) + ([_delete_sql("artists", barred)] if barred else [])
+        db.sql("; ".join(removal))
+    if not library.artist_keys(local):
+        raise Stop(
+            "the local library has no artists, so there is nothing to push, and a push would delete every artist "
+            "the database has. Nothing was deleted or loaded."
+        )
     artists, works, neighbours, held = build(local)
     slugs = {row["slug"] for row in artists}
     sent = {(row["artist_slug"], row["page_url"]) for row in works}
-    there = db.sql(LISTING_SQL)
-    gone_artists = {int(row["artist_id"]) for row in there if row["slug"] not in slugs}
-    gone_works = {
-        int(row["work_id"])
-        for row in there
-        if row["work_id"] is not None and row["slug"] in slugs and (row["slug"], row["page_url"]) not in sent
-    }
+    have_artists = {int(row["artist_id"]) for row in there} - barred
+    gone_artists = {int(row["artist_id"]) for row in there if row["slug"] not in slugs} - barred
+    have_works = [row for row in there if row["work_id"] is not None and row["slug"] in slugs]  # of artists who stay
+    gone_works = {int(row["work_id"]) for row in have_works if (row["slug"], row["page_url"]) not in sent}
+    empty = sum(row["neighbor_slug"] is None for row in neighbours)
+    counts = (
+        {"artists_sent": len(artists)}
+        | {f"artists_held_{reason}": held[f"artists_held_{reason}"] for reason in ARTIST_REASONS}
+        | {"works_sent": len(works)}
+        | {f"works_held_{reason}": held[f"works_held_{reason}"] for reason in WORK_REASONS}
+        | {
+            "neighbours_sent": len(neighbours) - empty,
+            "artists_sent_without_neighbours": empty,
+            "neighbours_skipped_by_database": 0,
+            "artists_deleted_from_database": len(gone_artists),
+            "works_deleted_from_database": len(gone_works),
+            "removed_artists_deleted_from_database": len(barred),
+            "removals_added_to_database": len(unlisted),
+            "removals_applied_here": applied,
+            "artists_purged_here": purged,
+        }
+    )
+
+    def allowed(have: int) -> int:
+        return max(DELETE_FLOOR, have * DELETE_PERCENT // 100) if allow_delete is None else allow_delete
+
+    if len(gone_artists) > allowed(len(have_artists)) or len(gone_works) > allowed(len(have_works)):
+        raise Stop(
+            f"this run would delete {len(gone_artists)} of the {len(have_artists)} artists the database has (it may "
+            f"delete {allowed(len(have_artists))}) and {len(gone_works)} of the {len(have_works)} works of the artists "
+            f"who stay (it may delete {allowed(len(have_works))}). Nothing was deleted or loaded. If that is what "
+            f"should happen, run it again with --allow-delete {max(len(gone_artists), len(gone_works))}.",
+            counts,
+        )
     if not dry_run:
         # Before the load: db.load ends by rebuilding the search words, and a handle or a site that has moved
         # to another artist must be free when their row is written.
         stale = [_delete_sql(table, ids) for table, ids in (("works", gone_works), ("artists", gone_artists)) if ids]
         if stale:
             db.sql("; ".join(stale))  # one call: both or neither
-        db.load(artists, works, neighbours)
-    return (
-        {"artists_sent": len(artists)}
-        | {f"artists_held_{reason}": held[f"artists_held_{reason}"] for reason in ARTIST_REASONS}
-        | {"works_sent": len(works)}
-        | {f"works_held_{reason}": held[f"works_held_{reason}"] for reason in WORK_REASONS}
-        | {
-            "neighbours_sent": len(neighbours),
-            "artists_removed_from_database": len(gone_artists),
-            "works_removed_from_database": len(gone_works),
-            "removals_applied_here": applied,
-            "artists_purged_here": purged,
-        }
-    )
+        # Each row that names no neighbour is one the database counts as skipped: those are not news.
+        counts["neighbours_skipped_by_database"] = max((db.load(artists, works, neighbours) or 0) - empty, 0)
+    return counts
 
 
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description=(__doc__ or "").splitlines()[0])
     parser.add_argument("--dry-run", action="store_true", help="do everything but write to the database")
+    parser.add_argument(
+        "--allow-delete",
+        type=int,
+        metavar="N",
+        help="let this one run delete up to N artists who no longer qualify, and up to N works of artists who stay "
+        f"(without it: {DELETE_PERCENT} percent of what the database has, and never fewer than {DELETE_FLOOR})",
+    )
     args = parser.parse_args(argv)
     try:
-        counts = run(args.dry_run)
+        counts = run(args.dry_run, args.allow_delete)
+    except Stop as stop:
+        if stop.counts is not None:
+            print(json.dumps(stop.counts))  # what the run would have done
+        sys.exit(f"stopped: {stop}")
     except Exception as error:
         # Whatever fails, the run ends there with a status that is not zero and no counts. On stderr: the kind
         # of failure and the start of its message, no more, because a database error can quote the row it refused.
