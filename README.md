@@ -46,7 +46,7 @@ Examples from the log:
 
 - **Nothing is rehosted.** The database holds links and thumbnail addresses. The site loads thumbnails from the source's own image host, with credit and a link back.
 - **Images are cached only on the owner's machine,** in a folder git ignores. A commit hook rejects image files and anything that looks like a secret.
-- **Collection is polite.** It uses the official API at no more than one request a second, identifies itself with a contact address, and backs off when told to. The crawler for artists' own sites obeys robots.txt and waits three seconds between requests to a host.
+- **Collection is polite.** It uses the official API at no more than one request every two seconds, identifies itself with a contact address, and when the API asks it to slow down it slows down for the rest of the run, not only for the request that was refused. The crawler for artists' own sites obeys robots.txt and waits three seconds between requests to a host.
 - **Only public, professional information is kept:** handle, public bio, specialties, public links, and whether the artist says they are open for work, in their own words. Contact details found in titles or tags are held back.
 - **Left out:** works marked mature or rated suggestive, works the artist declares AI-made, and artists with a large share of either.
 - **No model is trained and no image is generated.** Models only describe and compare.

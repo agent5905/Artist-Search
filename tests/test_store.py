@@ -665,18 +665,105 @@ def test_an_own_site_the_collect_stage_keeps_is_written_into_the_row_where_a_rem
         store.keep_own_site("zz fake", "https://zz-fake-late.art/", db)
 
 
-def test_the_artists_stored_since_a_time_are_those_whose_row_was_first_stored_then_or_later(db):
-    add(db, username="zz-fake-old")
-    add(db, username="zz-fake-new", links=())
+def test_discovery_stores_an_artist_without_their_links_and_the_link_a_row_has_stays(db):
+    """Discovery reads no profile, so it knows no link. It must not blank the one the collect stage keeps."""
+    add(db, username="zz-fake-old", hits=3)  # with the painter's site as their link
     with closing(sqlite3.connect(db)) as conn, conn:
-        conn.execute("UPDATE artists SET discovered_at = '2020-01-01T00:00:00+00:00' WHERE key = 'da:zz-fake-old'")
+        conn.execute("UPDATE artists SET discovered_at = '2020-01-01T00:00:00+00:00'")
+    assert store.upsert_artist("ZZ-Fake-Old", "https://www.deviantart.com/ZZ-Fake-Old", None, 9, db) is True
+    assert store.upsert_artist("zz-fake-new", "https://www.deviantart.com/zz-fake-new", None, 3, db) is True
+    assert [(row[0], row[1], json.loads(row[3]), row[4]) for row in rows(db)] == [
+        ("da:zz-fake-new", "zz-fake-new", [], 3),
+        ("da:zz-fake-old", "ZZ-Fake-Old", [PAINTER], 9),  # the handle and the hits brought up to date, the link kept
+    ]
+    assert rows(db)[1][5] == "2020-01-01T00:00:00+00:00"
+    store.mark_removed("da:zz-fake-new", db)
+    assert store.upsert_artist("zz-fake-new", "https://www.deviantart.com/zz-fake-new", None, 4, db) is False
+    assert keys(db) == ["da:zz-fake-old"]
+
+
+def test_the_tally_counts_each_work_once_and_holds_nothing_but_hashes(db):
+    page = [
+        ("FAKE-WORK-1", "ZZ-Fake-A"),
+        ("FAKE-WORK-2", "zz-fake-a"),
+        ("FAKE-WORK-3", None),
+        ("FAKE-WORK-4", "zz-fake-b"),
+    ]
+    assert store.count_works(page, db) == {"ZZ-Fake-A": 2, "zz-fake-a": 2, "zz-fake-b": 1}  # a handle in any case
+    # Work 1 is under another tag too, and work 3 was counted for nobody the first time it was seen.
+    again = [("FAKE-WORK-1", "zz-fake-a"), ("FAKE-WORK-5", "zz-fake-a"), ("FAKE-WORK-3", "zz-fake-b")]
+    assert store.count_works(again, db) == {"zz-fake-a": 3, "zz-fake-b": 1}
+    assert store.count_works([], db) == {}
+    assert rows(db, "counted") == sorted(
+        [
+            (sha("work:FAKE-WORK-1"), sha("da:zz-fake-a")),
+            (sha("work:FAKE-WORK-2"), sha("da:zz-fake-a")),
+            (sha("work:FAKE-WORK-3"), None),
+            (sha("work:FAKE-WORK-4"), sha("da:zz-fake-b")),
+            (sha("work:FAKE-WORK-5"), sha("da:zz-fake-a")),
+        ]
+    )
+    assert b"fake" not in db.read_bytes().lower()  # no id and no handle: nobody is written down by name
+    with pytest.raises(ValueError):
+        store.count_works([("FAKE-WORK-9", "zz fake")], db)
+    assert len(rows(db, "counted")) == 5
+
+
+def test_the_tally_in_numbers_says_who_has_works_enough_and_what_became_of_them(db):
+    """Pages, works counted, mature works, authors, and of the authors with works enough: all, the removed, the
+    ones not stored yet, the stored. The last three add up to the one before them."""
+    assert store.tally(3, db) == (0, 0, 0, 0, 0, 0, 0, 0)
+    for author, works in (("zz-fake-a", 4), ("zz-fake-b", 3), ("zz-fake-c", 3), ("zz-fake-d", 2), (None, 2)):
+        store.count_works([(f"FAKE-WORK-{author}-{n}", author) for n in range(works)], db)
+    store.note_browsed("zz-fake-tag", 50, db)
+    assert store.tally(3, db) == (1, 12, 2, 4, 3, 0, 3, 0)
+    assert store.tally(4, db)[4:] == (1, 0, 1, 0) and store.tally(5, db)[4:] == (0, 0, 0, 0)
+    add(db, username="ZZ-Fake-A", links=())
+    add(db, username="zz-fake-d", links=())  # stored some other time: not one of this pass's candidates
+    assert store.tally(3, db) == (1, 12, 2, 4, 3, 0, 2, 1)
+    store.mark_removed("da:zz-fake-b", db)  # never stored
+    store.mark_removed("da:zz-fake-a", db)  # stored, and gone with the removal
+    assert store.tally(3, db) == (1, 12, 2, 4, 3, 2, 1, 0)
+
+
+def test_a_browsing_pass_is_saved_tag_by_tag_and_forgotten_whole_when_its_first_page_is_too_old(db):
     now = datetime.now(UTC)
-    assert store.stored_since(now - timedelta(days=1), db) == {"da:zz-fake-new"}
-    assert store.stored_since(datetime(2020, 1, 1, tzinfo=UTC), db) == {"da:zz-fake-new", "da:zz-fake-old"}
-    assert store.stored_since(datetime(2020, 1, 1, 0, 0, 1, tzinfo=UTC), db) == {"da:zz-fake-new"}
-    assert store.stored_since(now + timedelta(days=1), db) == set()
-    add(db, username="zz-fake-old", hits=9)  # a refresh is not a first storing: see the function's own note
-    assert store.stored_since(now - timedelta(days=1), db) == {"da:zz-fake-new"}
+    assert store.browsing_pass(now, db) == {}
+    store.note_browsed("zz-fake-tag", 40, db)
+    store.note_browsed("zz-fake-tag", 80, db)
+    store.note_browsed("zz-fake-other", None, db)  # the API said this tag has no more
+    store.count_works([("FAKE-WORK-1", "zz-fake-a")], db)
+    add(db, username="zz-fake-a", links=())
+    saved = {"zz-fake-tag": (80, 2), "zz-fake-other": (None, 1)}
+    assert store.browsing_pass(now - timedelta(days=1), db) == saved and store.tally(1, db)[:2] == (3, 1)
+    with closing(sqlite3.connect(db)) as conn, conn:  # one tag was begun a week before the other
+        conn.execute(
+            "UPDATE browsed SET began_at = ? WHERE tag = 'zz-fake-other'", ((now - timedelta(days=7)).isoformat(),)
+        )
+    assert store.browsing_pass(now - timedelta(days=8), db) == saved
+    assert store.browsing_pass(now - timedelta(days=6), db) == {}  # a pass is as old as its first page
+    assert rows(db, "browsed") == rows(db, "counted") == [] and store.tally(1, db) == (0,) * 8
+    assert keys(db) == ["da:zz-fake-a"]  # what is forgotten is the pass: nobody who is stored goes with it
+
+
+def test_only_a_browsing_pass_adds_its_two_tables_to_a_store_and_it_changes_no_other(db):
+    """No table of the store changes shape, and none is added, just because some other stage ran."""
+
+    def made():
+        with closing(sqlite3.connect(db)) as conn:
+            return dict(conn.execute("SELECT name, sql FROM sqlite_master WHERE type = 'table'"))
+
+    add(db)
+    store.mark_removed("da:zz-fake-someone", db)
+    store.import_removed([sha("da:zz-fake-other")], db)
+    store.record_listing("zz-fake-painter", ["zz-fake-painter.art"], db)
+    store.keep_own_site("zz-fake-painter", PAINTER, db)
+    assert store.all_artists(db) and store.own_site_candidates(db) and store.is_removed("zz-fake-someone", db)
+    before = made()
+    assert set(before) == {"artists", "removed", "listed"}
+    assert store.browsing_pass(datetime.now(UTC), db) == {}  # discovery, at the start of a run
+    assert set(made()) == {"artists", "removed", "listed", "browsed", "counted"}
+    assert {name: sql for name, sql in made().items() if name in before} == before
 
 
 # --- the list for the collect stage ---

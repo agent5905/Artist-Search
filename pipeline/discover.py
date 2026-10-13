@@ -2,35 +2,42 @@
 
     uv run python -m pipeline.discover --max-artists 200
 
-An author with MIN_HITS or more non-mature works under the niche tags is stored, whether or not their profile
-names a site of their own (owner decision 7 in PROGRESS.md: DeviantArt is the primary source, an own site is
-optional). Later stages collect and analyze the works. This stage has no use for any of that content, so
-nothing from a response is printed, logged or stored except the handle, the profile URL built from it, the
-front page of the artist's own domain when the profile names one, and a hit count. Output is counts only.
-One more thing is kept, as hashes that name nobody: which registrable domain each profile's website field
-mentions, so that a domain several profiles list is never taken for one artist's own site.
+An author with MIN_HITS or more non-mature works under the niche tags is stored, straight from the tally of the
+browse pages (owner decision 7 in PROGRESS.md: DeviantArt is the primary source, an own site is optional). No
+profile is read here. The collect stage reads each artist's profile on their turn, and every rule about what a
+profile says is enforced there: the site of their own, a removed site, a domain several profiles list. Nothing
+from a response is printed, logged or stored except the handle of an author who has works enough, the profile
+URL built from it, and a hit count. Output is counts only.
+
+Browsing survives a stop. After every page the store has where the tag's next page is, and the tally so far as
+hashes that name nobody, so a run that is stopped, by the pacing rule or by a person, is carried on by the next
+one, and an artist reaches the store on the page that gives them works enough. A saved pass is carried on from
+for PASS_VALID after its first page. A run that finds an older one forgets it and browses afresh, and nothing
+else does: a run that finds a finished pass younger than that has nothing to browse and makes no request.
+
+Every request waits its turn in one place, Pace, which slows down for the rest of the run when the API asks.
+While a run is on, tell() keeps a file in the cache folder that says where it is.
 
 Endpoints (deviantart.readme.io, read 2026-10-11). Each is documented as accepting a client_credentials token:
     POST /oauth2/token                          grant_type=client_credentials
     GET  /api/v1/oauth2/browse/tags             scope "browse"
-    GET  /api/v1/oauth2/user/profile/{username} scope "browse"
 """
 
 import argparse
 import contextlib
 import logging
+import math
 import pathlib
 import sys
 import time
 import traceback
-from collections import Counter
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import httpx
 
-from pipeline import config, crawl, store
+from pipeline import config, store
 
 ENV_NAMES = ("DEVIANT_ART_ID", "DEVIANT_ART_SECRET")  # the client id and secret, as .env.example names them
 TOKEN_URL = "https://www.deviantart.com/oauth2/token"
@@ -47,50 +54,117 @@ NICHE_TAGS = (
 MIN_HITS = 3  # deviations under the niche tags before an author counts as a niche artist
 PAGE_SIZE = 50  # the documented maximum for browse/tags
 MAX_OFFSET = 50000  # the documented maximum for browse/tags
-# ponytail: fixed browse depth, 18 tags x 120 pages x 50 = 108,000 deviations a run at most: 2,160 requests,
-# which is 36 minutes before the first profile is read. Nothing is stored until then, so a run stopped while
-# it browses starts again from nothing. Store the hits per tag if that ever costs a night.
+# ponytail: fixed browse depth, 18 tags x 120 pages x 50 = 108,000 deviations a pass at most: 2,160 requests,
+# which is 72 minutes at the base pace. Raise it, and a saved pass is carried on deeper.
 PAGES_PER_TAG = 120
-STORED_LATELY = timedelta(days=1)  # an artist stored this lately is not looked up again: a rerun after a stop is fast
-MIN_INTERVAL = 1.0  # seconds between any two requests
-MAX_429 = 6  # HTTP 429s in a row on one request before the run stops. The wait doubles each time: 1 to 32 seconds.
-SERVER_WAITS = (2.0, 4.0, 8.0, None)  # seconds before a 5XX answer is asked for again. The API docs suggest three.
-# This stage's own, longer patience. The first wide run met an outage of some minutes (504, then 503 on the token
-# request) and lost 200 pages of browsing to it: nothing is stored until browsing ends, so the run waits it out.
-OUTAGE_WAITS = (*SERVER_WAITS[:-1], 60.0, 300.0, 600.0, None)
-# The summary adds up: candidates = skipped (removed) + skipped (stored lately) + profiles unavailable
-# + not reached + artists stored.
-LATELY = "skipped (stored within the last day)"
+PASS_VALID = timedelta(days=7)  # how long after its first page a saved browsing pass is carried on from
+# The pacing rule's numbers (see Pace). The base is half the rate the API limited us at after most of a day.
+BASE_INTERVAL = 2.0  # seconds between two requests to the API while nothing has asked for more
+MAX_INTERVAL = 300.0  # seconds: the ceiling that 429s raise the interval to
+EASE = 0.9  # what an answered request multiplies a raised interval by: down gradually, never below the base
+SERVER_RETRIES = 3  # times a 5XX answer is asked for again. The API docs suggest three for a 500.
+MAX_AT_CEILING = 12  # 429s in a row, each after a wait at the ceiling, before the run stops: an hour of them
+_KEPT = "Everything stored is kept: run again later"
+
+
+class Stop(Exception):
+    """The run cannot go on. The message is safe to print: it never carries response data or credentials."""
+
+
+class Pace:
+    """The interval between requests to one host, for the life of the client. The one place for the pacing rule.
+
+    It starts at `base`. A 429 or a 5XX doubles it, up to MAX_INTERVAL, for every request that follows and not
+    only for the one that is asked again: the API docs call a 429 "a request to slow down", and say that a
+    client which keeps to a fixed rate after one stays limited for longer. Any other answer takes a tenth off
+    it, and never below the base. A Retry-After that asks for longer than the interval is waited, once.
+    MAX_AT_CEILING 429s in a row, each after a wait at the ceiling, stop the run: an hour of slowing down has
+    not helped by then. How often an answer is asked for again is the caller's rule, not this one's.
+    """
+
+    def __init__(self, base: float, host: str) -> None:
+        self.base = self.interval = self.longest = base
+        self.host = host  # a name of ours for the summary, such as "the API"
+        self.requests = self.limited = self._at_ceiling = 0
+        self.waited = self._asked = 0.0  # seconds waited so far, and seconds the last Retry-After asked for
+        self.tell: Callable[[], None] = lambda: None  # called before every request: see tell()
+
+    def wait(self) -> None:
+        """Call before every request to the host. It waits the interval, except before the first one."""
+        self.tell()
+        if self.requests:
+            seconds = max(self.interval, self._asked)
+            # Not injectable, on purpose: the tests replace time.sleep, so this is the line they prove.
+            time.sleep(seconds)
+            self.waited += seconds
+        self.requests += 1
+        self._asked = 0.0
+
+    def ease(self) -> None:
+        """Call after an answer that is neither a 429 nor a 5XX."""
+        self.interval, self._at_ceiling = max(self.base, self.interval * EASE), 0
+
+    def slow(self, response: httpx.Response | None = None) -> None:
+        """Call after an answer that is a 429 or a 5XX, and with nothing after no answer at all."""
+        if response is not None and response.status_code == 429:
+            self.limited += 1
+            self._at_ceiling += self.interval == MAX_INTERVAL
+        if self._at_ceiling == MAX_AT_CEILING:
+            said = f"{MAX_AT_CEILING} times in a row, {MAX_INTERVAL / 60:.0f} minutes apart"
+            raise Stop(f"rate limited: {self.host} answered HTTP 429 {said}. {_KEPT}")
+        # ponytail: Retry-After as a number of seconds only. Given as a date it is not read, and the doubled
+        # interval is what is waited. Read the date too if a host is ever seen to send one.
+        asked = response.headers.get("retry-after", "") if response is not None else ""
+        self._asked = float(asked) if asked.isascii() and asked.isdigit() else 0.0
+        if self._asked > MAX_AT_CEILING * MAX_INTERVAL:
+            raise Stop(f"rate limited: {self.host} asks for a wait of more than an hour. {_KEPT}")
+        self.interval = min(self.interval * 2, MAX_INTERVAL)
+        self.longest = max(self.longest, self.interval)
+
+    def counts(self) -> dict[str, int]:
+        """What the pace has done so far, for the summary and for tell(): counts, and whole seconds rounded up."""
+        return {
+            f"requests to {self.host}": self.requests,
+            f"rate limit answers from {self.host}": self.limited,
+            f"longest interval between requests to {self.host}, in seconds": math.ceil(self.longest),
+            f"interval between requests to {self.host} now, in seconds": math.ceil(max(self.interval, self._asked)),
+            f"seconds spent waiting between requests to {self.host}": round(self.waited),
+        }
+
+
 NOT_REACHED = "not reached (--max-artists)"
-# Every stored artist falls under exactly one of these five: they have an own-site link, or this is why not.
-# Only the count is kept. An own site is optional (owner decision 7): an artist is stored either way.
-OWN_SITE = "of those, with an own-site link"
-NO_WEBSITE = "of those, no website given"
-ON_PLATFORM = "of those, website on a listed platform or DeviantArt"
-OTHER_SHAPE = "of those, website on another domain, not a bare front page"  # a path, subdomain, query or fragment
-NO_HOST = "of those, website names no public host"  # free text, a local name, no registrable domain
-_COUNTS = (
+# The first eight are the browsing pass as it is saved, whichever runs made it, in the order store.tally() gives
+# them. They add up: candidates = skipped (removed) + not reached + artists stored. The rest are this run's own.
+_TALLY = (
     "pages fetched",
     "deviations counted",
     "mature skipped",
     "authors seen",
     f"candidates (>= {MIN_HITS} hits)",
     "skipped (removed)",
-    LATELY,
-    "profiles unavailable",
     NOT_REACHED,
-    "profiles fetched",
     "artists stored",
-    OWN_SITE,
-    NO_WEBSITE,
-    ON_PLATFORM,
-    OTHER_SHAPE,
-    NO_HOST,
 )
+_PACING = tuple(Pace(BASE_INTERVAL, "the API").counts())  # the labels of what the API's pace did
+_COUNTS = (*_TALLY, *_PACING)
 
 
-class Stop(Exception):
-    """The run cannot go on. The message is safe to print: it never carries response data or credentials."""
+def tell(stage: str, counts: dict[str, int] | None = None) -> None:
+    """Say where a running stage is, in a file in the cache folder that anybody may read while it runs, and that
+    `scripts/gpu.py status` shows: the time, then the counts as the summary will print them. Counts only, never
+    a handle, a title or an address. Called with no counts when the run is over, and the file goes: one that
+    is there is a run in progress, or one that was killed, and the time in it says which.
+
+    It only informs. A file that cannot be written or deleted never ends a run.
+    """
+    path = config.CACHE_DIR / f"{stage}.status"
+    with contextlib.suppress(OSError):
+        if counts is None:
+            path.unlink(missing_ok=True)
+        else:
+            lines = [datetime.now(UTC).isoformat(timespec="seconds"), *(f"{name}: {n}" for name, n in counts.items())]
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
 class _Api:
@@ -100,20 +174,23 @@ class _Api:
         self._http = http
         self._credentials = {"grant_type": "client_credentials", "client_id": client_id, "client_secret": client_secret}
         self._token = ""
-        self._started = False
+        self.pace = Pace(BASE_INTERVAL, "the API")
 
     def _send(self, method: str, url: str, **kwargs: Any) -> httpx.Response:
-        wait = MIN_INTERVAL
-        for _ in range(MAX_429):
-            if self._started:
-                # Not injectable, on purpose: the tests replace time.sleep, so this is the line they prove.
-                time.sleep(wait)
-            self._started = True
+        """One request at the pace of the run, asked for again while the answer is one to back off from: a 429
+        until the pace gives up, a 5XX SERVER_RETRIES times. So a 429 never comes back from here, and a 5XX
+        that does has outlasted its retries. What comes back is the caller's to judge."""
+        failed = 0
+        while True:
+            self.pace.wait()
             response = self._http.request(method, url, **kwargs)
-            if response.status_code != 429:
+            if response.status_code != 429 and response.status_code < 500:
+                self.pace.ease()
                 return response
-            wait *= 2  # the docs ask for exponential backoff on 429
-        raise Stop(f"rate limited: {MAX_429} HTTP 429 responses in a row")
+            self.pace.slow(response)
+            failed += response.status_code != 429
+            if failed > SERVER_RETRIES:
+                return response
 
     def _new_token(self) -> None:
         response = self._send("POST", TOKEN_URL, data=self._credentials)  # in the body, never in the URL
@@ -135,63 +212,6 @@ class _Api:
         return response
 
 
-def patient_get(
-    api: _Api, path: str, waits: tuple[float | None, ...] = SERVER_WAITS, /, **params: str | int
-) -> httpx.Response:
-    """api.get(), with a 5XX answer asked for again after each of `waits`. What comes back after that is the
-    caller's to judge. A run browses for half an hour before it stores anything, so one bad answer must not end it.
-    """
-    for wait in waits:
-        response = api.get(path, **params)
-        if response.status_code < 500 or wait is None:
-            break
-        time.sleep(wait)  # on top of the second _Api leaves before every request
-    return response
-
-
-def _website(website: object) -> httpx.URL | None:
-    """The profile's website field as a URL whose host is in its one spelling. None when it names no public host."""
-    if not isinstance(website, str) or len(website) > 300:
-        return None
-    text = website.strip()
-    try:
-        url = httpx.URL(text if "://" in text else f"https://{text}")  # the parser is_own_site itself uses
-        host = store.canonical_host(url.raw_host.decode("ascii"))
-        return url.copy_with(host=host) if host else None
-    except (httpx.InvalidURL, UnicodeError):  # UnicodeError: a lone surrogate, which JSON can carry
-        return None
-
-
-def _external_links(website: object) -> list[str]:
-    """The profile's website field as zero or one link: the front page of the artist's own domain.
-
-    crawl.is_own_site is the rule, and it sees the whole URL: only http(s)://janedoe.art/ or its www. form passes.
-    A link with a path, a query, a fragment, a user subdomain, a port or credentials is dropped whole, never
-    trimmed to the site root, because it cannot be told from a profile on a platform. What is kept is rebuilt
-    as scheme://host/, so nothing else in the field can reach the store.
-    """
-    url = _website(website)
-    if url is None or not crawl.is_own_site(str(url)):
-        return []
-    return [f"{url.scheme}://{url.raw_host.decode('ascii')}/"]
-
-
-def _why_no_link(website: object, hosts: set[str]) -> str:
-    """Which count a stored artist with no own-site link falls under, given the hosts their website field names.
-
-    For the printed summary only. Nothing about the profile or the link is kept: the answer is one of four labels.
-    """
-    if not isinstance(website, str) or not website.strip():
-        return NO_WEBSITE
-    if any(store.registrable_domain(host) for host in hosts):  # a domain that could be their own, in another shape
-        return OTHER_SHAPE
-    for labels in (host.split(".") for host in hosts):  # the two lists the crawl stage refuses: names, then domains
-        on_a_listed_domain = any(".".join(labels[start:]) in crawl.PLATFORM_DOMAINS for start in range(len(labels)))
-        if on_a_listed_domain or not crawl.PLATFORM_NAMES.isdisjoint(labels):
-            return ON_PLATFORM
-    return NO_HOST
-
-
 @contextlib.contextmanager
 def _http_logs_off() -> Iterator[None]:
     """httpx logs every request URL at INFO, and a profile lookup's URL holds a handle. Not during a run."""
@@ -207,18 +227,19 @@ def _http_logs_off() -> Iterator[None]:
 
 
 def _run(api: _Api, counts: dict[str, int], max_artists: int, db: pathlib.Path | str | None) -> None:
-    hits: Counter[str] = Counter()  # lowercased handle -> distinct non-mature deviations under the niche tags
-    names: dict[str, str] = {}  # lowercased handle -> the handle as DeviantArt spells it
-    seen: set[str] = set()  # deviation ids, held in memory only, so a work under two tags counts once
-
+    progress = store.browsing_pass(datetime.now(UTC) - PASS_VALID, db)
+    # The pass as it is saved, first: a run that stops at its first request still says where the pass is.
+    counts.update(zip(_TALLY, store.tally(MIN_HITS, db), strict=True))
+    known = {key for key, _, _ in store.all_artists(db)}
+    added = 0  # artists this run has stored who were not in the store before it
     for tag in NICHE_TAGS:
-        offset = 0
-        for _ in range(PAGES_PER_TAG):
-            response = patient_get(api, "/browse/tags", OUTAGE_WAITS, tag=tag, offset=offset, limit=PAGE_SIZE)
+        offset, pages = progress.get(tag, (0, 0))
+        while offset is not None and pages < PAGES_PER_TAG:
+            response = api.get("/browse/tags", tag=tag, offset=offset, limit=PAGE_SIZE)
             if response.status_code != 200:
                 raise Stop(f"browse failed with HTTP {response.status_code}")
             page = response.json()
-            counts["pages fetched"] += 1
+            works: list[tuple[str, str | None]] = []  # deviation id, and its author's handle when the work counts
             for deviation in page.get("results") or []:
                 if not isinstance(deviation, dict):  # one malformed entry is skipped; it does not end the run
                     continue
@@ -226,74 +247,33 @@ def _run(api: _Api, counts: dict[str, int], max_artists: int, db: pathlib.Path |
                 username = author.get("username") if isinstance(author, dict) else None
                 if not isinstance(deviation_id, str) or not isinstance(username, str):
                     continue
-                if not store.HANDLE.fullmatch(username) or deviation_id in seen:
+                if store.HANDLE.fullmatch(username):
+                    # Only an explicit "not mature" counts. Any other work is in the tally for nobody.
+                    works.append((deviation_id, username if deviation.get("is_mature") is False else None))
+            # The tally takes the page, as hashes, and says how many works each of its authors has now. Whoever
+            # has enough is stored there and then, under the handle this page spells: none is written down sooner.
+            capped = False
+            for username, hits in store.count_works(works, db).items():
+                key = store.artist_key(username)
+                if hits < MIN_HITS:
                     continue
-                seen.add(deviation_id)
-                if deviation.get("is_mature") is not False:  # only an explicit "not mature" counts
-                    counts["mature skipped"] += 1
-                    continue
-                counts["deviations counted"] += 1
-                hits[username.lower()] += 1
-                names[username.lower()] = username
-                counts["authors seen"] = len(hits)
-            # The next page is where the response says it is, never our own arithmetic, and only forwards
-            # inside the documented range.
-            next_offset = page.get("next_offset")
-            if page.get("has_more") is not True or type(next_offset) is not int:
-                break
-            if not offset < next_offset <= MAX_OFFSET:
-                break
-            offset = next_offset
-
-    candidates = sorted((key for key, n in hits.items() if n >= MIN_HITS), key=lambda key: (-hits[key], key))
-    counts[f"candidates (>= {MIN_HITS} hits)"] = len(candidates)
-    # Every artist is stored as soon as their profile is read, so a run that is stopped keeps what it has, and
-    # the run after it does not read again the profiles of those it stored.
-    lately = store.stored_since(datetime.now(UTC) - STORED_LATELY, db)
-    for position, key in enumerate(candidates):
-        if counts["artists stored"] >= max_artists:
-            counts[NOT_REACHED] = len(candidates) - position
-            break
-        username = names[key]
-        if store.is_removed(store.artist_key(username), db):  # hard rule 7: skipped without a lookup
-            counts["skipped (removed)"] += 1
-            continue
-        if store.artist_key(username) in lately:
-            counts[LATELY] += 1
-            continue
-        response = patient_get(api, f"/user/profile/{username}", OUTAGE_WAITS)
-        status = response.status_code
-        # The docs give 4XX for a profile that cannot be shown (suspended, inactive, gone). One such account
-        # must not end the run. 401 means our token, and 429 never gets here.
-        unavailable = 400 <= status < 500 and status not in (401, 429)
-        if status != 200 and not unavailable:
-            raise Stop(f"profile lookup failed with HTTP {status}")
-        if status == 200:
-            counts["profiles fetched"] += 1
-        # ponytail: the website field is the only link the profile response documents. Links typed into the bio
-        # are not read, because that means parsing DeviantArt text. Revisit if too few artists have a website.
-        body = response.json() if status == 200 else None
-        website = body.get("website") if isinstance(body, dict) else None
-        # The removal list is asked about every host the field names, however it is written, before the own-site
-        # rule gets to drop the link. The same hosts are recorded as hashes for the shared-domain rule.
-        # A profile that names a removed site is not stored. That is one answer's word, so it deletes nothing
-        # and bars nobody: an artist who is stored already stays as they are, and is read again next run.
-        # ponytail: not marked here. The collect stage reads the same field on the artist's turn and marks them.
-        hosts = store.hosts_in(website)
-        if store.record_listing(username, hosts, db):
-            counts["skipped (removed)"] += 1
-            continue
-        if unavailable:
-            counts["profiles unavailable"] += 1
-            continue
-        # Every candidate whose profile can be read is stored. A link is kept only if it is their own site's
-        # front page; without one the artist is stored all the same, with no link.
-        links = _external_links(website)
-        if not store.upsert_artist(username, PROFILE_URL.format(username), links, hits[key], db):
-            counts["skipped (removed)"] += 1
-            continue
-        counts["artists stored"] += 1
-        counts[OWN_SITE if links else _why_no_link(website, hosts)] += 1
+                if key not in known and added >= max_artists:
+                    capped = True  # the page is not noted as read: the next run reads it again and stores the rest
+                    break
+                # The store has the last word (hard rule 7): somebody on the removal list is not stored again.
+                if store.upsert_artist(username, PROFILE_URL.format(username), None, hits, db) and key not in known:
+                    known.add(key)
+                    added += 1
+            if not capped:
+                # The next page is where the response says it is, never our own arithmetic, and only forwards
+                # inside the documented range.
+                next_offset = page.get("next_offset")
+                more = page.get("has_more") is True and type(next_offset) is int and offset < next_offset <= MAX_OFFSET
+                offset, pages = next_offset if more else None, pages + 1
+                store.note_browsed(tag, offset, db)
+            counts.update(zip(_TALLY, store.tally(MIN_HITS, db), strict=True))
+            if capped:
+                return
 
 
 def discover(
@@ -304,18 +284,25 @@ def discover(
     db: pathlib.Path | str | None = None,
     transport: httpx.BaseTransport | None = None,
 ) -> int:
-    """Run one discovery pass and print its counts. Returns the exit code."""
+    """Run one discovery pass, or carry on the one that is saved, and print its counts. Returns the exit code."""
     counts = dict.fromkeys(_COUNTS, 0)
     status = 0
     try:
         # A redirect is never followed: it would carry the credentials or the token to wherever it points.
+        # httpx adds Accept-Encoding to every request beside this user agent: the API docs ask for both.
         with (
             _http_logs_off(),
             httpx.Client(
                 headers={"User-Agent": config.USER_AGENT}, transport=transport, timeout=30, follow_redirects=False
             ) as http,
         ):
-            _run(_Api(http, client_id, client_secret), counts, max_artists, db)
+            api = _Api(http, client_id, client_secret)
+            api.pace.tell = lambda: tell("discover", counts | api.pace.counts())
+            try:
+                _run(api, counts, max_artists, db)
+            finally:
+                counts.update(api.pace.counts())
+                tell("discover")
     except Stop as stop:
         print(f"stopped: {stop}", file=sys.stderr)
         status = 1
@@ -330,8 +317,8 @@ def discover(
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Find niche artists through the DeviantArt API (handles and links).")
-    parser.add_argument("--max-artists", type=int, default=200, help="stop after storing this many artists")
+    parser = argparse.ArgumentParser(description="Find niche artists through the DeviantArt API (handles only).")
+    parser.add_argument("--max-artists", type=int, default=200, help="stop after storing this many new artists")
     args = parser.parse_args(argv)
     try:
         env = config.load_env()
