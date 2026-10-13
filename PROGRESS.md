@@ -1,6 +1,6 @@
 # Artist Search: Progress
 
-**Status, 2026-10-13:** No push to the public database until the push stage is fixed: its first critic failed it on five of ten properties. Style lost to DeviantArt's "More Like This", 11 seeds to 17 after one fix, mostly for want of a bigger pool. Profiles have had an unsupported claim on 2 of 20 artists for five rounds and are changing approach. Collection passed its check on real data and the wide discovery is running, toward 3,000-plus artists. The GPU work can now be paused and resumed. 119 artists are public; the site runs locally only and nothing is deployed.
+**Status, 2026-10-13, evening:** Scaling is paused on the API side: DeviantArt rate-limited our client after a day at one request a second, and our pacing was wrong for its adaptive limit. No API requests are being made while that clears, and the client is being rebuilt to slow down when asked. Push stays closed until a critic passes it; two of its three fix rounds are in. Style lost to DeviantArt's "More Like This", 11 seeds to 17. Profiles changed approach in round 6 and await their critic. The GPU work continues and can be paused. 119 artists are public; nothing is deployed.
 
 ## Waiting on the owner
 
@@ -639,3 +639,45 @@ Push had four unjudged rounds. It is the last gate before the public, so it was 
 **Discovery, first wide run: stopped by an outage.** After 202 of 2,160 browse pages DeviantArt's API answered 504, and minutes later 503 on the token request. A probe a few minutes on found every depth answering in about a second, so depth was not the cause. Discovery stores nothing until browsing ends, so 45 minutes were lost and nothing else. It now waits out a server error for up to about 16 minutes (retries after 2, 4 and 8 seconds, then 1, 5 and 10 minutes) and has been started again.
 
 **Pipeline counts:** artists discovered 472, collected 472, works 5,126, works tagged about 4,800, artists public 119, works public 1,130. **Database:** 16.8 MB of 400 MB.
+
+### Round 14: rate-limited by DeviantArt; readings tied to what was read; profiles round 6 (2026-10-13)
+
+**The API rate-limited us, and our pacing was at fault.**
+- The second wide discovery run crawled for four hours without finishing its browsing or storing one artist. A measurement showed every request answered HTTP 429.
+- DeviantArt's documentation says the limit is adaptive: bursts are allowed, a sustained rate is throttled, a 429 is "a request to slow down", and a client that carries on "at the same or even a lower fixed rate" stays limited longer.
+- Our client backed off on a 429 for that one request and then returned to one request a second. Collection and discovery ran that way for most of the day. That is the pattern the documentation warns against.
+- The lead's own measurement made it slightly worse: 30 requests a second apart, continued after the first 429s. It should have stopped at the first.
+- Discovery was stopped. No request is being made to the API while the limit clears.
+
+**What changes (in progress, then a critic, since staying within the API's terms is hard rule 3)**
+- Pacing for the whole run: a slower base rate, an interval that doubles on each 429 and comes down only gradually, and a stop if the API keeps refusing for about an hour. One client at a time.
+- Discovery no longer looks up each candidate's profile. It did so only for the website field, which collection reads anyway. About 3,500 requests fewer.
+- Browsing saves its progress, so a stop loses nothing. Two runs lost all their browsing today.
+- Long runs report where they are. For four hours there was no way to tell whether discovery was working, waiting or stuck.
+
+**Effect on the schedule.** About 12,000 requests are needed for 3,000 more artists. At a pace the API accepts that is likely one to two days.
+
+**Readings are now tied to what was read (the push critic's biggest gap).**
+- Every reading by a model carries a fingerprint of exactly what it was given: the image bytes, or the words.
+- A reading that does not match the current image or words counts as never made. Tagging makes it again, profiles waits, push holds the work or the text back. A replaced image is fetched again and its old readings go stale with it.
+- All three of the critic's stale-reading counterexamples now behave correctly. 2,258 tests pass on the merged code.
+- The migration measured the real store against the backup from before today's second collection:
+
+| | Count |
+|---|---|
+| Readings fingerprinted | 35,666 |
+| Works whose title had changed since it was read | 16 |
+| Works whose tags had changed | 3 |
+| Artists whose tagline had changed | 4 |
+| Works with a replaced image | 0 |
+
+- None of those reached the public database: nothing has been pushed since the second collection. They are what the next push would have sent under old readings.
+- Merging this with profiles round 6 produced two collisions that the text merge did not flag and the type checker did. Both are fixed, and the per-work look now waits when an image changes mid-run.
+
+**Push, round 5: 10 of the critic's 14 counterexamples fixed.** Every rating counts toward an artist's share and an unrated work counts against; a removal is recorded before any file is deleted and covers every handle of the account; a missing row is never read as a removal; many deletions or removals at once stop the run; a dry run changes nothing anywhere; every text field passes the contact rule when it is sent. With the fingerprints, 13 of 14 are fixed. The last is disputed: when ten artists list one removed site, the critic expects nine to stay and an existing store test requires the opposite; push now stops and asks. A fresh critic judges the stage before any push.
+
+**Profiles, round 6: landed, not yet judged.** Claims are counted on each work at full size; the kind of output leads the card ("Character design sheets, mostly fantasy"); the repeated-word bug is fixed; wording follows the share. Of 52 genres or manners that round 5 stated flat on the sheet count, 18 no longer qualify. 21 seconds an artist. The worker is redoing every card; the critic follows.
+
+**GPU control.** `scripts/gpu.py` pauses, resumes and reports (owner decision 10).
+
+**Pipeline counts:** artists discovered 472, collected 472, works 5,126, all tagged, rated and with style vectors; artists public 119. **Database:** 16.8 MB of 400 MB.
