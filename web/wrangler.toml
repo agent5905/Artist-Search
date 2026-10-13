@@ -1,0 +1,12 @@
+# Cloudflare Pages project (owner decision 9). Nothing here deploys: that is asked for separately.
+name = "artist-search"
+pages_build_output_dir = "dist"
+compatibility_date = "2026-10-01"
+
+# Workers AI: the search box's query becomes a bge-m3 embedding (functions/api/search.ts).
+[ai]
+binding = "AI"
+remote = true # there is no local Workers AI: local runs call the real one too
+
+# The function also reads VITE_SUPABASE_URL and VITE_SUPABASE_PUBLISHABLE_KEY, the two browser-safe
+# values: from .dev.vars locally (scripts/dev.mjs writes it), from the Pages project's settings when hosted.
