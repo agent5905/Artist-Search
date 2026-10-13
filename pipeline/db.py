@@ -6,6 +6,7 @@ Nothing here prints a value from .env. Errors carry the HTTP status and the serv
 never the request URL (it holds the project ref).
 """
 
+import itertools
 import sys
 import time
 from typing import Any, Literal
@@ -16,7 +17,12 @@ from pipeline.config import ROOT, load_env
 
 Key = Literal["publishable", "secret"]
 _KEY_ENV = {"publishable": "VITE_SUPABASE_PUBLISHABLE_KEY", "secret": "SUPABASE_SECRET_KEY"}
-_http = httpx.Client(timeout=180)  # a full-scale load or rewrite is one statement of a minute or more
+_http = httpx.Client(timeout=180)  # a vacuum or a rebuild at full scale is one statement of a minute or more
+# Artists written per batch by load(). With ten works each that is a statement of about 100 rows, which
+# stays far inside the Data API's 8 s even when the free tier is throttled (500 rows did not).
+LOAD_BATCH = 10
+VACUUM_EVERY = 50  # batches between vacuums during a load, so old row versions never pile up
+LOAD_REST = 5.0  # the longest load() rests after a batch, in seconds
 
 
 def _send(method: str, url: str, headers: dict[str, str], **kwargs: Any) -> httpx.Response:
@@ -66,7 +72,7 @@ def upsert(table: str, rows: list[dict[str, Any]], on_conflict: str, returning: 
     downloading embeddings). The database leaves two kinds of row out, and so they are missing from
     the result: an artist who was removed (or who links to a removed site or profile), and a row
     that already holds exactly these values, which is not rewritten. So read the ids to attach works
-    with from rpc("artist_ids", {}, "secret"), not from here. Call after_load() when done.
+    with from rpc("artist_ids", {}, "secret"), not from here. To load artists with their works, use load().
     """
     if not rows:
         return []
@@ -107,22 +113,67 @@ def migrate() -> None:
     raise RuntimeError("the Data API did not pick up the schema within 30 seconds")
 
 
-def after_load() -> None:
-    """Run after every load: rebuild what the public functions read, then vacuum.
+def load(artists: list[dict[str, Any]], works: list[dict[str, Any]]) -> None:
+    """Write artists and their works a few at a time, so the public never meets a database in mid-rewrite.
 
-    Until it has run, similar_artists cannot see a new artist, and a misspelled search word is only
-    put right to words that were already known. The rebuilds go through the Management API, which
-    has no 8 s limit: a first fill of the style table for 3,000 artists writes about 46 MB.
+    Each work names its artist by "artist_slug" in place of artist_id. For every batch of LOAD_BATCH
+    artists: the artists, their works, then the style rows similar_artists reads, for those artists
+    only. After each batch it rests for as long as the batch took (LOAD_REST at most), so the load uses
+    half of what the database can do and visitors get the rest; a slow database is given more room.
+    Dead row versions are vacuumed every VACUUM_EVERY batches, without the statistics pass: that one
+    samples whole tables, which is the heaviest reading a load would do. A work whose artist the
+    database skipped (a removed artist) is skipped with them. Safe to repeat: rows that have not
+    changed are not rewritten.
     """
-    sql("select public.refresh_style_centroids()")
+    by_artist: dict[str, list[dict[str, Any]]] = {}
+    for work in works:
+        row = {name: value for name, value in work.items() if name != "artist_slug"}
+        by_artist.setdefault(work["artist_slug"], []).append(row)
+    for number, batch in enumerate(itertools.batched(artists, LOAD_BATCH), start=1):
+        began = time.perf_counter()
+        for attempt in (1, 2):
+            try:
+                _load_batch(list(batch), by_artist)
+                break
+            except RuntimeError as error:
+                # One more try for a batch the database was too busy to finish in time (it is safe to repeat).
+                if attempt == 2 or "57014" not in str(error):
+                    raise
+                time.sleep(LOAD_REST)
+        time.sleep(min(time.perf_counter() - began, LOAD_REST))
+        if number % VACUUM_EVERY == 0:
+            vacuum_analyze(analyze=False)
+    after_load(refresh_styles=False)  # each batch refreshed its own
+
+
+def _load_batch(batch: list[dict[str, Any]], by_artist: dict[str, list[dict[str, Any]]]) -> None:
+    slugs = [row["slug"] for row in batch]
+    upsert("artists", batch, "slug", "slug")
+    ids = rpc("artist_ids", {"p_slugs": slugs}, "secret")
+    rows = [{**work, "artist_id": ids[slug]} for slug in slugs if slug in ids for work in by_artist.get(slug, [])]
+    upsert("works", rows, "artist_id,key", "id")
+    rpc("refresh_style_centroids", {"p_slugs": slugs}, "secret")
+
+
+def after_load(refresh_styles: bool = True) -> None:
+    """Finish a load: sweep, rebuild what the public functions read, vacuum. load() calls it.
+
+    Call it yourself after writing rows with upsert(). The sweep deletes any artist on the removal
+    list that a removal had to leave because a load held the row. The rebuilds go through the
+    Management API, which has no 8 s limit.
+    """
+    sql("select public.delete_removed()")
+    if refresh_styles:
+        sql("select public.refresh_style_centroids()")
     sql("select public.refresh_search_words()")
     vacuum_analyze()
 
 
-def vacuum_analyze() -> None:
-    """Clear dead row versions and refresh the planner's statistics."""
+def vacuum_analyze(analyze: bool = True) -> None:
+    """Clear dead row versions and, unless told not to, refresh the planner's statistics."""
+    command = "vacuum (analyze)" if analyze else "vacuum"
     for table in ("artists", "works", "artist_styles", "search_words"):
-        sql(f"vacuum (analyze) public.{table}")  # one call each: vacuum cannot share a transaction
+        sql(f"{command} public.{table}")  # one call each: vacuum cannot share a transaction
 
 
 if __name__ == "__main__":

@@ -1,53 +1,49 @@
 -- Artist Search schema. Every statement is idempotent, so the file is safe to rerun.
 --
--- Hard rule 1: no column holds image bytes. There is no bytea anywhere, every URL (the URL columns
--- and each entry of artists.links) must pass clean_url, which a data: URL cannot, and every text
--- column and list entry is too short to carry an image as text (the *_sizes constraints below).
--- Hard rule 7: a handle and a site have exactly one spelling here. Anything else is refused at
--- write time, so a removed artist cannot come back under a variant the removal keys do not match.
+-- Hard rule 1: no column holds image bytes. There is no bytea anywhere, every URL must pass
+-- clean_url (which nothing carrying "data:" can) and sit on the host its source says it is on, and
+-- every text column and list entry is too short to carry an image as text (the *_sizes constraints).
+-- Hard rule 7: an artist is known by a DeviantArt handle and, if they have a site, its registrable
+-- domain. Each has exactly one spelling here, so a removed artist cannot come back under a variant.
 -- Row level security is on for every table with no policies: the public role reads only through
 -- the functions in 002_functions.sql.
 
 create extension if not exists vector with schema extensions;
 create extension if not exists pg_trgm with schema extensions; -- for misspelled search words
+create extension if not exists pgcrypto with schema extensions; -- for the removal proof code
+
+-- A function created later is not the public's to call until it is granted. (The first line takes back
+-- what every function gets by default; the second, what this project's defaults added in this schema.)
+alter default privileges for role postgres revoke execute on functions from public;
+alter default privileges for role postgres in schema public revoke execute on functions from anon, authenticated;
 
 -- A strict http(s) URL, at most 2,048 characters:
 --   * the host is a public DNS name in its one canonical spelling: lowercase ASCII (punycode for
 --     other scripts), no user, no trailing dot, no IP address. The same rule as pipeline/store.py.
 --   * the rest is URL characters only (RFC 3986): no spaces, control or non-ASCII characters.
 --     Encode those as %XX before storing.
---   * no fragment. It never reaches the server, so it is only a place to hide data.
+--   * no fragment (it never reaches the server, so it is only a place to hide data) and no "data:"
+--     anywhere, in any case.
 -- A DeviantArt deviation page and its signed thumbnail URL (a long token in the query) both pass.
 create or replace function public.clean_url(p_url text) returns boolean
 language sql immutable set search_path = ''
 as $fn$
-  select length(p_url) <= 2048 and p_url ~ (
+  select length(p_url) <= 2048 and p_url !~* 'data:' and p_url ~ (
     '^https?://(?=[^/?:]{4,253}([/?:]|$))'
     || '([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+([a-z]{2,63}|xn--[a-z0-9-]{1,59})'
     || '(:[0-9]{1,5})?'
     || '([/?][A-Za-z0-9._~:/?@!$&''()*+,;=%-]*)?$')
 $fn$;
 
--- artists.links: a list of at most 50 clean URLs.
-create or replace function public.clean_links(p_links jsonb) returns boolean
+-- The host of a clean URL.
+create or replace function public.url_host(p_url text) returns text
 language sql immutable set search_path = ''
-as $$
-  select case when jsonb_typeof(p_links) = 'array' then
-    jsonb_array_length(p_links) <= 50 and not exists (
-      select 1 from jsonb_array_elements(p_links) link
-      where jsonb_typeof(link) <> 'string' or public.clean_url(link #>> '{}') is not true)
-  else false end
-$$;
+as $$ select substring(p_url from '^https?://([a-z0-9.-]+)') $$;
 
--- The host a site is known by: www.example.com and example.com are one site.
--- Null for deviantart.com, which is never an artist's own site (the same rule as pipeline/store.py),
--- so one removal can never put the host every profile links to on the removal list.
-create or replace function public.site_host(p_url text) returns text
+-- Whether a host is a domain or lies under it: example.com and shop.example.com, not notexample.com.
+create or replace function public.host_under(p_host text, p_domain text) returns boolean
 language sql immutable set search_path = ''
-as $$
-  select nullif(regexp_replace(host, '^(.*\.)?deviantart\.com$', ''), '')
-  from (select regexp_replace(substring(p_url from '^https?://([a-z0-9.-]+)'), '^www\.(?=.*\.)', '') as host) url
-$$;
+as $$ select p_host = p_domain or right(p_host, length(p_domain) + 1) = '.' || p_domain $$;
 
 -- A list of at most p_max_items entries, each at most p_max_length characters.
 create or replace function public.short_list(p_list text[], p_max_items int, p_max_length int) returns boolean
@@ -56,6 +52,12 @@ as $$
   select coalesce(cardinality(p_list), 0) <= p_max_items
      and not exists (select 1 from unnest(p_list) item where item is null or length(item) > p_max_length)
 $$;
+
+-- What the removal list holds of an identifier ('da:<handle>' or 'site:<domain>'): its sha256, so the
+-- list names nobody. The same hash as pipeline/store.py makes.
+create or replace function public.key_hash(p_key text) returns text
+language sql immutable set search_path = ''
+as $$ select encode(sha256(convert_to(p_key, 'UTF8')), 'hex') $$;
 
 -- What keyword search reads of an artist. The name counts most, then the artist's own short words and
 -- the stated facts, then the written profile, then the rest of their own words.
@@ -77,9 +79,9 @@ create table if not exists public.artists (
   id bigint generated always as identity primary key,
   slug text not null unique check (slug ~ '^[a-z0-9]+(-[a-z0-9]+)*$'),
   name text not null,
-  da_username text not null,
-  site_url text, -- most artists have none
-  links jsonb not null default '[]',
+  da_username text not null, -- the profile is https://www.deviantart.com/<da_username>
+  site_url text, -- the artist's own site; most artists have none
+  site_domain text, -- its registrable domain (janedoe.art for portfolio.janedoe.art), worked out by the push stage
   tagline text, -- the artist's own words
   top_tags text[] not null default '{}', -- the tags the artist uses most
   search_text text, -- more of the artist's own words, gathered by the push stage: titles, tags, stated specialty
@@ -96,7 +98,11 @@ create table if not exists public.artists (
   updated_at timestamptz not null default now(),
   fts tsvector generated always as (
     public.artist_fts(name, tagline, profile, specialties, mediums, top_tags, search_text)
-  ) stored
+  ) stored,
+  -- What the removal list would hold for this artist. Kept in the row so that a removal finds its
+  -- rows, and a reader leaves a removed artist out, by an index lookup.
+  da_key text generated always as (public.key_hash('da:' || lower(da_username))) stored,
+  site_key text generated always as (public.key_hash('site:' || site_domain)) stored
 );
 
 create table if not exists public.works (
@@ -117,7 +123,7 @@ create table if not exists public.works (
 );
 
 -- What similar_artists reads, so that a call never walks the works table or the wide artists rows.
--- Derived: refresh_style_centroids() rebuilds it from works, and db.after_load() calls that.
+-- Derived: refresh_style_centroids() rebuilds it from works, and db.load() calls that for each batch.
 -- It exists because of memory, not arithmetic: on the free tier (0.5 GB) the first call after a big
 -- write has to bring every page it touches back into memory, and the public role is cut off at 3 s.
 create table if not exists public.artist_styles (
@@ -129,8 +135,8 @@ create table if not exists public.artist_styles (
   first_works extensions.halfvec(768)[] storage external not null check (cardinality(first_works) between 1 and 10)
 );
 
--- The words artists use, for putting a misspelled search word right. Derived: refresh_search_words()
--- rebuilds it, and db.after_load() calls that.
+-- The words visible artists use, for putting a misspelled search word right. Derived:
+-- refresh_search_words() rebuilds it; db.load() and every removal call that.
 create table if not exists public.search_words (
   word text primary key check (length(word) between 4 and 40),
   artists int not null -- how many artists use it
@@ -144,59 +150,61 @@ create index if not exists search_words_trgm_idx on public.search_words using gi
 -- artists.profile_embedding and keep the mean style vector to index as well.
 
 -- Removal requests waiting for the owner: logged, never acted on by themselves (owner decision 6).
--- At most 5 per artist; the owner clears them with purge_removed or reject_removal.
+-- One row per artist: when it was first and last asked for, how often, and what the first request
+-- said. A later request only counts; nothing a visitor sends can erase what an artist wrote.
 create table if not exists public.removal_requests (
-  id bigint generated always as identity primary key,
-  artist_slug text not null,
-  note text,
-  created_at timestamptz not null default now()
+  artist_slug text primary key,
+  note text, -- the first request's note
+  first_at timestamptz not null default now(),
+  last_at timestamptz not null default now(),
+  requests bigint not null default 1
 );
 
--- One open proof per artist: the hash of the code they were asked to put on their own page, and
--- when it stops counting. The code itself is never stored.
-create table if not exists public.removal_proofs (
-  artist_slug text primary key check (length(artist_slug) <= 80),
-  code_hash text not null check (code_hash ~ '^[0-9a-f]{64}$'),
-  expires_at timestamptz not null
+-- The one secret a removal proof code is derived from. Readable by the table owner only, which the
+-- two functions that need it run as. Made once, with a random value.
+create table if not exists public.removal_secret (
+  only_row boolean primary key default true check (only_row),
+  secret text not null default encode(extensions.gen_random_bytes(32), 'hex')
 );
+insert into public.removal_secret default values on conflict do nothing;
 
--- sha256 hex of 'da:<handle>' and 'site:<host>' for every removed artist, so they are never re-added.
+-- sha256 hex of 'da:<handle>' and 'site:<domain>' for every removed artist, so they are never re-added.
 create table if not exists public.removed (
   key_hash text primary key,
   removed_at timestamptz not null default now()
 );
 
--- A database made by an earlier version of this file: bring it up to the tables above.
-alter table public.artists alter column da_username set not null;
-alter table public.artists drop column if exists style_centroid;
-alter table public.artists drop constraint if exists artists_site_url_check;
+-- A database made by the previous version of this file: bring it up to the tables above.
+drop index if exists public.artists_da_username_idx; -- replaced by the unique index on da_key
+drop index if exists public.artists_site_host_idx; -- replaced by the unique index on site_key
+alter table public.artists drop column if exists links; -- a site and a handle are all an artist is known by
 alter table public.artists
-  add column if not exists tagline text,
-  add column if not exists top_tags text[] not null default '{}',
-  add column if not exists search_text text,
-  add column if not exists profile_bits bit(1024)
-    generated always as (extensions.binary_quantize(profile_embedding)) stored;
+  add column if not exists site_domain text,
+  add column if not exists da_key text generated always as (public.key_hash('da:' || lower(da_username))) stored,
+  add column if not exists site_key text generated always as (public.key_hash('site:' || site_domain)) stored;
+drop function if exists public.clean_links(jsonb);
+drop function if exists public.site_host(text);
+drop table if exists public.removal_proofs; -- the proof code is derived now, not stored
 do $$
 begin
-  if (select pg_get_expr(d.adbin, d.adrelid) not like '%artist_fts%'
-      from pg_attrdef d join pg_attribute a on a.attrelid = d.adrelid and a.attnum = d.adnum
-      where d.adrelid = 'public.artists'::regclass and a.attname = 'fts') then
-    alter table public.artists alter column fts set expression as (
-      public.artist_fts(name, tagline, profile, specialties, mediums, top_tags, search_text)
-    );
+  if exists (
+    select 1 from pg_attribute
+    where attrelid = 'public.removal_requests'::regclass and attname = 'id' and not attisdropped
+  ) then
+    -- One row per request became one row per artist: keep each artist's first request.
+    delete from public.removal_requests newer using public.removal_requests older
+    where older.artist_slug = newer.artist_slug and (older.created_at, older.id) < (newer.created_at, newer.id);
+    alter table public.removal_requests drop constraint removal_requests_pkey;
+    alter table public.removal_requests drop column id;
+    alter table public.removal_requests rename column created_at to first_at;
+    alter table public.removal_requests drop constraint if exists removal_requests_sizes;
+    update public.removal_requests set note = left(note, 300);
   end if;
 end
 $$;
-drop function if exists public.words(text[]); -- what the first keyword index was built with
-
-alter table public.works
-  drop constraint if exists works_page_url_check,
-  drop constraint if exists works_image_url_check,
-  drop constraint if exists works_artist_id_image_url_key; -- replaced by one work per key
-alter table public.works add column if not exists source text not null default 'site';
-alter table public.works alter column source drop default; -- every load must say where a work is from
-alter table public.works add column if not exists key text
-  generated always as (case when source = 'deviantart' then page_url else image_url end) stored;
+alter table public.removal_requests
+  add column if not exists last_at timestamptz not null default now(),
+  add column if not exists requests bigint not null default 1;
 
 -- Search reads every artist's row, and after a big write each page of them has to come back into
 -- memory before the public's 3 s run out. So the row keeps only what search reads (the keyword
@@ -207,19 +215,6 @@ alter table public.artists
   alter column profile_bits set storage plain,
   alter column specialties set storage main,
   alter column mediums set storage main;
-
-do $$
-begin
-  if exists (
-    select 1 from pg_constraint
-    where conrelid = 'public.removal_requests'::regclass and pg_get_constraintdef(oid) = 'PRIMARY KEY (artist_slug)'
-  ) then
-    alter table public.removal_requests drop constraint removal_requests_pkey; -- it allowed one request per artist
-  end if;
-end
-$$;
-alter table public.removal_requests add column if not exists id bigint generated always as identity;
-alter table public.removal_requests drop column if exists hidden_at; -- requests no longer hide anyone
 
 -- Every constraint that is not part of a "create table" above, added once ("add constraint" has no
 -- "if not exists"). The sizes: a name, tagline or title is a line, a profile or description a
@@ -233,19 +228,32 @@ begin
       -- A DeviantArt handle, the same pattern as pipeline/store.py.
       ('artists', 'artists_da_username_clean', $$check (da_username ~ '^[A-Za-z0-9_-]{1,40}$')$$),
       ('artists', 'artists_site_url_clean', 'check (public.clean_url(site_url))'),
-      ('artists', 'artists_links_clean', 'check (public.clean_links(links))'),
+      -- A site comes with its registrable domain, and lies on it or under it. The domain is a plain
+      -- lowercase DNS name, and never DeviantArt's or its image host's: those are nobody's own site.
+      ('artists', 'artists_site_domain_clean',
+       $$check ((site_url is null) = (site_domain is null) and (site_domain is null or (
+           length(site_domain) <= 253
+           and site_domain ~ '^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+([a-z]{2,63}|xn--[a-z0-9-]{1,59})$'
+           and site_domain !~ '(^|\.)(deviantart|wixmp)\.com$'
+           and public.host_under(public.url_host(site_url), site_domain))))$$),
       ('artists', 'artists_sizes',
        'check (length(slug) <= 80 and length(name) between 1 and 120 and length(profile) <= 2000'
        ' and public.short_list(specialties, 20, 60) and public.short_list(mediums, 20, 60))'),
       ('artists', 'artists_own_words_sizes',
        'check (length(tagline) <= 300 and length(search_text) <= 4000 and public.short_list(top_tags, 40, 60))'),
       ('works', 'works_urls_clean', 'check (public.clean_url(page_url) and public.clean_url(image_url))'),
+      -- A DeviantArt work is a deviation page and a thumbnail on DeviantArt's image host. (A work on
+      -- the artist's own site is checked against that site by the trigger works_before_write.)
+      ('works', 'works_deviantart_hosts',
+       $$check (source <> 'deviantart' or (public.url_host(page_url) = 'www.deviantart.com'
+                                           and public.host_under(public.url_host(image_url), 'wixmp.com')
+                                           and public.url_host(image_url) <> 'wixmp.com'))$$),
       ('works', 'works_sizes',
        'check (length(title) <= 200 and length(description) <= 2000 and public.short_list(tags, 40, 60))'),
       ('works', 'works_source_known', $$check (source in ('deviantart', 'site'))$$),
       ('works', 'works_one_per_key', 'unique (artist_id, key)'),
-      ('removal_requests', 'removal_requests_pkey', 'primary key (id)'),
-      ('removal_requests', 'removal_requests_sizes', 'check (length(artist_slug) <= 80 and length(note) <= 1000)'),
+      ('removal_requests', 'removal_requests_pkey', 'primary key (artist_slug)'),
+      ('removal_requests', 'removal_requests_short', 'check (length(artist_slug) <= 80 and length(note) <= 300)'),
       ('removed', 'removed_key_is_a_hash', $$check (key_hash ~ '^[0-9a-f]{64}$')$$)
     ) as listed (table_name, name, definition)
   loop
@@ -264,9 +272,8 @@ create index if not exists artists_fts_idx on public.artists using gin (fts);
 alter index public.artists_fts_idx set (fastupdate = off);
 -- One row per DeviantArt account and one per site. No two rows can share a removal key, so removing
 -- an artist leaves no second copy behind, and removing one artist never blocks another.
-create unique index if not exists artists_da_username_idx on public.artists (lower(da_username));
-create unique index if not exists artists_site_host_idx on public.artists (public.site_host(site_url));
-create index if not exists removal_requests_slug_idx on public.removal_requests (artist_slug, created_at, id);
+create unique index if not exists artists_da_key_idx on public.artists (da_key);
+create unique index if not exists artists_site_key_idx on public.artists (site_key);
 -- A card shows an artist's first four works: with this, it reads four rows instead of all of them.
 create index if not exists works_artist_position_idx on public.works (artist_id, position, id);
 
@@ -275,16 +282,15 @@ alter table public.works enable row level security;
 alter table public.artist_styles enable row level security;
 alter table public.search_words enable row level security;
 alter table public.removal_requests enable row level security;
-alter table public.removal_proofs enable row level security;
+alter table public.removal_secret enable row level security;
 alter table public.removed enable row level security;
 
 revoke all on table
   public.artists, public.works, public.artist_styles, public.search_words,
-  public.removal_requests, public.removal_proofs, public.removed
+  public.removal_requests, public.removal_secret, public.removed
 from public, anon, authenticated;
+revoke all on table public.removal_secret from service_role;
 grant all on table
-  public.artists, public.works, public.artist_styles, public.search_words,
-  public.removal_requests, public.removal_proofs, public.removed
+  public.artists, public.works, public.artist_styles, public.search_words, public.removal_requests, public.removed
 to service_role;
-revoke all on sequence public.artists_id_seq, public.works_id_seq, public.removal_requests_id_seq
-  from public, anon, authenticated;
+revoke all on sequence public.artists_id_seq, public.works_id_seq from public, anon, authenticated;
