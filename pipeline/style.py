@@ -23,7 +23,7 @@ import pathlib
 import sqlite3
 import sys
 import time
-from collections.abc import Callable, Container, Iterator
+from collections.abc import Callable, Collection, Container, Iterable, Iterator, Mapping
 
 import numpy as np
 import torch
@@ -303,9 +303,43 @@ def closest_works(
     mine, theirs = (artist_vectors(key, model, db) for key in (artist_key, other_key))
     if not mine or not theirs:
         return []
-    seed = np.stack(list(mine.values())).astype(np.float32)  # unit length already: a dot product is the cosine
-    best = (np.stack(list(theirs.values())).astype(np.float32) @ seed.T).max(axis=1)
-    return [list(theirs)[at] for at in np.argsort(-best, kind="stable")[:top]]
+    seed, others = (np.stack(list(works.values())).astype(np.float32) for works in (mine, theirs))
+    return [list(theirs)[at] for at in _closest(seed, others, top)]
+
+
+def _closest(seed: np.ndarray, others: np.ndarray, top: int) -> list[int]:
+    """closest_works()'s rule on two stacks of vectors: the rows of `others`, best first, a tie to the lower row."""
+    best = (others @ seed.T).max(axis=1)  # unit length already: a dot product is the cosine
+    return np.argsort(-best, kind="stable")[:top].tolist()
+
+
+def all_closest_works(
+    pairs: Iterable[tuple[str, str]],
+    shown: Mapping[str, Collection[str]],
+    model: str,
+    top: int = 4,
+    db: pathlib.Path | str | None = None,
+) -> dict[tuple[str, str], list[str]]:
+    """closest_works() for every (artist key, other key) pair, from one read of the vectors.
+
+    `shown` is the works that count, as each artist's deviation ids: the other's are measured against the
+    artist's works in it, and the answer comes from the other's works in it. So what is shown beside an artist
+    is chosen by what is shown of them. Empty for a pair when either has no such work with a vector.
+    """
+    # ponytail: reads every vector again after all_neighbors, and scores a pair at a time. Measured: 2 s and
+    # 0.2 GB for 72,000 pairs (3,000 artists with 10 works each, 24 others each). It grows with the pairs. If
+    # that gets slow, score one artist's others in one product.
+    stacks: dict[str, tuple[list[str], np.ndarray]] = {}
+    for key, works in _vectors(model, db).items():
+        if kept := [work for work in works if work in shown.get(key, ())]:  # in id order: a tie goes to the lower
+            stacks[key] = kept, np.stack([works[work] for work in kept]).astype(np.float32)
+    found: dict[tuple[str, str], list[str]] = {}
+    for mine, other in pairs:
+        found[mine, other] = []
+        if mine in stacks and other in stacks:
+            ids, others = stacks[other]
+            found[mine, other] = [ids[at] for at in _closest(stacks[mine][1], others, top)]
+    return found
 
 
 def main(argv: list[str] | None = None) -> int:

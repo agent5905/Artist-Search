@@ -6,6 +6,7 @@
 
 -- A function of the previous version whose arguments changed.
 drop function if exists public.artist_card(bigint, int); -- it takes the search's words as well now
+drop function if exists public.artist_card(bigint, int, tsquery); -- and the works to lead with
 
 -- What a removal remembers of an artist without keeping their name (hard rule 7): the hashes of
 -- 'da:<lowercased handle>' and 'site:<registrable domain>'. The same keys as pipeline/store.py, so
@@ -167,8 +168,10 @@ $$;
 -- passes the words searched for, and then the works that say those words of themselves come first,
 -- the best match first (the tags count most, then the title, then the description), and the rest
 -- follow in the artist's order. So a card found for "creature design" leads with the creatures.
+-- Without words, p_first does the same by position: similar_artists passes a neighbour's picks, and the
+-- works at those positions come first, in the order given, and the rest follow in the artist's order.
 create or replace function public.artist_card(
-  p_artist_id bigint, p_work_limit int default 4, p_matching tsquery default null
+  p_artist_id bigint, p_work_limit int default 4, p_matching tsquery default null, p_first smallint[] default null
 ) returns jsonb
 language sql stable set search_path = ''
 as $$
@@ -183,11 +186,17 @@ as $$
         ) order by w.fit desc, w.position, w.id),
         '[]')
       from (
-        -- No words: the first works by position, and no others are read.
+        -- No words and none to lead with: the first works by position, and no others are read.
         (select works.*, 0::real as fit
          from public.works
-         where p_matching is null and artist_id = a.id
+         where p_matching is null and p_first is null and artist_id = a.id
          order by position, id limit p_work_limit)
+        union all
+        -- Works to lead with: every work of the artist is read (about ten a card), as with words below.
+        (select works.*, coalesce(-array_position(p_first::int[], position)::real, '-infinity') as fit
+         from public.works
+         where p_matching is null and p_first is not null and artist_id = a.id
+         order by fit desc, position, id limit p_work_limit)
         union all
         -- ponytail: with words, every work of the artist is weighed on the spot (about ten a card).
         -- Ceiling: artists with hundreds of works; then store the work's tsvector in a generated column.
@@ -350,7 +359,8 @@ as $$
 $$;
 
 -- Service role only: db.load() calls it. p_rows is a JSON list of
--- {"artist_slug", "neighbor_slug", "rank", "score"}. Every artist named as an artist_slug ends up with
+-- {"artist_slug", "neighbor_slug", "rank", "score"}, each with "picks" when the neighbour's works to
+-- show were picked (see artist_neighbors). Every artist named as an artist_slug ends up with
 -- exactly the listed rows whose two artists are both in the database: what they had at any other rank
 -- is deleted, and a row that already holds the same values is not rewritten. A row naming an artist
 -- who is not in the database (removed, or never loaded) is skipped. Returns how many were skipped.
@@ -362,11 +372,12 @@ create or replace function public.replace_neighbors(p_rows jsonb) returns int
 language sql set search_path = ''
 as $$
   with listed as materialized (
-    select r.artist_slug, r.neighbor_slug, r.rank, r.score
-    from jsonb_to_recordset(p_rows) as r (artist_slug text, neighbor_slug text, rank smallint, score real)
+    select r.artist_slug, r.neighbor_slug, r.rank, r.score, r.picks
+    from jsonb_to_recordset(p_rows)
+      as r (artist_slug text, neighbor_slug text, rank smallint, score real, picks smallint[])
   ),
   known as materialized (
-    select a.id as artist_id, b.id as neighbor_id, l.rank, l.score
+    select a.id as artist_id, b.id as neighbor_id, l.rank, l.score, l.picks
     from listed l
     join public.artists a on a.slug = l.artist_slug
     join public.artists b on b.slug = l.neighbor_slug
@@ -378,11 +389,11 @@ as $$
       and not exists (select 1 from known k where k.artist_id = n.artist_id and k.rank = n.rank)
   ),
   written as (
-    insert into public.artist_neighbors as n (artist_id, neighbor_id, rank, score)
-    select artist_id, neighbor_id, rank, score from known
+    insert into public.artist_neighbors as n (artist_id, neighbor_id, rank, score, picks)
+    select artist_id, neighbor_id, rank, score, picks from known
     on conflict (artist_id, rank) do update
-      set neighbor_id = excluded.neighbor_id, score = excluded.score
-      where (n.neighbor_id, n.score) is distinct from (excluded.neighbor_id, excluded.score)
+      set neighbor_id = excluded.neighbor_id, score = excluded.score, picks = excluded.picks
+      where (n.neighbor_id, n.score, n.picks) is distinct from (excluded.neighbor_id, excluded.score, excluded.picks)
   )
   select (select count(*) from listed)::int - (select count(*) from known)::int
 $$;
@@ -422,12 +433,15 @@ $$;
 -- Other artists nearest in style: the artist's stored neighbours, best first, read by key. Nothing is
 -- computed here, so a call costs a handful of rows whatever the size of the index. An artist with no
 -- stored neighbours gets an empty answer. At most 24 are returned, whatever p_limit says, and a
--- hidden or removed neighbour takes up none of them.
+-- hidden or removed neighbour takes up none of them. Each card leads with the neighbour's works that
+-- were picked as closest to the seed's (artist_neighbors.picks); with none picked, their first four.
+-- ponytail: a pick is a position, read when the card is built. Ceiling: while a load is between an
+-- artist's works and the neighbour rows that name them, a card can lead with other works of theirs.
 create or replace function public.similar_artists(p_slug text, p_limit int default 24) returns setof jsonb
 language sql stable security definer set search_path = ''
 as $$
   with page as materialized (
-    select n.neighbor_id, n.rank
+    select n.neighbor_id, n.rank, n.picks
     from public.artists seed
     join public.artist_neighbors n on n.artist_id = seed.id
     join public.artists a on a.id = n.neighbor_id
@@ -438,7 +452,7 @@ as $$
     order by n.rank
     limit least(greatest(coalesce(p_limit, 24), 1), 24)
   )
-  select public.artist_card(page.neighbor_id, 4)
+  select public.artist_card(page.neighbor_id, 4, null, page.picks)
   from page
   order by page.rank
 $$;
@@ -567,7 +581,7 @@ revoke all on function
   public.removed_after_insert(),
   public.works_before_write(),
   public.artist_ids(text[]),
-  public.artist_card(bigint, int, tsquery),
+  public.artist_card(bigint, int, tsquery, smallint[]),
   public.query_embedding(real[]),
   public.search_artists(text, real[], text[], text[], boolean, int, int),
   public.replace_neighbors(jsonb),
@@ -601,7 +615,7 @@ grant execute on function
   public.artist_keys(text, text),
   public.delete_removed(text[]),
   public.artist_ids(text[]),
-  public.artist_card(bigint, int, tsquery),
+  public.artist_card(bigint, int, tsquery, smallint[]),
   public.query_embedding(real[]),
   public.search_artists(text, real[], text[], text[], boolean, int, int),
   public.replace_neighbors(jsonb),

@@ -124,7 +124,8 @@ def load(artists: list[dict[str, Any]], works: list[dict[str, Any]], neighbors: 
     A work names its artist by "artist_slug" and needs "source" ('deviantart' or 'site'), "page_url"
     and "image_url"; "title", "description", "tags", "position" and the image's size in pixels,
     "width" with "height" (both or neither), are optional.
-    A neighbour is {"artist_slug", "neighbor_slug", "rank", "score"}, rank 1 the nearest.
+    A neighbour is {"artist_slug", "neighbor_slug", "rank", "score"}, rank 1 the nearest; "picks" is optional:
+    the "position" of each of the neighbour's works to show beside the artist, first to last, four at most.
     Within one call every artist needs the same keys, and so does every work.
 
     First the artists with their works, LOAD_BATCH artists at a time. Then the neighbours, by which

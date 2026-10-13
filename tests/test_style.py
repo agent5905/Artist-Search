@@ -298,6 +298,48 @@ def test_closest_works_are_the_other_artists_works_nearest_any_of_the_seeds_best
     assert style.closest_works(ALPHA, BRAVO, "siglip2") == []  # another model's vectors are another matter
 
 
+def test_all_closest_works_is_closest_works_for_many_pairs_from_one_read_and_only_the_works_given_count(
+    model, monkeypatch
+):
+    model.table = {
+        1: [1, 0, 0],  # ALPHA
+        2: [0, 1, 0],  # ALPHA, in another manner
+        3: [0, 0, 1],  # BRAVO: like neither
+        4: [3, 4, 0],  # BRAVO: 0.8 with ALPHA's second work, 0.6 with its first
+        5: [0, 2, 0],  # BRAVO: ALPHA's second work exactly
+        6: [5, 0, 0],  # BRAVO: ALPHA's first work exactly
+        7: [0, 0, 3],  # CHARLIE: BRAVO's first work exactly, and a tie between the rest of BRAVO's
+    }
+    collect(ALPHA, 1, 2)
+    collect(BRAVO, 3, 4, 5, 6)
+    collect(CHARLIE, 7)
+    collect(ECHO, broken=[8])  # collected, but no vector could be made
+    style.run("csd", 500)
+    every = {ALPHA: [work_id(1), work_id(2)], BRAVO: [work_id(n) for n in (6, 5, 4, 3)], CHARLIE: [work_id(7)]}
+    every[ECHO] = [work_id(8)]
+    pairs = [(ALPHA, BRAVO), (BRAVO, ALPHA), (CHARLIE, BRAVO), (ALPHA, ECHO), (ECHO, ALPHA), (ALPHA, "da:nobody")]
+    reads, read = [], style._vectors
+    monkeypatch.setattr(style, "_vectors", lambda *args: reads.append(args) or read(*args))
+
+    found = style.all_closest_works(pairs, every, "csd")
+    assert len(reads) == 1  # however many pairs
+    # With all their works counting it is closest_works for each pair: the order they are given in changes nothing.
+    assert found == {pair: style.closest_works(*pair, "csd") for pair in pairs}
+    assert found[ALPHA, BRAVO] == [work_id(5), work_id(6), work_id(4), work_id(3)]
+    assert found[CHARLIE, BRAVO] == [work_id(3), work_id(4), work_id(5), work_id(6)] and found[ALPHA, ECHO] == []
+    assert style.all_closest_works(pairs[:1], every, "csd", top=2) == {(ALPHA, BRAVO): [work_id(5), work_id(6)]}
+    # Only the works given count, on both sides. Without ALPHA's second work, BRAVO's copy of its first leads and
+    # the work halfway scores 0.6; BRAVO's copy of the second is not given, so it is not answered with at all.
+    shown = {ALPHA: [work_id(1)], BRAVO: [work_id(3), work_id(4), work_id(6)], ECHO: [work_id(8)]}
+    assert style.all_closest_works([(ALPHA, BRAVO), (BRAVO, ALPHA), (ALPHA, CHARLIE), (ALPHA, ECHO)], shown, "csd") == {
+        (ALPHA, BRAVO): [work_id(6), work_id(4), work_id(3)],
+        (BRAVO, ALPHA): [work_id(1)],
+        (ALPHA, CHARLIE): [],  # none of CHARLIE's works counts
+        (ALPHA, ECHO): [],  # the one that counts has no vector
+    }
+    assert style.all_closest_works(pairs, every, "siglip2") == dict.fromkeys(pairs, [])
+
+
 def test_the_mutual_rule_puts_a_consistent_artist_above_one_with_a_bit_of_everything(model, capsys):
     model.table = {
         1: [1, 0, 0],  # ALPHA, the seed

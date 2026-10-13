@@ -44,7 +44,7 @@ WORK_FIELDS = {
     *("artist_slug", "source", "page_url", "image_url", "title", "description", "tags", "position"),
     *("width", "height"),
 }
-NEIGHBOUR_FIELDS = {"artist_slug", "neighbor_slug", "rank", "score"}
+NEIGHBOUR_FIELDS = {"artist_slug", "neighbor_slug", "rank", "score", "picks"}
 COUNTS = [
     "artists_sent",
     *(f"artists_held_{reason}" for reason in push.ARTIST_REASONS),
@@ -337,6 +337,7 @@ def traced(fake, monkeypatch):
     calls = (
         *((store, "import_removed"), (library, "purge"), (profiles, "profiles"), (profiles, "excluded")),
         *((tagging, "results"), (tagging, "contacts"), (push, "_collected"), (style, "all_neighbors")),
+        (style, "all_closest_works"),
     )
 
     def note(module, name):
@@ -353,7 +354,7 @@ def traced(fake, monkeypatch):
 
 
 # Every read a row is built from.
-BUILDS = {"profiles", "excluded", "results", "contacts", "_collected", "all_neighbors"}
+BUILDS = {"profiles", "excluded", "results", "contacts", "_collected", "all_neighbors", "all_closest_works"}
 
 
 def seed(fake, count, works=0, prefix="old-fake"):
@@ -833,6 +834,36 @@ def test_each_artist_gets_the_24_nearest_of_those_who_go_from_one_pass(fake, mon
         style, "all_neighbors", lambda model, top, rule, among, db: one_pass(model, 999, rule, among, db)
     )
     assert sorted(row["rank"] for row in push.build()[2] if row["artist_slug"] == handles[0]) == list(range(1, 25))
+
+
+def test_a_neighbour_is_sent_with_their_works_closest_to_the_artists_counting_only_the_works_that_go(fake):
+    mine = artist(ALPHA, 12)  # ten go: the two oldest are over the limit
+    theirs = artist(BRAVO, 6)
+    bare = artist(CHARLIE, 12)
+    # Each work's style, as its first four numbers. BRAVO's third work is ALPHA's two oldest exactly.
+    looks = {
+        ALPHA: [(0, 0, 0, 1)] * 7 + [(0.8, 0, 0, 0.6), (1, 0, 0, 0), (0.6, 0, 0, 0.8)] + [(0, 1, 0, 0)] * 2,
+        BRAVO: [(0, 0, 1, 0), (0, 0, 1, 0), (0, 1, 0, 0), (0.6, 0, 0.8, 0), (1, 0, 0, 0), (0.8, 0, 0.6, 0)],
+    }
+    with closing(sqlite3.connect(config.LOCAL_DB)) as conn, conn:
+        for work, look in zip(mine + theirs, looks[ALPHA] + looks[BRAVO], strict=True):
+            vector = np.array([*look, *[0] * (style.DIMENSIONS - 4)], dtype=np.float16).tobytes()
+            conn.execute("UPDATE style_vectors SET vector = ? WHERE deviation_id = ?", (vector, work["id"]))
+        # And an artist none of whose works that go has a vector: only the two that are over the limit have.
+        conn.executemany("DELETE FROM style_vectors WHERE deviation_id = ?", [(work["id"],) for work in bare[:10]])
+
+    push.run(False)
+    picks = {(row["artist_slug"], row["neighbor_slug"]): row["picks"] for row in fake.loads[-1][2]}
+
+    assert len(picks) == 6  # each is sent as a neighbour of the other two
+    # By position, best first: BRAVO's copy of ALPHA's ninth work, then 0.8 and 0.6 with it, then the first of
+    # those like nothing of ALPHA's that goes. The copy of the two that do not go is one of those: it does not lead.
+    assert picks[ALPHA, BRAVO] == [4, 5, 3, 0]
+    # And of ALPHA's works, only those that go are picked from: the two oldest, BRAVO's third exactly, are not.
+    assert picks[BRAVO, ALPHA] == [8, 7, 9, 0]
+    # Nothing to measure with, or nothing to measure: no picks, and the neighbour's newest works are shown.
+    assert [picks[pair] for pair in picks if CHARLIE in pair] == [None] * 4
+    assert not any(work["id"].lower() in fake.sent() for work in mine + theirs + bare)  # a position is no id
 
 
 def test_an_artist_who_goes_without_neighbours_loses_the_ones_they_had(fake):

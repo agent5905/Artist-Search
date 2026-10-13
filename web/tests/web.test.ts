@@ -1,11 +1,15 @@
-// The search function's request, its fallback and its retry; and what the built site may contain.
+// The search function's request, its fallback and its retry; a card's works; and what the built site may contain.
 // No network: Workers AI and the database are stand-ins.
 import { existsSync, readdirSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { parseEnv } from 'node:util'
+import { createElement } from 'react'
+import { renderToStaticMarkup } from 'react-dom/server'
+import { MemoryRouter } from 'react-router'
 import { describe, expect, it, vi } from 'vitest'
 import { handle, MAX_QUERY, PAGE, type Env } from '../functions/api/search'
+import { Cards } from '../src/ui'
 
 const VECTOR = Array.from({ length: 1024 }, (_, i) => i / 1024)
 const embeds = () => vi.fn(async () => ({ shape: [1, 1024], data: [VECTOR] }))
@@ -113,6 +117,24 @@ describe('GET /api/search', () => {
     expect(response.status).toBe(502)
     expect(await response.json()).toEqual({ error: 'The search is not answering right now.' })
     expect(down.calls).toHaveLength(2)
+  })
+})
+
+describe('an artist card', () => {
+  it('shows the first four works it is given, in the order given', () => {
+    // similar_artists puts the works closest to the seed's first: the card must not sort or pick again.
+    const works = [7, 0, 10, 3, 1].map((n) => ({
+      page_url: `https://www.deviantart.com/someone/art/work-${n}`,
+      image_url: `https://images-wixmp-x.wixmp.com/f/${n}.jpg`,
+      title: `Work ${10 - n}`,
+      source: 'deviantart',
+      width: 300 - n,
+      height: 200 + n,
+    }))
+    const artist = { slug: 'someone', name: 'Someone', tagline: null, profile: null, specialties: null, mediums: null, open_for_work: null, works }
+    const html = renderToStaticMarkup(createElement(MemoryRouter, null, createElement(Cards, { artists: [artist] })))
+
+    expect([...html.matchAll(/class="thumb" href="[^"]*work-(\d+)"/g)].map((found) => Number(found[1]))).toEqual([7, 0, 10, 3])
   })
 })
 

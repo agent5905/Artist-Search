@@ -58,6 +58,9 @@ ADULT_PERCENT = 30
 SAFE_RATING = "safe"  # the only rating a work is sent with
 ADULT_RATINGS = ("suggestive", "explicit")
 NEIGHBOURS = 24  # similar artists sent for each artist: as many as similar_artists ever returns
+# Of a similar artist's works, those picked to show beside the artist: as many as a card shows, and as the
+# database takes (sql/001_schema.sql: artist_neighbors_few_picks).
+PICKS = 4
 DELETE_PERCENT = 10  # of the artists, or of the works, the database holds: more than this going at once is not believed
 DELETE_FLOOR = 5  # deletions of each kind that a run may always make, however little the database holds
 TEST_SLUG = "zz-"  # how the other builders' test rows begin. Never sent, and a database that has one is left alone
@@ -237,8 +240,10 @@ def build(local: pathlib.Path | str | None = None) -> tuple[Rows, Rows, Rows, Co
     when the collect stage has it.
 
     Everything in an artist's row that comes from their works comes from the works that are sent, and a
-    neighbour is always an artist who is sent too. An artist who goes and has no neighbour gets one row that
-    names no neighbour (see the end of this function). Reads the local stores and changes nothing.
+    neighbour is always an artist who is sent too. A neighbour's row says which of their works to show beside
+    the artist: the PICKS closest in style to the artist's (style.all_closest_works), best first, counting only
+    works that are sent on either side. An artist who goes and has no neighbour gets one row that names no
+    neighbour (see the end of this function). Reads the local stores and changes nothing.
     """
     listed = {key: username for key, username, _ in store.all_artists(local)}
     marked_artists, marked_works = library.artist_marks(local), library.work_marks(local)
@@ -254,9 +259,10 @@ def build(local: pathlib.Path | str | None = None) -> tuple[Rows, Rows, Rows, Co
     artists: Rows = []
     works: Rows = []
     slugs: dict[str, str] = {}  # artist key -> slug, for every artist who goes
+    sent: dict[str, list[str]] = {}  # artist key -> the deviation ids of their works that go, by position
     for key in sorted(listed.keys() & (works_of.keys() | fields.keys())):
-        # page, thumbnail, title, the artist's tags, verified result, the thumbnail's (width, height)
-        ready: list[tuple[str, str, str | None, list[str], dict[str, Any], tuple[int | None, int | None]]] = []
+        # page, thumbnail, title, the artist's tags, verified result, the thumbnail's (width, height), deviation id
+        ready: list[tuple[str, str, str | None, list[str], dict[str, Any], tuple[int | None, int | None], str]] = []
         ratings: list[str] = []
         tagline, website, stored = fields.get(key, (None, None, ""))
         for work_id, page, title, own_tags, thumb, seen in works_of.get(key, []):
@@ -273,7 +279,7 @@ def build(local: pathlib.Path | str | None = None) -> tuple[Rows, Rows, Rows, Co
                 counts[f"works_held_{reason or 'bad_address'}"] += 1
             else:
                 own = [tag for tag in json.loads(own_tags) if isinstance(tag, str)]
-                ready.append((*address, title, own, result, _size(sizes.get(work_id))))
+                ready.append((*address, title, own, result, _size(sizes.get(work_id)), work_id))
         site_url, site_domain = _own_site(website)
         slug = _slug(listed[key])
         why = None
@@ -301,6 +307,7 @@ def build(local: pathlib.Path | str | None = None) -> tuple[Rows, Rows, Rows, Co
         counts["works_held_over_limit"] += len(ready[MAX_WORKS:])
         ready = ready[:MAX_WORKS]  # the most recently published: that is the order they were read in
         slugs[key] = slug
+        sent[key] = [work_id for *_, work_id in ready]
         profile = written[key]
         used = Counter(tag for _, _, _, own, *_ in ready for tag in set(own))
         most_used = [tag for tag, _ in sorted(used.items(), key=lambda item: (-item[1], item[0]))]
@@ -327,7 +334,7 @@ def build(local: pathlib.Path | str | None = None) -> tuple[Rows, Rows, Rows, Co
                 "profile_embedding": profile["embedding"],
             }
         )
-        for position, (page_url, image_url, title, _, result, (width, height)) in enumerate(ready):
+        for position, (page_url, image_url, title, _, result, (width, height), _) in enumerate(ready):
             verified = [result["medium"], *result["subjects"], *result["genres"], *result["style_words"]]
             verified += result.get("formats") or []
             works.append(
@@ -354,19 +361,33 @@ def build(local: pathlib.Path | str | None = None) -> tuple[Rows, Rows, Rows, Co
     # One pass, with the artists who go as the whole pool. What comes back is still held to that pool here: this
     # is the last place an artist who was left out could get into a row.
     near = style.all_neighbors(STYLE_MODEL, NEIGHBOURS, STYLE_RULE, set(slugs), local)
-    neighbours: Rows = []
-    for key, slug in slugs.items():
-        going = [
-            (slugs[other], score)
+    going = {
+        key: [
+            (other, score)
             for other, score in near.get(key, [])
             if other in slugs and other != key and math.isfinite(score)
-        ]
+        ][:NEIGHBOURS]
+        for key in slugs
+    }
+    # What a neighbour is shown with beside the artist: of the neighbour's works that go, the closest in style to
+    # the artist's that go. A work is named by its position among its artist's, never by its deviation id.
+    pairs = [(key, other) for key, others in going.items() for other, _ in others]
+    closest = style.all_closest_works(pairs, sent, STYLE_MODEL, PICKS, local)
+    neighbours: Rows = []
+    for key, slug in slugs.items():
         # replace_neighbors (sql/002_functions.sql) leaves an artist it gets no row for with the neighbours they
         # had. It has no way to be told "none", but a row that names the artist and no neighbour does it: the row
         # is skipped, and every rank it did not write for that artist is deleted. db.load counts it as skipped.
         neighbours += [
-            {"artist_slug": slug, "neighbor_slug": other, "rank": rank, "score": round(score, 4)}
-            for rank, (other, score) in enumerate(going[:NEIGHBOURS], start=1)
+            {
+                "artist_slug": slug,
+                "neighbor_slug": slugs[other],
+                "rank": rank,
+                "score": round(score, 4),
+                # None when either has no work that goes with a style vector: the neighbour's newest are shown.
+                "picks": [sent[other].index(work) for work in closest[key, other]] or None,
+            }
+            for rank, (other, score) in enumerate(going[key], start=1)
         ] or [{"artist_slug": slug, "neighbor_slug": None, "rank": None, "score": None}]
     return artists, works, neighbours, counts
 

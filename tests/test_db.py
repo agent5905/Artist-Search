@@ -750,6 +750,44 @@ def test_a_load_that_changes_neighbours_leaves_no_stale_row(seeded):
     assert similar("alpha") == ALPHA_SIMILAR and similar("beta") == ["zz-test-alpha"]
 
 
+def test_a_similar_artist_leads_with_the_works_picked_for_the_seed(seeded):
+    def shown(of: str) -> dict[str, list[str]]:
+        cards = db.rpc("similar_artists", {"p_slug": f"zz-test-{of}"})
+        return {card["slug"]: [work["title"] for work in card["works"]] for card in cards}
+
+    def replace(*rows: dict[str, Any]) -> httpx.Response:
+        return db.data_api("POST", "rpc/replace_neighbors", "secret", json={"p_rows": list(rows)})
+
+    stored = """select to_jsonb(n.picks) as picks, n.xmin::text || ':' || n.ctid::text as version
+                from public.artist_neighbors n join public.artists a on a.id = n.artist_id
+                where a.slug = 'zz-test-beta'"""
+    unpicked = shown("beta"), shown("alpha")
+    assert unpicked[0] == {"zz-test-alpha": ["alpha 0", "alpha 1", "alpha 2", "alpha 3"]}  # none picked: the first four
+    assert db.sql(stored)[0]["picks"] is None
+    row = neighbor("beta", "alpha", 1, 0.5)
+    try:
+        # Alpha's works at these positions are the closest to beta's, best first. The load stores them, and
+        # beside beta alpha is shown with those, in that order. Still four works.
+        assert db.load([], [], [{**row, "picks": [7, 0, 10, 3]}]) == 0
+        [first] = db.sql(stored)
+        assert first["picks"] == [7, 0, 10, 3]
+        assert shown("beta") == {"zz-test-alpha": ["alpha 7", "alpha 0", "alpha 10", "alpha 3"]}
+        assert shown("alpha") == unpicked[1]  # a row's picks are its own: nobody else's card changes
+        assert replace({**row, "picks": [7, 0, 10, 3]}).json() == 0 and db.sql(stored) == [first]  # not rewritten
+        # Fewer than a card shows, and one that names no work: the rest follow in the artist's own order.
+        assert replace({**row, "picks": [9, 99]}).json() == 0
+        assert shown("beta") == {"zz-test-alpha": ["alpha 9", "alpha 0", "alpha 1", "alpha 2"]}
+        # More than a card shows is refused, and changes nothing.
+        assert refused(replace({**row, "picks": [0, 1, 2, 3, 4]}), "artist_neighbors_few_picks")
+        assert db.sql(stored)[0]["picks"] == [9, 99]
+        # A row sent without picks has none: the first four again.
+        assert replace(row).json() == 0
+        assert db.sql(stored)[0]["picks"] is None and (shown("beta"), shown("alpha")) == unpicked
+    finally:
+        seed()
+    assert (shown("beta"), shown("alpha")) == unpicked
+
+
 def test_an_artist_is_never_their_own_neighbour(seeded):
     alpha = seeded["zz-test-alpha"]
     own = {"artist_id": alpha, "neighbor_id": alpha, "rank": 9, "score": 1}
@@ -1534,9 +1572,10 @@ select a.id, 'deviantart',
 from public.artists a cross join generate_series(0, 9) n
 where a.slug like 'zz-test-bulk-%';
 
--- Twenty-four neighbours each: for artist g, artists g + 37, g + 74 and so on, counting round.
-insert into public.artist_neighbors (artist_id, neighbor_id, rank, score)
-select a.id, b.id, k, 1 - k / 100.0
+-- Twenty-four neighbours each: for artist g, artists g + 37, g + 74 and so on, counting round. Each with
+-- four of the neighbour's works picked, so a card is built the way it is after a push.
+insert into public.artist_neighbors (artist_id, neighbor_id, rank, score, picks)
+select a.id, b.id, k, 1 - k / 100.0, array[k % 10, (k + 3) % 10, (k + 5) % 10, (k + 8) % 10]
 from public.artists a
 cross join generate_series(1, 24) k
 join public.artists b
@@ -1601,7 +1640,10 @@ def reload_rows(numbers: random.Random) -> tuple[list[dict[str, Any]], list[dict
             )
         for k in range(1, 25):  # nobody keeps a neighbour: g + 41, g + 82 and so on, counting round
             nearest = f"zz-test-bulk-{(g - 1 + k * 41) % 3000 + 1}"
-            neighbors.append({"artist_slug": slug, "neighbor_slug": nearest, "rank": k, "score": 1 - k / 100})
+            picks = [(k + n) % 10 for n in (1, 2, 4, 9)]
+            neighbors.append(
+                {"artist_slug": slug, "neighbor_slug": nearest, "rank": k, "score": 1 - k / 100, "picks": picks}
+            )
     return artists, works, neighbors
 
 
