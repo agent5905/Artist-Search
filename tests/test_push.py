@@ -17,10 +17,12 @@ from array import array
 from contextlib import closing
 from urllib.parse import urlsplit
 
+import httpx
 import numpy as np
 import pytest
 
 from pipeline import config, crawl, library, profiles, push, store, style, tagging
+from pipeline import db as real_db
 
 ALPHA, BRAVO, CHARLIE, DELTA = "yy-fake-alpha", "yy-fake-bravo", "yy-fake-charlie", "yy-fake-delta"
 VERIFIED = tagging.result_set(profiles.TAGGER, profiles.TAGGER)
@@ -50,9 +52,11 @@ COUNTS = [
     *(f"artists_held_{reason}" for reason in push.ARTIST_REASONS),
     "works_sent",
     *(f"works_held_{reason}" for reason in push.WORK_REASONS),
+    "texts_left_out_for_contact",
     *("neighbours_sent", "artists_sent_without_neighbours", "neighbours_skipped_by_database"),
-    *("artists_deleted_from_database", "works_deleted_from_database", "removed_artists_deleted_from_database"),
-    *("removals_added_to_database", "removals_applied_here", "artists_purged_here"),
+    *("artists_deleted_from_database", "works_deleted_from_database", "neighbours_deleted_from_database"),
+    *("removed_artists_deleted_from_database", "removals_added_to_database", "removals_applied_here"),
+    *("artists_purged_here", "artists_left_to_purge_here"),
 ]
 NO_NEIGHBOUR = {"neighbor_slug": None, "rank": None, "score": None}  # beside artist_slug: "this artist has none"
 _BASES: dict[str, int] = {}  # handle -> where its works' ids begin
@@ -112,17 +116,19 @@ class FakeDb:
             for artist_id, row in self.artists.items():
                 da_key, site_key = self.keys(row)
                 artist = {"artist_id": artist_id, "slug": row["slug"], "da_key": da_key, "site_key": site_key}
+                artist["neighbours"] = sum(near["artist_slug"] == row["slug"] for near in self.neighbors)
                 mine = [(work_id, work) for work_id, work in self.works.items() if work["artist_slug"] == row["slug"]]
                 rows += [artist | {"work_id": work_id, "page_url": work["page_url"]} for work_id, work in mine] or [
                     artist | {"work_id": None, "page_url": None}
                 ]
             return rows
-        # The only other SQL: key hashes for the removal list, and deletes by id.
+        # The only other SQL: key hashes for the removal list, deletes by id, and an artist's own words emptied.
         hashes = r"((?:\('[0-9a-f]{64}'\)(?:, )?)+)"
         insert = rf"insert into public\.removed \(key_hash\) values {hashes} on conflict \(key_hash\) do nothing"
         delete = r"delete from public\.(works|artists) where id in \(([0-9, ]+)\)"
+        blank = r"update public\.artists set search_text = '', top_tags = '\{\}' where id in \(([0-9, ]+)\)"
         statements = query.split("; ")
-        assert all(re.fullmatch(f"{insert}|{delete}", statement) for statement in statements), query[:80]
+        assert all(re.fullmatch(f"{insert}|{delete}|{blank}", statement) for statement in statements), query[:80]
         self._note("removal" if "insert" in query else "delete")
         for statement in statements:
             if added := re.fullmatch(insert, statement):
@@ -130,6 +136,9 @@ class FakeDb:
                 self.removed += new
                 for artist_id in [key for key, row in self.artists.items() if set(self.keys(row)) & set(new)]:
                     self._delete_artist(artist_id)
+            elif emptied := re.fullmatch(blank, statement):
+                for row_id in set(map(int, emptied[1].split(", "))) & set(self.artists):
+                    self.artists[row_id] |= {"search_text": "", "top_tags": []}
             else:
                 table, ids = re.fullmatch(delete, statement).groups()
                 for row_id in map(int, ids.split(", ")):  # an id that is no longer there deletes nothing
@@ -378,21 +387,26 @@ def seed(fake, count, works=0, prefix="old-fake"):
 
 
 @pytest.mark.parametrize("dry_run", [False, True])
-def test_a_removal_made_through_the_site_is_imported_before_any_row_is_built(fake, monkeypatch, dry_run):
+def test_a_removal_made_through_the_site_is_written_down_and_purged_before_any_row_is_built(fake, monkeypatch, dry_run):
     artist(ALPHA, angle=0.0)
     removed = artist(BRAVO, angle=0.01, website=f"https://{BRAVO}.art/")
     artist(CHARLIE, angle=0.5)
     fake.removed = [digest(f"da:{BRAVO}")]
     traced(fake, monkeypatch)
+    before = local_state()
 
     counts = push.run(dry_run)
 
-    assert fake.calls[:3] == ["listing", "removed", "import_removed"]
-    first_build = min(fake.calls.index(name) for name in BUILDS)
-    last_removal = max(place for place, name in enumerate(fake.calls) if name in ("import_removed", "purge", "removal"))
-    assert "purge" in fake.calls and last_removal < first_build
-    assert ("removal" in fake.calls) is not dry_run
+    # A dry run says what the run would do, to the number, and does none of it.
     assert counts["removals_applied_here"] == 1 and counts["artists_purged_here"] == 1
+    assert counts["removals_added_to_database"] == 1 and counts["artists_sent"] == 2
+    if dry_run:
+        assert local_state() == before and fake.loads == [] and fake.removed == [digest(f"da:{BRAVO}")]
+        assert not {"import_removed", "purge", "removal"} & set(fake.calls)
+        return
+    # Here, then there, and only then is a file deleted: all of it before the first row is built.
+    assert fake.calls[:5] == ["listing", "removed", "import_removed", "removal", "purge"]
+    assert not {"import_removed", "purge", "removal"} & set(fake.calls[5:]) and fake.calls[5] in BUILDS
     # Nothing of theirs is left here: no row, no image, and the handle and account are barred. A handle removal
     # bars no site (it must not travel to other artists who list the same one).
     assert f"da:{BRAVO}" not in library.artist_keys()
@@ -402,10 +416,6 @@ def test_a_removal_made_through_the_site_is_imported_before_any_row_is_built(fak
     assert [key for key, _, _ in store.all_artists()] == [f"da:{ALPHA}", f"da:{CHARLIE}"]
     # What the removal reached here goes back to the list of record: their account under any handle.
     reached = {library.account(f"FAKE-USER-{BRAVO}")}
-    assert counts["removals_added_to_database"] == 1
-    if dry_run:
-        assert fake.loads == [] and counts["artists_sent"] == 2 and fake.removed == [digest(f"da:{BRAVO}")]
-        return
     assert set(fake.removed) == {digest(f"da:{BRAVO}")} | reached == push._removed_here(None)
     assert sorted(sent_artists(fake)) == [ALPHA, CHARLIE]
     assert not any(word in fake.sent() for word in of_artist(BRAVO))
@@ -442,22 +452,59 @@ def test_a_removal_list_that_cannot_be_applied_stops_the_run_before_anything_is_
     with pytest.raises(SystemExit) as stopped:
         push.main([])
     assert stopped.value.code not in (0, None)
-    assert fake.calls == ["listing", "removed", "import_removed"] and capsys.readouterr().out == ""
+    assert fake.calls == ["listing", "removed"] and capsys.readouterr().out == ""  # read, refused, nothing written
 
 
-def test_a_purge_that_fails_stops_the_run_and_nothing_is_sent(fake, monkeypatch):
-    artist(ALPHA)
-    artist(BRAVO)
-    fake.removed = [digest(f"da:{BRAVO}")]
+def held_open(monkeypatch, work):
+    """Somebody holds a work's cached image open, so it cannot be deleted: an image viewer, or another stage.
+    Returns the list to empty when they let go."""
+    held, unlink = [work["id"]], type(library.image_dir()).unlink
 
-    def stuck(*args, **kwargs):
-        raise OSError("a cached file could not be deleted")
+    def refused(path, *args, **kwargs):
+        if path.stem in held:
+            raise PermissionError("FAKE: the file is in use")
+        return unlink(path, *args, **kwargs)
 
-    monkeypatch.setattr(library, "purge", stuck)
-    with pytest.raises(SystemExit) as stopped:
-        push.main([])
-    assert stopped.value.code not in (0, None)
-    assert fake.calls == ["listing", "removed"]
+    monkeypatch.setattr(type(library.image_dir()), "unlink", refused)
+    return held
+
+
+@pytest.mark.parametrize("where", ["here", "through_the_site"])
+def test_a_file_that_cannot_be_deleted_never_holds_up_the_removal_and_is_tried_again(fake, monkeypatch, capsys, where):
+    artist(ALPHA, angle=0.0)
+    gone = artist(BRAVO, angle=0.2)
+    artist(CHARLIE, angle=0.4)
+    push.run(False)
+    assert BRAVO in fake.held()
+    if where == "here":
+        store.mark_removed(BRAVO)
+    else:
+        fake.sql(push._removed_sql({digest(f"da:{BRAVO}")}))
+    held = held_open(monkeypatch, gone[0])
+    wanted = {digest(f"da:{BRAVO}"), library.account(f"FAKE-USER-{BRAVO}")}
+
+    for _ in range(2):  # run after run while the file is held: the removal stands, and the push is done
+        capsys.readouterr()
+        with pytest.raises(SystemExit) as stopped:
+            push.main([])
+        counts = json.loads(capsys.readouterr().out)
+        assert "not finished" in str(stopped.value.code) and "yy-fake" not in str(stopped.value.code)
+        assert counts["artists_left_to_purge_here"] == 1 and counts["artists_purged_here"] == 0
+        assert set(fake.removed) == wanted == push._removed_here(None) and len(fake.removed) == 2
+        assert not any(word in fake.held() for word in of_artist(BRAVO))
+        assert sorted(sent_artists(fake)) == [ALPHA, CHARLIE] and counts["artists_sent"] == 2
+        # Everything else of theirs went all the same: the one work whose file is held is all that is left.
+        assert library.work_ids(f"da:{BRAVO}") == {gone[0]["id"]}
+        assert [path.stem for path in library.image_dir().iterdir() if path.stem in {w["id"] for w in gone}] == held
+
+    held.clear()  # they let go, and the next run finishes it
+    counts = push.run(False)
+    assert counts["artists_purged_here"] == 1 and counts["artists_left_to_purge_here"] == 0
+    assert f"da:{BRAVO}" not in library.artist_keys() and counts["removals_added_to_database"] == 0
+    assert not any(path.stem == gone[0]["id"] for path in library.image_dir().iterdir())
+    assert set(fake.removed) == wanted and store.is_removed(BRAVO)
+    again = push.run(False)
+    assert again["artists_purged_here"] == again["artists_left_to_purge_here"] == 0
 
 
 def test_a_removal_stays_applied_here_when_the_database_then_fails(fake):
@@ -541,12 +588,10 @@ def test_an_artist_left_out_appears_nowhere_in_what_is_sent_not_even_as_a_neighb
 def test_the_thresholds_are_the_named_ones(fake):
     assert (push.MIN_WORKS, push.MAX_WORKS, push.ADULT_PERCENT, push.NEIGHBOURS) == (4, 10, 30, 24)
     assert (push.DELETE_PERCENT, push.DELETE_FLOOR, push.TEST_SLUG) == (10, 5, "zz-")
-    # Exactly 4 works that may go, with 2 of 7 rated works suggestive (28.6 percent) and 3 not rated at all: sent.
-    edits = {0: {"rating": "suggestive"}, 1: {"rating": "explicit"}, 2: {"rating": None}}
-    edits |= {3: {"rating": None}, 4: {"rating": None}, 5: {"not_artwork": True}}
-    artist(ALPHA, 10, edits=edits)
+    # Exactly 4 works that may go, with 2 of 7 suggestive or not rated yet (28.6 percent): sent.
+    artist(ALPHA, 7, edits={0: {"rating": "suggestive"}, 1: {"rating": None}, 2: {"not_artwork": True}})
     # Fewer than 30 percent, and one work short.
-    artist(BRAVO, 10, edits={n: {"rating": None} for n in range(7)})
+    artist(BRAVO, 10, edits={0: {"rating": None}, 1: {"rating": None}} | {n: {"declared": "yes"} for n in range(2, 7)})
     # 3 of 10 is 30 percent: out, though 7 works could go.
     artist(CHARLIE, 10, edits={n: {"rating": "explicit"} for n in (0, 1, 2)})
     # 30 percent of the rated works, whatever else holds them back: 3 of 10 again, two of them not artwork.
@@ -555,11 +600,14 @@ def test_the_thresholds_are_the_named_ones(fake):
         10,
         edits={0: {"rating": "suggestive"}} | {n: {"rating": "explicit", "not_artwork": True} for n in (1, 2)},
     )
+    # And 3 of 10 where two are only not rated yet: out as well, and not called an adult portfolio.
+    artist("yy-fake-echo", 10, edits={0: {"rating": "suggestive"}, 1: {"rating": None}, 2: {"rating": None}})
     counts = push.run(False)
     assert sorted(sent_artists(fake)) == [ALPHA]
     assert counts["works_sent"] == 4
     assert counts["artists_held_too_few_works"] == 1 and counts["artists_held_adult_portfolio"] == 2
-    assert counts["works_held_artist_held_back"] == 3 + 7 + 7
+    assert counts["artists_held_not_all_rated"] == 1
+    assert counts["works_held_artist_held_back"] == 3 + 7 + 7 + 7
 
 
 def test_two_handles_that_make_one_slug_do_not_share_a_row(fake):
@@ -1292,6 +1340,7 @@ def test_an_empty_local_library_stops_the_run_and_nothing_is_deleted(fake, capsy
         push.main(["--dry-run"] if dry_run else ["--allow-delete", "999"])
     assert stopped.value.code not in (0, None) and "no artists" in str(stopped.value.code)
     assert fake.calls == ["listing", "removed"] and fake.held() == held and capsys.readouterr().out == ""
+    assert config.LOCAL_DB.exists() is not dry_run  # a run makes the file it found missing; a dry run, nothing
 
 
 def test_a_removal_is_not_held_up_by_an_empty_library_and_a_new_local_file_hears_of_it(fake):
@@ -1316,16 +1365,17 @@ def test_a_removal_made_here_is_added_to_the_databases_list(fake, dry_run):
     assert push.run(False)["removals_added_to_database"] == 0 and fake.removed == []
     store.mark_removed(BRAVO)
 
+    before = local_state()
     counts = push.run(dry_run)
 
     # The hashes the store holds, as it holds them: the artist and their account (a handle removal bars no site).
     wanted = {digest(f"da:{BRAVO}"), library.account(f"FAKE-USER-{BRAVO}")}
-    assert push._removed_here(None) == wanted
     assert counts["removals_added_to_database"] == 2 and counts["removed_artists_deleted_from_database"] == 1
     assert counts["artists_deleted_from_database"] == 0
     if dry_run:
-        assert fake.removed == [] and BRAVO in fake.held()
+        assert fake.removed == [] and BRAVO in fake.held() and local_state() == before
         return
+    assert push._removed_here(None) == wanted
     assert set(fake.removed) == wanted and len(fake.removed) == 2
     assert not any(word in fake.held() for word in of_artist(BRAVO))
     assert fake.calls[-4:] == ["listing", "removed", "removal", "load"]
@@ -1358,7 +1408,7 @@ def test_only_sha256_digests_are_written_into_the_statement_for_the_removal_list
 
 def kept(monkeypatch, artists, pages):
     """Make the next push build exactly these rows, whatever the local stores hold."""
-    monkeypatch.setattr(push, "build", lambda local=None: (artists, pages, [], push.Counter()))
+    monkeypatch.setattr(push, "build", lambda local=None, removed=(): (artists, pages, [], push.Counter()))
 
 
 @pytest.mark.parametrize(
@@ -1456,3 +1506,369 @@ def test_the_guard_never_holds_up_a_removal(fake, capsys):
 
     push.main(["--allow-delete", "6"])  # the six go when the run is told they may
     assert sorted(row["slug"] for row in fake.artists.values()) == [handles[7]]
+
+
+# What the first critic of this stage found (round 13). Each is a sequence: a run, a change, a run.
+
+
+def rate_now(works, rating="safe"):
+    """The tagging stage gets to works it had not rated."""
+    sorted_as = json.dumps({"formats": [], "rating": rating})
+    with closing(sqlite3.connect(config.LOCAL_DB)) as conn, conn:
+        for work in works:
+            row = (work["id"], profiles.TAGGER, tagging.FORMAT_VERSION, sorted_as, AT)
+            conn.execute("INSERT OR REPLACE INTO work_format VALUES (?, ?, ?, ?, ?)", row)
+
+
+def test_every_rating_counts_towards_the_share_and_an_image_nobody_has_rated_counts_against(fake):
+    # The tagging stage rates every image, tags or none: 4 of these 10 are rated explicit and have no verified tags.
+    artist(ALPHA, 10, edits={n: {"result": None, "rating": "explicit"} for n in range(4)})
+    waiting = artist(BRAVO, 10, edits={n: {"rating": None} for n in range(3)})  # 3 of 10 are not rated yet
+    artist(CHARLIE, 10, edits={n: {"rating": None} for n in range(2)})  # 2 of 10: under the share
+    unseen = artist(DELTA, 10, edits={n: {"rating": None} for n in range(4)})
+    with closing(sqlite3.connect(config.LOCAL_DB)) as conn, conn:  # 4 of 10 with no image: there is nothing to rate
+        conn.executemany("UPDATE works SET image_file = NULL WHERE deviation_id = ?", [(w["id"],) for w in unseen[:4]])
+
+    counts = push.run(False)
+
+    assert sorted(sent_artists(fake)) == [CHARLIE, DELTA]
+    assert counts["artists_held_adult_portfolio"] == 1 and counts["artists_held_not_all_rated"] == 1
+    assert counts["works_held_artist_held_back"] == 6 + 7 and counts["works_sent"] == 8 + 6
+    assert not any(word in fake.sent() for word in of_artist(ALPHA) + of_artist(BRAVO))
+
+    rate_now(waiting[:3])  # rated, and safe: they go
+    assert push.run(False)["artists_held_not_all_rated"] == 0 and sorted(sent_artists(fake)) == [BRAVO, CHARLIE, DELTA]
+    rate_now(waiting[:3], "suggestive")  # rated again, and not safe: an adult portfolio, and they leave
+    counts = push.run(False)
+    assert counts["artists_held_adult_portfolio"] == 2 and counts["artists_deleted_from_database"] == 1
+    assert not any(word in fake.held() for word in of_artist(BRAVO))
+
+
+def renamed(fake):
+    """BRAVO's account takes the handle CHARLIE, as the collect stage does it, and is public under the new one."""
+    artist(ALPHA, angle=0.0)
+    artist(BRAVO, angle=0.2)
+    push.run(False)
+    library.mark_artist(f"da:{BRAVO}", "account gone")
+    artist(CHARLIE, angle=0.21, user=BRAVO, old_keys=[f"da:{BRAVO}"])
+    push.run(False)
+    assert sorted(sent_artists(fake)) == [ALPHA, CHARLIE] and BRAVO not in fake.held()
+
+
+@pytest.mark.parametrize("asked", ["the_new_handle_through_the_site", "the_new_handle_here", "the_old_handle_here"])
+def test_a_removal_covers_the_account_under_every_handle_it_is_kept_under(fake, asked):
+    renamed(fake)
+    if asked == "the_new_handle_through_the_site":  # as remove_artists does: the hash joins the list, the row goes
+        fake.sql(push._removed_sql({digest(f"da:{CHARLIE}")}))
+    else:
+        store.mark_removed(CHARLIE if asked == "the_new_handle_here" else BRAVO)
+    wanted = {digest(f"da:{BRAVO}"), digest(f"da:{CHARLIE}"), library.account(f"FAKE-USER-{BRAVO}")}
+
+    for run in range(3):  # purging one handle frees no other: it stays so, run after run
+        counts = push.run(False)
+        assert counts["artists_purged_here"] == (2 if run == 0 else 0)
+        assert sorted(sent_artists(fake)) == [ALPHA] and counts["artists_sent"] == 1
+        assert not any(word in fake.held() for word in of_artist(BRAVO) + of_artist(CHARLIE))
+        assert set(fake.removed) == wanted == push._removed_here(None)
+        assert library.artist_keys() == [f"da:{ALPHA}"] and library.artist_marks() == {}
+    # Neither handle is taken in again, the account is known under a handle it takes later, and nobody else is touched.
+    for handle in (BRAVO, CHARLIE):
+        assert not store.upsert_artist(handle, f"https://www.deviantart.com/{handle}", [], 1)
+    assert library.account_removed(f"FAKE-USER-{BRAVO}") and not library.account_removed(f"FAKE-USER-{ALPHA}")
+    assert not store.is_removed(ALPHA) and len(library.work_ids(f"da:{ALPHA}")) == 5
+
+
+def test_neighbour_rows_going_all_at_once_are_not_believed(fake, capsys):
+    for n in range(12):
+        artist(f"yy-fake-s{n:02d}", 4, angle=0.1 * n)
+    push.run(False)
+    before = list(fake.neighbors)
+    assert len(before) == 12 * 11
+    with closing(sqlite3.connect(config.LOCAL_DB)) as conn, conn:
+        conn.execute("DELETE FROM style_vectors")  # a model renamed, a table lost, a style run begun again
+    capsys.readouterr()
+
+    for arguments in (["--dry-run"], [], ["--allow-delete", "131"]):
+        with pytest.raises(SystemExit) as stopped:
+            push.main(arguments)
+        counts = json.loads(capsys.readouterr().out)
+        assert "132 of their 132 neighbour rows" in str(stopped.value.code)
+        assert "--allow-delete 132" in str(stopped.value.code) and counts["neighbours_deleted_from_database"] == 132
+        assert fake.neighbors == before and fake.calls[-2:] == ["listing", "removed"] and len(fake.loads) == 1
+
+    push.main(["--allow-delete", "132"])  # told that they may go
+    assert fake.neighbors == [] and len(fake.artists) == 12
+
+
+def test_a_neighbour_row_that_is_replaced_or_goes_with_its_artist_is_not_a_row_lost(fake):
+    handles = [f"yy-fake-r{n:02d}" for n in range(27)]
+    for n, handle in enumerate(handles):
+        artist(handle, 4, angle=0.05 * n)
+    assert push.run(False)["neighbours_sent"] == 27 * 24
+    with closing(sqlite3.connect(config.LOCAL_DB)) as conn, conn:  # one stops qualifying: 24 artists name them
+        conn.execute("DELETE FROM artist_profiles WHERE artist_key = ?", (f"da:{handles[3]}",))
+    counts = push.run(False)  # each of the 24 gets another in their place: no row is lost, and no flag is needed
+    assert counts["artists_deleted_from_database"] == 1 and counts["neighbours_deleted_from_database"] == 0
+    assert len(fake.neighbors) == 26 * 24
+    with closing(sqlite3.connect(config.LOCAL_DB)) as conn, conn:  # and two more: now there are 23 others, not 24
+        conn.executemany("DELETE FROM artist_profiles WHERE artist_key = ?", [(f"da:{h}",) for h in handles[4:6]])
+    counts = push.run(False)
+    assert counts["artists_deleted_from_database"] == 2 and counts["neighbours_deleted_from_database"] == 0
+    assert len(fake.neighbors) == 24 * 23
+
+
+@pytest.mark.parametrize("dry_run", [True, False])
+def test_an_artist_the_stores_table_lacks_is_nobodys_removal(fake, dry_run):
+    handles = [f"yy-fake-t{n}" for n in range(8)]
+    for n, handle in enumerate(handles):
+        artist(handle, 4, angle=0.1 * n)
+    first = push.run(False)
+    with closing(sqlite3.connect(config.LOCAL_DB)) as conn, conn:
+        conn.execute("DELETE FROM artists")  # the discover stage's table is emptied; everything else is as it was
+    before, held = local_state(), fake.held()
+
+    for _ in range(2):
+        with pytest.raises(push.Stop, match="8 of the 8 artists") as stopped:
+            push.run(dry_run)
+        # A run that would delete everybody, and is not believed. Nobody was taken for removed: nothing is purged,
+        # nobody is barred, and neither removal list has a hash it did not have.
+        assert stopped.value.counts["artists_purged_here"] == stopped.value.counts["removals_added_to_database"] == 0
+        assert local_state() == before and fake.held() == held and len(fake.artists) == 8
+        assert fake.removed == [] and push._removed_here(None) == set()
+        assert fake.calls[-2:] == ["listing", "removed"]
+
+    for handle in handles:  # discovery fills its table again, and everybody is as they were
+        assert store.upsert_artist(handle, f"https://www.deviantart.com/{handle}", [], 1)
+    again = push.run(False)
+    assert again == first and fake.held() == held
+
+
+def test_many_new_removals_at_once_stop_the_run_until_it_is_told_they_are_real(fake, capsys):
+    handles = [f"yy-fake-m{n}" for n in range(8)]
+    for n, handle in enumerate(handles):
+        artist(handle, 4, angle=0.1 * n)
+    push.run(False)
+    for handle in handles[:3]:  # three at once, each a handle and an account: 6 hashes, and 5 is a handful
+        store.mark_removed(handle)
+    before, held = local_state(), fake.held()
+    capsys.readouterr()
+
+    for arguments in (["--dry-run"], [], ["--allow-delete", "5"], ["--dry-run", "--allow-delete", "5"]):
+        with pytest.raises(SystemExit) as stopped:
+            push.main(arguments)
+        said = str(stopped.value.code)
+        assert "add 6 key hashes" in said and "purge 3 artists here" in said and "--allow-delete 6" in said
+        assert "yy-fake" not in said and capsys.readouterr().out == ""
+        # Nothing was done, here or there.
+        assert local_state() == before and fake.held() == held and fake.removed == []
+        assert fake.calls[-2:] == ["listing", "removed"] and len(fake.loads) == 1
+
+    push.main(["--allow-delete", "6"])  # they are real: all of it goes through
+    counts = json.loads(capsys.readouterr().out)
+    assert counts["removals_added_to_database"] == 6 and counts["artists_purged_here"] == 3
+    assert len(fake.removed) == 6 and sorted(row["slug"] for row in fake.artists.values()) == handles[3:]
+    assert library.artist_keys() == [f"da:{handle}" for handle in handles[3:]]
+
+    store.mark_removed(handles[3])  # one more, as removals come: it goes through whatever a run is told
+    push.main(["--allow-delete", "0"])
+    assert len(fake.removed) == 8 and sorted(row["slug"] for row in fake.artists.values()) == handles[4:]
+
+
+def test_a_dry_run_changes_nothing_anywhere_and_says_what_the_run_then_does(fake, capsys):
+    mine = artist(ALPHA, 6, angle=0.0)
+    artist(BRAVO, angle=0.2)
+    artist(CHARLIE, angle=0.4)
+    artist(DELTA, angle=0.6)
+    push.run(False)
+    # Everything a run acts on, pending at once: a removal made through the site, one made here, a work that
+    # stopped qualifying, an artist who did, and contact sheets a purge would delete.
+    fake.sql(push._removed_sql({digest(f"da:{BRAVO}")}))
+    store.mark_removed(CHARLIE)
+    library.mark_works(f"da:{ALPHA}", {mine[0]["id"]: "mature"})
+    with closing(sqlite3.connect(config.LOCAL_DB)) as conn, conn:
+        conn.execute("DELETE FROM artist_profiles WHERE artist_key = ?", (f"da:{DELTA}",))
+    library.review_dir().mkdir(parents=True)
+    (library.review_dir() / "FAKE-SHEET.jpg").write_bytes(JPEG)
+
+    def files():
+        return sorted((str(path), path.stat().st_mtime_ns) for path in config.CACHE_DIR.rglob("*") if path.is_file())
+
+    before, there, on_disk = local_state(), (fake.held(), list(fake.removed)), files()
+    capsys.readouterr()
+
+    for _ in range(2):  # and a second dry run says the same: the first changed nothing it reads
+        push.main(["--dry-run"])
+        dry = capsys.readouterr().out
+        assert local_state() == before and (fake.held(), list(fake.removed)) == there and files() == on_disk
+        assert fake.calls[-2:] == ["listing", "removed"] and len(fake.loads) == 1
+    push.main([])
+    assert capsys.readouterr().out == dry
+
+    counts = json.loads(dry)
+    assert counts["removals_applied_here"] == 1 and counts["artists_purged_here"] == 2  # BRAVO; BRAVO and CHARLIE
+    assert counts["removals_added_to_database"] == 3  # CHARLIE's handle, and both accounts
+    assert counts["removed_artists_deleted_from_database"] == 1 and counts["artists_deleted_from_database"] == 1
+    assert counts["works_deleted_from_database"] == 1 and counts["artists_sent"] == 1 and counts["works_sent"] == 5
+    assert library.artist_keys() == [f"da:{ALPHA}", f"da:{DELTA}"] and not library.review_dir().exists()
+    assert [row["slug"] for row in fake.artists.values()] == [ALPHA] and len(fake.removed) == 4
+
+
+def edit_result(work, **fields):
+    """Change what the tagging stage's verified result says about a work."""
+    with closing(sqlite3.connect(config.LOCAL_DB)) as conn, conn:
+        (result,) = conn.execute("SELECT result FROM work_tags WHERE deviation_id = ?", (work["id"],)).fetchone()
+        changed = json.dumps(json.loads(result) | fields)
+        conn.execute("UPDATE work_tags SET result = ? WHERE deviation_id = ?", (changed, work["id"]))
+
+
+# What the collect stage's plain rule looks for: an "@", a domain, a link, nine digits, seven beside a word for calling.
+CONTACTS = [
+    "A knight in armor. A watermark reads fake.person@example.invalid.",
+    "A knight in armor, signed yy-fake-painter.example in the corner.",
+    "A poster with a knight on it. A line says tg://yyfakepainter.",
+    "A card with a knight and the number 555 010 019 942.",
+    "A knight on a flyer that says call 555 0199.",
+]
+
+
+@pytest.mark.parametrize("said", CONTACTS)
+@pytest.mark.parametrize("where", ["description", "title"])
+def test_a_work_whose_title_or_description_fails_the_plain_rule_is_not_sent(fake, where, said):
+    works = artist(ALPHA, 6)
+    artist(BRAVO, angle=0.3)
+    assert push.run(False)["works_sent"] == 11
+    # The tagging stage's reading says "no contact" all the while: a description is a model's own words about an
+    # image, which nothing reads, and a title can change after it was read.
+    if where == "description":
+        edit_result(works[1], description=said)
+    else:
+        with closing(sqlite3.connect(config.LOCAL_DB)) as conn, conn:
+            conn.execute("UPDATE works SET title = ? WHERE deviation_id = ?", (said, works[1]["id"]))
+
+    counts = push.run(False)
+
+    assert counts["works_held_contact_by_rule"] == 1 and counts["works_sent"] == 10
+    assert counts["works_deleted_from_database"] == 1 and counts["texts_left_out_for_contact"] == 0
+    assert said.lower() not in json.dumps(fake.loads[-1]).lower() and said.lower() not in fake.held()
+    assert works[1]["page"].lower() not in fake.held() and works[1]["tags"][0] not in fake.held()
+    assert [row["position"] for row in fake.loads[-1][1] if row["artist_slug"] == ALPHA] == list(range(5))
+
+
+def test_a_text_that_fails_the_plain_rule_is_left_out_of_a_row_that_is_sent_and_counted(fake):
+    works = artist(ALPHA, 5)
+    assert push.run(False)["texts_left_out_for_contact"] == 0
+    key, word = f"da:{ALPHA}", squashed(ALPHA)
+    said = {
+        "tagline": "FAKE-TAGLINE mail fake.person@example.invalid",
+        "profile": "FAKE-PROFILE, more at yy-fake-painter.example.",
+        "own tag": "zzcall5550199",
+        "own word": "zz 555 010 019 942",
+        "specialty": "zz@yy-fake",
+        "style word": "tg://yyfakepainter",
+    }
+    facts = FACTS | {"own_words": ["dragons", said["own word"]], "specialties": ["character", said["specialty"]]}
+    with closing(sqlite3.connect(config.LOCAL_DB)) as conn, conn:  # each read "no contact", or never read at all
+        conn.execute("UPDATE profiles SET tagline = ? WHERE artist_key = ?", (said["tagline"], key))
+        conn.execute("UPDATE works SET tags = ? WHERE deviation_id = ?", (f'["{said["own tag"]}"]', works[0]["id"]))
+        conn.execute(
+            "UPDATE artist_profiles SET written = ?, facts = ? WHERE artist_key = ?",
+            (said["profile"], json.dumps(facts), key),
+        )
+    edit_result(works[0], style_words=["painterly", said["style word"]])
+
+    counts = push.run(False)
+
+    row, first = sent_artists(fake)[ALPHA], fake.loads[-1][1][0]
+    assert counts["artists_sent"] == 1 and counts["works_sent"] == 5 and counts["works_held_contact_by_rule"] == 0
+    assert row["tagline"] is None and row["profile"] is None and row["specialties"] == ["character"]
+    assert row["top_tags"] == [f"zzall{word}", *(f"zzown{word}{n}" for n in range(1, 5))]
+    assert row["search_text"].startswith("character dragons digital painting")
+    assert first["tags"] == ["digital painting", "character", "fantasy", "realistic", "painterly", "portrait or bust"]
+    for text in said.values():
+        assert text.lower() not in json.dumps(fake.loads[-1]).lower() and text.lower() not in fake.held()
+    # Each text once, and the specialty twice: it is a search filter and a search word.
+    assert counts["texts_left_out_for_contact"] == len(said) + 1
+
+
+def test_a_database_error_is_scrubbed_of_every_key_before_it_is_cut(monkeypatch):
+    key = "sb_" + "secret_FAKE4444SECRET5555KEY6666"  # invented, and put together here so the secret scan passes it
+    monkeypatch.setattr(real_db, "load_env", lambda: {"SUPABASE_SECRET_KEY": key})
+    for lead in (0, 470, 485, 492):  # wherever the cut falls: before the key, or in the middle of it
+        with pytest.raises(RuntimeError) as raised:
+            real_db._checked(httpx.Response(500, text="x" * lead + key + " FAKE-TAIL"))
+        assert key[:6] not in str(raised.value) and len(str(raised.value)) <= 520
+
+
+def test_an_artist_public_with_a_removed_site_stays_out_whatever_site_they_name_next(fake):
+    artist(ALPHA)
+    made = artist(BRAVO, website=f"https://www.{BRAVO}.art/", links=[])  # the site is in the library's profile only
+    push.run(False)
+    assert sent_artists(fake)[BRAVO]["site_domain"] == f"{BRAVO}.art"
+    store.mark_removed(f"{BRAVO}.art")  # the request names the site, and the store's own links do not show whose it is
+
+    counts = push.run(False)
+
+    # The database does: it deletes the artist it shows with that site. So they are removed under their handle.
+    assert counts["artists_purged_here"] == 1 and library.artist_keys() == [f"da:{ALPHA}"]
+    wanted = {digest(f"site:{BRAVO}.art"), digest(f"da:{BRAVO}"), library.account(f"FAKE-USER-{BRAVO}")}
+    assert set(fake.removed) == wanted == push._removed_here(None) and not store.is_removed(ALPHA)
+    assert not any(word in fake.held() for word in of_artist(BRAVO))
+    # Their profile names another site now. The store will not list them, and if their rows come back all the
+    # same, the next run purges them again and sends nothing.
+    assert not store.upsert_artist(BRAVO, f"https://www.deviantart.com/{BRAVO}", [], 1)
+    work = {"work_id": made[0]["id"], "page_url": made[0]["page"], "title": made[0]["title"], "tags": []}
+    library.store_artist(
+        f"da:{BRAVO}",
+        user_id=f"FAKE-USER-{BRAVO}",
+        tagline=None,
+        specialty=None,
+        level=None,
+        website="https://www.yy-fake-bravo-two.art/",
+        works=[work | {"thumb_url": made[0]["thumb"], "published": str(PUBLISHED)}],
+    )
+    counts = push.run(False)
+    assert counts["artists_purged_here"] == 1 and library.artist_keys() == [f"da:{ALPHA}"]
+    assert sorted(sent_artists(fake)) == [ALPHA] and not any(word in fake.held() for word in of_artist(BRAVO))
+
+
+def test_a_site_another_artist_kept_here_gives_too_is_nobodys_whether_or_not_they_go(fake):
+    hub = "https://yy-fake-hub.art/"
+    artist(ALPHA, website=hub)  # the only one of the two who goes: the other has no profile yet
+    artist(BRAVO, website=hub, profile=None)
+    artist(CHARLIE, website=f"https://{CHARLIE}.art/")
+    push.run(False)
+    assert {row["da_username"]: row["site_domain"] for row in fake.loads[-1][0]} == {
+        ALPHA: None,
+        CHARLIE: f"{CHARLIE}.art",
+    }
+    assert "yy-fake-hub" not in fake.sent()
+    # So a removal ALPHA makes through the site names their handle and no site (remove_artists takes the keys
+    # from the row), and it reaches nobody else who gives that site here.
+    row = next(row for row in fake.artists.values() if row["slug"] == ALPHA)
+    fake.sql(push._removed_sql({key for key in fake.keys(row) if key}))
+    counts = push.run(False)
+    assert counts["artists_purged_here"] == 1 and library.artist_keys() == [f"da:{BRAVO}", f"da:{CHARLIE}"]
+    assert [key for key, _, _ in store.all_artists()] == [f"da:{BRAVO}", f"da:{CHARLIE}"]
+    assert not store.is_removed(BRAVO) and not store.is_removed("yy-fake-hub.art")
+
+
+def test_a_held_back_works_words_leave_the_artists_row_with_the_work_though_the_load_then_fails(fake):
+    mine = artist(ALPHA, 6, angle=0.0)
+    late = artist("yy-fake-z9", 6, angle=0.9)
+    push.run(False)
+    library.mark_works("da:yy-fake-z9", {late[2]["id"]: "contact details"})  # the collect stage finds one in a title
+    whole = next(row for row in fake.artists.values() if row["slug"] == ALPHA)["search_text"]
+
+    fake.fail = "load"  # the work's row is deleted, and the load fails before it writes the artist's row again
+    with pytest.raises(SystemExit):
+        push.main([])
+
+    assert not any(text in fake.held() for text in of_work(late[2]))  # not the title, not a tag: nowhere
+    rows = {row["slug"]: row for row in fake.artists.values()}
+    assert (rows["yy-fake-z9"]["search_text"], rows["yy-fake-z9"]["top_tags"]) == ("", [])
+    assert rows[ALPHA]["search_text"] == whole and mine[0]["title"] in whole  # nobody else's row is touched
+    fake.fail = None
+    push.run(False)  # and the next load writes the row again, with the words of the works that go
+    row = next(row for row in fake.artists.values() if row["slug"] == "yy-fake-z9")
+    assert late[1]["title"] in row["search_text"] and late[2]["title"] not in row["search_text"]
+    assert late[1]["tags"][0] in row["top_tags"] and late[2]["tags"][0] not in row["top_tags"]

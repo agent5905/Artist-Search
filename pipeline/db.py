@@ -36,11 +36,12 @@ def _send(method: str, url: str, headers: dict[str, str], **kwargs: Any) -> http
 
 def _checked(response: httpx.Response) -> Any:
     if response.is_error:
-        message = response.text[:500]
+        message = response.text
         for value in load_env().values():
             if len(value) >= 8:
                 message = message.replace(value, "***")
-        raise RuntimeError(f"HTTP {response.status_code}: {message}")
+        # Cut after the values are out of it: cut first, the start of one could be left at the end.
+        raise RuntimeError(f"HTTP {response.status_code}: {message[:500]}")
     return response.json() if response.content else None
 
 

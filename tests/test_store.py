@@ -714,3 +714,19 @@ def test_all_artists_never_hands_on_a_row_that_outlived_its_removal(db):
         conn.execute(stale, ("da:zz-fake-stale", "zz-fake-stale", "[]"))
         conn.execute(stale, ("da:zz-fake-site", "zz-fake-site", '["https://shop.zz-fake-barred.art/x"]'))
     assert store.all_artists(db) == [("da:zz-fake-a", "zz-fake-a", "https://www.deviantart.com/zz-fake-a")]
+
+
+def test_what_a_removal_would_bar_can_be_asked_before_it_is_written_and_asking_changes_nothing(db):
+    add(db, username="zz-fake-a", links=("https://shop.zz-fake-a.art/x",))
+    add(db, username="zz-fake-b", links=())
+    add(db, username="zz-fake-c", links=())
+    hashes, before = {sha("site:zz-fake-a.art"), sha("da:zz-fake-b")}, db.read_bytes()
+    assert sorted(store.named_by(hashes, db)) == ["da:zz-fake-a", "da:zz-fake-b"]
+    assert store.covers(hashes, "da:ZZ-Fake-B") and store.covers(hashes, "https://www.zz-fake-a.art/")
+    assert not store.covers(hashes, "da:zz-fake-a") and not store.covers(hashes, "zz-fake-c")  # a site names no handle
+    assert not store.covers((), "da:zz-fake-b")
+    with pytest.raises(ValueError):
+        store.covers(hashes, "FAKE: not a handle and not a host")
+    assert db.read_bytes() == before and not store.is_removed("da:zz-fake-b", db)
+    assert store.import_removed(hashes, db) == 2 and keys(db) == ["da:zz-fake-c"]  # and it is what a removal does
+    assert store.named_by(hashes, db) == []

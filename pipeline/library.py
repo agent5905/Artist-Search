@@ -215,6 +215,19 @@ def _contact(text: str) -> bool:
     return plain or digits >= 9 or (digits >= 7 and bool(_CALLING.search(text)))
 
 
+def holds_contact(value: object) -> bool:
+    """True when a text holds what _contact() looks for, as it is written or once its percent-encoding is undone;
+    and when it will not settle, or is too long to read. Anything that is not a text holds nothing.
+
+    The plain rule and no more, for a stage that sends a text on: the push stage asks it of every text it sends,
+    whoever wrote it.
+    """
+    if not isinstance(value, str):
+        return False
+    shown, probe = (_settle(value), _settle(value, percent=True)) if len(value) <= 10_000 else (None, None)
+    return shown is None or probe is None or _contact(shown) or _contact(probe)
+
+
 def _text(value: object, limit: int) -> str | None:
     """A short public text cut to `limit`, or None for anything else: not a text, or one that would not settle or
     could hold contact details, seven digits or a file, as it is written or once its percent-encoding is undone.

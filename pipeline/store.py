@@ -15,7 +15,7 @@ import pathlib
 import re
 import sqlite3
 import unicodedata
-from collections.abc import Iterable, Iterator
+from collections.abc import Collection, Iterable, Iterator
 from datetime import UTC, datetime
 from urllib.parse import unquote, urlsplit
 
@@ -243,6 +243,15 @@ def _removed(conn: sqlite3.Connection, keys: Iterable[str]) -> bool:
     return any(conn.execute(query, (_hash(key),)).fetchone() for key in keys)
 
 
+def _named_by(conn: sqlite3.Connection, named: set[str]) -> list[str]:
+    """The keys of the stored artists these key hashes name: by their handle, or by the site their stored link is on."""
+    # ponytail: reads every artist row per removal. Fine at a few thousand rows; index the link hosts if it grows.
+    rows = conn.execute("SELECT key, links FROM artists").fetchall()
+    return [
+        key for key, links in rows if named & {_hash(covering) for covering in (key, *_link_keys(json.loads(links)))}
+    ]
+
+
 def _remove(conn: sqlite3.Connection, key_hashes: Iterable[str]) -> int:
     """Put key hashes on the removal list and delete the stored artists they name. Returns how many that was.
 
@@ -251,12 +260,8 @@ def _remove(conn: sqlite3.Connection, key_hashes: Iterable[str]) -> int:
     A removal goes no further: a removed handle bars no site, so it never reaches another artist. It works on
     hashes, so it also works for a site known only as a hash.
     """
-    # ponytail: reads every artist row per removal. Fine at a few thousand rows; index the link hosts if it grows.
     named = set(key_hashes)
-    rows = conn.execute("SELECT key, links FROM artists").fetchall()
-    gone = [
-        key for key, links in rows if named & {_hash(covering) for covering in (key, *_link_keys(json.loads(links)))}
-    ]
+    gone = _named_by(conn, named)
     conn.executemany("DELETE FROM artists WHERE key = ?", [(key,) for key in gone])
     barred = sorted(named | {_hash(key) for key in gone})
     conn.executemany("INSERT OR IGNORE INTO removed VALUES (?, ?)", [(key_hash, _now()) for key_hash in barred])
@@ -271,6 +276,20 @@ def is_removed(identifier: str, db: pathlib.Path | str | None = None) -> bool:
     kind, value = _parse(identifier)
     with _open(db) as conn:
         return _removed(conn, [f"da:{value}"] if kind == "da" else _host_keys(value))
+
+
+def covers(key_hashes: Collection[str], identifier: str) -> bool:
+    """is_removed(), asked of key hashes that need not be in the file: True when one of them is the artist's, the
+    site's or a parent domain's. For a caller that must know what a removal list will bar before it is written.
+    ValueError as is_removed()."""
+    kind, value = _parse(identifier)
+    return any(_hash(key) in key_hashes for key in ([f"da:{value}"] if kind == "da" else _host_keys(value)))
+
+
+def named_by(key_hashes: Iterable[str], db: pathlib.Path | str | None = None) -> list[str]:
+    """The keys of the stored artists import_removed() would delete for these key hashes. It changes nothing."""
+    with _open(db) as conn:
+        return _named_by(conn, set(key_hashes))
 
 
 def mark_removed(identifier: str, db: pathlib.Path | str | None = None) -> int:

@@ -1876,3 +1876,10 @@ def test_drop_orphans_leaves_the_cache_alone_when_the_database_is_not_the_one_th
 
 def test_drop_orphans_with_no_cache_directory_does_nothing(tmp_path):
     assert library.drop_orphans() == (0, 0) and files(tmp_path) == []
+
+
+def test_holds_contact_is_the_plain_rule_a_title_is_held_to_for_any_text_a_later_stage_sends():
+    assert all(library.holds_contact(text) for text in CONTACTS)
+    assert not any(library.holds_contact(text) for text in [*LEFT_FOR_ANALYSIS, *(given for given, _ in KEPT)])
+    assert library.holds_contact("FAKE word " * 1001)  # too long to read, so not passed
+    assert not any(library.holds_contact(value) for value in (None, 12345, ["FAKE"]))  # no text, nothing held
