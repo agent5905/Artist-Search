@@ -681,3 +681,38 @@ Push had four unjudged rounds. It is the last gate before the public, so it was 
 **GPU control.** `scripts/gpu.py` pauses, resumes and reports (owner decision 10).
 
 **Pipeline counts:** artists discovered 472, collected 472, works 5,126, all tagged, rated and with style vectors; artists public 119. **Database:** 16.8 MB of 400 MB.
+
+### Round 15: profiles' sixth critic, a step back; the pacing rebuild lands (2026-10-13)
+
+**Profiles, round 6: judged, and worse on the bar that matters.**
+
+| | R1 | R2 | R3 | R4 | R5 | R6 |
+|---|---|---|---|---|---|---|
+| Artists with an unsupported claim | 2 | 3 | 3 | 2 | 2 | 9 |
+| Cards judged useful | - | 15 | 18 | 14 | 9 | 14 |
+| Groups a studio could tell apart | few | 6 | 12 | 10 | 13 | 12 |
+| Cards not fit to print | - | - | - | 4 | 3 | 6 |
+| Artists judged unsuitable | - | - | - | 2 | 0 | 1 |
+
+- A caveat: this critic's brief was stricter. It defined a flat statement as about 7 works in 10, where earlier briefs said "most". That accounts for some of the rise, not most.
+- **The kind-of-output word was the most frequent error.** "Designs", "design sheets" or "character illustrations" failed on five cards and were marginal on three: "designs" where 2 of 14 works are designs.
+- **The per-work check says yes too easily.** "Including dragons" where 2 of 15 works are dragons and 8 or 9 are dinosaurs; "trees" at 2 of 10; "mostly demons" at 3 or 4 of 10. Asked whether a picture shows a dragon, the model agrees for a dinosaur.
+- Ten cards understate, such as "mostly dragons" at 14 of 14.
+- The lead's expectation was wrong. Checking each work at full size works for the tagging stage's fixed list of tags. It does not work for free-text claims put to the model as yes-or-no questions.
+
+**Round 7 changes direction: say less, and take specifics from the artist.**
+- The first sentence states only what the checked per-work tags can count: subject, genre, manner, medium, worded by share. No proposed things and no kind-of-output claim; those two account for nearly all nine errors.
+- A second sentence gives the artist's own most-used tags, attributed to them. That is an exact count from data, not a model's judgement, and it names what the critic said the cards miss (dinosaurs, anthropomorphic animals).
+- The per-work look is deleted, which takes the stage back to about 14 seconds an artist.
+- If this holds at one or two errors in twenty, that is likely the practical ceiling for this model, and "good enough" goes to the owner.
+
+**Collect and discovery, round 9: merged, not yet judged or run.**
+- Pace: 2 seconds between API requests. Every 429 or server error doubles the interval for all later requests, up to 5 minutes; each success brings it down by a tenth. A burst of six 429s takes about 19 minutes to recover from. An hour of refusals at the ceiling stops the run, with everything stored kept.
+- Discovery makes no profile lookups. Each rule the lookup enforced now lives in collection, where the profile is read: the removed-site check, the shared-domain listing, the own-site shape rule.
+- Browsing is saved page by page, valid for seven days. A handle is written down only for an author who reaches three works; everyone else is counted by a hash.
+- Progress goes to a status file that `scripts/gpu.py status` shows.
+- A full run is about 12,700 API requests, down from 16,200: roughly 12 hours at the base pace if nothing throttles.
+- 2,258-plus tests pass on the merged code. No request was made to DeviantArt in building it. A critic judges it before it runs.
+- One point left for the lead: an artist who lists a site that was removed before they were ever stored now gets a bare handle row, marked and never collected. The old lookup stored nothing for them.
+
+**Pipeline counts:** artists discovered 472, collected 472, works 5,126; profiles 433, left out 37 (30 mostly AI-declared); artists public 119. **Database:** 16.8 MB of 400 MB.
