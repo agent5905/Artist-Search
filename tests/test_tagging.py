@@ -30,9 +30,12 @@ GOOD = {  # a model's first answer
     "not_artwork": False,
 }
 KEPT = {name: value for name, value in GOOD.items() if name != "manner"}  # what is stored of it
+READ = {"declared_ai": "no", "contact_in_text": "no"}  # what results() adds to it: what the work's words said
 COUNTS = re.compile(
-    r'\{"analyzed": \d+, "failed": \d+, "flagged": \d+, "skipped": \d+, "removed": \d+, "declared_yes": \d+, '
-    r'"declared_no": \d+, "declared_unclear": \d+, "seconds_per_image": \d+\.\d+, '
+    r'\{"analyzed": \d+, "failed": \d+, "flagged": \d+, "skipped": \d+, "removed": \d+, '
+    r'"descriptions_changed": \d+, "details_removed": \d+, "declared_yes": \d+, '
+    r'"declared_no": \d+, "declared_unclear": \d+, "contact_yes": \d+, "contact_no": \d+, '
+    r'"tagline_contact_yes": \d+, "tagline_contact_no": \d+, "seconds_per_image": \d+\.\d+, '
     r'"seconds_per_verification": \d+\.\d+\}\n'
 )
 
@@ -57,7 +60,7 @@ def cache(tmp_path, monkeypatch):
     monkeypatch.setattr(socket, "create_connection", no_network)
 
 
-def works(*numbers, artist=ALPHA, without_image=(), tags=None):
+def works(*numbers, artist=ALPHA, without_image=(), tags=None, tagline=None):
     """Collect these invented works as all the artist has. Each image is unique to its work: JPEG, then its number.
 
     A work's title is FAKE-TITLE-<n> and its tags are ["faketag<n>"], or tags[n] when that is given.
@@ -77,7 +80,7 @@ def works(*numbers, artist=ALPHA, without_image=(), tags=None):
         }
         for n, work_id in zip(numbers, ids, strict=True)
     ]
-    library.store_artist(artist, user_id=None, tagline=None, specialty=None, level=None, website=None, works=rows)
+    library.store_artist(artist, user_id=None, tagline=tagline, specialty=None, level=None, website=None, works=rows)
     return ids
 
 
@@ -86,16 +89,31 @@ class FakeOllama:
 
     answer:   the first pass. What the model says, or a function (work number, attempt, request) -> that. A dict
               is sent as the model's JSON, a str as it is, a Response whole, and an exception is raised.
-    confirm:  the verifier on one tag: True, False, or a function (work number, tag, request) -> an answer.
-    look:     the verifier's own pick of manner and colour, or a function (work number, request) -> that.
-    declared: the reader of title and tags: "yes", "no", "unclear", or a function (request) -> an answer.
+    confirm:  the verifier on each tag of its one call: True, False, or a function (work number, tag, request) ->
+              that. Anything else it gives for a tag is sent as the whole answer instead.
+    look:     the verifier's own pick of manner and colour, in the same call.
+    rewrite:  the verifier's check of the description: None to send it back as it was, a str to send that as the
+              checked description, a function (work number, description, request) -> either or a whole answer.
+    declared: the reader of title and tags for AI: "yes", "no", "unclear", or a function (request) -> an answer.
+    contact:  the reader of a text for a private contact: "yes", "no", or a function (request) -> an answer.
     """
 
-    def __init__(self, answer=GOOD, confirm=True, look=None, declared="no", capabilities=("completion", "vision")):
+    def __init__(
+        self,
+        answer=GOOD,
+        confirm=True,
+        look=None,
+        rewrite=None,
+        declared="no",
+        contact="no",
+        capabilities=("completion", "vision"),
+    ):
         self.answer, self.confirm, self.declared, self.capabilities = answer, confirm, declared, capabilities
-        self.look = look or {"manner": "painted illustration", "colour": "mixed"}
+        self.contact, self.contact_readings = contact, []  # the text-only requests about a private contact
+        self.look, self.rewrite = look or {"manner": "painted illustration", "colour": "mixed"}, rewrite
         self.requests, self.chats, self.attempts = [], [], {}  # chats and attempts: the first pass only
         self.checks, self.readings = [], []  # (work number, tag or "look", model) and the text-only requests
+        self.rewrites = []  # (work number, the description sent, model)
 
     def __call__(self, request):
         self.requests.append(request)
@@ -108,17 +126,28 @@ class FakeOllama:
             self.readings.append(chat)
             answer = self.declared(chat) if callable(self.declared) else self.declared
             return self.say({"says": "FAKE-REASON", "declared": answer} if answer in tagging.AI_ANSWERS else answer)
+        if prompt == tagging.CONTACT_PROMPT:
+            self.contact_readings.append(chat)
+            answer = self.contact(chat) if callable(self.contact) else self.contact
+            found = {"found": "FAKE-FOUND", "contact": answer}
+            return self.say(found if answer in tagging.CONTACT_ANSWERS else answer)
         (image,) = asked["images"]
         n = int(base64.b64decode(image).removeprefix(JPEG))
-        if prompt == tagging.VERIFY_PROMPT:
-            tag = asked["content"].splitlines()[0].partition(": ")[2]
-            self.checks.append((n, tag, chat["model"]))
-            answer = self.confirm(n, tag, chat) if callable(self.confirm) else self.confirm
-            return self.say({"shown_by": "FAKE-EVIDENCE", "confirmed": answer} if isinstance(answer, bool) else answer)
-        if prompt == tagging.LOOK_PROMPT:
-            self.checks.append((n, "look", chat["model"]))
-            answer = self.look(n, chat) if callable(self.look) else self.look
-            return self.say({"faces": "FAKE-FACES", **answer} if isinstance(answer, dict) else answer)
+        if prompt == tagging.CHECK_PROMPT:
+            tags = [tag for tag in chat["format"]["properties"] if tag not in tagging._LOOK]
+            self.checks += [(n, tag, chat["model"]) for tag in ("look", *tags)]
+            said = {tag: self.confirm(n, tag, chat) if callable(self.confirm) else self.confirm for tag in tags}
+            whole = [value for value in said.values() if not isinstance(value, bool)]
+            if whole or not isinstance(self.look, dict):
+                return self.say(whole[0] if whole else self.look)
+            return self.say({"faces": "FAKE-FACES", "about": "FAKE-ABOUT", **self.look, **said})
+        if prompt == tagging.DESCRIPTION_PROMPT:
+            description = asked["content"].removeprefix("Description: ")
+            self.rewrites.append((n, description, chat["model"]))
+            answer = self.rewrite(n, description, chat) if callable(self.rewrite) else self.rewrite
+            answer = description if answer is None else answer
+            empty = dict.fromkeys(tagging._DOUBTS, [])
+            return self.say(empty | {"description": answer} if isinstance(answer, str) else answer)
         assert prompt == tagging.PROMPT
         self.chats.append(chat)
         self.attempts[n] = self.attempts.get(n, 0) + 1
@@ -200,7 +229,7 @@ def test_any_host_but_loopback_is_refused_before_a_byte_is_sent(url):
     with pytest.raises(ValueError, match="loopback"):
         run(fake, verifier="model-v", ollama_url=url)
     assert fake.requests == []  # not the image, not the title and tags
-    assert stored() == [] and stored("work_ai_declared") == []
+    assert [stored(table) for table in tagging.TABLES] == [[], [], [], []]
 
 
 @pytest.mark.parametrize(
@@ -222,7 +251,7 @@ def test_a_loopback_ollama_gets_the_image_and_a_prompt_and_nothing_about_the_wor
     offered = chat["format"]["properties"]["genres"]["items"]["enum"] + chat["format"]["properties"]["manner"]["enum"]
     assert set(tagging.GENRES) < set(offered)
     with_image = [request.content for request in fake.requests if b'"images"' in request.content]
-    assert len(with_image) == 1 + len(fake.checks) > 1  # the first pass and every question of the verifier
+    assert len(with_image) == 3  # the first pass, then the verifier's two calls: the tags and the description
     for kept_back in (work_id, "zz-fake-alpha", "fake-title", "faketag", "deviantart", "wixmp", ".jpg"):
         assert kept_back.lower() not in b"".join(with_image).decode().lower()
 
@@ -266,10 +295,13 @@ def test_the_prompts_name_every_vocabulary_value_and_forbid_guessing():
     for value in (*tagging.MEDIUMS, *tagging.SUBJECTS, *tagging.GENRES):
         assert f"- {value}: " in tagging.PROMPT
     for value in tagging.GENRES:
-        assert (f"- {value}: " in tagging.LOOK_PROMPT) == (value in tagging._MANNERS)
+        assert (f"- {value}: " in tagging.CHECK_PROMPT) == (value in tagging._MANNERS)
     for rule in ("only what you can see", "leave it out", "Never name or guess the artist, the software"):
         assert rule in tagging.PROMPT
-    assert "leaves no doubt" in tagging.VERIFY_PROMPT
+    for rule in ("No left or right", "No numbers", "No gender, age or species", "Not how figures stand to one another"):
+        assert rule in tagging.PROMPT
+    assert "leaves no doubt" in tagging.CHECK_PROMPT
+    assert "Add nothing" in tagging.DESCRIPTION_PROMPT
 
 
 # 2. Out-of-vocabulary values never reach the store; a malformed or empty answer never crashes the run.
@@ -383,6 +415,28 @@ def test_a_retry_is_asked_differently_and_its_good_answer_is_kept():
 
 
 @pytest.mark.parametrize(
+    "said",
+    [
+        "A figure holds a blade in its right hand.",
+        "A dragon on the LEFT of a tower.",
+        "Three figures in armour.",
+        "A sheet with 2 poses.",
+        "A beast facing a figure.",
+        "A figure stands behind a wall.",
+    ],
+)
+def test_a_description_that_names_a_side_a_count_or_a_position_is_asked_again(said):
+    retried, stuck = works(1, 2)
+    plain = "A figure holds a blade. Brightly lit, upright and tense."  # "bright" and "upright" are not "right"
+    fake = FakeOllama(lambda n, attempt, chat: {**GOOD, "description": said if n == 2 or attempt == 1 else plain})
+    assert run(fake)["analyzed"] == 2
+    assert fake.attempts == {1: 2, 2: tagging.MAX_ATTEMPTS}
+    results = tagging.results()
+    assert results[retried]["description"] == plain
+    assert results[stuck]["description"] == said  # a model that will not stop is not a failed work
+
+
+@pytest.mark.parametrize(
     "trouble",
     [
         httpx.Response(500, json={"error": "out of memory"}),
@@ -422,7 +476,7 @@ def test_a_rerun_asks_nothing_and_stores_nothing_new():
     assert again.requests == []  # not the failed work, not a tag, not a title
     with closing(sqlite3.connect(config.LOCAL_DB)) as conn:
         assert [conn.execute(f"SELECT * FROM {table} ORDER BY 1, 2").fetchall() for table in tagging.TABLES] == before
-    assert [len(rows) for rows in before] == [6, 3]  # three works: a first pass and a verified row each, one reading
+    assert [len(rows) for rows in before] == [6, 3, 3, 1]  # three works, each: two results, two readings; one tagline
 
 
 def test_max_works_bounds_a_run_and_the_next_run_does_the_rest():
@@ -435,16 +489,30 @@ def test_max_works_bounds_a_run_and_the_next_run_does_the_rest():
     assert [row[0] for row in stored()] == ids
 
 
-def test_works_another_result_set_covers_go_first_so_that_sets_line_up():
-    ids = works(1, 2, 3, 4)
-    run(FakeOllama(), model="model-old", max_works=0)
-    with closing(sqlite3.connect(config.LOCAL_DB)) as conn, conn:  # an older result set holds the last two works
-        for work_id in ids[2:]:
-            conn.execute("INSERT INTO work_tags VALUES (?, 'model-old', 1, NULL, 'FAKE-TIME')", (work_id,))
-    fake = FakeOllama()
-    run(fake, max_works=2)
-    assert sorted(fake.attempts) == [3, 4]
-    assert sorted(tagging.results()) == ids[2:]
+def test_works_go_artist_by_artist_in_key_order_and_one_artist_is_finished_before_the_next_is_begun():
+    # Work ids are handed out so that id order and artist order disagree: bravo holds 1 and 4, alpha 2 and 3.
+    works(1, 4, artist=BRAVO)
+    works(2, 3, artist=ALPHA)
+    steps = []
+
+    class Watching(FakeOllama):
+        def __call__(self, request):
+            chat = json.loads(request.content)
+            images = chat.get("messages", [{}])[-1].get("images")
+            if images:
+                kind = "first" if chat["messages"][0]["content"] == tagging.PROMPT else "check"
+                steps.append((kind, int(base64.b64decode(images[0]).removeprefix(JPEG))))
+            return super().__call__(request)
+
+    run(Watching(), model="model-a", verifier="model-a", max_works=3)
+    one_artist = [("first", 2), ("first", 3), ("check", 2), ("check", 2), ("check", 3), ("check", 3)]
+    assert steps == [*one_artist, ("first", 1), ("check", 1), ("check", 1)]  # alpha whole, then bravo as far as it goes
+    assert len(tagging.results("model-a", verifier="model-a")) == 3
+
+    steps.clear()
+    run(Watching(), model="model-a", verifier="model-v")  # another model checks: no going back and forth
+    assert [step for step in steps if step[0] == "first"] == [("first", 4)]
+    assert [n for kind, n in steps if kind == "check"] == [2, 2, 3, 3, 1, 1, 4, 4]
 
 
 def test_each_model_and_each_prompt_version_keeps_its_own_result_set(monkeypatch):
@@ -529,12 +597,12 @@ def test_the_sample_prints_one_json_object_a_line_with_the_image_path_and_the_st
 
     rows = printed("--sample", "5", "--seed", "7", "--model", "model-a")
     assert len(rows) == 5 and len({row["deviation_id"] for row in rows}) == 5
-    by_work = {key: value | {"declared_ai": "no"} for key, value in tagging.results("model-a").items()}
+    by_work = {key: value | READ for key, value in tagging.results("model-a").items()}
     for row in rows:
         path = library.image_dir() / f"{row['deviation_id']}.jpg"
         assert row["image"] == str(path) and path.is_file()
         assert row["model"] == "model-a"
-        assert (row["result"] and row["result"] | {"declared_ai": "no"}) == by_work.get(row["deviation_id"])
+        assert (row["result"] and row["result"] | READ) == by_work.get(row["deviation_id"])
     assert printed("--sample", "5", "--seed", "7", "--model", "model-a") == rows
     for other in (["--model", "model-b"], ["--model", "model-a", "--verifier", "model-v"]):
         same = printed("--sample", "5", "--seed", "7", *other)
@@ -545,10 +613,10 @@ def test_the_sample_prints_one_json_object_a_line_with_the_image_path_and_the_st
     assert len(everything) == 8 and sum(row["result"] is None for row in everything) == 1
 
 
-# The second pass: a verifier is asked about each tag, and what it does not confirm is taken out.
+# The second pass: the verifier is asked about the tags in one call and about the description in another.
 
 
-def test_the_verifier_is_asked_about_each_tag_and_what_it_does_not_confirm_is_taken_out():
+def test_the_verifier_is_asked_about_every_tag_in_one_call_and_what_it_does_not_confirm_is_taken_out():
     (work_id,) = works(1)
     first = {
         **GOOD,
@@ -565,15 +633,15 @@ def test_the_verifier_is_asked_about_each_tag_and_what_it_does_not_confirm_is_ta
     counts = run(fake, model="model-a", verifier="model-v")
     assert (counts["analyzed"], counts["removed"], counts["flagged"]) == (1, 3, 0)
     assert [chat["model"] for chat in fake.chats] == ["model-a"]  # the model looks once
-    asked = ["character", "prop or weapon", "environment", "fantasy", "horror", "not artwork", "look"]
-    assert sorted(fake.checks) == sorted((1, tag, "model-v") for tag in asked)  # each tag on its own, by the verifier
+    asked = ["look", "character", "environment", "prop or weapon", "fantasy", "horror", "not artwork"]
+    assert fake.checks == [(1, tag, "model-v") for tag in asked]  # one call for all of them, by the verifier
     kept = tagging.validated(first)
-    assert tagging.results("model-a")[work_id] == kept | {"declared_ai": "no"}  # the first pass is a set of its own
+    assert tagging.results("model-a")[work_id] == kept | READ  # the first pass is a set of its own
     assert tagging.results("model-a", verifier="model-v")[work_id] == kept | {
         "subjects": ["character", "environment"],
         "genres": ["fantasy", "anime style"],
         "not_artwork": False,
-        "declared_ai": "no",
+        **READ,
     }
 
 
@@ -583,9 +651,9 @@ def test_the_verifier_is_asked_about_each_tag_and_what_it_does_not_confirm_is_ta
         ({"manner": "anime style", "colour": "vivid"}, ["fantasy", "anime style"], ["painterly", "saturated"]),
         ({"manner": "stylized cartoon", "colour": "muted"}, ["fantasy"], ["painterly"]),
         ({"manner": "painted illustration", "colour": "mixed"}, ["fantasy"], ["painterly"]),
-        ({"manner": "cubist", "colour": "vivid"}, ["fantasy"], ["painterly"]),  # not an answer: nothing confirmed
-        ({"colour": "vivid"}, ["fantasy"], ["painterly"]),
-        ("not json", ["fantasy"], ["painterly"]),
+        ({"manner": "cubist", "colour": "vivid"}, [], ["painterly"]),  # not an answer: nothing is confirmed
+        ({"colour": "vivid"}, [], ["painterly"]),
+        ("not json", [], ["painterly"]),
     ],
     ids=repr,
 )
@@ -596,16 +664,18 @@ def test_a_manner_and_a_colour_word_stay_only_when_the_verifier_picks_the_same_f
     run(fake, verifier="model-v")
     result = tagging.results(verifier="model-v")[work_id]
     assert (result["genres"], result["style_words"]) == (genres, style_words)
-    whole = isinstance(look, dict) and look.get("manner") in tagging._MANNER_CHOICES and "colour" in look
-    assert sum(check[1] == "look" for check in fake.checks) == (1 if whole else tagging.MAX_ATTEMPTS)
+    assert sum(check[1] == "look" for check in fake.checks) == (1 if genres else tagging.MAX_ATTEMPTS)
 
 
-def test_a_work_with_no_manner_and_no_colour_word_is_not_asked_for_them_and_nothing_is_ever_added():
+def test_the_verifier_never_adds_a_tag_of_its_own():
     (work_id,) = works(1)
-    fake = FakeOllama(look={"manner": "anime style", "colour": "vivid"})
+    fake = FakeOllama(look={"manner": "anime style", "colour": "vivid"})  # what it sees, the first pass did not say
     run(fake, verifier="model-v")
-    assert [check[1] for check in fake.checks] == ["character", "fantasy"]
-    assert tagging.results(verifier="model-v")[work_id] == KEPT | {"declared_ai": "no"}
+    assert [check[1] for check in fake.checks] == ["look", "character", "fantasy"]
+    assert tagging.results(verifier="model-v")[work_id] == KEPT | READ
+
+
+LOOKED = {"faces": "FAKE-FACES", "manner": "painted illustration", "colour": "mixed", "about": "FAKE-ABOUT"}
 
 
 @pytest.mark.parametrize(
@@ -615,44 +685,51 @@ def test_a_work_with_no_manner_and_no_colour_word_is_not_asked_for_them_and_noth
         "not json",
         "[]",
         {},
-        {"confirmed": "true"},
-        {"confirmed": 1},
-        {"shown_by": "FAKE-EVIDENCE"},
+        {**LOOKED, "character": "true", "fantasy": True},
+        {**LOOKED, "character": 1, "fantasy": True},
+        {**LOOKED, "character": True},  # one tag is not answered
+        {"character": True, "fantasy": True},  # it did not look
         httpx.Response(400),
     ],
     ids=repr,
 )
-def test_a_malformed_answer_from_the_verifier_confirms_nothing_and_the_run_carries_on(bad):
+def test_a_malformed_answer_about_the_tags_confirms_nothing_and_the_run_carries_on(bad):
     first, second = works(1, 2)
     fake = FakeOllama(confirm=lambda n, tag, chat: bad if n == 1 else True)
     counts = run(fake, verifier="model-v")
     assert (counts["analyzed"], counts["failed"], counts["removed"]) == (2, 0, 2)
-    assert fake.checks.count((1, "character", "model-v")) == tagging.MAX_ATTEMPTS  # asked again, a bounded number
+    assert fake.checks.count((1, "look", "model-v")) == tagging.MAX_ATTEMPTS  # asked again, a bounded number
     results = tagging.results(verifier="model-v")
     assert (results[first]["subjects"], results[first]["genres"]) == ([], [])
     assert (results[second]["subjects"], results[second]["genres"]) == (["character"], ["fantasy"])
 
 
-def test_the_verifier_sees_the_image_and_the_meaning_of_the_tag_and_nothing_of_the_first_answer():
+def test_the_verifier_sees_the_image_the_meaning_of_each_tag_and_of_the_first_answer_only_the_description():
     works(1)
 
     class Recording(FakeOllama):
         def __call__(self, request):
             chat = json.loads(request.content)
-            if chat.get("messages", [{}])[0].get("content") in (tagging.VERIFY_PROMPT, tagging.LOOK_PROMPT):
+            if chat.get("messages", [{}])[0].get("content") in (tagging.CHECK_PROMPT, tagging.DESCRIPTION_PROMPT):
                 seen.append(chat)
             return super().__call__(request)
 
     seen = []
     first = {**GOOD, "description": "FAKE-DESCRIPTION of a figure.", "manner": "realistic", "style_words": ["fakeword"]}
     run(Recording(first), verifier="model-v")
-    assert len(seen) == 3  # the subject, the genre, the manner
+    describe, check = seen  # two calls an image, and no more
+    assert describe["messages"][0]["content"] == tagging.DESCRIPTION_PROMPT
     for chat in seen:
+        assert chat["model"] == "model-v" and chat["think"] is False
         assert chat["messages"][1]["images"] == [base64.b64encode(JPEG + b"1").decode()]
-        assert "FAKE-DESCRIPTION" not in json.dumps(chat) and "fakeword" not in json.dumps(chat)
-    questions = [chat["messages"][1]["content"] for chat in seen]
-    assert f"Tag (main subject): character\nMeaning: {tagging.SUBJECTS['character']}" in questions
-    assert f"Tag (kind of world): fantasy\nMeaning: {tagging.GENRES['fantasy']}" in questions
+        assert "fakeword" not in json.dumps(chat) and "faketag" not in json.dumps(chat)
+    assert "FAKE-DESCRIPTION" not in json.dumps(check)  # the tags are checked against the image alone
+    assert check["messages"][1]["content"].splitlines() == [
+        "Tags to check:",
+        f"- character (what the image is about): {tagging.SUBJECTS['character']}",
+        f"- fantasy (the kind of world shown): {tagging.GENRES['fantasy']}",
+    ]
+    assert describe["messages"][1]["content"] == "Description: FAKE-DESCRIPTION of a figure."
 
 
 def test_a_second_verifier_checks_the_same_first_pass_into_a_result_set_of_its_own():
@@ -663,10 +740,105 @@ def test_a_second_verifier_checks_the_same_first_pass_into_a_result_set_of_its_o
     run(fake, model="model-a", verifier="model-v")
     assert fake.attempts == {1: 1, 2: 1}  # one first pass a work, shared by both verifiers
     assert sorted({check[2] for check in fake.checks}) == ["model-a", "model-v"]
-    assert len(fake.checks) == 2 * 2 * 2  # two works, two tags each, each verifier once
+    assert len(fake.checks) == 2 * 3 * 2  # two works, its own look and two tags each, each verifier once
+    both = [(n, model) for n in (1, 2) for model in ("model-a", "model-v")]
+    assert sorted(rewrite[::2] for rewrite in fake.rewrites) == both
     assert sorted({row[1] for row in stored()}) == ["model-a", "model-a+model-a", "model-a+model-v"]
     for verifier in (None, "model-a", "model-v"):
         assert sorted(tagging.results("model-a", verifier=verifier)) == ids
+
+
+# The description is checked too: the verifier may leave a detail out or put it more generally, and never add one.
+
+SAID = "A woman holds a spiked mace in her right hand, standing on a mound of debris. Three figures watch from behind."
+
+
+def test_the_checked_description_is_stored_and_the_first_one_is_kept_beside_it():
+    (work_id,) = works(1)
+    checked = "A figure holds a large weapon, standing on a mound of debris. Figures watch."
+    answer = dict.fromkeys(tagging._DOUBTS, []) | {
+        "things": ["a spiked mace: a long axe"],
+        "places": ["in her right hand: both hands", "from behind: beside"],
+        "numbers": ["Three figures: several"],
+        "kinds": ["woman: cannot be told"],
+        "description": checked,
+    }
+    fake = FakeOllama({**GOOD, "description": SAID}, rewrite=lambda n, description, chat: answer)
+    counts = run(fake, model="model-a", verifier="model-v")
+    assert (counts["analyzed"], counts["descriptions_changed"], counts["details_removed"]) == (1, 1, 5)
+    assert fake.rewrites == [(1, SAID, "model-v")]
+    assert tagging.results("model-a")[work_id]["description"] == SAID  # the original, in the first pass's own set
+    assert tagging.results("model-a", verifier="model-v")[work_id]["description"] == checked
+    assert [row["result"]["description"] for row in tagging.sample(5, 7, "model-a", verifier="model-v")] == [checked]
+
+
+def test_a_description_with_nothing_wrong_is_stored_as_it_was():
+    (work_id,) = works(1)
+    counts = run(FakeOllama({**GOOD, "description": SAID}), verifier="model-v")
+    assert (counts["descriptions_changed"], counts["details_removed"]) == (0, 0)
+    assert tagging.results(verifier="model-v")[work_id]["description"] == SAID
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [
+        "A figure holds a glowing sword.",  # a new thing
+        f"{SAID[:-1]} at night.",  # everything it said, and one detail more
+        "A queen holds a mace.",
+        "A man holds a mace.",
+        "",
+        "...",
+        {},
+        {"description": 42},
+        {"things": ["mace"], "description": None},
+        httpx.Response(400),
+        httpx.Response(200, json={"message": {"content": "not json"}}),
+        httpx.Response(200, text="<html>not the api</html>"),
+    ],
+    ids=repr,
+)
+def test_a_check_that_adds_a_detail_or_is_malformed_leaves_the_description_as_it_was(answer):
+    first, second = works(1, 2)
+    fake = FakeOllama(
+        {**GOOD, "description": SAID},
+        rewrite=lambda n, description, chat: answer if n == 1 else "A figure holds a weapon.",
+    )
+    counts = run(fake, verifier="model-v")
+    assert (counts["analyzed"], counts["failed"], counts["descriptions_changed"]) == (2, 0, 1)
+    assert [rewrite[0] for rewrite in fake.rewrites].count(1) == tagging.MAX_ATTEMPTS  # asked again, a bounded number
+    results = tagging.results(verifier="model-v")
+    assert results[first]["description"] == SAID
+    assert results[second]["description"] == "A figure holds a weapon."
+
+
+def test_a_checked_description_may_leave_out_and_generalise_but_never_add():
+    for less in (
+        SAID,
+        "A figure holds a large weapon, standing on a mound of debris.",
+        "A figure holding a weapon. Several figures.",
+        "A woman stands on debris.",  # another form of a word it had
+        "Figures.",
+    ):
+        assert tagging.plainer(SAID, less) == less
+    for more in (
+        "A woman holds a spiked mace and a shield.",
+        "A queen holds a mace.",
+        "A woman holds a mace at night.",
+        "A man holds a mace.",
+        "A woman holds a mace. She smiles.",
+        "A woman holds a spiked , standing on a mound of debris.",  # a word cut out, the hole left showing
+        "A woman holds a, standing on a mound of debris.",
+        "A woman holds a spiked mace in her right hand, , standing.",
+        "",
+        "  ",
+        "?!",
+        None,
+        5,
+        ["A woman."],
+        "A woman " + "holds " * 100 + "a mace.",  # too long to be a description
+    ):
+        assert tagging.plainer(SAID, more) is None
+    assert tagging.plainer(SAID, "A  woman.   Holds a mace. In her hand.") == "A woman. Holds a mace."  # two sentences
 
 
 # The words: whether the artist's own title and tags declare the work AI-generated.
@@ -746,6 +918,90 @@ def test_a_malformed_reading_is_unclear_after_a_bounded_number_of_tries(bad):
     assert again.requests == []
 
 
+# The words again, asked a second question in a call of its own: is there a way to contact someone privately?
+
+
+def test_titles_tags_and_taglines_are_read_for_a_private_contact_and_the_answers_are_stored_and_read_back():
+    plain, phone = works(1, 2, artist=ALPHA, tags={2: ["faketag-call-me"]}, tagline="FAKE-TAGLINE with a handle")
+    (other,) = works(3, artist=BRAVO)  # no tagline: nothing to read, so "no" without asking
+    fake = FakeOllama(
+        contact=lambda chat: (
+            "yes" if "call-me" in chat["messages"][1]["content"] or "handle" in chat["messages"][1]["content"] else "no"
+        )
+    )
+    counts = run(fake, model="model-a")
+    assert (counts["contact_yes"], counts["contact_no"]) == (1, 2)
+    assert (counts["tagline_contact_yes"], counts["tagline_contact_no"]) == (1, 1)
+    assert len(fake.contact_readings) == 4  # three works and one tagline
+    expected = {plain: "no", phone: "yes", other: "no", ALPHA: "yes", BRAVO: "no"}
+    assert tagging.contacts("model-a") == expected
+    assert {key: value["contact_in_text"] for key, value in tagging.results("model-a").items()} == {
+        plain: "no",
+        phone: "yes",
+        other: "no",
+    }
+    version = tagging.CONTACT_PROMPT_VERSION
+    assert stored("work_contact") == [(key, "model-a", version, expected[key]) for key in sorted((plain, phone, other))]
+    assert stored("artist_contact") == [(ALPHA, "model-a", version, "yes"), (BRAVO, "model-a", version, "no")]
+
+    again = FakeOllama()
+    counts = run(again, model="model-a", verifier="model-v")  # another result set of the same model: nothing re-read
+    assert again.contact_readings == [] and again.readings == []
+    assert (counts["contact_yes"], counts["contact_no"], counts["tagline_contact_yes"]) == (0, 0, 0)
+    assert {value["contact_in_text"] for value in tagging.results("model-a", verifier="model-v").values()} == {
+        "yes",
+        "no",
+    }
+
+
+def test_the_contact_question_is_a_call_of_its_own_that_carries_the_text_and_nothing_else():
+    (work_id,) = works(1, tags={1: ["faketag-one", "faketag_two"]}, tagline="FAKE-TAGLINE")
+    fake = FakeOllama()
+    run(fake, model="model-a", verifier="model-v")
+    about_work, about_artist = fake.contact_readings
+    for reading in fake.contact_readings:
+        assert reading["model"] == "model-a" and reading["think"] is False and reading["stream"] is False
+        assert reading["messages"][0] == {"role": "system", "content": tagging.CONTACT_PROMPT}
+        assert set(reading["messages"][1]) == {"role", "content"}  # no image
+        assert reading["format"]["properties"]["contact"]["enum"] == ["yes", "no"]
+        sent = json.dumps(reading).lower()
+        for kept_back in (
+            work_id,
+            "zz-fake-alpha",
+            "deviantart",
+            "wixmp",
+            ".jpg",
+            base64.b64encode(JPEG).decode()[:40],
+        ):
+            assert kept_back.lower() not in sent
+    assert about_work["messages"][1]["content"].splitlines() == [
+        "Title: FAKE-TITLE-1",
+        "Tags: faketag-one, faketag_two",
+    ]
+    assert about_artist["messages"][1]["content"] == "Tagline: FAKE-TAGLINE"
+    (about_ai,) = fake.readings  # the other question about the same words: asked apart, so neither colours the other
+    assert about_ai["messages"][0]["content"] == tagging.AI_PROMPT
+    assert "contact" not in tagging.AI_PROMPT.lower() and " ai " not in tagging.CONTACT_PROMPT.lower()
+    assert all("FAKE-TAGLINE" not in json.dumps(chat) for chat in fake.chats)  # and the image calls see none of it
+
+
+@pytest.mark.parametrize(
+    "bad",
+    ["", "not json", "[]", {}, {"contact": "maybe"}, {"contact": True}, {"found": "yes"}, httpx.Response(400)],
+    ids=repr,
+)
+def test_a_malformed_answer_about_a_contact_is_yes_after_a_bounded_number_of_tries(bad):
+    first, second = works(1, 2)
+    fake = FakeOllama(contact=lambda chat: bad if "faketag1" in chat["messages"][1]["content"] else "no")
+    counts = run(fake)
+    assert (counts["contact_yes"], counts["contact_no"], counts["analyzed"]) == (1, 1, 2)
+    assert len(fake.contact_readings) == tagging.MAX_ATTEMPTS + 1
+    assert tagging.contacts() == {first: "yes", second: "no", ALPHA: "no"}  # the cautious answer: left out, not leaked
+    again = FakeOllama()
+    run(again)
+    assert again.requests == []
+
+
 # Works that are not there to analyze, works that were removed, and a database another stage is holding.
 
 
@@ -770,25 +1026,22 @@ def test_a_removed_artist_is_not_read_back_and_their_rows_go_at_the_next_run():
     assert [row["deviation_id"] for row in tagging.sample(40, 7)] == [kept]
     run(FakeOllama(), verifier="model-v")
     for table in tagging.TABLES:
-        assert {row[0] for row in stored(table)} == {kept}
-        assert removed not in json.dumps(stored(table))
+        assert {row[0] for row in stored(table)} == {BRAVO if table == "artist_contact" else kept}
+        assert removed not in json.dumps(stored(table)) and ALPHA not in json.dumps(stored(table))
 
 
 def test_nothing_is_stored_for_a_work_once_it_is_removed_even_while_a_model_is_looking_at_it():
-    for step, tables_written_before in (("declared", 0), ("answer", 1), ("confirm", 2)):
-        works(1, artist=ALPHA)
+    for step in ("declared", "contact", "answer", "rewrite", "confirm"):
+        works(1, artist=ALPHA, tagline="FAKE-TAGLINE")
 
         def purging(*args, step=step):
-            library.purge(ALPHA)
-            return {"declared": "yes", "answer": GOOD, "confirm": True}[step]
+            library.purge(ALPHA)  # which also deletes what this stage had stored about the artist until then
+            return {"declared": "yes", "contact": "yes", "answer": GOOD, "rewrite": None, "confirm": True}[step]
 
         run(FakeOllama(**{step: purging}), verifier="model-v")
-        # What was stored before the removal is swept by the next run; what came after it was never stored.
-        assert sum(bool(stored(table)) for table in tagging.TABLES) == tables_written_before
-        assert f"{tagging.DEFAULT_MODEL}+model-v" not in {row[1] for row in stored()}
+        assert [stored(table) for table in tagging.TABLES] == [[], [], [], []], step
         assert tagging.results() == tagging.results(verifier="model-v") == tagging.declared_ai() == {}
-        run(FakeOllama(), verifier="model-v")
-        assert [stored(table) for table in tagging.TABLES] == [[], []]
+        assert tagging.contacts() == {}
 
 
 def test_a_database_another_stage_is_holding_is_waited_for(monkeypatch):
