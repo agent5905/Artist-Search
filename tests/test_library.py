@@ -1603,6 +1603,27 @@ def test_an_image_address_whose_last_part_carries_what_a_title_may_not_is_refuse
         )  # the artist's handle and DeviantArt's own numbers are not it
 
 
+def test_a_file_as_deviantart_names_it_is_not_read_as_a_number_to_call():
+    """The first rerun on real data marked 177 kept works for this. A preview served as the file itself ends in
+    <id>-<uuid>.<type>, a name DeviantArt made, and a UUID has more than nine digits in it."""
+    uuid = "12345678-9012-4345-8678-901234567890"
+
+    def address(name):
+        return f"https://images-wixmp-zzcdn.wixmp.com/f/{uuid}/{name}?{SIGNED}"
+
+    for name in (f"d1a2b3c-{uuid}.png", f"dfakeid-{uuid}.jpg", f"d999999-{uuid}.gif"):
+        assert library.image_address(address(name)) == address(name)
+    for name in (
+        f"5550199000-{uuid}.png",  # an id that is itself a number
+        f"call-5550199-{uuid}.png",
+        f"d1a2b3c-{uuid}-5550199000.png",
+        f"d1a2b3c-{uuid.replace('9', 'A')}.png",  # not the shape DeviantArt makes: read as any other name
+        f"d1a2b3c-{uuid}.png.5550199000",
+    ):
+        with pytest.raises(library.ContactInTitle):
+            library.image_address(address(name))
+
+
 def test_a_removed_account_is_known_by_its_hash_on_the_stores_removal_list():
     """Hard rule 7 across a rename that comes after the removal. The purge deletes the profile and the hash with
     it, so the collector first hands the hash to the store's removal list; from then on the account is known

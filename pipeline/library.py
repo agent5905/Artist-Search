@@ -147,6 +147,7 @@ _THUMBNAIL = re.compile(
     rf"https://[a-z0-9-]{{1,63}}\.wixmp\.com/[fi]/{_HEX_UUID}/[0-9a-z]{{1,12}}-{_HEX_UUID}\.[a-z]{{3,4}}"
     r"(?:/v1/[a-z]{1,12}/[a-z0-9_,]{1,60}/[a-z0-9_]{1,200}-[0-9a-z]{1,12}\.[a-z]{3,4})?(?:\?.*)?"
 )
+_OWN_FILE = re.compile(rf"(?P<id>[0-9a-z]{{1,12}})-{_HEX_UUID}\.[a-z]{{3,4}}")  # the file's own name, as above
 RENAMED = "renamed"  # the mark on the key an account was kept under before it took another handle
 # The mark on an artist or a work of which something stayed as it was kept because the answer for it is one the
 # rules here refuse. What is kept may be out of date, so a later stage holds the artist or the work back.
@@ -351,8 +352,14 @@ def image_address(value: object) -> str:
     probe = _settle(path, percent=True)
     if probe is None or "@" in probe or _LINK.search(probe):
         raise ContactInTitle("contact details in an image address")
-    # Its last part is "<title>_by_<artist>_<id>-<size>.jpg". The title in it is held to the whole of the rule.
     last = probe.rpartition("/")[2]
+    # An image served as the file itself ends in the name DeviantArt gave it, <id>-<uuid>.<type>. Nothing of the
+    # title is in that, and a UUID's digits are no number to call: the first rerun on real data marked 177 kept
+    # works for it. Only that exact shape, and an id with fewer digits than a number has.
+    own = _OWN_FILE.fullmatch(last)
+    if own and _digits(own["id"]) < 7:
+        return str(url)
+    # Otherwise it is "<title>_by_<artist>_<id>-<size>.jpg". The title in it is held to the whole of the rule.
     named = last.rpartition("_by_")[0] if "_by_" in last else last.rpartition(".")[0]
     if _contact(named):
         raise ContactInTitle("contact details in an image address")
