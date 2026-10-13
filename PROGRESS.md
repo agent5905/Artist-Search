@@ -1,10 +1,14 @@
 # Artist Search: Progress
 
-**Status, 2026-10-13 (later):** The first full collection finished cleanly: 442 artists, 4,381 works, each with a locally cached image. Three blind A/B tests on real artwork are done (two on style, one on tagging). The seed-artist eval set is frozen. Tagging and collect are in their next rounds; the database's critic is queued.
+**Status, 2026-10-14:** The first 55 real artist profiles are written and with a blind critic. Tagging is on its third round and the full run over all 4,381 works is under way (about 9 hours on the local GPU). Five blind A/B tests on real artwork are done. Collect and the database have each failed their critics again on narrower gaps and are in rounds 4 and 5. Nothing is in the public database yet.
 
 ## Waiting on the owner
 
-Nothing is blocking. One optional item: the draft note to DeviantArt in `docs/` can still be sent as a courtesy question.
+Nothing is blocking. Three things to weigh when convenient:
+
+1. **How strict should the content filter be?** Critics keep finding sexualised pin-ups and some gore among collected works, and one of the 30 frozen seed artists is adult-oriented. The "explicit" flag has fired once in 1,100 works, so it is too lenient to rely on. Default: tighten it to cover suggestive content and exclude artists with several flagged works.
+2. **Brief slow-downs during a data load.** On the free-tier database a full load takes 12 to 15 minutes, and in one test run of two, 5 of 1,812 visitor calls made during the load timed out. Default: the site retries a failed call once, and loads run at quiet hours.
+3. **Tagging time at scale.** Checked tags and descriptions take about 8 seconds a work, so 30,000 works is roughly 66 hours of local GPU time. Fine as a multi-night job; say so if it is not.
 
 The first public deployment will be asked for separately when the site reaches its preview stage.
 
@@ -346,3 +350,44 @@ The strict own-site rule costs about 2%. Most artists simply have no site of the
 - **Narrow, found with made-up data, real cache clean:** a dropped title surviving inside the page address; messaging links kept as a website (now an allow-list of portfolio hosts instead of a deny-list); an artist removed and then renamed being collected again (the removal list now remembers the account's hashed user id).
 
 **Pipeline counts:** artists discovered 472, artists collected 442, works 4,381, images cached 4,381, tagged 500 per model, style vectors being computed for all. **Database:** 12.6 MB of 400 MB, artists 0, works 0.
+
+### Round 7: verification passes, first profiles, style correction (2026-10-13 to 14)
+
+**Tags and descriptions: second blind test** (30 fresh works).
+
+| | Round 1, one pass | Round 2, checked by the same model | Round 2, checked by the second model |
+|---|---|---|---|
+| Works with at least one unsupported claim | 15 of 30 | **11 of 30** | 13 of 30 |
+| Unsupported claims | 21 | **13** | 16 |
+| Of those, in genres | 8 | **2** | 4 |
+| Of those, in the description | 4 | 9 | 9 |
+
+- **What changed:** a verification pass. Each proposed subject and genre is asked about on its own with the image and kept only if confirmed. Drawing manner needed a different check: asked "is this anime style?", both models said yes to a sheet of dragon heads, so the verifier picks a manner itself and the tag survives only if the two agree.
+- **Verdict:** tags are mostly right now. Descriptions became the biggest gap (an axe called a mace "in its right hand").
+- **Round 3** applies the same approach to descriptions: a pass that may only remove or generalise a detail, never add one. A third blind test is running. Cost: about 8 seconds a work.
+
+**Deciding with a model instead of a list.** Two rules failed their critics three and four rounds running as lists of spellings: "is this work declared AI-made?" and "does this text contain contact details?". Both moved to the tagging stage, where the local language model reads the artist's own title and tags. First numbers on 500 works: 7 declared AI-made, of which the tag list catches 5.
+
+**Style similarity: third blind test** (12 frozen seed artists, pool of 442).
+
+| | Two-way rule | With a correction for artists near everyone |
+|---|---|---|
+| Seeds won | 4 | **7**, with 1 tie |
+| Rows judged a real style match, of 48 | 35 | **37** |
+| Mixed-portfolio rows, of 48 | **4** | 8 |
+
+The correction is adopted. The larger gain came from the pool: real matches rose from 29 of 48 at 148 artists to 35 and 37 at 442.
+
+**Artist profiles: built, first real output.** 55 artists profiled from verified tags counted across each artist's works; 6 say in their own words that they are open for work. The local embedding model and Cloudflare's copy agree on the 36 eval queries (cosine 0.99999, same nearest neighbour 36 of 36). A blind critic is reading 20 profiles next to the artists' works.
+
+**Collect: third critic, fail, 4 of 10; round 4 built.**
+- **Caught before it touched real data:** if DeviantArt refused every profile lookup, the second run would have deleted the whole local library and reported success. Now a refusal counts as the API failing, five in a row stop the run, and an account is purged only on a documented "user is gone" answer on two healthy runs.
+- **The AI rule failed in both directions,** purging artists whose works carry anti-AI protest tags. All pattern matching is deleted; collect keeps an exact list of 20 tags.
+
+**Database: fourth critic, fail, 4 of 11; round 5 built.**
+- **The lead's own mistake:** "keep the newest five requests" let anonymous calls push out a real artist's request, and "asking again replaces the proof code" let one anonymous call cancel a real removal. Fixed: the code is derived from the slug and a secret, so it cannot be replaced, and a request never deletes anything.
+- The links field is gone; loads are incremental in batches of 10 artists. Builder's full-scale numbers: 172 MB loaded, 200 MB peak; one of two runs had 5 timeouts in 1,812 visitor calls during a load.
+
+**A scheduling mistake by the lead:** the full tagging run was started on round 2 code while round 3 was changing the prompt version. It was stopped and restarted on round 3, with one artist's works tagged together so profiles can start early.
+
+**Pipeline counts:** artists discovered 472, collected 442, works 4,381, images cached 4,381, style vectors 4,381, works with checked tags 600 and rising, artists profiled 55. **Database:** 12.1 MB of 400 MB, artists 0, works 0.

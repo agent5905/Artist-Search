@@ -231,3 +231,4 @@ node_modules/
 # Any other env-style file the owner drops in (tokens, account info)
 .env.*
 !.env.example
+critic_probes_*/
