@@ -73,8 +73,8 @@ DIMENSIONS = 1024  # sql/001_schema.sql: artists.profile_embedding is halfvec(10
 QUERIES = config.ROOT / "eval" / "queries.jsonl"
 
 MIN_WORKS = 5  # eligible works; with fewer an artist cannot be characterised
-MIN_SUPPORT = 3  # works: nothing is stated on fewer, whatever share they are
-PART_PERCENT = 30  # of the eligible works: a subject is named; a genre, manner or format is stated with a hedge
+MIN_SUPPORT = 4  # works: nothing is stated on fewer, whatever share they are
+PART_PERCENT = 40  # of the eligible works: a subject is named; a genre, manner or format is stated with a hedge
 CLEAR_PERCENT = 70  # a genre is stated flat; a medium or a verified colour word is a fact
 NEARLY_ALL_PERCENT = 90  # any other style word is a fact
 AT_MOST = {"specialties": 3, "worlds": 2, "manners": 1, "own_words": 2, "formats": 2, "style_words": 2}
@@ -83,9 +83,9 @@ CELL, PER_ROW, LABEL = 300, 5, 34  # the contact sheet: pixels a picture, pictur
 RECENT_DAYS = 180  # a work's own tags say something about commissions for this long
 MAX_PROFILE = 420  # characters of a profile's one sentence; the longest the template can write is under it
 MAX_WRITES = 3  # times the model is asked for one artist's sentence
-TEMPLATE_VERSION = 3  # bump when template() would say something else
-WRITTEN_VERSION = 4  # bump when WRITE_PROMPT, GLUE or unsupported() changes
-SHEET_VERSION = 1  # bump when the sheet, PROPOSE_PROMPT, COUNT_PROMPT or specifics() changes
+TEMPLATE_VERSION = 4  # bump when template() would say something else
+WRITTEN_VERSION = 5  # bump when WRITE_PROMPT, GLUE or unsupported() changes
+SHEET_VERSION = 2  # bump when the sheet, PROPOSE_PROMPT, COUNT_PROMPT or specifics() changes
 
 # Every value a profile may state, and the spellings it may state it in. The first is the template's.
 # "photo" and "unclear" are not here: neither says what the art is made with. Nor is "digital" on its own: with
@@ -104,9 +104,9 @@ SUBJECT_FORMS = {
     "character": ("character", "characters"),
     "creature": ("creature", "creatures"),
     "environment": ("environment", "environments"),
-    "prop or weapon": ("prop or weapon", "props or weapons", "prop", "props"),
-    "vehicle or mech": ("vehicle or mech", "vehicles or mechs"),
-    "interface or icons": ("interface or icon", "interface or icons", "interfaces or icons"),
+    "prop or weapon": ("prop", "props"),
+    "vehicle or mech": ("vehicle", "vehicles"),
+    "interface or icons": ("interface", "interfaces"),
 }
 WORLD_FORMS = {
     "fantasy": ("fantasy",),
@@ -147,19 +147,19 @@ COLOUR_WORDS = dict.fromkeys(("saturated", "vibrant", "vivid"), "saturated") | {
     "monochrome": "monochrome",
 }
 # How a format of the tagging stage is said. A format it adds later is said as it spells it (see _spellings).
-FORMAT_FORMS = {
-    "character sheet or turnaround": ("character sheets", "character sheet", "character sheets or turnarounds"),
+FORMAT_FORMS = {  # each by the one plain word for it: an either-or name says less than it seems to
+    "character sheet or turnaround": ("character sheets", "character sheet"),
     "creature sheet": ("creature sheets", "creature sheet"),
-    "expression or pose sheet": ("expression or pose sheets", "expression or pose sheet"),
-    "environment keyframe or scene": ("environment scenes", "environment scene", "environment keyframes or scenes"),
-    "concept sketches or thumbnails": ("concept sketches", "concept sketches or thumbnails"),
-    "card or splash illustration": ("card or splash illustrations", "card or splash illustration"),
-    "portrait or bust": ("portraits", "portrait", "portraits or busts"),
-    "adoptable or design-for-sale sheet": ("designs for sale or adoption", "designs for adoption or sale"),
-    "comic page or panel sequence": ("comic pages or panel sequences", "comic page or panel sequence"),
-    "icons or interface elements": ("icons or interface elements",),
+    "expression or pose sheet": ("expression sheets", "expression sheet"),
+    "environment keyframe or scene": ("environment scenes", "environment scene"),
+    "concept sketches or thumbnails": ("concept sketches",),
+    "card or splash illustration": ("card illustrations", "card illustration"),
+    "portrait or bust": ("portraits", "portrait"),
+    "adoptable or design-for-sale sheet": ("designs for sale",),
+    "comic page or panel sequence": ("comic pages", "comic page"),
+    "icons or interface elements": ("icons",),
     "sprite sheet": ("sprite sheets", "sprite sheet"),
-    "colour keys or mood studies": ("colour keys or mood studies", "color keys or mood studies"),
+    "colour keys or mood studies": ("colour studies", "color studies"),
 }
 # A format that names a subject counts on a work only when the verifier gave the work that subject, as a word of
 # the artist's own does: the format is one model's pick, and a figure in a room is not an "environment scene".
@@ -270,9 +270,9 @@ COUNTED_AS = {
 }
 # How a phrase is said after its first word has been said: "Environment designs, mostly keyframes or scenes".
 SHORT = {
-    "character sheets": "sheets or turnarounds",
+    "character sheets": "design sheets",
     "creature sheets": "design sheets",
-    "environment scenes": "keyframes or scenes",
+    "environment scenes": "finished scenes",
     "character designs": "designs",
     "creature designs": "designs",
     "environment designs": "designs",
@@ -284,7 +284,7 @@ FORMS |= {term: (*forms, SHORT[forms[0]]) for term, forms in FORMS.items() if fo
 # The fields of the facts whose values a profile may state, in the order the vector's text lists them.
 STATED = ("recurring", "specialties", "own_words", "mediums", "genres", "formats", "style_words")
 _LEADS = ("character", "creature")  # a recurring subject of these kinds is said in their place: "dinosaur art"
-_PAIRED = ("prop or weapon", "vehicle or mech", "interface or icons")  # each said on its own: "prop or weapon art"
+_PAIRED: tuple[str, ...] = ()  # each said on its own: "prop or weapon art"
 # A fact that holds for part of the works may only be said after one of these, in the same clause: the first is
 # the template's. "With" is a hedge for a genre ("with fantasy themes") and none for a manner or a format.
 _HEDGES = {
@@ -317,6 +317,7 @@ natural, with the style, manner and theme words before the kind of art.
 that, not "character art".
 - A fact under "most of the works" is said as "mostly dragons", or put in the place of the kind of art: \
 "dragon art".
+- A look is said after the kind of art: "character art in pen-and-ink hatching".
 - A fact under "only part of the works" is true of some works and not of the rest. Say it only as it is listed, \
 after its "with", "partly" or "including", and never before the kind of art.
 - From "kinds of art: environment / medium: 3D / themes: science fiction / style: saturated" a good sentence \
@@ -349,29 +350,46 @@ _NOT_A_SUBJECT = frozenset(
     "fan subject subjects human humans man men woman women girl girls boy boys male female face faces head "
     "heads eye eyes hand hands hair body bodies portrait portraits".split()
 )
+_DEFINING = re.compile(r"[a-z]+(?:[ -][a-z]+){1,5}")  # the defining thing: two to four plain words, some hyphened
+UNSUITABLE = "sexualised or gory"  # a claim counted on every sheet and never stated: the push stage's to weigh
 PROPOSE_PROMPT = f"""You look at one sheet of numbered pictures, all by one artist, for a search index of artists \
-that game studios use. A reviewer will hold every word you give against the pictures.
+that game studios use. A reviewer will count the pictures that show each thing you name, as you name it.
 
-Name up to {AT_MOST["recurring"]} concrete things that RECUR across the pictures: what is drawn in them, such as \
-dinosaurs, horses, birds, cats, dragons, armoured knights, soldiers, robots, castles, forests, spaceships or swords. \
-Each must be plain to see in at least half of the pictures. Fewer is better than a doubtful one, and an empty \
-list is a good answer: many artists draw no one thing again and again.
+First the defining thing: the ONE subject or look that most of the pictures share, and that would tell this \
+artist from another. Two to four plain lowercase words. A subject is what is drawn, as closely as most pictures \
+bear out: "dragon head portraits", "white-armoured knights", "gothic witches and demons", "city streets at \
+night", "wildlife in sunset landscapes". A look is how it is drawn, when that is what the pictures share: \
+"pen-and-ink hatching", "gestural ink sketches", "flat pastel shapes". Say which it is, and for a subject which \
+kind of thing it is. When most pictures share no one thing, say none: that is a good answer.
+
+Then up to {AT_MOST["recurring"]} other concrete things that recur: what is drawn, such as dinosaurs, horses, \
+birds, dragons, armoured knights, robots, castles or spaceships. Each plain to see in several pictures. An empty \
+list is a good answer.
 
 Rules
-- Only what can be seen. A real animal is named as what it is: horses, not creatures.
+- Only what can be seen, named as what it is. A horse-shaped creature that is not a horse is not "horses".
 - Never a name, and nothing that takes knowing one to recognise: no franchise, game, film, series, character, \
 person or brand.
-- No word for a style, a technique, a colour, a mood or a genre (painterly, dark, fantasy, anime).
-- No word as general as character, figure, person, people, man, woman, creature, environment, scene, object, \
-design or art, and no part of a figure (faces, hands, eyes).
+- No praise, no mood, and no word as general as character, figure, person, creature, scene or art on its own.
 
-Answer with one JSON object with one field, recurring: a list, each entry with
-many: the thing in the plural, one to three plain lowercase words: "armoured knights"
-one: the same in the singular, as it stands before the word art: "armoured knight"
-kind: which of these it is a kind of: {", ".join(SUBJECT_FORMS)}"""
+Answer with one JSON object with these fields.
+defining: phrase (the words, or "" for none), is (subject, look or none), kind (one of: {", ".join(SUBJECT_FORMS)})
+recurring: a list, each entry with
+  many: the thing in the plural, one to three plain lowercase words: "armoured knights"
+  one: the same in the singular, as it stands before the word art: "armoured knight"
+  kind: which of the same kinds it is"""
 _PROPOSED = {
     "type": "object",
     "properties": {
+        "defining": {
+            "type": "object",
+            "properties": {
+                "phrase": {"type": "string"},
+                "is": {"type": "string", "enum": ["subject", "look", "none"]},
+                "kind": {"type": "string", "enum": list(SUBJECT_FORMS)},
+            },
+            "required": ["phrase", "is", "kind"],
+        },
         "recurring": {
             "type": "array",
             "maxItems": AT_MOST["recurring"],
@@ -384,21 +402,24 @@ _PROPOSED = {
                 },
                 "required": ["many", "one", "kind"],
             },
-        }
+        },
     },
-    "required": ["recurring"],
+    "required": ["defining", "recurring"],
 }
-COUNT_PROMPT = """You check claims about one sheet of numbered pictures, all by one artist, for a search index \
-of artists. A reviewer will hold each claim against each picture: a picture you list that does not plainly show \
-the thing counts against us, and a picture you leave out costs nothing. So list a picture only when it leaves no \
-doubt.
+COUNT_PROMPT = """You check one claim about one sheet of numbered pictures, all by one artist, for a search index \
+of artists. A reviewer will hold the claim against each picture you list: a picture that does not plainly show \
+the thing AS IT IS NAMED counts against us, and a picture you leave out costs nothing. So list a picture only \
+when it leaves no doubt.
+
+Something like the thing is not the thing. A horse-shaped fantasy creature is not a horse. A finished scene is \
+not a design sheet. A small figure standing in a landscape does not make the picture about a character. A \
+picture that merely looks rendered is not shown to be 3D.
 
 Answer with one JSON object with these fields.
-
-pictures: one entry for each picture, in the order of the numbers: a few plain words on what it shows.
-
-Then one field for each claim you are asked about, named exactly as the claim is: the numbers of the pictures \
-that plainly show it. An empty list is a good answer."""
+closest: a few plain words on what the pictures that come nearest to the claim really show.
+like_it_only: the numbers of the pictures that show something like the claim, and not the thing as named.
+shows: the numbers of the pictures that plainly show the thing as named. Never one that is in like_it_only. \
+An empty list is a good answer."""
 
 # An artist's own words on whether they take work. A tagline is read a part at a time ("NO AI | COMMISSIONS -
 # OPEN" is two parts), each part as plain lowercase words; a tag is read with its "_" and "-" taken out.
@@ -630,20 +651,28 @@ def _sheet(names: Iterable[str]) -> tuple[str | None, int]:
 
 
 def _proposed(client: httpx.Client, sheet: str, pictures: int) -> list[dict[str, str]]:
-    """Up to three things the model says recur across the sheet, each as many, one and kind. Not yet believed.
+    """What the model says the sheet shows again and again: not yet believed, each to be counted on its own.
 
-    Kept only as plain words: one to three of them, none a genre, style, medium or subject word of the fixed
-    vocabularies (those are said from the verified tags) and none too general to tell one artist from another.
-    `one` must be `many` in the singular, by its first letters. Nothing an answer says of a name can be checked
-    by code: the prompt forbids one, and the count that follows is of what can be seen.
+    First the defining thing, if it names one: the one subject or look that most of the pictures share, two to
+    four plain words ("dragon head portraits", "pen-and-ink hatching"). Then up to three recurring things, each
+    as many, one and kind. A recurring thing is kept only as plain words that are none of the fixed
+    vocabularies' own and not too general to tell artists apart, and its `one` must be `many` in the singular.
+    Nothing an answer says of a name can be checked by code: the prompt forbids one, and the count that follows
+    is of what can be seen, as it is named.
     """
     for attempt in range(tagging.MAX_ATTEMPTS):
         question = f"The sheet has {pictures} pictures, numbered 1 to {pictures}."
         answer = tagging._chat(client, WRITER, PROPOSE_PROMPT, question, sheet, _PROPOSED, attempt)
         items = answer.get("recurring") if isinstance(answer, dict) else None
-        if not isinstance(items, list):
+        if not isinstance(answer, dict) or not isinstance(items, list):
             continue
         kept: dict[str, dict[str, str]] = {}
+        first = answer.get("defining")
+        phrase, what, kind = (first.get(name) if isinstance(first, dict) else None for name in ("phrase", "is", "kind"))
+        if isinstance(phrase, str) and _DEFINING.fullmatch(phrase) and what in ("subject", "look"):
+            plain = not set(re.split("[ -]", phrase)) <= _NOT_A_SUBJECT  # some word of it says what is drawn, or how
+            if plain and (what == "look" or kind in SUBJECT_FORMS):
+                kept[phrase] = {"many": phrase, "one": phrase, "kind": str(kind), "is": str(what), "defining": "yes"}
         for item in items:
             many, one, kind = (item.get(name) if isinstance(item, dict) else None for name in ("many", "one", "kind"))
             if not all(isinstance(value, str) and _PHRASE.fullmatch(value) for value in (many, one)):
@@ -651,13 +680,15 @@ def _proposed(client: httpx.Client, sheet: str, pictures: int) -> list[dict[str,
             words, single = str(many).split(), str(one).split()
             alike = len(words) == len(single) and words[:-1] == single[:-1] and words[-1][:3] == single[-1][:3]
             if alike and kind in SUBJECT_FORMS and not _NOT_A_SUBJECT & {*words, *single}:
-                kept.setdefault(str(many), {"many": str(many), "one": str(one), "kind": str(kind)})
-        return list(kept.values())[: AT_MOST["recurring"]]
+                kept.setdefault(str(many), {"many": str(many), "one": str(one), "kind": str(kind), "is": "subject"})
+        return list(kept.values())[: AT_MOST["recurring"] + 1]
     return []
 
 
 def _meaning(term: str) -> str:
     """What a claim means, where its words alone could be read loosely: told to the model that counts it."""
+    if term in SUBJECT_FORMS:
+        return f"the picture is about this. {tagging.SUBJECTS.get(term, '')}"
     if term in MANNER_FORMS:
         return f"drawn in this manner. {tagging.GENRES.get(term, '')}"
     formats = getattr(tagging, "FORMATS", {}) | COUNTED_AS
@@ -667,66 +698,82 @@ def _meaning(term: str) -> str:
     return formats.get(term, "")
 
 
-def _counted(client: httpx.Client, sheet: str, pictures: int, claims: dict[str, str]) -> dict[str, int]:
-    """In how many pictures of the sheet each claim plainly shows: claim -> count. Empty when the model gave no
-    whole answer in MAX_ATTEMPTS, and then nothing is counted and so nothing specific is said.
+def _claims(facts: dict[str, Any], proposed: list[dict[str, str]]) -> dict[str, str]:
+    """Every claim there is to count on the sheet, by the words a profile would say it in -> what it means: the
+    subjects the tags gave, what the model proposed, the artist's own words, the formats, a manner the tags gave
+    part of the works. And one that no profile states: how many pictures are sexualised or gory (UNSUITABLE)."""
+    claims = {_spellings(term)[0]: _meaning(term) for term in facts["specialties"]}
+    claims |= {item["many"]: "drawn this way" if item["is"] == "look" else "" for item in proposed}
+    claims |= {_spellings(term)[0]: _meaning(term) for term in (*facts["own_words"], *facts["formats"])}
+    claims |= {_spellings(term)[0]: _meaning(term) for term in facts["hedged"] if term in MANNER_FORMS}
+    return claims | {UNSUITABLE: "a figure posed or dressed in a sexualised way, or strong gore"}
 
-    The model lists the numbers of the pictures for each claim, after saying what each picture shows; the count
-    is of the numbers it lists, each once, and a number that is not on the sheet makes the answer no answer.
-    ponytail: one call for all of an artist's claims, as the tagging stage checks all of a work's tags in one.
-    A call a claim is the upgrade, if counts are found to follow one another.
+
+def _counted(client: httpx.Client, sheet: str, pictures: int, claims: dict[str, str]) -> dict[str, int]:
+    """In how many pictures of the sheet each claim plainly shows, as it is named: claim -> count.
+
+    One call a claim, so that no count can follow another's. The model says what the nearest pictures really
+    show, lists those that only show something like the claim, and lists those that show it as named; the count
+    is of the last list, each number once, less any it also put in the other. A number that is not on the
+    sheet makes the answer no answer. A claim with no whole answer in MAX_ATTEMPTS is not counted, and what is
+    not counted is not said.
     """
-    question = f"The sheet has {pictures} pictures, numbered 1 to {pictures}.\nClaims to check:"
-    question += "".join(f"\n- {claim}{': ' + meaning if meaning else ''}" for claim, meaning in claims.items())
     numbers = {"type": "array", "items": {"type": "integer", "minimum": 1, "maximum": pictures}, "maxItems": pictures}
-    looked = {"type": "array", "items": {"type": "string"}, "maxItems": pictures}
     shape = {
         "type": "object",
-        "properties": {"pictures": looked} | dict.fromkeys(claims, numbers),
-        "required": ["pictures", *claims],
+        "properties": {"closest": {"type": "string"}, "like_it_only": numbers, "shows": numbers},
+        "required": ["closest", "like_it_only", "shows"],
     }
-    for attempt in range(tagging.MAX_ATTEMPTS):
-        answer = tagging._chat(client, WRITER, COUNT_PROMPT, question, sheet, shape, attempt)
-        listed = [answer.get(claim) for claim in claims] if isinstance(answer, dict) else [None]
-        if all(
-            isinstance(found, list) and all(type(n) is int and 1 <= n <= pictures for n in found) for found in listed
-        ):
-            return {claim: len(set(found or ())) for claim, found in zip(claims, listed, strict=True)}
-    return {}
-
-
-def _claims(facts: dict[str, Any], proposed: list[dict[str, str]]) -> dict[str, str]:
-    """Every specific claim there is to count on the sheet, by the words a profile would say it in -> its meaning:
-    what the model proposed, the artist's own words, the formats, and a manner the tags gave part of the works."""
-    claims = {item["many"]: "" for item in proposed}
-    claims |= {_spellings(term)[0]: _meaning(term) for term in (*facts["own_words"], *facts["formats"])}
-    return claims | {_spellings(term)[0]: _meaning(term) for term in facts["hedged"] if term in MANNER_FORMS}
+    counts = {}
+    for claim, meaning in claims.items():
+        question = f"The sheet has {pictures} pictures, numbered 1 to {pictures}.\nClaim: {claim}"
+        question += f"\nIt means: {meaning}" if meaning else ""
+        for attempt in range(tagging.MAX_ATTEMPTS):
+            answer = tagging._chat(client, WRITER, COUNT_PROMPT, question, sheet, shape, attempt)
+            lists = [answer.get(name) for name in ("shows", "like_it_only")] if isinstance(answer, dict) else [None]
+            if all(
+                isinstance(found, list) and all(type(n) is int and 1 <= n <= pictures for n in found) for found in lists
+            ):
+                counts[claim] = len(set(lists[0] or ()) - set(lists[1] or ()))
+                break
+    return counts
 
 
 def specifics(
     facts: dict[str, Any], proposed: list[dict[str, str]], counts: dict[str, int], pictures: int
 ) -> dict[str, Any]:
-    """The facts with every specific claim held to the count of the sheet: a recurring subject the model
-    proposed, a word of the artist's own, a format. Each is said as far as the pictures bear it out, counted
-    together, and no further:
-      - at CLEAR_PERCENT of the pictures, flat: "mostly dragons", and a recurring character or creature leads
-        the profile in the place of that word ("dinosaur art", not "creature art");
-      - at PART_PERCENT, hedged: "including dragons";
-      - below that, or on fewer than MIN_SUPPORT pictures, or with no sheet at all: not said.
-    A recurring subject must also be a kind of a subject the verified tags gave the artist. What it says is
-    not said again by a word or a format of the same spelling, and two hedged things at most are kept, those
-    most pictures show. A drawing manner the tags gave part of the works is stated flat when NEARLY_ALL_PERCENT
-    of the pictures are drawn so; the count never takes a manner away, which the verifier saw work by work.
-    What the count removed is kept in `sheet`, with the counts.
+    """The facts with every claim held to its count on the sheet: a subject the tags gave, the defining thing and
+    the recurring subjects the model proposed, a word of the artist's own, a format. Each is said as far as the
+    pictures bear it out, and no further:
+      - at CLEAR_PERCENT of the pictures, flat: the defining thing leads the profile, a recurring character or
+        creature stands in the place of that word ("dinosaur art", not "creature art"), anything else is
+        "mostly" that;
+      - at PART_PERCENT, and on MIN_SUPPORT pictures at least: a subject is named, anything else is hedged
+        ("including dragons"), two such things at most. A look is said flat or not at all;
+      - below that, or with no sheet: not said. So a subject the tags gave works in which a figure merely
+        appears is not named, and without a sheet nothing is.
+    A recurring subject must be a kind of a subject that is itself counted in. A word of the artist's own is
+    not said beside a recurring subject that stands for the same kind of thing ("dragon art, mostly monsters"),
+    nor a word or format beside one of the same spelling. For "mostly", a format needs the tagging stage's pick
+    of most works as well. A manner the tags gave part of the works is stated flat when NEARLY_ALL_PERCENT of
+    the pictures are drawn so; the count never takes a manner away, which the verifier saw work by work.
+    What the count removed is kept in `sheet`, with every count.
     """
     part, clear, nearly_all = (
         _need(pictures, percent) for percent in (PART_PERCENT, CLEAR_PERCENT, NEARLY_ALL_PERCENT)
     )
-    recurring = {
+    subjects = [term for term in facts["specialties"] if counts.get(_spellings(term)[0], 0) >= part]
+    # ponytail: when the count keeps none of them, the first subject of the tags stays: they were verified work by
+    # work at full size, and the sheet shows each work small. Trust the count alone once it is checked against more.
+    subjects = subjects or facts["specialties"][: bool(counts)]
+    recurring: dict[str, dict[str, Any]] = {
         item["many"]: item | {"count": counts[item["many"]]}
         for item in proposed
-        if counts.get(item["many"], 0) >= part and item["kind"] in facts["specialties"]
+        if counts.get(item["many"], 0) >= (clear if item["is"] == "look" else part)
     }
+    flat = [many for many, item in recurring.items() if counts[many] >= clear and item["is"] == "subject"]
+    leads = {recurring[many]["kind"] for many in flat}
+    defined = any(recurring[many].get("defining") for many in flat)
     named = {field: {term: _spellings(term)[0] for term in facts[field]} for field in ("own_words", "formats")}
     count = {term: counts.get(claim, 0) for claims in named.values() for term, claim in claims.items()}
     count |= {many: counts[many] for many in recurring}
@@ -734,6 +781,15 @@ def specifics(
         field: [term for term, claim in claims.items() if count[term] >= part and claim not in recurring]
         for field, claims in named.items()
     }
+    # "dragon art, mostly monsters": the artist's broader word for what a recurring subject already names
+    kept["own_words"] = [
+        word
+        for word in kept["own_words"]
+        if word.endswith(" designs") or word in SAME_AS_FORMAT or not OWN_WORDS[word][0] & leads
+    ]
+    # and when the defining thing leads, what most of the works are is said: nothing broader is added after it
+    if defined:
+        kept = {field: [term for term in terms if count[term] < clear] for field, terms in kept.items()}
     # A format the tagging stage picked for part of the works stays hedged whatever the count: for "mostly",
     # the pick work by work and the count of the sheet must both say most.
     partly = sorted(
@@ -748,10 +804,13 @@ def specifics(
     recurring = {many: item for many, item in recurring.items() if many not in partly[AT_MOST["hedged"] :]}
     hedged = [term for term in facts["hedged"] if term in WORLD_FORMS]
     hedged += [m for m in facts["hedged"] if m in MANNER_FORMS and counts.get(_spellings(m)[0], 0) < nearly_all]
-    removed = {"recurring": [item["many"] for item in proposed if counts.get(item["many"], 0) < part]}
+    removed = {"subjects": [term for term in facts["specialties"] if term not in subjects]}
+    removed |= {"recurring": [item["many"] for item in proposed if item["many"] not in count]}
     removed |= {field: [term for term in claims if count[term] < part] for field, claims in named.items()}
     sheet = {"pictures": pictures, "counts": counts, "recurring": recurring, "removed": removed}
-    return facts | kept | {"recurring": list(recurring), "hedged": hedged + partly[: AT_MOST["hedged"]], "sheet": sheet}
+    sheet |= {"unsuitable": counts.get(UNSUITABLE, 0)}
+    stated = {"specialties": subjects, "recurring": list(recurring), "hedged": hedged + partly[: AT_MOST["hedged"]]}
+    return facts | kept | stated | {"sheet": sheet}
 
 
 def _spellings(term: str) -> tuple[str, ...]:
@@ -779,24 +838,35 @@ def _and(items: list[str]) -> str:
     return " and ".join(filter(None, [", ".join(items[:-1]), *items[-1:]]))
 
 
-def _kinds(facts: dict[str, Any]) -> tuple[list[str], list[str]]:
-    """The kinds of art a profile leads with, and what most of the works are, more closely than that.
+def _kinds(facts: dict[str, Any]) -> tuple[list[str], list[str], list[str]]:
+    """The kinds of art a profile leads with, what most of the works are more closely than that, and the look
+    they share.
 
-    A kind is a recurring character or creature of the sheet, in the place of that word ("dinosaur", not
-    "creature"); or a subject no recurring one stands for; or the artist's own word for that subject, in its
-    place ("character designs", not "character art, mostly character designs"). Most of the works are what else
-    recurs, what the artist's other words say, and a format: each where the count of the sheet makes it most.
+    A kind is the defining subject of the sheet, or a recurring character or creature, in the place of the
+    subject it is a kind of ("dinosaur", not "creature"); or a subject none of those stands for; or the artist's
+    own word for that subject, in its place ("character designs", not "character art, mostly character
+    designs"). Most of the works are what else recurs, what the artist's other words say, and a format: each
+    where the count of the sheet makes it most.
     """
     recurring = (facts.get("sheet") or {}).get("recurring", {})
     flat = [
         term for field in ("recurring", "own_words", "formats") for term in facts[field] if term not in facts["hedged"]
     ]
-    leading = [many for many in flat if many in recurring and recurring[many]["kind"] in _LEADS]
-    mostly = [_spellings(term)[0] if term not in recurring else term for term in flat if term not in leading]
+    looks = [many for many in flat if many in recurring and recurring[many].get("is") == "look"]
+    leading = [
+        many
+        for many in flat
+        if many in recurring
+        and many not in looks
+        and (recurring[many].get("defining") or {recurring[many]["kind"]} & {*_LEADS} & {*facts["specialties"]})
+    ]
+    mostly = [
+        term if term in recurring else _spellings(term)[0] for term in flat if term not in leading and term not in looks
+    ]
     designs = {subject: f"{_spellings(subject)[0]} designs" for subject in facts["specialties"]}
     stood_for = {recurring[many]["kind"] for many in leading}
     kinds = leading + [designs[s] if designs[s] in mostly else s for s in facts["specialties"] if s not in stood_for]
-    return kinds, [word for word in mostly if word not in kinds]
+    return kinds, [word for word in mostly if word not in kinds], looks
 
 
 def _once(items: list[str], said: str) -> list[str]:
@@ -808,41 +878,78 @@ def _once(items: list[str], said: str) -> list[str]:
     return found
 
 
+def _told(term: str, said: Iterable[str]) -> bool:
+    """True when these phrases have every word of one spelling of the fact: "sci-fi streets" has science fiction."""
+    words = set(re.split("[ -]", " ".join(said).lower()))
+    return any(set(re.split("[ -]", form.lower())) <= words for form in _spellings(term))
+
+
+def _themes(facts: dict[str, Any]) -> str:
+    """What is said of the genres that hold for part of the works: "with fantasy themes", after no comma. Not
+    of one that a recurring subject of the sheet names already."""
+    worlds = [term for term in facts["hedged"] if term in WORLD_FORMS and not _told(term, facts["recurring"])]
+    worlds = [_spellings(term)[0] for term in worlds]
+    return f"with {_and(worlds)} themes" if worlds else ""
+
+
 def _hedged(facts: dict[str, Any], said: str) -> list[str]:
-    """The clauses that say what holds for part of the works, each begun by the hedge of its kind."""
-    of = {kind: [_spellings(term)[0] for term in facts["hedged"] if _kind(term) == kind] for kind in _HEDGES}
-    of["formats"] = [
+    """The clauses that say what else holds for part of the works, each begun by the hedge of its kind."""
+    manners = [_spellings(term)[0] for term in facts["hedged"] if term in MANNER_FORMS]
+    things = [
         term if term in facts["recurring"] else _spellings(term)[0]
         for term in facts["hedged"]
         if _kind(term) == "formats"
     ]
-    clauses = [f"with {_and(of['worlds'])} themes"] if of["worlds"] else []
-    clauses += [f"partly in {'an' if manner[0] in 'aeiou' else 'a'} {manner} style" for manner in of["manners"]]
-    return clauses + ([f"including {_and(_once(of['formats'], said))}"] if of["formats"] else [])
+    clauses = [f"partly in {'an' if manner[0] in 'aeiou' else 'a'} {manner} style" for manner in manners]
+    return clauses + ([f"including {_and(_once(things, said))}"] if things else [])
 
 
 def template(facts: dict[str, Any]) -> str:
-    """One sentence that states every fact these facts allow and nothing else, the same way for every artist:
-    what leads it is what holds for the body of work, a recurring subject before a general one; what holds for
-    part of it comes after, hedged; and no clause repeats a word of the one before."""
+    """One sentence that states every fact these facts allow and nothing else, the same way for every artist.
+
+    What leads it is what holds for the body of work: the defining thing as the model named it, or the
+    recurring subjects before the general ones. What holds for part of it comes after, hedged. No clause
+    repeats a word of the one before, and there is one way with commas: between stacked style words, before
+    "mostly", "partly" and "including", and none before "with ... themes".
+    """
     said = {term: _forms(facts, term)[0] for term in _stated(facts)}
-    flat = [term for term in facts["genres"] if term not in facts["hedged"]]
-    kinds, mostly = _kinds(facts)
-    one = {many: _forms(facts, many)[-1] for many in facts["recurring"]}  # "dinosaur", before the word art
-    plain = [one.get(k, said.get(k, k)) for k in kinds if k in one or (k in SUBJECT_FORMS and k not in _PAIRED)]
-    named = [k for k in kinds if k not in one and k not in SUBJECT_FORMS]
+    recurring = (facts.get("sheet") or {}).get("recurring", {})
+    kinds, mostly, looks = _kinds(facts)
+    whole = [kind for kind in kinds if kind in recurring and recurring[kind].get("defining")]  # stands as it is
+    one = {many: recurring[many]["one"] for many in kinds if many in recurring and many not in whole}
+    plain = [one.get(kind) or said[kind] for kind in kinds if kind in one or kind in SUBJECT_FORMS]
+    named = whole + [kind for kind in kinds if kind not in recurring and kind not in SUBJECT_FORMS]
     named += [f"{_and(plain)} art"] if plain else []
-    named += [f"{said[kind]} art" for kind in kinds if kind in _PAIRED]
-    lead = [", ".join(said[word] for word in facts["style_words"])]
+    flat = [term for term in (*facts["style_words"], *facts["genres"]) if term not in facts["hedged"]]
+    flat = [term for term in flat if not _told(term, facts["recurring"])]  # not what the sheet's words say already
+    lead = [", ".join(said[word] for word in flat if word in STYLE_FORMS)]
     lead += [said[manner] for manner in flat if manner in MANNER_FORMS]
     lead += [_and([said[world] for world in flat if world in WORLD_FORMS]), _and(named) or "artwork"]
     text = " ".join(filter(None, lead))
-    if media := [said[medium] for medium in facts["mediums"] if medium in said]:
+    if media := [said[medium] for medium in facts["mediums"] if medium in said] + looks:
         text += f" in {_and(media)}"
+    text = " ".join(filter(None, [text, _themes(facts)]))
     if mostly:
         text += f", mostly {_and(_once(mostly, text))}"
     text = ", ".join([text, *_hedged(facts, text)])
     return text[0].upper() + text[1:] + "."
+
+
+_STYLES = "|".join(
+    sorted((re.escape(form.lower()) for forms in STYLE_FORMS.values() for form in forms), key=len, reverse=True)
+)
+# Words a profile may not end on: one that needs another after it, a style word, a subject in the singular.
+_LOOSE = frozenset(
+    "and or with in of for on as to by a an the including partly mostly also some plus that which who whose their "
+    "its is are both alongside across".split()
+) | {form.lower() for forms in STYLE_FORMS.values() for form in forms if " " not in form}
+_LOOSE |= {forms[0].lower() for forms in SUBJECT_FORMS.values()}
+
+
+def _tidy(text: str) -> str:
+    """A written sentence with the template's commas: none before "with", one between stacked style words."""
+    text = re.sub(r"\s*,\s*(with\b)", r" \1", text, flags=re.IGNORECASE)
+    return re.sub(rf"\b({_STYLES}) (?=(?:{_STYLES})\b)", r"\1, ", text, flags=re.IGNORECASE)
 
 
 def unsupported(text: object, facts: dict[str, Any]) -> str | None:
@@ -888,29 +995,37 @@ def unsupported(text: object, facts: dict[str, Any]) -> str | None:
     used |= {item["kind"] for many, item in (facts.get("sheet") or {}).get("recurring", {}).items() if many in used}
     # "character designs" states two facts: the artist's word, and the subject it is a kind of
     used |= {subject for subject in facts["specialties"] if f"{_spellings(subject)[0]} designs" in used}
-    return None if len(used) >= min(2, len(stated)) else "it must state at least two of the facts"
+    if len(used) < min(2, len(stated)):
+        return "it must state at least two of the facts"
+    last = re.findall(r"[a-z0-9-]+", whole)[-1]
+    if whole.rstrip().endswith((",", ";")) or last in _LOOSE:
+        return f'it must be a whole phrase, and it breaks off at "{last}": end on what the art is'
+    return None
 
 
 def _question(facts: dict[str, Any]) -> str:
     """All the model is told about an artist: the facts a profile may state, as the template would spell them."""
     stated = _stated(facts)
-    kinds, mostly = _kinds(facts)
+    recurring = (facts.get("sheet") or {}).get("recurring", {})
+    kinds, mostly, looks = _kinds(facts)
 
     def flat(terms: Iterable[str]) -> str:
-        return ", ".join(
-            _forms(facts, term)[-1 if term in facts["recurring"] else 0]
+        said = (
+            recurring[term]["one"] if term in recurring else _spellings(term)[0]
             for term in terms
             if term in stated and not stated[term]
         )
+        return ", ".join(said)
 
     said = {
         "kinds of art": flat(kinds),
         "most of the works": ", ".join(_once(mostly, flat(kinds))),
         "medium": flat(facts["mediums"]),
+        "look": ", ".join(looks),
         "manner": flat(term for term in facts["genres"] if term in MANNER_FORMS),
         "themes": flat(term for term in facts["genres"] if term in WORLD_FORMS),
         "style": flat(facts["style_words"]),
-        "only part of the works": "; ".join(_hedged(facts, flat(kinds))),  # no word of the kinds again
+        "only part of the works": "; ".join(filter(None, [_themes(facts), *_hedged(facts, flat(kinds))])),
     }
     return "Facts" + "".join(f"\n{name}: {terms}" for name, terms in said.items() if terms)
 
@@ -929,6 +1044,7 @@ def _written(client: httpx.Client, facts: dict[str, Any]) -> str | None:
         answer = tagging._chat(client, WRITER, WRITE_PROMPT, asked, None, _WRITTEN, attempt)
         text = answer.get("profile") if isinstance(answer, dict) else None
         text = " ".join(text.split()) if isinstance(text, str) else None
+        text = _tidy(text) if text else text
         refused = unsupported(text, facts)
         if refused is None:
             return text
@@ -993,7 +1109,17 @@ def run(
     counts = dict.fromkeys(("profiled", *(f"excluded_{reason}" for reason in REASONS)), 0)
     counts |= dict.fromkeys(("unchanged", "waiting_for_tags", "left_for_next_run", "removed"), 0)
     counts |= {"open_for_work": 0, "written_fallback": 0}
-    counts |= dict.fromkeys(("with_recurring", "phrases_removed", "own_words_removed", "formats_removed"), 0)
+    counts |= dict.fromkeys(
+        (
+            "with_recurring",
+            "with_defining",
+            "subjects_removed",
+            "phrases_removed",
+            "own_words_removed",
+            "formats_removed",
+        ),
+        0,
+    )
     versions = [TEMPLATE_VERSION, WRITTEN_VERSION, SHEET_VERSION, WRITER, EMBEDDER]
     result_set = tagging.result_set(TAGGER, TAGGER)
 
@@ -1072,10 +1198,8 @@ def run(
             sheet, pictures = _sheet(name for work_id, name, _, _ in collected[key] if work_id in facts["counted"])
             enough = sheet is not None and pictures >= MIN_WORKS
             proposed = _proposed(client, str(sheet), pictures) if enough else []
-            claims = _claims(facts, proposed) if enough else {}
-            facts = specifics(
-                facts, proposed, _counted(client, str(sheet), pictures, claims) if claims else {}, pictures
-            )
+            counted = _counted(client, str(sheet), pictures, _claims(facts, proposed)) if enough else {}
+            facts = specifics(facts, proposed, counted, pictures)
             if not _stated(facts):
                 counts["excluded_nothing_clear"] += store_row(
                     key, basis, "nothing_clear", json.dumps(facts), "[]", *[None] * 6
@@ -1094,7 +1218,16 @@ def run(
                 counts["open_for_work"] += bool(evidence)
                 counts["written_fallback"] += composed is None
                 counts["with_recurring"] += bool(facts["recurring"])
-                for field, name in (("recurring", "phrases"), ("own_words", "own_words"), ("formats", "formats")):
+                counts["with_defining"] += any(
+                    item.get("defining") and many not in facts["hedged"]
+                    for many, item in facts["sheet"]["recurring"].items()
+                )
+                for field, name in (
+                    ("subjects", "subjects"),
+                    ("recurring", "phrases"),
+                    ("own_words", "own_words"),
+                    ("formats", "formats"),
+                ):
                     counts[f"{name}_removed"] += len(facts["sheet"]["removed"][field])
     return {**counts, "seconds_per_artist": round(seconds / counts["profiled"], 2) if counts["profiled"] else 0.0}
 
@@ -1137,6 +1270,9 @@ def profiles(db: pathlib.Path | str | None = None) -> list[dict[str, Any]]:
                 "open_for_work": True if json.loads(evidence) else None,
                 "open_evidence": json.loads(evidence),
                 "facts": facts,
+                # for the push stage to weigh: of how many pictures on the sheet, how many are sexualised or gory
+                "pictures": (facts.get("sheet") or {}).get("pictures", 0),
+                "unsuitable_pictures": (facts.get("sheet") or {}).get("unsuitable", 0),
                 "embedding": vector.tolist(),
             }
         )
