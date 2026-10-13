@@ -1,14 +1,15 @@
 # Artist Search: Progress
 
-**Status, 2026-10-15:** The site exists and won its first comparison against ArtStation and Behance, 7 pairs of 8. 119 real artists are in the public database and searchable. Tagging continues over the remaining works. The site runs locally only; nothing is deployed.
+**Status, 2026-10-13:** All 4,381 collected works are tagged and checked. Collect has been through seven critics and is cleared to run on real data; scaling from 442 artists toward 2,000-plus starts when its last three fixes land. The site won its second comparison against ArtStation and Behance, 7 pairs of 8 again. 119 artists are public and searchable. The site runs locally only; nothing is deployed.
 
 ## Waiting on the owner
 
-Nothing is blocking. Three things to weigh when convenient:
+Nothing is blocking. Four things to weigh when convenient; each has a default in place:
 
-1. **How strict should the content filter be?** Critics keep finding sexualised pin-ups and some gore among collected works, and one of the 30 frozen seed artists is adult-oriented. The "explicit" flag has fired once in 1,100 works, so it is too lenient to rely on. Default: tighten it to cover suggestive content and exclude artists with several flagged works.
-2. **Brief slow-downs during a data load.** On the free-tier database a full load takes 12 to 15 minutes, and in one test run of two, 5 of 1,812 visitor calls made during the load timed out. Default: the site retries a failed call once, and loads run at quiet hours.
-3. **Tagging time at scale.** Checked tags and descriptions take about 8 seconds a work, so 30,000 works is roughly 66 hours of local GPU time. Fine as a multi-night job; say so if it is not.
+1. **When is collect good enough?** It has failed seven critics, each on narrower cases, and the seventh said it would run this code on the real data. Default: fix that critic's three findings, then run and scale without another full critic round, and record the remaining limits (Round 10).
+2. **How strict should the content filter be?** Default in place: works rated suggestive or explicit are held back, and an artist is held back when 30% or more of their works are. The profile critic still found 2 of 20 artists it judged unsuitable for a studio-facing site, so the count is being tightened to include sexualised framing and dress.
+3. **Tagging time at scale.** Checked tags take about 9 seconds a work, so 30,000 works is roughly 75 hours of local GPU time. Fine as a multi-night job; say so if it is not.
+4. **Brief slow-downs during a data load.** Default: the site retries a failed call once, and loads run at quiet hours. The last three test runs had no failed visitor calls.
 
 The first public deployment will be asked for separately when the site reaches its preview stage.
 
@@ -53,7 +54,7 @@ The reference for pieces 5 and 6 changed under path B. See owner decision 3.
 ### The eval set (`eval/`, frozen before the first judged round)
 
 - **`eval/queries.jsonl`, 36 queries. Frozen 2026-10-11, SHA-256 `e1a7f9b59a66c62b88166aa2d8fe55bd5c3abf3703de78acfd78e165e3ff13ee`.** 12 plain briefs in the spec's style (style + subject + availability), 12 written the way game studios phrase art roles (for example "stylized hand-painted prop concepts"), 12 hard cases (a medium filter, a negation, a misspelling, a rare style). Written before any search code exists, so they cannot be tuned to it.
-- **`eval/seeds.jsonl`, 30 seed artists. Frozen 2026-10-13, SHA-256 `a0943b593a284174d262105af5da111acd2fd78008642152c68b0567fbc953e3`.** Drawn at random with a fixed seed (20261013) from the 437 collected artists with at least 6 works, not hand-picked. Stored as hashes of the artist key, so no name sits in the repo's history and a removed artist leaves nothing behind there.
+- **`eval/seeds.jsonl`, 30 seed artists. Frozen 2026-10-12, SHA-256 `a0943b593a284174d262105af5da111acd2fd78008642152c68b0567fbc953e3`.** Drawn at random with a fixed seed (20261013) from the 437 collected artists with at least 6 works, not hand-picked. Stored as hashes of the artist key, so no name sits in the repo's history and a removed artist leaves nothing behind there.
 - **Claim sample.** 50 artists per round, drawn at random with a recorded seed, for the tag and profile checks.
 - **Reference results** are captured once per query and seed and frozen with the set.
 - The SHA-256 of each eval file is recorded here when it is frozen. A changed hash without an owner note is a failed round.
@@ -272,7 +273,7 @@ The strict own-site rule costs about 2%. Most artists simply have no site of the
 
 **Pipeline counts:** artists discovered 245 and rising, artists collected 5, works 50, images cached 50. **Database:** 12.6 MB of 400 MB, artists 0, works 0.
 
-### Round 5: first blind A/B tests; collect's first critic (2026-10-12 to 13)
+### Round 5: first blind A/B tests; collect's first critic (2026-10-12)
 
 **Piece 6, style similarity: two blind tests on real artwork.** For each of 12 seed artists drawn at random, the critic saw three contact sheets: the seed's works, and two competing sets of the four nearest artists, labeled A and B in an order shuffled per seed. The critic judged style only (rendering, line, palette, finish), not subject. The answer key was kept where the critic was not told to look. The sheet maker is `eval/style_sheets.py`; the sheets themselves stay in the git-ignored cache.
 
@@ -310,7 +311,7 @@ The strict own-site rule costs about 2%. Most artists simply have no site of the
 
 **Pipeline counts:** artists discovered 472, artists collected 148, works 1,470, images cached 1,470, style vectors 1,470 per model. **Database:** 12.6 MB of 400 MB, artists 0, works 0.
 
-### Round 6: first full collection; blind tagging test; collect's second critic (2026-10-13)
+### Round 6: first full collection; blind tagging test; collect's second critic (2026-10-12)
 
 **First full collection (collect round 2 code), exit 0 after about 2 hours 50 minutes.**
 
@@ -351,7 +352,7 @@ The strict own-site rule costs about 2%. Most artists simply have no site of the
 
 **Pipeline counts:** artists discovered 472, artists collected 442, works 4,381, images cached 4,381, tagged 500 per model, style vectors being computed for all. **Database:** 12.6 MB of 400 MB, artists 0, works 0.
 
-### Round 7: verification passes, first profiles, style correction (2026-10-13 to 14)
+### Round 7: verification passes, first profiles, style correction (2026-10-12)
 
 **Tags and descriptions: second blind test** (30 fresh works).
 
@@ -392,7 +393,7 @@ The correction is adopted. The larger gain came from the pool: real matches rose
 
 **Pipeline counts:** artists discovered 472, collected 442, works 4,381, images cached 4,381, style vectors 4,381, works with checked tags 600 and rising, artists profiled 55. **Database:** 12.1 MB of 400 MB, artists 0, works 0.
 
-### Round 8: first real data in the public database (2026-10-14)
+### Round 8: first real data in the public database (2026-10-12)
 
 **End to end.** Discover, collect, style vectors, tags, profiles, push, and the database's public functions have now all run on real data.
 
@@ -438,7 +439,7 @@ Held back by the push stage's rules: 300 artists not yet analysed, 21 with adult
 
 **Pipeline counts:** artists discovered 472, collected 442, works 4,381, works with checked tags about 1,500 and rising, artists profiled 140, artists public 119. **Database:** 16.8 MB of 400 MB.
 
-### Round 9: the site, and its first comparison (2026-10-14 to 15)
+### Round 9: the site, and its first comparison (2026-10-12)
 
 **Pieces 7 to 9, site pages: built.** Search, similar style, artist profile and a claim-or-remove flow, in React on Cloudflare Pages' stack, running locally against the real database. A search function embeds the query on Workers AI and calls the database, falls back to keywords if the embedding fails, and retries a failed call once. Thumbnails load straight from the source's image host; nothing is proxied or stored. Screenshots stay in the git-ignored cache and were sent to the owner.
 
@@ -456,3 +457,63 @@ Held back by the push stage's rules: 300 artists not yet analysed, 21 with adult
 - **Needs the data stages:** thumbnails are 300 pixels wide at the source, so they are soft on dense screens, and works are cropped to a fixed tile because the database holds no image dimensions.
 
 **Pipeline counts:** artists discovered 472, collected 442, works 4,381, artists public 119, works public 1,130. **Database:** 16.8 MB of 400 MB.
+
+### Round 10: collect through four more critics; every work tagged; the site's second comparison (2026-10-13)
+
+**A correction to this log.** Rounds 5 to 9 were dated up to two days late. Their headings now match the commit times: all five were on 2026-10-12.
+
+**Collect and store: critics 4 to 7.** All four failed, each on narrower cases than the one before. The approach changed in round 5, as the loop requires when a gap survives: the stage stopped trying to guard its deletions and stopped deleting.
+
+| Round | What changed |
+|---|---|
+| 5 | Nothing is deleted on what the API says. A work the API reports as mature, AI-tagged or carrying contact details, and an artist it calls gone or renamed, is marked with a reason and held back from publishing. Only the removal list and stray image files delete |
+| 6 | A stored account id is never replaced. Stored work fields are kept when a later answer is worse |
+| 7 | A removal no longer travels to another artist. The run stops when the image host refuses everywhere |
+
+**The seventh critic's numbers.** 660 sequences, about 3,300 runs and 1,900 removals, with wrong account ids for stored artists and every kind of failed answer:
+- nothing of a non-removed artist was lost;
+- no removal reached anyone else;
+- every removed artist left no row and no file;
+- the tests caught 76 of 77 deliberate breaks.
+
+Asked directly whether it would run this code on the real data, for the 442 artists and for several thousand new ones: "Yes. It cannot lose what is kept."
+
+**What still failed, and round 8 (in progress)**
+- An image host answering 403 to everything never stopped the run, which stored artists with no works. An expired signed address would look the same at scale. Being fixed.
+- A site removal could miss an artist who added their own site after discovery first saw them. Being fixed.
+- A value our own rules refuse blanked the stored one, where a work's title in the same case is marked and kept. Being fixed.
+- A phone number typed across several tags would be stored. No real work has this. Recorded, not fixed.
+
+**Known limits, recorded and not fixed**
+- A rename and a removal landing between two runs.
+- A wrong account id on an artist's very first collection could link two artists, so a later removal takes both. It needs the API to return a false id; the critic rated it very unlikely.
+- Site names with non-ASCII letters such as "ß" are refused loudly in removal matching.
+- Any removal clears every review sheet in the local cache.
+
+**Tags: complete.** 4,381 of 4,381 works have checked tags, a format and a content rating; none failed. The run took about 9 seconds a work.
+
+**Profiles: critics 3 and 4** (20 fresh artists each)
+
+| | Round 1 | Round 2 | Round 3 | Round 4 |
+|---|---|---|---|---|
+| Artists with an unsupported claim | 2 | 3 | 3 | 2 |
+| Cards judged useful | Not scored | 15 | 18 | 14 |
+| Groups a studio could tell apart | Barely any | About 6 | About 12 | About 10 |
+
+- Both round 4 errors came from a claim that skipped the count on the sheet: a fallback subject stated when every counted one was rejected, and a genre taken from per-work tags. Every claim that went through the count held up.
+- Usefulness fell because the stricter 40% rule left 6 of 20 cards saying only "Fantasy character art."
+- Round 5 (in progress, fresh builder): no fallback, so an artist with nothing that passes gets no profile; genres are counted too; the drawing manner and kind of output are named when the works show them; a check that each line reads as a sentence; a stricter suitability count.
+
+**Push, rounds 3 and 4.** It holds back whatever collect marks, applies the artist-level suitability count, and sends image sizes so the site can stop cropping. Not yet judged.
+
+**Database, round 7.** A result card leads with the works that matched the query. Not yet judged.
+
+**Site, round 2: second comparison.** Contacting the artist is now the primary action, availability is stated or shown as "not stated", and claim-or-remove sits apart from the actions. Result: 7 of 8 pairs again. The one loss is the same, ArtStation's desktop profile with its hiring card. Hard rule 6 limits what our profile can show (no location, no direct message), so that pair may be the ceiling. Same caveats as before: logos are visible, and first screens only.
+
+**References for the text-search test.** DeviantArt's own search results are captured from the public website for all 36 frozen queries. Our side of each pair waits on the larger push.
+
+**Deferred, to stay on the critical path:** critics for the crawler (round 4), push, database rounds 6 and 7, and the tagging format pass; discovery's non-ASCII fix; a rate limit on the search endpoint; the removal-proof checker.
+
+**Process.** The usage limit cut agents off five times; each was resumed against its task list. A builder that has run about four rounds is now replaced by a fresh one with a handover note.
+
+**Pipeline counts:** artists discovered 472, collected 442, works 4,381, works with checked tags 4,381, artists public 119, works public 1,130. **Database:** 16.8 MB of 400 MB.
