@@ -1,6 +1,6 @@
 # Artist Search: Progress
 
-**Status, 2026-10-13:** All 4,381 collected works are tagged and checked. Collect has been through seven critics and is cleared to run on real data; scaling from 442 artists toward 2,000-plus starts when its last three fixes land. The site won its second comparison against ArtStation and Behance, 7 pairs of 8 again. 119 artists are public and searchable. The site runs locally only; nothing is deployed.
+**Status, 2026-10-13:** The first blind test against DeviantArt itself is in, and we lost it: its "More Like This" beat our similar-style results on 21 of 29 seed artists, then on 17 of 29 after one fix. The main gap is the size of our pool, 442 artists, so scaling comes next. Collect's round 8 is committed and rerunning on real data. All works are tagged. 119 artists are public and searchable. The site runs locally only; nothing is deployed.
 
 ## Waiting on the owner
 
@@ -517,3 +517,41 @@ Asked directly whether it would run this code on the real data, for the 442 arti
 **Process.** The usage limit cut agents off five times; each was resumed against its task list. A builder that has run about four rounds is now replaced by a fresh one with a handover note.
 
 **Pipeline counts:** artists discovered 472, collected 442, works 4,381, works with checked tags 4,381, artists public 119, works public 1,130. **Database:** 16.8 MB of 400 MB.
+
+### Round 11: the style test against DeviantArt's "More Like This" (2026-10-13)
+
+**Piece 6, the spec's own bar, run for the first time.** Lost, twice.
+
+| | Round 1 | Round 2 |
+|---|---|---|
+| Seeds our side won | 8 | 11 |
+| Seeds DeviantArt won | 21 | 17 |
+| Ties | 0 | 1 |
+| Our works judged a real style match | 192 of 459 (42%) | 255 of 459 (56%) |
+| DeviantArt's works judged a real style match | 270 of 459 (59%) | 264 of 459 (58%) |
+
+**How it was run**
+- **Reference:** DeviantArt's public More Like This page for each frozen seed artist's two newest works, taking turns, keeping the first 16 works by other artists. Read from the website with our crawler's name, one request every three seconds; robots.txt allows these pages. The API was not used, because its license bars benchmarking through it. 29 of the 30 seeds had a reference; for one, DeviantArt returned nothing by other artists.
+- **Blind:** both sides are 16 works in the same shuffled grid, A and B swapped at random per seed. Two fresh critics per round split the seeds. They were told to judge how the work is made, not what it shows.
+- **The judges agree with each other.** DeviantArt's side was identical in both rounds, and four different critics scored it 59% and 58%.
+
+**Why we lost round 1, from the critics' notes matched to the key**
+- "Unrelated, or a different medium" was our side in 8 of 9 cases, and "right genre, wrong handling" in all 7. Several of our sheets had 1 to 6 matches of 16. With 442 artists, many seeds have nobody close, so the nearest artist is generic or unrelated.
+- "Matches the subject, not the style" was DeviantArt's side in all 11 cases. That is how it loses when it loses.
+- Our side showed more unsuitable content, 7 sheets to 4, because the test drew from every collected work, including what the push stage holds back.
+
+**Round 2 changed one thing.** For each similar artist we had shown their four newest works. Now we show their four works closest to the seed's. That alone lifted our matches from 42% to 56%, level with DeviantArt's, and turned three seeds. It did not turn the result: a set that is half right still loses to a set that is consistently close.
+
+**What follows**
+- **Scale is the fix for the main gap.** The pool goes from 442 to 3,000-plus artists. The test is rerun on the same frozen seeds after that.
+- **The closest-works rule goes into the product:** push, the database's similar-style function and the site's page. Today the site shows a similar artist's newest works.
+- **The test will draw from published artists and works only,** so it shows what the site shows.
+- **A caveat that stays:** DeviantArt's feature answers "more like this work" and ours answers "more like this artist". The spec names it as the bar, so it is the bar.
+
+**A new fact about the "noai" label.** DeviantArt's website marks each work with whether the artist disallows AI use and whether the work is AI-generated. The API does not expose either, which is why the earlier finding said the label could not be read. Nothing changed because of this; owner decision 7 stands. The label could now be checked per work at one page request each, and that would be a new use of the site, so it waits for the owner.
+
+**Collect and store, round 8: committed.** The seventh critic's three findings are fixed (see Round 10), discovery now covers 18 tags at 120 pages each, and both stages retry a server error three times before stopping. 1,708 tests pass. The rerun over the 442 existing artists is in progress as the check on real data.
+
+**Also done:** a first real README, and the progress log's dates corrected.
+
+**Pipeline counts:** artists discovered 472, collected 442, artists public 119, works public 1,130. **Database:** 16.8 MB of 400 MB.
