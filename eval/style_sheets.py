@@ -4,8 +4,11 @@
     uv run python eval/style_sheets.py --a csd:best --b csd:mutual --seeds 12 --name round2
     uv run python eval/style_sheets.py --a csd:mutual --b csd:local --frozen --seeds 12 --name round3
     uv run python eval/style_sheets.py --a csd:local --b reference --frozen --seeds 30 --name style_ab_r1
+    uv run python eval/style_sheets.py --a csd:local:closest --b reference --reference style_ab_r1 \
+        --frozen --seeds 30 --name style_ab_r2
 
-"reference" is DeviantArt's own More Like This, as captured by eval/style_reference.py under the same --name.
+"reference" is DeviantArt's own More Like This, as captured by eval/style_reference.py under --reference (--name
+when not given). A third part, "closest", shows each similar artist's works nearest the seed's, not their newest.
 Against it both sheets show the same number of works in shuffled order, so one row per artist cannot give our
 side away.
 
@@ -44,6 +47,14 @@ def works(conn: sqlite3.Connection, artist: str, limit: int) -> list[pathlib.Pat
         (artist, limit),
     )
     return [library.image_dir() / name for (name,) in rows]
+
+
+def closest(conn: sqlite3.Connection, artist: str, other: str, model: str) -> list[pathlib.Path]:
+    """The other artist's works nearest the seed artist's in style, best first."""
+    ids = style.closest_works(artist, other, model, PER_ARTIST)
+    marks = ",".join("?" * len(ids))
+    files = dict(conn.execute(f"select deviation_id, image_file from works where deviation_id in ({marks})", ids))
+    return [library.image_dir() / files[work] for work in ids if files.get(work)]
 
 
 def sheet(rows: list[list[pathlib.Path]], out: pathlib.Path) -> None:
@@ -97,6 +108,7 @@ def main() -> int:
     parser.add_argument("--rng", type=int, default=20261012)
     parser.add_argument("--name", required=True, help="folder name under cache/review/")
     parser.add_argument("--frozen", action="store_true", help="use the frozen seed artists in eval/seeds.jsonl")
+    parser.add_argument("--reference", help="folder under cache/review/ that holds the captured reference")
     args = parser.parse_args()
 
     out = config.CACHE_DIR / "review" / args.name
@@ -114,11 +126,16 @@ def main() -> int:
         rows = {}
         for model in models:
             if model == "reference":
-                rows[model] = [reference(out / "reference", artist)]
+                captured = config.CACHE_DIR / "review" / (args.reference or args.name) / "reference"
+                rows[model] = [reference(captured, artist)]
                 continue
-            name, _, rule = model.partition(":")  # "csd" or "csd:mutual"
+            name, _, rest = model.partition(":")  # "csd", "csd:mutual" or "csd:local:closest"
+            rule, _, pick = rest.partition(":")
             nearest = [key for key, _ in style.neighbors(artist, name, top=NEIGHBORS, rule=rule or "best")]
-            rows[model] = [works(conn, key, PER_ARTIST) for key in nearest]
+            rows[model] = [
+                closest(conn, artist, key, name) if pick == "closest" else works(conn, key, PER_ARTIST)
+                for key in nearest
+            ]
         if "reference" in rows:
             count = min(sum(len(row) for row in side) for side in rows.values())
             if not count:

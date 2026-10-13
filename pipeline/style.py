@@ -293,6 +293,21 @@ def neighbors(
     return all_neighbors(model, top, rule, None, db).get(artist_key, [])
 
 
+def closest_works(
+    artist_key: str, other_key: str, model: str, top: int = 4, db: pathlib.Path | str | None = None
+) -> list[str]:
+    """The other artist's works most like this artist's, best first, as deviation ids: the works to show when
+    the other is offered as similar. Each is scored by its best cosine match among this artist's works, so an
+    artist with two manners is matched in either. Ties go to the lower id. Empty when either has no vectors.
+    """
+    mine, theirs = (artist_vectors(key, model, db) for key in (artist_key, other_key))
+    if not mine or not theirs:
+        return []
+    seed = np.stack(list(mine.values())).astype(np.float32)  # unit length already: a dot product is the cosine
+    best = (np.stack(list(theirs.values())).astype(np.float32) @ seed.T).max(axis=1)
+    return [list(theirs)[at] for at in np.argsort(-best, kind="stable")[:top]]
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Style vectors for the collected works, computed on this machine.")
     parser.add_argument("--model", choices=sorted(WEIGHTS), required=True)

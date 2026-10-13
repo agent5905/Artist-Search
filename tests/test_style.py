@@ -278,6 +278,26 @@ def test_neighbors_is_the_mean_over_the_seeds_works_of_the_best_match_among_the_
     assert capsys.readouterr().out == ""
 
 
+def test_closest_works_are_the_other_artists_works_nearest_any_of_the_seeds_best_first(model):
+    model.table = {
+        1: [1, 0, 0],  # ALPHA
+        2: [0, 1, 0],  # ALPHA, in another manner
+        3: [0, 0, 1],  # BRAVO: like neither
+        4: [3, 4, 0],  # BRAVO: 0.8 with ALPHA's second work
+        5: [0, 2, 0],  # BRAVO: ALPHA's second work exactly
+        6: [5, 0, 0],  # BRAVO: ALPHA's first work exactly, so a tie that goes to the lower id
+    }
+    collect(ALPHA, 1, 2)
+    collect(BRAVO, 3, 4, 5, 6)
+    collect(ECHO, broken=[8])  # collected, but no vector could be made
+    style.run("csd", 500)
+    assert style.closest_works(ALPHA, BRAVO, "csd") == [work_id(5), work_id(6), work_id(4), work_id(3)]
+    assert style.closest_works(ALPHA, BRAVO, "csd", top=2) == [work_id(5), work_id(6)]
+    assert style.closest_works(BRAVO, ALPHA, "csd") == [work_id(1), work_id(2)]
+    assert style.closest_works(ALPHA, ECHO, "csd") == style.closest_works(ECHO, ALPHA, "csd") == []
+    assert style.closest_works(ALPHA, BRAVO, "siglip2") == []  # another model's vectors are another matter
+
+
 def test_the_mutual_rule_puts_a_consistent_artist_above_one_with_a_bit_of_everything(model, capsys):
     model.table = {
         1: [1, 0, 0],  # ALPHA, the seed
