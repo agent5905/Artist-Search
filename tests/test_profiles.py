@@ -108,11 +108,18 @@ def artist(handle, results, *, tagline=None, own_tags=None, declared=None, publi
         if result is not None:
             tag(work_id, result, (declared or {}).get(n, "no"))
     if contact:
-        tagging.results()  # so that its tables exist
-        row = (f"da:{handle}", profiles.TAGGER, tagging.CONTACT_PROMPT_VERSION, contact, "2026-01-01T00:00:00+00:00")
-        with closing(sqlite3.connect(config.LOCAL_DB)) as conn, conn:
-            conn.execute("INSERT OR REPLACE INTO artist_contact VALUES (?, ?, ?, ?, ?)", row)
+        read_tagline(handle, contact)
     return ids
+
+
+def read_tagline(handle, contact="no"):
+    """Store what the tagging stage finds when it reads the artist's tagline, as it is now, for a private contact."""
+    tagging.results()  # so that its tables exist
+    with closing(sqlite3.connect(config.LOCAL_DB)) as conn, conn:
+        (tagline,) = conn.execute("SELECT tagline FROM profiles WHERE artist_key = ?", (f"da:{handle}",)).fetchone()
+        row = (f"da:{handle}", profiles.TAGGER, tagging.CONTACT_PROMPT_VERSION, contact, "2026-01-01T00:00:00+00:00")
+        row = (*row, tagging.tagline_print(tagline))
+        conn.execute("INSERT OR REPLACE INTO artist_contact VALUES (?, ?, ?, ?, ?, ?)", row)
 
 
 def picture(n):
@@ -140,13 +147,18 @@ def tag(work_id, result, declared="no", result_set=VERIFIED, words_only=False):
     """Store a work's tags as the tagging stage would, under one result set, and what its own words declare.
 
     A result of None is the row of a work that could not be analyzed. words_only: the declaration and no tags.
+    Each row is read from the work as it is now: its fingerprint is that of the image in the cache, or of the
+    title and tags.
     """
     tagging.results()  # so that its tables exist
     at = "2026-01-01T00:00:00+00:00"
     with closing(sqlite3.connect(config.LOCAL_DB)) as conn, conn:
-        row = (work_id, result_set, tagging.PROMPT_VERSION, json.dumps(result) if result else None, at)
+        image = conn.execute("SELECT fingerprint FROM work_images WHERE deviation_id = ?", (work_id,)).fetchone()
+        words = conn.execute("SELECT title, tags FROM works WHERE deviation_id = ?", (work_id,)).fetchone()
+        seen, read = image and image[0], tagging.words_print(*words)
+        row = (work_id, result_set, tagging.PROMPT_VERSION, json.dumps(result) if result else None, at, seen)
         if not words_only:
-            conn.execute("INSERT OR REPLACE INTO work_tags VALUES (?, ?, ?, ?, ?)", row)
+            conn.execute("INSERT OR REPLACE INTO work_tags VALUES (?, ?, ?, ?, ?, ?)", row)
         # A format is in the result as tagging.results() gives it. Where the tagging stage keeps formats in a
         # table of their own, it is read from there, so it goes there too.
         if (
@@ -155,11 +167,11 @@ def tag(work_id, result, declared="no", result_set=VERIFIED, words_only=False):
             and conn.execute("SELECT 1 FROM sqlite_master WHERE name = 'work_format'").fetchone()
         ):
             sorted_as = json.dumps({"formats": result["formats"], "rating": result.get("rating", "safe")})
-            row = (work_id, profiles.TAGGER, getattr(tagging, "FORMAT_VERSION", 1), sorted_as, at)
-            conn.execute("INSERT OR REPLACE INTO work_format VALUES (?, ?, ?, ?, ?)", row)
+            row = (work_id, profiles.TAGGER, getattr(tagging, "FORMAT_VERSION", 1), sorted_as, at, seen)
+            conn.execute("INSERT OR REPLACE INTO work_format VALUES (?, ?, ?, ?, ?, ?)", row)
         if declared:
-            row = (work_id, profiles.TAGGER, tagging.AI_PROMPT_VERSION, declared, at)
-            conn.execute("INSERT OR REPLACE INTO work_ai_declared VALUES (?, ?, ?, ?, ?)", row)
+            row = (work_id, profiles.TAGGER, tagging.AI_PROMPT_VERSION, declared, at, read)
+            conn.execute("INSERT OR REPLACE INTO work_ai_declared VALUES (?, ?, ?, ?, ?, ?)", row)
 
 
 def vector(text, scale=3.0):
@@ -2657,3 +2669,95 @@ def test_a_written_text_that_breaks_off_is_refused_and_the_template_stands_in(te
     assert run(Fake(write=text)) == {"profiled": 1, "written_fallback": 1}
     (profile,) = profiles.profiles()
     assert profile["written"] == profile["template"] == "Painterly fantasy character art in traditional media."
+
+
+# A row is tied to the readings it was made from. Each of these is a sequence: profile, change, run again.
+
+THUMB = "https://images-wixmp-zzfake.wixmp.com/f/FAKE-THUMB.jpg"  # what artist() stores every work with
+ANOTHER = "https://images-wixmp-zzfake.wixmp.com/f/FAKE-ANOTHER-FILE.jpg"  # the file an artist puts in its place
+
+
+def collected_again(handle, n, *, title=None, thumb=THUMB, image=None):
+    """The collect stage's next turn for one work of artist()'s: with another title, or with a thumbnail that shows
+    another file; and with `image`, the collector has fetched that file and says so."""
+    work_id = f"00000000-0000-4000-A000-{ {ALPHA: 1000, BRAVO: 2000, CHARLIE: 3000}[handle] + n:012d}"
+    if image is not None:
+        library.save_image(work_id, "image/png", image)
+    row = {
+        "work_id": work_id,
+        "page_url": f"https://www.deviantart.com/{handle}/art/FAKE-TITLE-{n}",
+        "title": title or f"FAKE-TITLE-{n}",
+        "tags": ["faketag"],
+        "thumb_url": thumb,
+        "published": str(int(RECENT.timestamp())),
+        "fetched": image is not None,
+    }
+    library.store_artist(
+        f"da:{handle}", user_id=None, tagline=None, specialty=None, level="Professional", website=None, works=[row]
+    )
+
+
+def test_an_artist_whose_work_was_read_from_an_image_they_replaced_waits_and_the_row_is_made_again():
+    ids = artist(ALPHA, [tags()] * 6)
+    assert run(Fake())["profiled"] == 1
+    kept, key = table(), f"da:{ALPHA}"
+    assert profiles.current() == {key} and profiles.profiles()[0]["current"] is True
+
+    collected_again(ALPHA, 2, thumb=ANOTHER)  # the thumbnail shows another file: the tags are of the old image
+    quiet = Fake()
+    assert run(quiet) == {"waiting_for_tags": 1} and quiet.requests == [] and table() == kept  # the row is kept,
+    assert profiles.current() == set() and profiles.profiles()[0]["current"] is False  # and is not one to publish
+    assert profiles.sample(5, 1) == []  # nor one to hold against the pictures as they are now
+    collected_again(ALPHA, 2, thumb=ANOTHER, image=picture(9))  # fetched, and not read yet
+    assert run(quiet) == {"waiting_for_tags": 1} and profiles.current() == set()
+
+    tag(ids[2], tags())  # the tagging stage reads the new image, and finds the very same tags
+    assert profiles.current() == set()  # the same tags of another picture: the sheet was of the old one
+    again = Fake()
+    assert run(again)["profiled"] == 1 and 9 in again.sheets[0]["works"]  # made again, from the pictures as they are
+    assert profiles.current() == {key} and table()[0][1] != kept[0][1]
+    assert run(quiet) == {"unchanged": 1} and quiet.requests == []
+
+
+def test_a_row_is_not_current_while_a_work_it_counted_has_words_nobody_read_or_words_that_say_otherwise():
+    ids = artist(ALPHA, [tags()] * 6)
+    assert run(Fake())["profiled"] == 1
+    kept, key = table(), f"da:{ALPHA}"
+
+    collected_again(ALPHA, 2, title="FAKE-TITLE-2 CHANGED")  # what the old title was read to declare is stale
+    quiet = Fake()
+    assert run(quiet) == {"waiting_for_tags": 1} and table() == kept and profiles.current() == set()
+    tag(ids[2], None, "no", words_only=True)  # read again, and it declares what it declared: nothing
+    assert profiles.current() == {key}  # so the row is current again as it stands, and nothing is asked
+    assert run(quiet) == {"unchanged": 1} and quiet.requests == [] and table() == kept
+
+    collected_again(ALPHA, 2, title="FAKE-TITLE-2 made with FAKE-GENERATOR")
+    tag(ids[2], None, "yes", words_only=True)  # read again: this time the words declare the work AI-made
+    assert profiles.current() == set()  # the row counted a work that does not count any more
+    assert run(Fake())["profiled"] == 1 and profiles.current() == {key}
+    assert profiles.profiles()[0]["facts"]["counted"] == sorted(set(ids) - {ids[2]})
+
+
+def test_a_work_collected_after_the_row_was_made_leaves_the_row_current():
+    """The row rests on the works it counted. One it never counted cannot make it out of date."""
+    ids = artist(ALPHA, [tags()] * 6)
+    assert run(Fake())["profiled"] == 1
+    kept = table()
+    collected_again(ALPHA, 6, image=picture(6))  # a seventh work, with its image: not tagged yet
+    assert library.work_ids(f"da:{ALPHA}") > set(ids) and run(Fake()) == {"waiting_for_tags": 1}
+    assert table() == kept and profiles.current() == {f"da:{ALPHA}"}
+
+
+def test_a_store_made_before_readings_carried_fingerprints_stops_the_stage_before_a_model_is_asked():
+    artist(ALPHA, [tags()] * 6)
+    assert run(Fake())["profiled"] == 1
+    with closing(sqlite3.connect(config.LOCAL_DB)) as conn:
+        conn.execute("PRAGMA user_version = 0")  # as every store was before the migration
+    before, fake = config.LOCAL_DB.read_bytes(), Fake()
+    calls = [lambda: run(fake), profiles.profiles, profiles.excluded, profiles.current, lambda: profiles.sample(5, 1)]
+    calls += [lambda: profiles.main(["--max-artists", "5"], httpx.MockTransport(fake))]
+    for call in calls:
+        with pytest.raises(SystemExit) as stopped:
+            call()
+        assert "uv run python -m pipeline.tagging --migrate --backup" in str(stopped.value)
+    assert fake.requests == [] and config.LOCAL_DB.read_bytes() == before

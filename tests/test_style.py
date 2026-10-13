@@ -579,3 +579,89 @@ def test_a_removed_artists_vectors_are_never_read_again_and_are_deleted_by_the_n
     model.meanwhile = lambda: library.purge(CHARLIE)  # removed while their work is in the model
     style.run("csd", 500)
     assert model.batches[-1][0] == 3 and [work for work, _, _ in stored()] == [work_id(2)]
+
+
+# A vector is tied to the image it was made from. A sequence: embed, the artist replaces the image, run again.
+
+ANOTHER = "https://images-wixmp-zzfake.wixmp.com/f/FAKE-ANOTHER-FILE.jpg"  # the file an artist puts in its place
+
+
+def collect_again(artist, n, thumb, image=None):
+    """The collect stage's next turn for one work: its thumbnail shows this file now, and with `image` the
+    collector has fetched the new file and says so."""
+    if image is not None:
+        library.save_image(work_id(n), "image/png", image)
+    work = {
+        "work_id": work_id(n),
+        "page_url": f"https://www.deviantart.com/zz-fake/art/FAKE-TITLE-{n}",
+        "title": "FAKE-TITLE",
+        "tags": [],
+        "thumb_url": thumb,
+        "published": "1",
+        "fetched": image is not None,
+    }
+    library.store_artist(artist, user_id=None, tagline=None, specialty=None, level=None, website=None, works=[work])
+
+
+def test_a_vector_of_an_image_the_artist_replaced_is_not_used_and_is_made_again_from_the_new_one(model):
+    collect(ALPHA, 1, 2)
+    collect(BRAVO, 3)
+    style.run("csd", 500)
+    assert list(style.artist_vectors(ALPHA, "csd")) == [work_id(1), work_id(2)]
+
+    collect_again(ALPHA, 1, ANOTHER)  # the thumbnail shows another file; the image in the cache is the old one
+    assert style.vector(work_id(1), "csd") is None and list(style.artist_vectors(ALPHA, "csd")) == [work_id(2)]
+    shown = {ALPHA: [work_id(1), work_id(2)], BRAVO: [work_id(3)]}
+    assert style.all_closest_works([(BRAVO, ALPHA)], shown, "csd") == {(BRAVO, ALPHA): [work_id(2)]}
+    assert style.run("csd", 500) == {"embedded": 0, "failed": 0} and model.loads == 1  # and nobody embeds the old one
+
+    collect_again(ALPHA, 1, ANOTHER, square(9))  # the collector has fetched the new file
+    assert style.vector(work_id(1), "csd") is None  # the vector that is stored is still the old image's
+    assert style.run("csd", 500)["embedded"] == 1 and set(model.batches[-1]) == {9}  # the one work, and no other
+    assert np.allclose(style.vector(work_id(1), "csd"), unit(model.vector(9)), atol=1e-3)
+    assert len(stored()) == 3  # the new vector took the old one's place
+    assert style.run("csd", 500) == {"embedded": 0, "failed": 0} and model.loads == 2
+
+
+def test_an_image_replaced_while_it_is_in_the_model_does_not_pass_for_embedded(model):
+    collect(ALPHA, 1)
+    model.meanwhile = lambda: collect_again(ALPHA, 1, ANOTHER, square(9))
+    assert style.run("csd", 500)["embedded"] == 1 and model.batches[0][0] == 1
+    assert style.vector(work_id(1), "csd") is None  # it was made from the bytes that were read, not from these
+    model.meanwhile = None
+    assert style.run("csd", 500)["embedded"] == 1 and model.batches[-1][0] == 9
+    assert np.allclose(style.vector(work_id(1), "csd"), unit(model.vector(9)), atol=1e-3)
+
+
+def test_a_vector_carries_the_fingerprint_of_the_bytes_it_was_made_from_not_of_the_image_expected(model, monkeypatch):
+    """The collector saves a new file before it stores the row that says so. A run in between reads the new
+    bytes while the store still knows the old image."""
+    collect(ALPHA, 1)
+
+    def loading(name):  # after the run has listed its works, before it opens their files
+        library.save_image(work_id(1), "image/png", square(9))
+        return model(name)
+
+    monkeypatch.setattr(style, "load_model", loading)
+    assert style.run("csd", 500)["embedded"] == 1 and model.batches[0][0] == 9
+    assert style.vector(work_id(1), "csd") is None  # a vector of the new picture is not the old picture's
+    collect_again(ALPHA, 1, ANOTHER, square(9))  # the collector stores the row: the work shows the new picture
+    assert np.allclose(style.vector(work_id(1), "csd"), unit(model.vector(9)), atol=1e-3)
+    assert style.run("csd", 500) == {"embedded": 0, "failed": 0}  # and it was made from exactly those bytes
+
+
+def test_a_store_made_before_readings_carried_fingerprints_stops_the_stage_before_a_model_is_loaded(model):
+    collect(ALPHA, 1)
+    style.run("csd", 500)
+    with closing(sqlite3.connect(config.LOCAL_DB)) as conn:
+        conn.execute("ALTER TABLE style_vectors DROP COLUMN fingerprint")
+        conn.execute("DROP TABLE work_images")
+        conn.execute("PRAGMA user_version = 0")  # as every store was before the migration
+    before = config.LOCAL_DB.read_bytes()
+    calls = [lambda: style.run("csd", 500), lambda: style.vector(work_id(1), "csd")]
+    calls += [lambda: style.neighbors(ALPHA, "csd"), lambda: style.main(["--model", "csd"])]
+    for call in calls:
+        with pytest.raises(SystemExit) as stopped:
+            call()
+        assert "uv run python -m pipeline.tagging --migrate --backup" in str(stopped.value)
+    assert model.loads == 1 and config.LOCAL_DB.read_bytes() == before

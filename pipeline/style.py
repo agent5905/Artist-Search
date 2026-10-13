@@ -17,6 +17,7 @@ Stdout is counts and throughput only, except `--neighbors`: one JSON object per 
 
 import argparse
 import contextlib
+import io
 import json
 import os
 import pathlib
@@ -52,9 +53,13 @@ CREATE TABLE IF NOT EXISTS style_vectors (
     deviation_id TEXT NOT NULL,      -- works.deviation_id
     model TEXT NOT NULL,             -- a key of WEIGHTS
     vector BLOB,                     -- 768 float16 numbers, unit length. NULL: no vector could be made (failed)
+    fingerprint TEXT,                -- library.fingerprint() of the image bytes it was made from
     PRIMARY KEY (deviation_id, model)
 ) STRICT;
 """
+# A vector is of one image. Made from an image the work no longer shows, it is as if it had never been made:
+# no read returns it and the next run makes it again (library.IMAGE is the rule, for a query that names `w`).
+_CURRENT = f"v.fingerprint = {library.IMAGE}"
 # Hard rule 7: when a work is removed (library.purge), what was computed from it goes too. The library does not
 # know this table, so every run does it, first and after each write; until then no read returns such a vector.
 _SWEEP = "DELETE FROM style_vectors WHERE deviation_id NOT IN (SELECT deviation_id FROM works)"
@@ -133,16 +138,18 @@ def load_model(model: str) -> Embed:
 
 
 def run(model: str, max_works: int, db: pathlib.Path | str | None = None) -> dict[str, float]:
-    """Give up to max_works works a vector: those with a cached image and no row yet for this model.
+    """Give up to max_works works a vector: those whose cached image is the one they show now, and that have
+    no row for this model made from that image.
 
     A work whose image will not open, or whose vector comes out broken, gets a row with no vector and is not
-    tried again. Returns the counts and the throughput.
+    tried again while it has that image. Returns the counts and the throughput.
     """
     with _open(db) as conn:
         conn.execute(_SWEEP)
         todo = conn.execute(
-            "SELECT deviation_id, image_file FROM works WHERE image_file IS NOT NULL AND deviation_id NOT IN "
-            "(SELECT deviation_id FROM style_vectors WHERE model = ?) ORDER BY deviation_id LIMIT ?",
+            f"SELECT w.deviation_id, w.image_file, {library.IMAGE} FROM works w WHERE w.image_file IS NOT NULL "
+            f"AND {library.IMAGE} IS NOT NULL AND NOT EXISTS (SELECT 1 FROM style_vectors v "
+            f"WHERE v.deviation_id = w.deviation_id AND v.model = ? AND {_CURRENT}) ORDER BY w.deviation_id LIMIT ?",
             (model, max_works),
         ).fetchall()
     counts: dict[str, float] = {"embedded": 0, "failed": 0}
@@ -154,13 +161,18 @@ def run(model: str, max_works: int, db: pathlib.Path | str | None = None) -> dic
         torch.cuda.reset_peak_memory_stats()
     started = time.perf_counter()
     rows: dict[str, bytes | None] = {}
+    # The fingerprint of the bytes each image was opened from. A file that cannot be read at all failed as the
+    # image the work is known to have, so that it is not tried again until it has another.
+    read: dict[str, str] = {work_id: shown for work_id, _, shown in todo}
     for start in range(0, len(todo), BATCH):
         opened: dict[str, Image.Image] = {}
-        for work_id, name in todo[start : start + BATCH]:
+        for work_id, name, _ in todo[start : start + BATCH]:
             try:
                 # ponytail: decoded one at a time on this thread, and transparency is dropped, not laid on
                 # white. Fine for JPEG previews; use a DataLoader if decoding ever limits the GPU.
-                with Image.open(library.image_dir() / name) as image:
+                data = (library.image_dir() / name).read_bytes()
+                read[work_id] = library.fingerprint(data)
+                with Image.open(io.BytesIO(data)) as image:
                     opened[work_id] = image.convert("RGB")
             except Exception:  # Pillow raises many kinds for a bad file; none of them may stop the run
                 rows[work_id] = None
@@ -181,9 +193,9 @@ def run(model: str, max_works: int, db: pathlib.Path | str | None = None) -> dic
         if len(rows) < WRITE_EVERY and start + BATCH < len(todo):
             continue
         with _open(db) as conn:
-            conn.executemany(
-                "INSERT OR IGNORE INTO style_vectors (deviation_id, model, vector) VALUES (?, ?, ?)",
-                [(work_id, model, blob) for work_id, blob in rows.items()],
+            conn.executemany(  # OR REPLACE: the row there is of an image the work no longer shows
+                "INSERT OR REPLACE INTO style_vectors (deviation_id, model, vector, fingerprint) VALUES (?, ?, ?, ?)",
+                [(work_id, model, blob, read[work_id]) for work_id, blob in rows.items()],
             )
             conn.execute(_SWEEP)  # a work removed while its vector was being computed
         counts["embedded"] += sum(blob is not None for blob in rows.values())
@@ -200,10 +212,12 @@ def run(model: str, max_works: int, db: pathlib.Path | str | None = None) -> dic
 def _vectors(
     model: str, db: pathlib.Path | str | None, artist_key: str | None = None
 ) -> dict[str, dict[str, np.ndarray]]:
-    """artist key -> deviation id -> vector, for every work that is still collected and has one."""
+    """artist key -> deviation id -> vector, for every work that is still collected and has one of the image it
+    shows now."""
     query = (
         "SELECT w.artist_key, w.deviation_id, v.vector FROM works w JOIN style_vectors v USING (deviation_id) "
-        "WHERE v.model = ? AND v.vector IS NOT NULL AND w.artist_key = COALESCE(?, w.artist_key) ORDER BY 1, 2"
+        f"WHERE v.model = ? AND v.vector IS NOT NULL AND {_CURRENT} "
+        "AND w.artist_key = COALESCE(?, w.artist_key) ORDER BY 1, 2"
     )
     found: dict[str, dict[str, np.ndarray]] = {}
     with _open(db) as conn:
@@ -216,7 +230,7 @@ def vector(work_id: str, model: str, db: pathlib.Path | str | None = None) -> np
     """The work's style vector, 768 float16 numbers of unit length. None when it has none."""
     query = (
         "SELECT v.vector FROM works w JOIN style_vectors v USING (deviation_id) "
-        "WHERE w.deviation_id = ? AND v.model = ? AND v.vector IS NOT NULL"
+        f"WHERE w.deviation_id = ? AND v.model = ? AND v.vector IS NOT NULL AND {_CURRENT}"
     )
     with _open(db) as conn:
         row = conn.execute(query, (work_id, model)).fetchone()

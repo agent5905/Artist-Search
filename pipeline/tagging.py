@@ -22,7 +22,16 @@ every variant keeps its own rows and a changed prompt (bump PROMPT_VERSION) is a
   - every answer goes through validated() before it is stored: the fixed vocabularies below, or nothing.
   - hard rule 7: the library deletes this stage's rows with the work or the artist; whatever is left of one it
     no longer holds is deleted at the start of every run, and is never read.
+  - a reading is tied to what was read: every row carries the fingerprint of exactly what the model was given,
+    the image's bytes or the words, taken from what was sent. A row whose fingerprint is not that of the image
+    (library.IMAGE) or of the words (WORDS, TAGLINE) as they are now is as if it had never been made: no reader
+    here returns it, and the next run makes it again. A work whose cached image is out of date is left alone
+    until the collect stage has fetched the image its thumbnail shows.
 Every function takes an optional `db` path; the default is config.LOCAL_DB.
+
+    uv run python -m pipeline.tagging --migrate --backup cache/backup/<a copy from before words last changed>
+
+Once, with every stage stopped, for a store made before readings carried fingerprints (see migrate).
 """
 
 import argparse
@@ -37,7 +46,7 @@ import re
 import sqlite3
 import sys
 import time
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from typing import Any
 
 import httpx
@@ -440,6 +449,8 @@ _AGREED = {
     "required": ["differ", "description"],
 }
 
+# The last column of every table is the fingerprint of what the model was given (library.fingerprint): the
+# image's bytes, or for the three tables about words the text. NULL on a row nobody can vouch for: it is stale.
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS work_tags (
     deviation_id TEXT NOT NULL,      -- works.deviation_id
@@ -447,6 +458,7 @@ CREATE TABLE IF NOT EXISTS work_tags (
     prompt_version INTEGER NOT NULL, -- PROMPT_VERSION when it was asked
     result TEXT,                     -- JSON object, exactly what validated() returned; NULL when the work failed
     analyzed_at TEXT NOT NULL,       -- ISO-8601 UTC
+    fingerprint TEXT,
     PRIMARY KEY (deviation_id, model, prompt_version)
 ) STRICT;
 -- Whether the artist's own title and tags declare the work AI-generated. Read from the words alone, by a call
@@ -457,6 +469,7 @@ CREATE TABLE IF NOT EXISTS work_ai_declared (
     prompt_version INTEGER NOT NULL, -- AI_PROMPT_VERSION when it was asked
     declared TEXT NOT NULL CHECK (declared IN ('yes', 'no', 'unclear')),
     asked_at TEXT NOT NULL,          -- ISO-8601 UTC
+    fingerprint TEXT,
     PRIMARY KEY (deviation_id, model, prompt_version)
 ) STRICT;
 -- Whether a text of the artist's holds a way to contact someone privately: a work's title and tags, and each
@@ -467,6 +480,7 @@ CREATE TABLE IF NOT EXISTS work_contact (
     prompt_version INTEGER NOT NULL, -- CONTACT_PROMPT_VERSION when it was asked
     contact TEXT NOT NULL CHECK (contact IN ('yes', 'no')),
     asked_at TEXT NOT NULL,          -- ISO-8601 UTC
+    fingerprint TEXT,
     PRIMARY KEY (deviation_id, model, prompt_version)
 ) STRICT;
 CREATE TABLE IF NOT EXISTS artist_contact (
@@ -475,6 +489,7 @@ CREATE TABLE IF NOT EXISTS artist_contact (
     prompt_version INTEGER NOT NULL, -- CONTACT_PROMPT_VERSION when it was asked
     contact TEXT NOT NULL CHECK (contact IN ('yes', 'no')),
     asked_at TEXT NOT NULL,          -- ISO-8601 UTC
+    fingerprint TEXT,
     PRIMARY KEY (artist_key, model, prompt_version)
 ) STRICT;
 -- Round 4's passes, each beside the rest: how a work is presented and rated (a JSON object, NULL when the model
@@ -482,17 +497,20 @@ CREATE TABLE IF NOT EXISTS artist_contact (
 -- second model and a result set agree on. In work_agreed, model names both: "<result set>~<second model>".
 CREATE TABLE IF NOT EXISTS work_format (
     deviation_id TEXT NOT NULL, model TEXT NOT NULL, prompt_version INTEGER NOT NULL,  -- FORMAT_VERSION
-    result TEXT, asked_at TEXT NOT NULL, PRIMARY KEY (deviation_id, model, prompt_version)
+    result TEXT, asked_at TEXT NOT NULL, fingerprint TEXT, PRIMARY KEY (deviation_id, model, prompt_version)
 ) STRICT;
 CREATE TABLE IF NOT EXISTS work_second (
     deviation_id TEXT NOT NULL, model TEXT NOT NULL, prompt_version INTEGER NOT NULL,  -- AGREE_VERSION
-    result TEXT, asked_at TEXT NOT NULL, PRIMARY KEY (deviation_id, model, prompt_version)
+    result TEXT, asked_at TEXT NOT NULL, fingerprint TEXT, PRIMARY KEY (deviation_id, model, prompt_version)
 ) STRICT;
 CREATE TABLE IF NOT EXISTS work_agreed (
     deviation_id TEXT NOT NULL, model TEXT NOT NULL, prompt_version INTEGER NOT NULL,  -- AGREE_VERSION
-    result TEXT NOT NULL, asked_at TEXT NOT NULL, PRIMARY KEY (deviation_id, model, prompt_version)
+    result TEXT NOT NULL, asked_at TEXT NOT NULL, fingerprint TEXT, PRIMARY KEY (deviation_id, model, prompt_version)
 ) STRICT;
 """
+# The fingerprint of a work's words and of an artist's tagline as they are now, for a query that names the rows
+# `w` and `p`: what library.IMAGE is for an image. A reading of words is current while its own equals this.
+WORDS, TAGLINE = "words_print(w.title, w.tags)", "tagline_print(p.tagline)"
 
 # ponytail: splits on any full stop followed by a space, so "Dr. Who" counts as a sentence end. A sentence
 # tokenizer is the upgrade if descriptions start coming back cut short.
@@ -759,6 +777,31 @@ def _words(title: str | None, tags: list[str]) -> str:
     return f"Title: {title or '(none)'}\nTags: {', '.join(tags)}"
 
 
+def _said(tagline: str | None) -> str:
+    """An artist's tagline as a model is given it. No tagline is no text."""
+    return f"Tagline: {tagline}" if tagline else ""
+
+
+def words_print(title: str | None, tags: str) -> str:
+    """The fingerprint of a work's words as a model is given them: its title, and its tags as the library keeps
+    them, a JSON list. Both questions about a work's words are asked of this text, or answered from it unasked."""
+    return library.fingerprint(_words(title, [tag for tag in json.loads(tags) if isinstance(tag, str)]))
+
+
+def tagline_print(tagline: str | None) -> str:
+    """The fingerprint of an artist's tagline as a model is given it."""
+    return library.fingerprint(_said(tagline))
+
+
+def read_as(works: Iterable[str], images: Mapping[str, str], declared: Mapping[str, str]) -> str:
+    """One fingerprint of what these works were read as: each one's image, by its own fingerprint, and what its
+    words declare about AI. `images` is library.image_prints() and `declared` is declared_ai(), so a work whose
+    reading is stale counts as one that has none. For whoever keeps something made from several works' readings,
+    as the profile stage does: when this is no longer what it was, a reading it rests on is stale or was made
+    again, and what was made from it is out of date."""
+    return library.fingerprint(json.dumps([[work, images.get(work), declared.get(work)] for work in works]))
+
+
 def _contact(client: httpx.Client, model: str, text: str) -> str:
     """Whether a text an artist wrote holds a way to contact someone privately: "yes" or "no".
 
@@ -778,9 +821,12 @@ def _contact(client: httpx.Client, model: str, text: str) -> str:
 
 @contextlib.contextmanager
 def _open(db: pathlib.Path | str | None) -> Iterator[sqlite3.Connection]:
-    """One transaction on the library's file, opened the library's way, with this table."""
+    """One transaction on the library's file, opened the library's way, with these tables, and with WORDS and
+    TAGLINE in its SQL."""
     with library._open(db) as conn:
         conn.executescript(_SCHEMA)
+        conn.create_function("words_print", 2, words_print, deterministic=True)
+        conn.create_function("tagline_print", 1, tagline_print, deterministic=True)
         yield conn
 
 
@@ -800,12 +846,14 @@ def _transact[T](db: pathlib.Path | str | None, work: Callable[[sqlite3.Connecti
             time.sleep(2)
 
 
-def _image(name: str) -> str | None:
-    """A cached image as base64, or None when the row does not name a file of the cache that is still there."""
+def _image(name: str) -> tuple[str, str] | None:
+    """A cached image as base64, with the fingerprint of the bytes that are sent: the one a reading of them is
+    stored with. None when the row does not name a file of the cache that is still there."""
     path = library.image_dir() / name
     if pathlib.PurePath(name).name != name or not path.is_file():
         return None
-    return base64.b64encode(path.read_bytes()).decode("ascii")
+    data = path.read_bytes()
+    return base64.b64encode(data).decode("ascii"), library.fingerprint(data)
 
 
 def _require_vision(client: httpx.Client, model: str) -> None:
@@ -842,6 +890,9 @@ def run(
     seconds_per_verification. Each row is committed as it is made, so a stopped run loses nothing and
     a rerun asks nothing twice. ValueError before anything is sent if the address is not loopback or a model
     cannot read images.
+
+    A row counts as there only when it was read from the words or the image as they are now (see the module's
+    docstring): one that was not is made again, and takes the old one's place.
     """
     counts = {"analyzed": 0, "failed": 0, "flagged": 0, "skipped": 0, "removed": 0}
     counts |= {"descriptions_changed": 0, "details_removed": 0}
@@ -856,13 +907,16 @@ def run(
             conn.execute(f"DELETE FROM {table} WHERE deviation_id NOT IN (SELECT deviation_id FROM works)")
         conn.execute("DELETE FROM artist_contact WHERE artist_key NOT IN (SELECT artist_key FROM profiles)")
         has = (
-            "EXISTS (SELECT 1 FROM {} t WHERE t.deviation_id = w.deviation_id AND t.model = ? AND t.prompt_version = ?)"
+            "EXISTS (SELECT 1 FROM {} t WHERE t.deviation_id = w.deviation_id AND t.model = ? "
+            "AND t.prompt_version = ? AND t.fingerprint = {})"
         )
         versions = (PROMPT_VERSION, PROMPT_VERSION, AI_PROMPT_VERSION, CONTACT_PROMPT_VERSION)
         works = conn.execute(
-            f"SELECT w.deviation_id, w.image_file, {has.format('work_tags')}, {has.format('work_tags')}, "
-            f"{has.format('work_ai_declared')}, {has.format('work_contact')}, w.title, w.tags, w.artist_key "
-            "FROM works w WHERE w.image_file IS NOT NULL ORDER BY w.artist_key, w.deviation_id",
+            f"SELECT w.deviation_id, w.image_file, {has.format('work_tags', library.IMAGE)}, "
+            f"{has.format('work_tags', library.IMAGE)}, {has.format('work_ai_declared', WORDS)}, "
+            f"{has.format('work_contact', WORDS)}, w.title, w.tags, w.artist_key FROM works w "
+            # An image that is out of date is not read: what it shows is not what the work shows any more.
+            f"WHERE w.image_file IS NOT NULL AND {library.IMAGE} IS NOT NULL ORDER BY w.artist_key, w.deviation_id",
             [
                 value
                 for name, version in zip((target, model, model, model), versions, strict=True)
@@ -870,21 +924,22 @@ def run(
             ],
         ).fetchall()
         unread = conn.execute(
-            "SELECT p.artist_key, p.tagline FROM profiles p WHERE NOT EXISTS (SELECT 1 FROM artist_contact a "
-            "WHERE a.artist_key = p.artist_key AND a.model = ? AND a.prompt_version = ?)",
+            "SELECT p.artist_key, p.tagline FROM profiles p WHERE NOT EXISTS (SELECT 1 FROM artist_contact a WHERE "
+            f"a.artist_key = p.artist_key AND a.model = ? AND a.prompt_version = ? AND a.fingerprint = {TAGLINE})",
             (model, CONTACT_PROMPT_VERSION),
         ).fetchall()
         return works, dict(unread)
 
-    def insert(table: str, *row: object) -> None:
+    def insert(table: str, read: str, *row: object) -> None:
         # Its own transaction, never held open while a model works: other stages write to this file too. Nothing
-        # is stored for a work or an artist that was removed meanwhile.
+        # is stored for a work or an artist that was removed meanwhile. `read` is the fingerprint of what the
+        # model was given. OR REPLACE: the row there is a stale one, of words or an image that have changed.
         owner = "profiles WHERE artist_key" if table == "artist_contact" else "works WHERE deviation_id"
-        query = f"INSERT OR IGNORE INTO {table} SELECT ?, ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM {owner} = ?)"
-        _transact(db, lambda conn: conn.execute(query, (*row, store._now(), row[0])))
+        query = f"INSERT OR REPLACE INTO {table} SELECT ?, ?, ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM {owner} = ?)"
+        _transact(db, lambda conn: conn.execute(query, (*row, store._now(), read, row[0])))
 
-    def stored(work_id: str, name: str, result: dict[str, Any] | None) -> None:
-        insert("work_tags", work_id, name, PROMPT_VERSION, result and json.dumps(result))
+    def stored(work_id: str, name: str, result: dict[str, Any] | None, read: str) -> None:
+        insert("work_tags", read, work_id, name, PROMPT_VERSION, result and json.dumps(result))
         if name == target:
             counts["analyzed" if result else "failed"] += 1
             counts["flagged"] += bool(result and (result["explicit"] or result["not_artwork"]))
@@ -893,19 +948,21 @@ def run(
         """The questions asked of words alone: the work's title and tags, and once an artist, the tagline."""
         work_id, _, _, _, declared, contacted, title, tags, artist = work
         names = [tag for tag in json.loads(tags) if isinstance(tag, str)]
-        # ponytail: asked once per work. An artist who edits the tags afterwards is not asked again: put a hash
-        # of the title and tags in the key if that turns out to matter.
+        # The fingerprint is of the words in hand, which are the ones sent: read when the run began, perhaps
+        # hours ago. If the artist has changed them since, the answer is stored as stale and asked again.
+        read = words_print(title, tags)
         if not declared:
             answer = _declared(client, model, title, names)
-            insert("work_ai_declared", work_id, model, AI_PROMPT_VERSION, answer)
+            insert("work_ai_declared", read, work_id, model, AI_PROMPT_VERSION, answer)
             counts[f"declared_{answer}"] += 1
         if not contacted:
             answer = _contact(client, model, _words(title, names) if title or names else "")
-            insert("work_contact", work_id, model, CONTACT_PROMPT_VERSION, answer)
+            insert("work_contact", read, work_id, model, CONTACT_PROMPT_VERSION, answer)
             counts[f"contact_{answer}"] += 1
         if artist in taglines:
-            answer = _contact(client, model, f"Tagline: {tagline}" if (tagline := taglines.pop(artist)) else "")
-            insert("artist_contact", artist, model, CONTACT_PROMPT_VERSION, answer)
+            tagline = taglines.pop(artist)
+            answer = _contact(client, model, _said(tagline))
+            insert("artist_contact", tagline_print(tagline), artist, model, CONTACT_PROMPT_VERSION, answer)
             counts[f"tagline_contact_{answer}"] += 1
 
     def look(batch: list[tuple[Any, ...]]) -> None:
@@ -917,7 +974,7 @@ def run(
         for work_id, name, *_ in first:
             if image := _image(name):
                 started = time.monotonic()
-                stored(work_id, model, _described(client, model, image))
+                stored(work_id, model, _described(client, model, image[0]), image[1])
                 seconds[0], asked[0] = seconds[0] + time.monotonic() - started, asked[0] + 1
         if verifier is None:
             return
@@ -926,21 +983,22 @@ def run(
             seeing.add(verifier)
         marks = ", ".join("?" * len(batch))
         query = (
-            "SELECT deviation_id, result FROM work_tags "
+            "SELECT deviation_id, result, fingerprint FROM work_tags "
             f"WHERE model = ? AND prompt_version = ? AND deviation_id IN ({marks})"
         )
         key = (model, PROMPT_VERSION, *(work[0] for work in batch))
-        described: dict[str, str | None] = dict(_transact(db, lambda conn: conn.execute(query, key).fetchall()))
+        rows = _transact(db, lambda conn: conn.execute(query, key).fetchall())
+        described: dict[str, tuple[str | None, str | None]] = {row[0]: row[1:] for row in rows}
         for work_id, name, *_ in batch:
             image = _image(name) if work_id in described else None
-            if image is None:
-                continue  # nothing to verify: no first pass, or the file is gone
-            if described[work_id] is None:
-                stored(work_id, target, None)
+            if image is None or image[1] != described[work_id][1]:
+                continue  # nothing to verify: no first pass of the image as it is now, or the file is gone
+            if described[work_id][0] is None:
+                stored(work_id, target, None, image[1])
                 continue
-            before = json.loads(described[work_id] or "")
+            before = json.loads(described[work_id][0] or "")
             started = time.monotonic()
-            after, doubts = _verified(client, verifier, image, before)
+            after, doubts = _verified(client, verifier, image[0], before)
             seconds[1], asked[1] = seconds[1] + time.monotonic() - started, asked[1] + 1
             counts["descriptions_changed"] += after["description"] != before["description"]
             counts["details_removed"] += doubts
@@ -948,7 +1006,7 @@ def run(
                 len(before[field]) - len(after[field]) for field in ("subjects", "genres", "style_words")
             )
             counts["removed"] += before["not_artwork"] - after["not_artwork"]
-            stored(work_id, target, after)
+            stored(work_id, target, after, image[1])
 
     with _client(ollama_url, transport) as client:
         works, taglines = _transact(db, listed)
@@ -1011,23 +1069,26 @@ def _agreed(client: httpx.Client, model: str, first: str, second: str) -> str:
 
 
 def _works_with_images(conn: sqlite3.Connection, table: str, name: str, version: int) -> list[tuple[str, str, int]]:
-    """Every work with a cached image, artist by artist: its id, its file, and whether `table` has its row."""
+    """Every work whose cached image is the one it shows now, artist by artist: its id, its file, and whether
+    `table` has its row, read from that image."""
     for own in WORK_TABLES:  # hard rule 7, as in run()
         conn.execute(f"DELETE FROM {own} WHERE deviation_id NOT IN (SELECT deviation_id FROM works)")
     query = (
-        f"SELECT w.deviation_id, w.image_file, EXISTS (SELECT 1 FROM {table} t "
-        "WHERE t.deviation_id = w.deviation_id AND t.model = ? AND t.prompt_version = ?) "
-        "FROM works w WHERE w.image_file IS NOT NULL ORDER BY w.artist_key, w.deviation_id"
+        f"SELECT w.deviation_id, w.image_file, EXISTS (SELECT 1 FROM {table} t WHERE t.deviation_id = w.deviation_id "
+        f"AND t.model = ? AND t.prompt_version = ? AND t.fingerprint = {library.IMAGE}) FROM works w "
+        f"WHERE w.image_file IS NOT NULL AND {library.IMAGE} IS NOT NULL ORDER BY w.artist_key, w.deviation_id"
     )
     return conn.execute(query, (name, version)).fetchall()
 
 
-def _insert(db: pathlib.Path | str | None, table: str, *row: object) -> None:
-    """One row of five into a table keyed by work, in a transaction of its own, unless the work was removed."""
+def _insert(db: pathlib.Path | str | None, table: str, read: str, *row: object) -> None:
+    """One row into a table keyed by work, in a transaction of its own, unless the work was removed: four values,
+    the time, and `read`, the fingerprint of the image it was made from. It takes the place of a stale one."""
     query = (
-        f"INSERT OR IGNORE INTO {table} SELECT ?, ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM works WHERE deviation_id = ?)"
+        f"INSERT OR REPLACE INTO {table} SELECT ?, ?, ?, ?, ?, ? "
+        "WHERE EXISTS (SELECT 1 FROM works WHERE deviation_id = ?)"
     )
-    _transact(db, lambda conn: conn.execute(query, (*row, store._now(), row[0])))
+    _transact(db, lambda conn: conn.execute(query, (*row, store._now(), read, row[0])))
 
 
 def run_formats(
@@ -1060,9 +1121,9 @@ def run_formats(
                 counts["skipped"] += 1
                 continue
             started = time.monotonic()
-            result = _formatted(client, model, image)
+            result = _formatted(client, model, image[0])
             seconds += time.monotonic() - started
-            _insert(db, "work_format", work_id, model, FORMAT_VERSION, result and json.dumps(result))
+            _insert(db, "work_format", image[1], work_id, model, FORMAT_VERSION, result and json.dumps(result))
             counts["sorted" if result else "failed"] += 1
             if result:
                 counts[f"rating_{result['rating']}"] += 1
@@ -1097,38 +1158,42 @@ def run_agreed(
     counts = {"described": 0, "agreed": 0, "changed": 0, "unmatched": 0, "skipped": 0}
     seconds = [0.0, 0.0]
 
-    def listed(conn: sqlite3.Connection) -> list[tuple[str, str, str, int, str | None]]:
+    def listed(conn: sqlite3.Connection) -> list[tuple[str, str, str, int, str | None, str]]:
+        # The set's description of the image as it is now, and the second model's and the agreed one of that
+        # same image: the last column is the fingerprint all three go by.
         return conn.execute(
-            "SELECT w.deviation_id, w.image_file, t.result, s.deviation_id IS NOT NULL, s.result FROM works w "
-            "JOIN work_tags t ON t.deviation_id = w.deviation_id AND t.model = ? AND t.prompt_version = ? "
+            "SELECT w.deviation_id, w.image_file, t.result, s.deviation_id IS NOT NULL, s.result, t.fingerprint "
+            "FROM works w JOIN work_tags t ON t.deviation_id = w.deviation_id AND t.model = ? "
+            f"AND t.prompt_version = ? AND t.fingerprint = {library.IMAGE} "
             "LEFT JOIN work_second s ON s.deviation_id = w.deviation_id AND s.model = ? AND s.prompt_version = ? "
+            "AND s.fingerprint = t.fingerprint "
             "WHERE w.image_file IS NOT NULL AND t.result IS NOT NULL AND NOT EXISTS (SELECT 1 FROM work_agreed a "
-            "WHERE a.deviation_id = w.deviation_id AND a.model = ? AND a.prompt_version = ?) "
-            "ORDER BY w.artist_key, w.deviation_id LIMIT ?",
+            "WHERE a.deviation_id = w.deviation_id AND a.model = ? AND a.prompt_version = ? "
+            "AND a.fingerprint = t.fingerprint) ORDER BY w.artist_key, w.deviation_id LIMIT ?",
             (base, PROMPT_VERSION, second, AGREE_VERSION, name, AGREE_VERSION, max(max_works, 0)),
         ).fetchall()
 
     with _client(ollama_url, transport) as client:
         pending = _transact(db, listed)
-        others: dict[str, str | None] = {work_id: other for work_id, _, _, described, other in pending if described}
+        others: dict[str, str | None] = {work_id: other for work_id, _, _, described, other, _ in pending if described}
         if len(others) < len(pending):
             _require_vision(client, second)
-        for work_id, file, _, described, _ in pending:
+        for work_id, file, _, described, _, read in pending:
             image = None if described else _image(file)
-            if image is None:
+            if image is None or image[1] != read:  # the file is gone, or is not the image the set described
                 continue
             started = time.monotonic()
             other = None
             for attempt in range(MAX_ATTEMPTS):
-                answer = _chat(client, second, SECOND_PROMPT, "Describe this image.", image, _SECOND, attempt)
+                answer = _chat(client, second, SECOND_PROMPT, "Describe this image.", image[0], _SECOND, attempt)
                 text = answer.get("description") if isinstance(answer, dict) else None
                 if other := _two_sentences(text) if isinstance(text, str) else None:
                     break
             others[work_id] = other
             seconds[0] += time.monotonic() - started
-            _insert(db, "work_second", work_id, second, AGREE_VERSION, others[work_id])
+            _insert(db, "work_second", read, work_id, second, AGREE_VERSION, others[work_id])
             counts["described"] += 1
-        for work_id, _, result, _, _ in pending:
+        for work_id, _, result, _, _, read in pending:
             if work_id not in others:
                 counts["skipped"] += 1
                 continue
@@ -1136,7 +1201,7 @@ def run_agreed(
             started = time.monotonic()
             agreed = _agreed(client, model, checked, other) if (other := others[work_id]) else checked
             seconds[1] += time.monotonic() - started
-            _insert(db, "work_agreed", work_id, name, AGREE_VERSION, agreed)
+            _insert(db, "work_agreed", read, work_id, name, AGREE_VERSION, agreed)
             counts["agreed"] += 1
             counts["changed"] += agreed != checked
             counts["unmatched"] += other is None
@@ -1165,16 +1230,21 @@ def results(
     contact_in_text ("yes", "no": see contacts()); and how it is presented and rated: formats (from FORMATS) and
     rating (from RATINGS: see run_formats). Each of those four is None while that pass has not been run.
     Flagged works are in it, for the caller to exclude. Failed works, and works the library no longer holds, are
-    not.
+    not. Nor is a work whose result was read from an image it no longer shows; and each of the four is None
+    again when it was read from words or an image that have changed since.
     """
     query = (
         "SELECT t.deviation_id, t.result, a.declared, c.contact, f.result, g.result FROM work_tags t "
         "JOIN works w ON w.deviation_id = t.deviation_id "
         "LEFT JOIN work_ai_declared a ON a.deviation_id = t.deviation_id AND a.model = ? AND a.prompt_version = ? "
+        f"AND a.fingerprint = {WORDS} "
         "LEFT JOIN work_contact c ON c.deviation_id = t.deviation_id AND c.model = ? AND c.prompt_version = ? "
+        f"AND c.fingerprint = {WORDS} "
         "LEFT JOIN work_format f ON f.deviation_id = t.deviation_id AND f.model = ? AND f.prompt_version = ? "
+        "AND f.fingerprint = t.fingerprint "
         "LEFT JOIN work_agreed g ON g.deviation_id = t.deviation_id AND g.model = ? AND g.prompt_version = ? "
-        "WHERE t.model = ? AND t.prompt_version = ? AND t.result IS NOT NULL"
+        "AND g.fingerprint = t.fingerprint "
+        f"WHERE t.model = ? AND t.prompt_version = ? AND t.result IS NOT NULL AND t.fingerprint = {library.IMAGE}"
     )
     name = result_set(model, verifier)
     key = [model, AI_PROMPT_VERSION, model, CONTACT_PROMPT_VERSION, model, FORMAT_VERSION]
@@ -1194,14 +1264,14 @@ def contacts(model: str = DEFAULT_MODEL, db: pathlib.Path | str | None = None) -
     """Whether an artist's own text holds a way to contact someone privately: "yes" or "no".
 
     By deviation id for a work's title and tags, and by artist key for an artist's tagline: every one that was
-    read. A caller that publishes leaves out the title and tags, or the tagline, marked "yes". Works and artists
-    the library no longer holds are not here.
+    read as it is now. A caller that publishes leaves out the title and tags, or the tagline, marked "yes", and
+    one that is not here at all. Works and artists the library no longer holds are not here.
     """
     query = (
         "SELECT c.deviation_id, c.contact FROM work_contact c JOIN works w ON w.deviation_id = c.deviation_id "
-        "WHERE c.model = :model AND c.prompt_version = :version UNION ALL "
+        f"WHERE c.model = :model AND c.prompt_version = :version AND c.fingerprint = {WORDS} UNION ALL "
         "SELECT c.artist_key, c.contact FROM artist_contact c JOIN profiles p ON p.artist_key = c.artist_key "
-        "WHERE c.model = :model AND c.prompt_version = :version"
+        f"WHERE c.model = :model AND c.prompt_version = :version AND c.fingerprint = {TAGLINE}"
     )
     key = {"model": model, "version": CONTACT_PROMPT_VERSION}
     return dict(_transact(db, lambda conn: conn.execute(query, key).fetchall()))
@@ -1210,12 +1280,13 @@ def contacts(model: str = DEFAULT_MODEL, db: pathlib.Path | str | None = None) -
 def declared_ai(model: str = DEFAULT_MODEL, db: pathlib.Path | str | None = None) -> dict[str, str]:
     """Whether each work's own title and tags declare it AI-generated: "yes", "no" or "unclear", by deviation id.
 
-    Every work that was asked about is here, with or without a result for its image, so that a caller can drop
-    the works marked "yes" and weigh an artist by all of theirs. Works the library no longer holds are not.
+    Every work whose words were asked about as they are now is here, with or without a result for its image, so
+    that a caller can drop the works marked "yes" and weigh an artist by all of theirs. Works the library no
+    longer holds are not.
     """
     query = (
         "SELECT a.deviation_id, a.declared FROM work_ai_declared a JOIN works w ON w.deviation_id = a.deviation_id "
-        "WHERE a.model = ? AND a.prompt_version = ?"
+        f"WHERE a.model = ? AND a.prompt_version = ? AND a.fingerprint = {WORDS}"
     )
     return dict(_transact(db, lambda conn: conn.execute(query, (model, AI_PROMPT_VERSION)).fetchall()))
 
@@ -1242,7 +1313,9 @@ def sample(
         "SELECT t.deviation_id, w.image_file, t.result, g.result FROM work_tags t "
         "JOIN works w ON w.deviation_id = t.deviation_id "
         "LEFT JOIN work_agreed g ON g.deviation_id = t.deviation_id AND g.model = ? AND g.prompt_version = ? "
-        "WHERE t.model = ? AND t.prompt_version = ?"
+        "AND g.fingerprint = t.fingerprint "
+        # Only rows read from the image that is in the cache now: the critic holds each against that file.
+        f"WHERE t.model = ? AND t.prompt_version = ? AND t.fingerprint = {library.IMAGE}"
     )
     name = result_set(model, verifier)
     key = (f"{name}~{second}", AGREE_VERSION, name, PROMPT_VERSION)
@@ -1260,11 +1333,132 @@ def sample(
     ]
 
 
+def migrate(backup: pathlib.Path | str | None = None, db: pathlib.Path | str | None = None) -> dict[str, int]:
+    """Give a store made before readings carried fingerprints what it lacks, once and with every stage stopped:
+    the fingerprint column of every reading table (this stage's and the style stage's), each cached image's row
+    in work_images, what each profile rests on (read_as) at the end of its basis, and the mark that lets the
+    stages open the file (library.SHAPE). One transaction, so all of it or none; and a store that has the mark
+    is left alone, so running it again does nothing.
+
+    No fingerprint is assumed. `backup` is a copy of the store from before any words or thumbnails of works
+    already read last changed. A reading of words that is in the backup read the backup's words and is
+    fingerprinted from those: where a title, a tag list or a tagline has changed since, it comes out stale by
+    itself. One made since the backup read the old words or the new, and where they differ nobody can say
+    which: it gets no fingerprint, which is stale. One of a work or an artist the backup does not have read
+    today's words if their row has not been stored again since the reading was made, and otherwise gets none
+    either: so without `backup`, what was collected once and then read is fingerprinted as it is, and what was
+    collected again since is read again. No cached image has ever been replaced, so a reading of an image, and
+    a style vector, has the fingerprint of the cached file, and that file is written down as the image of the
+    file the backup's thumbnail shows: where today's thumbnail shows another, the image is out of date, to be
+    fetched and read again.
+
+    ponytail: the image of a work the backup does not have is written down as that of today's thumbnail. True
+    while no collector of before has stored such a work twice with another file the second time; if one may
+    have, take the file's own time as evidence the way the words' rows are taken here.
+
+    Returns counts only. The images are read where they are and nothing but the store is written.
+    """
+    stale = ("title", "tags", "tagline")
+    unknown = "readings left stale: nothing says which words they read"
+    counts = dict.fromkeys(("stores migrated", "images fingerprinted", "readings fingerprinted"), 0)
+    counts |= dict.fromkeys((*(f"readings stale: {name} changed" for name in stale), unknown), 0)
+    counts |= dict.fromkeys(("works with a replaced image", "profiles tied to what they rest on"), 0)
+    kept = "SELECT deviation_id, title, tags, thumb_url, image_file, fetched_at FROM works"
+    said = "SELECT artist_key, tagline, fetched_at FROM profiles"
+    old_works: dict[str, tuple[Any, ...]] = {}
+    old_taglines: dict[str, tuple[Any, ...]] = {}
+    old_readings: set[tuple[Any, ...]] = set()
+    if backup is not None:
+        address = f"{pathlib.Path(backup).resolve(strict=True).as_uri()}?mode=ro"
+        with contextlib.closing(sqlite3.connect(address, uri=True)) as before:
+            old_works = {row[0]: row[1:] for row in before.execute(kept)}
+            old_taglines = {row[0]: row[1:2] for row in before.execute(said)}
+            for table in ("work_ai_declared", "work_contact", "artist_contact"):
+                old_readings |= {(table, *row[:5]) for row in before.execute(f"SELECT * FROM {table}")}
+    with store._open(db) as conn:  # not the library's way in: that one refuses this store
+        if conn.execute("PRAGMA user_version").fetchone()[0] >= library.SHAPE:
+            return counts
+        conn.executescript(library._SCHEMA)  # work_images: a new table, and an empty one if what follows fails
+        conn.execute("BEGIN IMMEDIATE")
+        tables = {name for (name,) in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
+        works = {row[0]: row[1:] for row in conn.execute(kept)}
+        for work_id, (_, _, thumb, name, _) in works.items():
+            path = library.image_dir() / (name or "")
+            if not name or pathlib.PurePath(name).name != name or not path.is_file():
+                continue
+            was = old_works.get(work_id)
+            shown = library.own_file(was[2] if was and was[3] else thumb)
+            conn.execute(
+                "INSERT OR REPLACE INTO work_images (deviation_id, source, fingerprint) VALUES (?, ?, ?)",
+                (work_id, shown, library.fingerprint(path.read_bytes())),
+            )
+            counts["images fingerprinted"] += 1
+            counts["works with a replaced image"] += shown != library.own_file(thumb)
+        for table in (*TABLES, "style_vectors"):
+            if table in tables and "fingerprint" not in {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN fingerprint TEXT")
+        for table in ("work_tags", "work_format", "work_second", "work_agreed", "style_vectors"):
+            if table in tables:
+                counts["readings fingerprinted"] += conn.execute(
+                    f"UPDATE {table} SET fingerprint = (SELECT i.fingerprint FROM work_images i "
+                    f"WHERE i.deviation_id = {table}.deviation_id) "
+                    "WHERE deviation_id IN (SELECT deviation_id FROM work_images)"
+                ).rowcount
+
+        def of_words(table: str, rows: dict[str, tuple[Any, ...]], was: dict[str, tuple[Any, ...]], names: Any) -> None:
+            """Fingerprint a table's readings of words. `rows` is each row they are about, by key: the words as
+            they are now, and last of all when the row was stored. `was` is the words as the backup has them."""
+            of = tagline_print if table == "artist_contact" else words_print
+            for row in conn.execute(f"SELECT rowid, * FROM {table}").fetchall() if table in tables else ():
+                key = row[1]
+                if key not in rows:
+                    continue  # of a work or an artist that is gone: hard rule 7 takes the row at the next run
+                *now, stored = rows[key]
+                known = was.get(key)
+                if known == (*now,) or (known is None and row[5] >= stored):  # row[5]: when the reading was made
+                    read = of(*now)
+                elif known and (table, *row[1:6]) in old_readings:
+                    read = of(*known)
+                    for name, old, new in zip(names, known, now, strict=True):
+                        counts[f"readings stale: {name} changed"] += old != new
+                else:
+                    read = None
+                    counts[unknown] += 1
+                conn.execute(f"UPDATE {table} SET fingerprint = ? WHERE rowid = ?", (read, row[0]))
+                counts["readings fingerprinted"] += read is not None
+
+        titles = {work_id: (*row[:2], row[4]) for work_id, row in works.items()}
+        for table in ("work_ai_declared", "work_contact"):
+            of_words(table, titles, {work_id: row[:2] for work_id, row in old_works.items()}, stale[:2])
+        of_words("artist_contact", {row[0]: row[1:] for row in conn.execute(said)}, old_taglines, stale[2:])
+        if "artist_profiles" in tables:  # the profile stage's: what each rests on, as it was when it was made
+            images = dict(conn.execute("SELECT deviation_id, fingerprint FROM work_images"))
+            declared = dict(
+                conn.execute(
+                    "SELECT deviation_id, declared FROM work_ai_declared WHERE model = ? AND prompt_version = ?",
+                    (DEFAULT_MODEL, AI_PROMPT_VERSION),
+                )
+                if "work_ai_declared" in tables
+                else ()
+            )
+            for key, basis, facts in conn.execute("SELECT artist_key, basis, facts FROM artist_profiles").fetchall():
+                rests = read_as(json.loads(facts).get("counted", []), images, declared)
+                conn.execute("UPDATE artist_profiles SET basis = ? WHERE artist_key = ?", (basis + rests, key))
+                counts["profiles tied to what they rest on"] += 1
+        conn.execute(f"PRAGMA user_version = {library.SHAPE}")
+        counts["stores migrated"] = 1
+    return counts
+
+
 def main(argv: list[str] | None = None, transport: httpx.BaseTransport | None = None) -> None:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--max-works", type=int, help="analyze at most this many works that have no result yet")
     mode.add_argument("--sample", type=int, help="print this many stored results, one JSON object a line")
+    mode.add_argument("--migrate", action="store_true", help="once, with every stage stopped: see migrate()")
+    parser.add_argument(
+        "--backup", help="with --migrate: a copy of the store from before words or thumbnails last changed"
+    )
     parser.add_argument("--seed", type=int, default=0, help="which sample")
     parser.add_argument("--model", default=DEFAULT_MODEL, help="the Ollama model that describes and tags")
     parser.add_argument("--verifier", help="the Ollama model that checks each tag; its results are a set of their own")
@@ -1276,6 +1470,11 @@ def main(argv: list[str] | None = None, transport: httpx.BaseTransport | None = 
         "With --sample: show that variant beside the set's own description",
     )
     args = parser.parse_args(argv)
+    if args.migrate:
+        if not args.backup:  # by hand, nothing is taken on trust: the copy says what each reading was made from
+            parser.error("--migrate needs --backup, a copy of the store from before words or thumbnails last changed")
+        print(json.dumps(migrate(args.backup)))  # counts only
+        return
     if args.sample is not None:
         for row in sample(args.sample, args.seed, args.model, verifier=args.verifier, second=args.second):
             print(json.dumps(row))

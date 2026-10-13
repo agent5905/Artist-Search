@@ -3223,3 +3223,90 @@ def test_main_reads_the_two_names_from_env_and_never_prints_a_value(monkeypatch,
     assert collect.main([]) == 1
     assert capsys.readouterr().err == "Missing in .env: DEVIANT_ART_ID, DEVIANT_ART_SECRET (see .env.example)\n"
     assert len(called) == 2
+
+
+# --- 8. a work whose image the artist replaces: a run, a change, a run ---
+#
+# The first critic of the push stage: "Collect keeps the old cached image and stores the new thumbnail address."
+# Every reading of the old image then stood for the new one.
+
+
+def replace_image(world, username, n, m, served=True):
+    """The artist puts another file under work n: its preview and its thumbnails are file m's from now on."""
+    entry = next(entry for entry in world.galleries[username.lower()] if entry["deviationid"] == uuid(n))
+    entry["preview"] = {"src": f"{CDN}{preview_path(m)}?{signed(m)}", "height": 600, "width": 800}
+    entry["thumbs"] = [{"src": thumb(m, size), "height": size, "width": size} for size in (150, 200, 300)]
+    if served:
+        world.images[preview_path(m)] = jpeg(m)
+
+
+def test_a_thumbnail_signed_again_and_cut_to_another_size_is_the_same_image_and_nothing_is_fetched(capsys):
+    world = solo(3)
+    assert run(world) == 0
+    first, seen = library.image_prints(), len(world.log)
+    assert first == {uuid(n): library.fingerprint(jpeg(n)) for n in (1, 2, 3)}
+    for n, entry in enumerate(world.galleries[ALPHA], start=1):  # what every later answer of the real API does
+        again = thumb(n, 400).replace("FAKE-CLAIMS-", "FAKE-CLAIMS-LATER-").replace("/f/", "/i/")
+        entry["thumbs"] = [{"src": again, "height": 400, "width": 400}]
+    counts = counts_of(world, capsys)
+    assert counts[collect.CACHED] == 3 and counts[collect.DOWNLOADED] == 0 and world.since(seen, "images") == []
+    assert all("FAKE-CLAIMS-LATER-" in row["thumb_url"] for row in rows("works"))  # the address is up to date
+    assert library.image_prints() == first  # and every reading of these images stands
+
+
+def test_an_artist_who_replaces_a_works_image_has_the_new_one_fetched_in_its_place(capsys):
+    world = solo(3)
+    assert run(world) == 0
+    first = library.image_prints()
+    replace_image(world, ALPHA, 2, 902)
+    seen = len(world.log)
+
+    counts = counts_of(world, capsys)
+
+    assert counts[collect.DOWNLOADED] == 1 and counts[collect.CACHED] == 2 and counts[collect.WORKS] == 3
+    assert [request.url.path for request in world.since(seen, "images")] == [preview_path(902)]
+    assert (library.image_dir() / f"{uuid(2)}.jpg").read_bytes() == jpeg(902) and cached() == image_files([1, 2, 3])
+    assert next(row for row in rows("works") if row["deviation_id"] == uuid(2))["thumb_url"] == thumb(902)
+    # The image the work has now is another one: whatever was read from the old one is stale by itself.
+    assert library.image_prints() == first | {uuid(2): library.fingerprint(jpeg(902))}
+    assert rows("work_images")[1]["source"] == library.own_file(thumb(902)) != library.own_file(thumb(2))
+    seen = len(world.log)
+    assert counts_of(world, capsys)[collect.CACHED] == 3 and world.since(seen, "images") == []  # and once only
+
+
+@pytest.mark.parametrize("answer", [404, 503, "not an image"])
+def test_a_replaced_image_that_cannot_be_had_leaves_the_work_as_it_was_kept_image_and_all(capsys, answer):
+    world = solo(3)
+    assert run(world) == 0
+    before, kept_rows, images = stored(), (without_time(rows("works")), rows("work_images")), library.image_prints()
+    replace_image(world, ALPHA, 2, 902, served=answer == "not an image")
+    if answer == 503:
+        world.detours.append(lambda request: httpx.Response(503) if request.url.path == preview_path(902) else None)
+    elif answer == "not an image":
+        world.images[preview_path(902)] = b"FAKE-BYTES-THAT-BEGIN-LIKE-NO-IMAGE"
+
+    counts = counts_of(world, capsys, expect_status=int(answer == 503))
+
+    assert counts[collect.WORKS] == 2 and counts[collect.DOWNLOADED] == 0 and nothing_lost(before)
+    assert (library.image_dir() / f"{uuid(2)}.jpg").read_bytes() == jpeg(2)  # the old image, whole
+    # The work is as it was: its old thumbnail beside its old image, and the readings of that image still its own.
+    assert (without_time(rows("works"))[1], rows("work_images"), library.image_prints()) == (
+        kept_rows[0][1],
+        kept_rows[1],
+        images,
+    )
+    world.detours.clear()
+    world.images[preview_path(902)] = jpeg(902)  # the host serves it after all: the next run has it
+    assert counts_of(world, capsys)[collect.DOWNLOADED] == 1
+    assert library.image_prints()[uuid(2)] == library.fingerprint(jpeg(902))
+
+
+def test_a_store_made_before_readings_carried_fingerprints_stops_the_run_before_a_request_is_made():
+    world = solo(2)
+    assert run(world) == 0
+    raw("PRAGMA user_version = 0")  # as every store was before the migration
+    before, seen = config.LOCAL_DB.read_bytes(), len(world.log)
+    with pytest.raises(SystemExit) as stopped:
+        run(world)
+    assert "uv run python -m pipeline.tagging --migrate --backup" in str(stopped.value)
+    assert config.LOCAL_DB.read_bytes() == before and world.since(seen) == [] and cached() == image_files([1, 2])

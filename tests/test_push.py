@@ -200,6 +200,11 @@ def squashed(handle):
     return handle.replace("-", "").replace("_", "")
 
 
+def seen(work):
+    """The fingerprint of the image artist() puts in the cache for a work."""
+    return library.fingerprint(JPEG + work["id"].encode())
+
+
 def style_vector(angle, n):
     numbers = np.zeros(style.DIMENSIONS, dtype=np.float32)
     numbers[:3] = math.cos(angle), math.sin(angle), 0.01 * n
@@ -219,6 +224,7 @@ def artist(
     user=None,
     old_keys=(),
     sheet=None,
+    counted=None,
 ):
     """Collect, tag, rate and profile one invented artist, and return their works, the most recent first.
 
@@ -230,7 +236,11 @@ def artist(
     user: the handle whose account this is, when it is an account that took another handle, and old_keys: the
     keys the collector found that account kept under, which it names when it stores the new one.
     sheet: (pictures on the sheet the profile stage looked at, how many of them it counted as unsuitable).
-    Everything about the artist carries their handle, with or without its hyphens, so it can be looked for.
+    counted: how many of the works, from the most recent, the profile was made from. Without it the profile
+    rests on no work, so nothing that happens to a work makes it out of date.
+    Every reading is of the work as it is collected here: it carries the fingerprint of the image, or of the
+    title and tags, or of the tagline. Everything about the artist carries their handle, with or without its
+    hyphens, so it can be looked for.
     """
     key, word = store.artist_key(handle), squashed(handle)
     base = _BASES.setdefault(handle, (len(_BASES) + 1) * 1000)
@@ -248,6 +258,8 @@ def artist(
         }
         made.append(work)
         library.save_image(work["id"], "image/jpeg", JPEG + work["id"].encode())
+        # What each reading was made from: the image in the cache, or the title and tags.
+        image, words = seen(work), tagging.words_print(work["title"], json.dumps(work["tags"]))
         result = {
             "medium": "digital painting",
             "subjects": ["character"],
@@ -258,17 +270,22 @@ def artist(
             "not_artwork": edit.get("not_artwork", False),
         }
         if edit.get("result", result) is not None:
-            rows.append(("work_tags", (work["id"], VERIFIED, tagging.PROMPT_VERSION, json.dumps(result), AT)))
+            rows.append(("work_tags", (work["id"], VERIFIED, tagging.PROMPT_VERSION, json.dumps(result), AT, image)))
         if declared := edit.get("declared", "no"):
-            rows.append(("work_ai_declared", (work["id"], profiles.TAGGER, tagging.AI_PROMPT_VERSION, declared, AT)))
+            read = (work["id"], profiles.TAGGER, tagging.AI_PROMPT_VERSION, declared, AT, words)
+            rows.append(("work_ai_declared", read))
         if contact := edit.get("contact", "no"):
-            rows.append(("work_contact", (work["id"], profiles.TAGGER, tagging.CONTACT_PROMPT_VERSION, contact, AT)))
+            read = (work["id"], profiles.TAGGER, tagging.CONTACT_PROMPT_VERSION, contact, AT, words)
+            rows.append(("work_contact", read))
         if rating := edit.get("rating", "safe"):
             sorted_as = json.dumps({"formats": ["portrait or bust"], "rating": rating})
-            rows.append(("work_format", (work["id"], profiles.TAGGER, tagging.FORMAT_VERSION, sorted_as, AT)))
-        rows.append(("style_vectors", (work["id"], "csd", style_vector(angle, n))))
+            rows.append(("work_format", (work["id"], profiles.TAGGER, tagging.FORMAT_VERSION, sorted_as, AT, image)))
+        rows.append(("style_vectors", (work["id"], "csd", style_vector(angle, n), image)))
     if tagline_contact:
-        rows.append(("artist_contact", (key, profiles.TAGGER, tagging.CONTACT_PROMPT_VERSION, tagline_contact, AT)))
+        read = tagging.tagline_print(f"FAKE-TAGLINE {handle}")
+        rows.append(
+            ("artist_contact", (key, profiles.TAGGER, tagging.CONTACT_PROMPT_VERSION, tagline_contact, AT, read))
+        )
     if profile:
         vector = array("f", [1.0, *[0.0] * (profiles.DIMENSIONS - 1)]).tobytes()
         texts = (
@@ -277,7 +294,11 @@ def artist(
         texts = texts if profile == "excluded" else (*texts, vector)
         reason = "nothing_clear" if profile == "excluded" else None
         facts = FACTS | ({"sheet": {"pictures": sheet[0], "unsuitable": sheet[1]}} if sheet else {})
-        rows.append(("artist_profiles", (key, "FAKE-BASIS", reason, json.dumps(facts), "[]", *texts, AT)))
+        # What the profile rests on, as the profile stage keeps it: the works it counted, each as it was read.
+        facts |= {"counted": sorted(work["id"] for work in made[: counted or 0])}
+        said = {work["id"]: edits.get(n, {}).get("declared", "no") for n, work in enumerate(made)}
+        basis = "FAKE-BASIS" + tagging.read_as(facts["counted"], {work["id"]: seen(work) for work in made}, said)
+        rows.append(("artist_profiles", (key, basis, reason, json.dumps(facts), "[]", *texts, AT)))
 
     own_site = bool(website) and crawl.is_own_site(website)
     assert store.upsert_artist(
@@ -316,6 +337,22 @@ def rate(work, rating):
     sorted_as = json.dumps({"formats": [], "rating": rating})
     with closing(sqlite3.connect(config.LOCAL_DB)) as conn, conn:
         conn.execute("UPDATE work_format SET result = ? WHERE deviation_id = ?", (sorted_as, work["id"]))
+
+
+def read_again(*works, handle=None):
+    """The tagging stage reads words that have changed, and answers what it answered before: its readings of
+    these works' titles and tags, and of this artist's tagline, are now readings of the words as they are."""
+    with closing(sqlite3.connect(config.LOCAL_DB)) as conn, conn:
+        for work in works:
+            words = conn.execute("SELECT title, tags FROM works WHERE deviation_id = ?", (work["id"],)).fetchone()
+            for table in ("work_ai_declared", "work_contact"):
+                read = (tagging.words_print(*words), work["id"])
+                conn.execute(f"UPDATE {table} SET fingerprint = ? WHERE deviation_id = ?", read)
+        if handle:
+            key = store.artist_key(handle)
+            (tagline,) = conn.execute("SELECT tagline FROM profiles WHERE artist_key = ?", (key,)).fetchone()
+            read = (tagging.tagline_print(tagline), key)
+            conn.execute("UPDATE artist_contact SET fingerprint = ? WHERE artist_key = ?", read)
 
 
 def local_state():
@@ -1516,8 +1553,8 @@ def rate_now(works, rating="safe"):
     sorted_as = json.dumps({"formats": [], "rating": rating})
     with closing(sqlite3.connect(config.LOCAL_DB)) as conn, conn:
         for work in works:
-            row = (work["id"], profiles.TAGGER, tagging.FORMAT_VERSION, sorted_as, AT)
-            conn.execute("INSERT OR REPLACE INTO work_format VALUES (?, ?, ?, ?, ?)", row)
+            row = (work["id"], profiles.TAGGER, tagging.FORMAT_VERSION, sorted_as, AT, seen(work))
+            conn.execute("INSERT OR REPLACE INTO work_format VALUES (?, ?, ?, ?, ?, ?)", row)
 
 
 def test_every_rating_counts_towards_the_share_and_an_image_nobody_has_rated_counts_against(fake):
@@ -1738,12 +1775,13 @@ def test_a_work_whose_title_or_description_fails_the_plain_rule_is_not_sent(fake
     artist(BRAVO, angle=0.3)
     assert push.run(False)["works_sent"] == 11
     # The tagging stage's reading says "no contact" all the while: a description is a model's own words about an
-    # image, which nothing reads, and a title can change after it was read.
+    # image, which nothing reads, and a model that reads a title can miss what the plain rule finds.
     if where == "description":
         edit_result(works[1], description=said)
     else:
         with closing(sqlite3.connect(config.LOCAL_DB)) as conn, conn:
             conn.execute("UPDATE works SET title = ? WHERE deviation_id = ?", (said, works[1]["id"]))
+        read_again(works[1])
 
     counts = push.run(False)
 
@@ -1770,6 +1808,7 @@ def test_a_text_that_fails_the_plain_rule_is_left_out_of_a_row_that_is_sent_and_
         conn.execute("UPDATE profiles SET tagline = ? WHERE artist_key = ?", (said["tagline"], key))
         conn.execute("UPDATE works SET tags = ? WHERE deviation_id = ?", (f'["{said["own tag"]}"]', works[0]["id"]))
         conn.execute("UPDATE artist_profiles SET facts = ? WHERE artist_key = ?", (json.dumps(facts), key))
+    read_again(works[0], handle=ALPHA)
     edit_result(works[0], style_words=["painterly", said["style word"]])
 
     counts = push.run(False)
@@ -1883,3 +1922,245 @@ def test_a_held_back_works_words_leave_the_artists_row_with_the_work_though_the_
     row = next(row for row in fake.artists.values() if row["slug"] == "yy-fake-z9")
     assert late[1]["title"] in row["search_text"] and late[2]["title"] not in row["search_text"]
     assert late[1]["tags"][0] in row["top_tags"] and late[2]["tags"][0] not in row["top_tags"]
+
+
+# A reading is tied to what was read. What the first critic of this stage called its biggest gap: "Every fixture
+# is read once and never changes afterwards." Each of these is a sequence: read and push, a change, push again.
+
+ANOTHER = "https://images-wixmp-yyfake.wixmp.com/f/FAKE-ANOTHER-FILE-NOBODY-RATED.jpg"  # what an artist puts in place
+NEW_PICTURE = JPEG + b"FAKE-ANOTHER-PICTURE"
+SIGNED_AGAIN = "?token=" + "eyJhbGciOiJIUzI1NiJ9" + ".FAKE-CLAIMS.FAKE-SIGNATURE"  # a header that names an algorithm
+
+
+def collected_again(handle, made, *, tagline=None, titles=None, tags=None, thumbs=None, images=None):
+    """The collect stage's next turn for an artist of artist()'s: the same works, with what the artist has changed
+    since, each by its place in the list. images: the bytes of the file an artist put under a work, which the
+    collector has fetched and says so. Nothing here reads anything: that is the tagging stage's to do."""
+    for n, data in (images or {}).items():
+        library.save_image(made[n]["id"], "image/jpeg", data)
+    assert library.store_artist(
+        store.artist_key(handle),
+        user_id=f"FAKE-USER-{handle}",
+        tagline=tagline if tagline is not None else f"FAKE-TAGLINE {handle}",
+        specialty="FAKE-SPECIALTY",
+        level="Professional",
+        website=None,
+        works=[
+            {
+                "work_id": work["id"],
+                "page_url": work["page"],
+                "title": (titles or {}).get(n, work["title"]),
+                "tags": (tags or {}).get(n, work["tags"]),
+                "thumb_url": (thumbs or {}).get(n, work["thumb"]),
+                "published": str(PUBLISHED - 86_400 * n),
+                "fetched": n in (images or {}),
+            }
+            for n, work in enumerate(made)
+        ],
+    ) == (0, 0, 0)
+
+
+def image_read_again(work, data, description):
+    """The tagging and style stages read the image a work has now: tags, a rating and a vector of these bytes."""
+    read = (library.fingerprint(data), work["id"])
+    edit_result(work, description=description)
+    with closing(sqlite3.connect(config.LOCAL_DB)) as conn, conn:
+        for table in ("work_tags", "work_format", "style_vectors"):
+            conn.execute(f"UPDATE {table} SET fingerprint = ? WHERE deviation_id = ?", read)
+
+
+def profiled_again(handle):
+    """The profile stage makes the artist's row again, from the readings there are now."""
+    images, declared, key = library.image_prints(), tagging.declared_ai(profiles.TAGGER), store.artist_key(handle)
+    with closing(sqlite3.connect(config.LOCAL_DB)) as conn, conn:
+        (facts,) = conn.execute("SELECT facts FROM artist_profiles WHERE artist_key = ?", (key,)).fetchone()
+        rests = tagging.read_as(json.loads(facts)["counted"], images, declared)
+        conn.execute("UPDATE artist_profiles SET basis = ? WHERE artist_key = ?", ("FAKE-BASIS" + rests, key))
+
+
+def test_a_tagline_that_changed_after_it_was_read_is_not_sent_until_it_is_read_again(fake):
+    """The critic's first counterexample."""
+    made = artist(ALPHA, counted=5)
+    push.run(False)
+    assert sent_artists(fake)[ALPHA]["tagline"] == f"FAKE-TAGLINE {ALPHA}"
+    said = "Commissions open, message me on Discord fakepainter_77"
+    collected_again(ALPHA, made, tagline=said)
+
+    counts = push.run(False)
+
+    assert counts["artists_sent"] == 1 and counts["works_sent"] == 5  # the artist stays, and their works
+    assert sent_artists(fake)[ALPHA]["tagline"] is None  # without the line nobody has read
+    assert "fakepainter_77" not in fake.sent() and "fakepainter_77" not in fake.held()
+    read_again(handle=ALPHA)  # the tagging stage reads it, and what it answers of these words is what counts
+    push.run(False)
+    assert sent_artists(fake)[ALPHA]["tagline"] == said
+
+
+def test_a_work_whose_title_or_tags_changed_after_they_were_read_is_held_until_they_are_read_again(fake):
+    """The critic's second counterexample: the title, top_tags and search_text under the old reading."""
+    made = artist(ALPHA, 6)
+    artist(BRAVO, angle=0.3)
+    assert push.run(False)["works_sent"] == 11
+    title, tag = "Commission sheet - telegram fakepainter or whatsapp five five five", "discord_fakepainter77"
+    collected_again(ALPHA, made, titles={1: title}, tags={2: [tag, made[2]["tags"][1]]})
+
+    counts = push.run(False)
+
+    assert counts["works_held_words_not_read"] == 2 and counts["works_sent"] == 9 and counts["artists_sent"] == 2
+    assert counts["works_deleted_from_database"] == 2
+    for text in ("telegram fakepainter", tag):  # in no row of any load, and nowhere in the database
+        assert text not in fake.sent() and text not in fake.held()
+    for work in made[1:3]:  # and the works are gone from it, with their old words: a page is made from the title
+        assert work["page"].lower() not in fake.held() and work["title"].lower() not in fake.held()
+        assert work["tags"][0] not in fake.held()
+    assert [row["position"] for row in fake.loads[-1][1] if row["artist_slug"] == ALPHA] == list(range(4))
+
+    read_again(made[1], made[2])  # read, and found to hold no contact: now they are words that were read
+    assert push.run(False)["works_sent"] == 11
+    assert title in sent_artists(fake)[ALPHA]["search_text"] and tag in sent_artists(fake)[ALPHA]["top_tags"]
+
+
+def test_a_work_whose_image_the_artist_replaced_is_held_until_the_new_image_is_fetched_and_read(fake):
+    """The critic's third counterexample: the new thumbnail under the old image's rating and description."""
+    made = artist(ALPHA, 6)
+    artist(BRAVO, angle=0.3)
+    assert push.run(False)["works_sent"] == 11
+    collected_again(ALPHA, made, thumbs={0: ANOTHER, 1: made[1]["thumb"] + SIGNED_AGAIN})
+
+    counts = push.run(False)
+
+    assert counts["works_held_not_tagged"] == 1 and counts["works_sent"] == 10 and counts["artists_sent"] == 2
+    assert ANOTHER.lower() not in fake.sent() and made[0]["page"].lower() not in fake.held()
+    assert made[0]["description"].lower() not in fake.held()  # the old picture's description goes with it
+    # A thumbnail that is only signed again shows the same image: its work goes, under the new address.
+    assert [row["image_url"] for row in fake.loads[-1][1] if row["artist_slug"] == ALPHA][0] == (
+        made[1]["thumb"] + SIGNED_AGAIN
+    )
+
+    collected_again(ALPHA, made, thumbs={0: ANOTHER}, images={0: NEW_PICTURE})  # fetched, and nobody has read it
+    counts = push.run(False)
+    assert counts["works_held_not_tagged"] == 1 and ANOTHER.lower() not in fake.sent()
+    image_read_again(made[0], NEW_PICTURE, "FAKE-DESCRIPTION of another picture.")
+    assert push.run(False)["works_sent"] == 11
+    first = next(row for row in fake.loads[-1][1] if row["artist_slug"] == ALPHA)
+    assert (first["image_url"], first["description"]) == (ANOTHER, "FAKE-DESCRIPTION of another picture.")
+
+
+def test_a_replaced_image_counts_as_one_nobody_has_rated_and_its_old_vector_as_none(fake):
+    made = artist(ALPHA, 10, angle=0.0)
+    artist(BRAVO, 10, angle=0.1)
+    push.run(False)
+    picks = next(row["picks"] for row in fake.loads[-1][2] if row["artist_slug"] == BRAVO)
+    collected_again(ALPHA, made, thumbs={n: f"{ANOTHER}-{n}.jpg" for n in picks[:1]})  # one that was shown beside BRAVO
+    push.run(False)
+    again = next(row["picks"] for row in fake.loads[-1][2] if row["artist_slug"] == BRAVO)
+    assert len(fake.loads[-1][1]) == 19 and len(again) == push.PICKS  # nine of ALPHA's go, and four are still shown
+
+    collected_again(ALPHA, made, thumbs={n: f"{ANOTHER}-{n}.jpg" for n in range(3)})  # three of ten: the share
+    counts = push.run(False)
+    assert counts["artists_held_not_all_rated"] == 1 and list(sent_artists(fake)) == [BRAVO]
+    assert not any(word in fake.held() for word in of_artist(ALPHA))
+
+
+def test_an_artist_whose_profile_rests_on_a_reading_that_went_stale_is_held_until_it_rests_on_what_is_there(fake):
+    """A profile is made from readings. While one of them is not of the work as it is now, the profile says what
+    nobody has read: the artist waits. A work the profile never counted cannot do that (see the tests above)."""
+    made = artist(ALPHA, 6, counted=6)
+    other = artist(BRAVO, 6, counted=6, angle=0.3)
+    late = artist(CHARLIE, 6, counted=5, angle=0.6)  # the sixth was collected after the profile was made
+    assert push.run(False)["artists_sent"] == 3
+    collected_again(ALPHA, made, titles={1: "FAKE-TITLE that is another now"})  # words of a work it counted
+    collected_again(BRAVO, other, thumbs={0: ANOTHER})  # the image of a work it counted
+    collected_again(CHARLIE, late, titles={5: "FAKE-TITLE of the late one, changed"})  # a work it never counted
+
+    counts = push.run(False)
+
+    assert counts["artists_held_profile_out_of_date"] == 2 and counts["artists_deleted_from_database"] == 2
+    assert list(sent_artists(fake)) == [CHARLIE] and counts["works_sent"] == 5
+    assert not any(word in fake.held() for word in of_artist(ALPHA) + of_artist(BRAVO))
+
+    read_again(made[1])  # ALPHA's words are read again and declare what they declared: the profile stands
+    collected_again(BRAVO, other, thumbs={0: ANOTHER}, images={0: NEW_PICTURE})
+    image_read_again(other[0], NEW_PICTURE, "FAKE-DESCRIPTION of another picture.")  # BRAVO's new picture is read,
+    counts = push.run(False)
+    assert sorted(sent_artists(fake)) == [ALPHA, CHARLIE]  # and their profile was still made from the old one
+    assert counts["artists_held_profile_out_of_date"] == 1 and counts["works_held_artist_held_back"] == 6
+    profiled_again(BRAVO)
+    assert push.run(False)["artists_held_profile_out_of_date"] == 0
+    assert sorted(sent_artists(fake)) == [ALPHA, BRAVO, CHARLIE]
+
+
+# The store's shape, and the one command that changes it.
+
+
+def before_fingerprints():
+    """Take the store back to what every store was before readings carried fingerprints: no such column, no note
+    of which image a work has, a basis that says nothing of what a profile rests on, and no mark."""
+    with closing(sqlite3.connect(config.LOCAL_DB)) as conn:
+        for table in (*tagging.TABLES, "style_vectors"):
+            conn.execute(f"ALTER TABLE {table} DROP COLUMN fingerprint")
+        conn.execute("UPDATE artist_profiles SET basis = substr(basis, 1, length(basis) - 64)")
+        conn.execute("DROP TABLE work_images")
+        conn.execute("PRAGMA user_version = 0")
+        conn.commit()
+
+
+@pytest.mark.parametrize("dry_run", [False, True])
+def test_a_store_made_before_readings_carried_fingerprints_stops_the_push_and_nothing_is_changed(fake, dry_run):
+    artist(ALPHA)
+    artist(BRAVO, angle=0.3)
+    push.run(False)
+    store.mark_removed(BRAVO)  # a removal is waiting too: not even that is half-done
+    before_fingerprints()
+    here, there = local_state(), fake.held()
+    fake.calls.clear()
+    for call in (lambda: push.run(dry_run), lambda: push.main(["--dry-run"] if dry_run else [])):
+        with pytest.raises(SystemExit) as stopped:
+            call()
+        assert "uv run python -m pipeline.tagging --migrate --backup" in str(stopped.value)
+    assert set(fake.calls) <= {"listing", "removed"} and (local_state(), fake.held()) == (here, there)
+
+
+def test_the_migration_ties_a_whole_store_to_what_was_read_and_what_changed_since_is_stale_by_itself(fake, tmp_path):
+    made = artist(ALPHA, 6, counted=6)
+    spoken = artist(BRAVO, 6, counted=6, angle=0.3)
+    shown = artist(CHARLIE, 6, counted=6, angle=0.6)
+    artist(DELTA, 6, counted=6, angle=0.9)
+    assert push.run(False)["artists_sent"] == 4
+    untouched = sent_artists(fake)[DELTA]
+    before_fingerprints()
+    backup = tmp_path / "before.sqlite"
+    backup.write_bytes(config.LOCAL_DB.read_bytes())
+    # The collection run after the copy, by a collector of before: it brings words and a thumbnail up to date.
+    said = "FAKE-TAGLINE message me on Discord fakepainter_77"
+    with closing(sqlite3.connect(config.LOCAL_DB)) as conn, conn:
+        retitled = ("FAKE-TITLE telegram fakepainter", made[1]["id"])
+        conn.execute("UPDATE works SET title = ? WHERE deviation_id = ?", retitled)
+        conn.execute("UPDATE profiles SET tagline = ? WHERE artist_key = ?", (said, f"da:{BRAVO}"))
+        conn.execute("UPDATE works SET thumb_url = ? WHERE deviation_id = ?", (ANOTHER, shown[0]["id"]))
+        resigned = (spoken[2]["thumb"] + SIGNED_AGAIN, spoken[2]["id"])
+        conn.execute("UPDATE works SET thumb_url = ? WHERE deviation_id = ?", resigned)
+
+    counts = tagging.migrate(backup)
+
+    assert counts == {
+        "stores migrated": 1,
+        "images fingerprinted": 24,
+        "readings fingerprinted": 24 * 3 + 24 * 2 + 4,  # tags, ratings and vectors; two readings of words; taglines
+        "readings stale: title changed": 2,
+        "readings stale: tags changed": 0,
+        "readings stale: tagline changed": 1,
+        "readings left stale: nothing says which words they read": 0,
+        "works with a replaced image": 1,
+        "profiles tied to what they rest on": 4,
+    }
+    counts = push.run(False, allow_delete=6)  # the stages open the store again, and each change is stale by itself
+    assert sorted(sent_artists(fake)) == [BRAVO, DELTA] and counts["artists_held_profile_out_of_date"] == 2
+    assert sent_artists(fake)[BRAVO]["tagline"] is None and counts["works_sent"] == 12
+    assert sent_artists(fake)[DELTA] == untouched  # what did not change keeps every reading it had
+    assert "fakepainter" not in fake.sent() and ANOTHER.lower() not in fake.sent()
+    assert style.vector(shown[0]["id"], "csd") is None and style.vector(shown[1]["id"], "csd") is not None
+    assert profiles.current() == {f"da:{BRAVO}", f"da:{DELTA}"}
+
+    settled = local_state()
+    assert tagging.migrate(backup)["stores migrated"] == 0 and local_state() == settled  # again: nothing

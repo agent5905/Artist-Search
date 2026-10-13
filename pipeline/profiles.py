@@ -9,6 +9,13 @@ result set "<model>+<model>" of pipeline/tagging.py, at its current prompt versi
 title and tags. Until then the artist waits: one who has no row gets none, and one who has a row keeps it, so
 that an artist is not gone from the site each time collection brings a new work of theirs.
 
+A reading counts only while it is of the image and the words as they are now (pipeline/tagging.py): one made
+before an artist replaced the image or changed the title is as if it had never been made, and the artist waits
+for it like any other. A row is tied to the readings it was made from: the end of its basis is one fingerprint
+of the works it counted, each by its image and by what its words declare about AI. While that is not what those
+works are read as now, the row is not current (see current): it is kept, it is not published, and it is made
+again when the readings come out otherwise. When they come out the same, it is current again as it stands.
+
 The facts are counts over the artist's eligible works: analyzed, not flagged or rated explicit, not flagged
 not_artwork, not declared AI-made. Only the verified tags are counted, never the descriptions. What a profile
 may state is a share of those works, and never rests on fewer than MIN_SUPPORT of them:
@@ -517,7 +524,7 @@ REASONS = ("mostly_ai_declared", "mostly_explicit", "too_few_works", "nothing_cl
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS artist_profiles (
     artist_key TEXT PRIMARY KEY,     -- works.artist_key
-    basis TEXT NOT NULL,             -- sha256 of all the row was made from: a run that finds it unchanged does nothing
+    basis TEXT NOT NULL,             -- sha256 of all the row was made from, then tagging.read_as() of what it counted
     excluded TEXT,                   -- one of REASONS: why there is no profile. NULL when there is one
     facts TEXT NOT NULL,             -- JSON: the counts, and the values that passed the threshold
     open_evidence TEXT NOT NULL,     -- JSON list of the artist's own words; empty means unknown
@@ -1419,8 +1426,9 @@ def run(
             dict(conn.execute("SELECT artist_key, tagline FROM profiles").fetchall()),
             {
                 work_id
-                for (work_id,) in conn.execute(
-                    "SELECT deviation_id FROM work_tags WHERE model = ? AND prompt_version = ?",
+                for (work_id,) in conn.execute(  # tagged, and from the image the work shows now
+                    "SELECT t.deviation_id FROM work_tags t JOIN works w USING (deviation_id) "
+                    f"WHERE t.model = ? AND t.prompt_version = ? AND t.fingerprint = {library.IMAGE}",
                     (result_set, tagging.PROMPT_VERSION),
                 )
             },
@@ -1444,6 +1452,7 @@ def run(
     with tagging._client(ollama_url, transport) as client:
         listed = _listed(db)
         results, declared = tagging.results(TAGGER, db=db, verifier=TAGGER), tagging.declared_ai(TAGGER, db)
+        images = library.image_prints(db)
         # A tagline is quoted as evidence, so only one that was read and found to hold no private contact is used.
         quotable = {key for key, answer in tagging.contacts(TAGGER, db).items() if answer == "no"}
         rows, taglines, tagged, stored = _transact(db, read)
@@ -1467,6 +1476,9 @@ def run(
             )
             evidence = open_evidence(taglines.get(key) if key in quotable else None, own, now)
             basis = hashlib.sha256(json.dumps([versions, facts, evidence], sort_keys=True).encode()).hexdigest()
+            # And what the row rests on (see current): the same tags read from another image make another row,
+            # because the sheet is of the images.
+            basis += tagging.read_as(facts["counted"], images, declared)
             if stored.get(key) == basis:
                 counts["unchanged"] += 1
             else:
@@ -1535,6 +1547,24 @@ def _rows(db: pathlib.Path | str | None, where: str) -> list[Any]:
     return [row for row in _transact(db, lambda conn: conn.execute(query).fetchall()) if row[0] in listed]
 
 
+def current(db: pathlib.Path | str | None = None) -> set[str]:
+    """The artists whose row still rests on what it was made from: each work it counted is read as it was then,
+    from the same image and with the same word on AI (tagging.read_as, kept at the end of the row's basis).
+
+    The others are waiting: for the tagging stage to read again a work whose image or words have changed, and
+    then, when that reading comes out otherwise, for this stage to make the row again. Their row stays, so that
+    a reading that comes out the same costs nothing; but it says what nobody has read of the work as it is, and
+    the push stage holds the artist back meanwhile (see profiles).
+    """
+    images, declared = library.image_prints(db), tagging.declared_ai(TAGGER, db)
+    rows = _transact(db, lambda conn: conn.execute("SELECT artist_key, basis, facts FROM artist_profiles").fetchall())
+    return {
+        key
+        for key, basis, facts in rows
+        if basis.endswith(tagging.read_as(json.loads(facts).get("counted", []), images, declared))
+    }
+
+
 def profiles(db: pathlib.Path | str | None = None) -> list[dict[str, Any]]:
     """Every artist's profile, in key order, for the push stage. Never an excluded or a removed artist's.
 
@@ -1542,9 +1572,10 @@ def profiles(db: pathlib.Path | str | None = None) -> list[dict[str, Any]]:
     is the template again), the search filters mediums and specialties, the leading genres, formats,
     style_words and own_words (the artist's own), hedged (which of those hold for part of the works only),
     open_for_work (True, or None for unknown) with its open_evidence, the facts with their counts, and the
-    embedding as 1,024 numbers.
+    embedding as 1,024 numbers. And `current`: False for a profile made from a reading that has gone stale or
+    been made again since (see current), which is not one to publish.
     """
-    found = []
+    found, fresh = [], current(db)
     for key, _, facts_json, evidence, built, built_version, composed, composed_version, by_model, blob in _rows(
         db, "excluded IS NULL"
     ):
@@ -1553,6 +1584,7 @@ def profiles(db: pathlib.Path | str | None = None) -> list[dict[str, Any]]:
         found.append(
             {
                 "artist_key": key,
+                "current": key in fresh,
                 "template": built,
                 "template_version": built_version,
                 "written": composed,
@@ -1584,9 +1616,11 @@ def sample(count: int, seed: int, db: pathlib.Path | str | None = None) -> list[
     `images` are the works the facts were counted over; `images_left_out` are the artist's other cached works
     (flagged or declared AI-made). `own_tags` are, for each word of the artist's own that the profile uses, the
     tags that say it, as the artist wrote them on those works: the support a claim has that no image shows.
-    The order is a hash of the seed and the artist, as in tagging.sample().
+    The order is a hash of the seed and the artist, as in tagging.sample(). Only profiles that are current: the
+    critic holds each against the images as they are now.
     """
-    chosen = sorted(profiles(db), key=lambda row: hashlib.sha256(f"{seed}:{row['artist_key']}".encode()).digest())
+    fresh = [row for row in profiles(db) if row["current"]]
+    chosen = sorted(fresh, key=lambda row: hashlib.sha256(f"{seed}:{row['artist_key']}".encode()).digest())
     query = "SELECT artist_key, deviation_id, image_file, tags FROM works ORDER BY 2"
     collected = _transact(db, lambda conn: conn.execute(query).fetchall())
     found = []
