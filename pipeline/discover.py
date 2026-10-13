@@ -55,6 +55,9 @@ STORED_LATELY = timedelta(days=1)  # an artist stored this lately is not looked 
 MIN_INTERVAL = 1.0  # seconds between any two requests
 MAX_429 = 6  # HTTP 429s in a row on one request before the run stops. The wait doubles each time: 1 to 32 seconds.
 SERVER_WAITS = (2.0, 4.0, 8.0, None)  # seconds before a 5XX answer is asked for again. The API docs suggest three.
+# This stage's own, longer patience. The first wide run met an outage of some minutes (504, then 503 on the token
+# request) and lost 200 pages of browsing to it: nothing is stored until browsing ends, so the run waits it out.
+OUTAGE_WAITS = (*SERVER_WAITS[:-1], 60.0, 300.0, 600.0, None)
 # The summary adds up: candidates = skipped (removed) + skipped (stored lately) + profiles unavailable
 # + not reached + artists stored.
 LATELY = "skipped (stored within the last day)"
@@ -132,11 +135,13 @@ class _Api:
         return response
 
 
-def patient_get(api: _Api, path: str, **params: str | int) -> httpx.Response:
-    """api.get(), with a 5XX answer asked for again after each of SERVER_WAITS. What comes back after that is the
+def patient_get(
+    api: _Api, path: str, waits: tuple[float | None, ...] = SERVER_WAITS, /, **params: str | int
+) -> httpx.Response:
+    """api.get(), with a 5XX answer asked for again after each of `waits`. What comes back after that is the
     caller's to judge. A run browses for half an hour before it stores anything, so one bad answer must not end it.
     """
-    for wait in SERVER_WAITS:
+    for wait in waits:
         response = api.get(path, **params)
         if response.status_code < 500 or wait is None:
             break
@@ -209,7 +214,7 @@ def _run(api: _Api, counts: dict[str, int], max_artists: int, db: pathlib.Path |
     for tag in NICHE_TAGS:
         offset = 0
         for _ in range(PAGES_PER_TAG):
-            response = patient_get(api, "/browse/tags", tag=tag, offset=offset, limit=PAGE_SIZE)
+            response = patient_get(api, "/browse/tags", OUTAGE_WAITS, tag=tag, offset=offset, limit=PAGE_SIZE)
             if response.status_code != 200:
                 raise Stop(f"browse failed with HTTP {response.status_code}")
             page = response.json()
@@ -256,7 +261,7 @@ def _run(api: _Api, counts: dict[str, int], max_artists: int, db: pathlib.Path |
         if store.artist_key(username) in lately:
             counts[LATELY] += 1
             continue
-        response = patient_get(api, f"/user/profile/{username}")
+        response = patient_get(api, f"/user/profile/{username}", OUTAGE_WAITS)
         status = response.status_code
         # The docs give 4XX for a profile that cannot be shown (suspended, inactive, gone). One such account
         # must not end the run. 401 means our token, and 429 never gets here.

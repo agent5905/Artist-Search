@@ -1393,7 +1393,7 @@ def test_any_other_answer_to_a_profile_lookup_stops_the_run(db, capsys, status):
     fake.before = lambda index, request: status if request.url.path == PROFILE_PATH + ALPHA else None
     assert run(fake, db) == 1
     assert capsys.readouterr().err == f"stopped: profile lookup failed with HTTP {status}\n"
-    asked = len(discover.SERVER_WAITS) if status >= 500 else 1  # a 5XX is asked for again; nothing else is
+    asked = len(discover.OUTAGE_WAITS) if status >= 500 else 1  # a 5XX is asked for again; nothing else is
     assert fake.looked_up() == [HOTEL] + [ALPHA] * asked
     assert all_rows(db) == []
 
@@ -1416,6 +1416,7 @@ def test_a_server_error_that_passes_does_not_end_the_run(db, capsys, monkeypatch
     assert capsys.readouterr().err == "" and stored(db) == EXPECTED
     assert len(fake.log) == BASE_REQUESTS + 2 and [wait for wait in waits if wait > 1] == [2.0, 4.0]
     assert discover.SERVER_WAITS == (2.0, 4.0, 8.0, None)
+    assert discover.OUTAGE_WAITS == (2.0, 4.0, 8.0, 60.0, 300.0, 600.0, None)  # an outage of minutes is waited out
 
 
 def test_wrong_credentials_stop_the_run_without_printing_them(db, capsys):
