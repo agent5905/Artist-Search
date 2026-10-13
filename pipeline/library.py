@@ -1,19 +1,24 @@
 """What the collect stage keeps: each artist's public profile fields, their recent works, one cached image a work.
 
-Three tables in the local SQLite file, beside the store's (pipeline/store.py), and image files in image_dir().
+Tables in the local SQLite file, beside the store's (pipeline/store.py), and image files in image_dir().
 Every value is checked here, on the way in, whoever calls. Nothing is cut out of a value to make it fit: a value
 that might hold what must not be kept is dropped whole.
   - hard rule 1: the tables are STRICT and hold text only: short texts, addresses and a file name. A text or an
     address with "data:" in it in any spelling, or a text with a long encoded-looking run, is not kept.
   - hard rule 2: image bytes are written by save_image() and nowhere else, as files under config.CACHE_DIR.
-  - hard rule 6: there is no free-text bio. A text with an "@", anything shaped like a domain, nine digits, or
-    seven beside a word for calling is not kept. A work whose title holds one of those is not kept at all,
-    because its page address is made from its title. These are the plain cases and no more: the analysis stage
-    reads every title and tagline with a language model before anything is published. A website is kept only
-    when it is the artist's own site or the front page of a profile on one of PROFILE_DOMAINS. The API's user
-    id is kept only as a hash.
+  - hard rule 6: there is no free-text bio. A text with an "@", a link, anything shaped like a domain, nine
+    digits, or seven beside a word for calling is not kept; nor is a tagline with seven digits. A work whose
+    title holds one of those is not kept at all, and its page address and thumbnail address are held to the
+    same rule, because DeviantArt makes them from the title. These are the plain cases and no more: the analysis
+    stage reads every title and tagline with a language model before anything is published. A website is kept
+    only when it is the artist's own site or the front page of a profile on one of PROFILE_DOMAINS. The API's
+    user id is kept only as a hash.
   - hard rule 7: purge() deletes everything kept about one artist in every table of the file, whichever stage
-    made it, and the files; drop_orphans() deletes every cached file that no row accounts for.
+    made it, with the files and the contact sheets; drop_orphans() deletes every cached file that no row
+    accounts for.
+Nothing else here deletes. store_artist() adds and brings up to date, and what an answer of the API says against
+a work or an artist that is kept is written beside it as a mark: see work_marks() and artist_marks(), which a
+later stage reads to decide what is published. A work's fetched_at is when it was last seen and still qualified.
 Every function that reads or writes the tables takes an optional `db` path; the default is config.LOCAL_DB. A
 work whose image_file is NULL has no cached image: the analysis stage must leave it alone.
 """
@@ -25,6 +30,7 @@ import html
 import json
 import pathlib
 import re
+import shutil
 import sqlite3
 import unicodedata
 from collections.abc import Iterable, Iterator, Mapping
@@ -69,7 +75,20 @@ CREATE INDEX IF NOT EXISTS works_by_artist ON works (artist_key);
 CREATE TABLE IF NOT EXISTS skipped (
     artist_key TEXT PRIMARY KEY,
     skipped_at TEXT NOT NULL CHECK (skipped_at GLOB '{_TIMESTAMP}'),  -- ISO-8601 UTC
-    unavailable INTEGER NOT NULL     -- runs that showed their account or all their works gone, since last stored
+    unavailable INTEGER NOT NULL     -- no longer used, and always 0: nothing is decided on how often
+) STRICT;
+-- What an answer of the API said against a work or an artist that is kept: a reason and the time. A mark is
+-- all that is ever done about it here. Nothing is deleted for it, and a later stage decides what is published.
+CREATE TABLE IF NOT EXISTS work_marks (
+    deviation_id TEXT PRIMARY KEY,
+    reason TEXT NOT NULL,            -- a few words of ours, such as 'mature' or 'tagged AI-made'
+    marked_at TEXT NOT NULL CHECK (marked_at GLOB '{_TIMESTAMP}')
+) STRICT;
+CREATE TABLE IF NOT EXISTS artist_marks (
+    artist_key TEXT PRIMARY KEY,
+    reason TEXT NOT NULL,            -- 'account gone', 'mostly AI-made' or 'renamed'
+    marked_at TEXT NOT NULL CHECK (marked_at GLOB '{_TIMESTAMP}'),
+    same_as TEXT                     -- for 'renamed': the key the same account is kept under now
 ) STRICT;
 """
 # A profiles table from an earlier version of this module (see _upgrade). It is rebuilt with the artists it
@@ -113,6 +132,7 @@ _PAGE_PATH = re.compile(r"/[A-Za-z0-9_-]{1,40}/art/[A-Za-z0-9_.%-]{1,200}")  # /
 _IMAGE_TOKEN = re.compile(r"token=(?P<header>[A-Za-z0-9_-]{1,100})\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+")
 MAX_TOKEN = 1000  # characters; the longest real one seen is 639
 MAX_IMAGE_PATH = 600  # characters; the longest real one seen is 252
+RENAMED = "renamed"  # the mark on the key an account was kept under before it took another handle
 _MARKUP = re.compile(r"<[^<>]*>")
 # Characters that show nothing and are not in Unicode's "other" categories, which _settle removes wholesale:
 # the grapheme joiner, the Hangul and Khmer fillers, the Mongolian and the general variation selectors, blank braille.
@@ -122,10 +142,14 @@ _INVISIBLE = re.compile(
 _ENCODED = re.compile(r"[A-Za-z0-9+/=_-]{100,}")  # no word is this long; a base64 file is
 # What makes seven or eight digits a number to call and not a date or a serial number.
 _CALLING = re.compile(r"call|tel|phone|whatsapp|\+", re.IGNORECASE)
+# A link, whatever it links to and whether or not a host with a dot is in it: "skype:name", "tg://name",
+# "sms:5550199", "http://10.0.0.7/x". A word, a colon, and something right after it. "Title: subtitle" is none.
+_LINK = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*:(?=\S)|://")
+_OWN_NUMBER = re.compile(r"-\d+$")  # how a work's page address ends: DeviantArt's number for the work
 
 
 class ContactInTitle(ValueError):
-    """A work's title holds contact details. The work is not kept: its page address is made from its title."""
+    """A work's title holds contact details, or one of its addresses does. The work is not kept."""
 
 
 def image_dir() -> pathlib.Path:
@@ -161,23 +185,30 @@ def _embedded(text: str) -> bool:
 
 
 def _contact(text: str) -> bool:
-    """True when a settled text holds a plain way to reach a person: an "@", anything shaped like a domain (an
-    address, a link, a messaging link), nine digits, or seven beside a word for calling.
+    """True when a settled text holds a plain way to reach a person: an "@", a link, anything shaped like a
+    domain, nine digits, or seven beside a word for calling.
 
     ponytail: the plain cases and no more, by the lead's decision. Addresses spelled out in words, service names
     and other scripts are left to the analysis stage, which reads every title and tagline with a language model.
     """
     digits = _digits(text)
-    return "@" in text or digits >= 9 or (digits >= 7 and bool(_CALLING.search(text))) or bool(store.hosts_in(text))
+    plain = "@" in text or bool(_LINK.search(text)) or bool(store.hosts_in(text))
+    return plain or digits >= 9 or (digits >= 7 and bool(_CALLING.search(text)))
 
 
 def _text(value: object, limit: int) -> str | None:
     """A short public text cut to `limit`, or None for anything else: not a text, or one that would not settle or
-    could hold contact details or a file, as it is written or once its percent-encoding is undone."""
+    could hold contact details, seven digits or a file, as it is written or once its percent-encoding is undone.
+
+    Seven digits with nothing beside them are dropped here and kept in a title: a title has dates and serial
+    numbers in it, and a line an artist writes about themselves has a number to call.
+    """
     if not isinstance(value, str) or len(value) > 10_000:
         return None
     shown, probe = _settle(value), _settle(value, percent=True)
-    if not shown or probe is None or any(_contact(text) or _embedded(text) for text in (shown, probe)):
+    if not shown or probe is None:
+        return None
+    if any(_contact(text) or _embedded(text) or _digits(text) >= 7 for text in (shown, probe)):
         return None
     return shown[:limit].strip() or None
 
@@ -191,9 +222,13 @@ def _title(value: object) -> str | None:
     if not isinstance(value, str) or len(value) > 10_000:
         return None
     shown, probe = _settle(value), _settle(value, percent=True)
-    if shown is None or probe is None or _contact(shown) or _contact(probe):
+    if shown is None or probe is None:
+        raise ContactInTitle("a title that will not settle")
+    if _embedded(shown) or _embedded(probe):  # no title, and no word of it reaches the page address check either way
+        return None
+    if _contact(shown) or _contact(probe):
         raise ContactInTitle("contact details in a title")  # never echoes the title
-    return None if _embedded(shown) or _embedded(probe) else shown[:200].strip() or None
+    return shown[:200].strip() or None
 
 
 def _choice(value: object) -> str | None:
@@ -263,10 +298,19 @@ def _address(value: object, domains: tuple[str, ...]) -> httpx.URL:
 
 def page_address(value: object) -> str:
     """The address of a work's own page: https://www.deviantart.com/<handle>/art/<title>, and nothing after it.
-    The title part is 200 characters at most, of the letters, digits and four marks DeviantArt makes it from."""
+    The title part is 200 characters at most, of the letters, digits and four marks DeviantArt makes it from.
+    ContactInTitle when the title part holds what a title may not."""
     url = _address(value, PAGE_DOMAINS)
-    if not _PAGE_PATH.fullmatch(url.raw_path.decode("ascii")):  # raw_path is the path and the query: so, no query
+    path = url.raw_path.decode("ascii")  # raw_path is the path and the query: so, no query
+    if not _PAGE_PATH.fullmatch(path):
         raise ValueError("not a work's page")
+    # DeviantArt makes the last part from the title and its own number for the work. What it made of the title
+    # is held to the title's rule: a clean title over an address that carries a phone number is no better. It
+    # is read with its percent-encoding undone, which is how a colon and every letter that is not ASCII are
+    # written there, and with its hyphens as the spaces they were: "FAKE%3A-the-gates" is "FAKE: the gates".
+    made_of_title = _settle(_OWN_NUMBER.sub("", path.rpartition("/")[2]), percent=True)
+    if made_of_title is None or _contact(made_of_title.replace("-", " ")):
+        raise ContactInTitle("contact details in a page address")
     return str(url)
 
 
@@ -278,6 +322,11 @@ def image_address(value: object) -> str:
     path, _, query = url.raw_path.decode("ascii").partition("?")
     if len(path) > MAX_IMAGE_PATH or (query and not _signature(query)):
         raise ValueError("not an image address")
+    # The path has the work's title in it too. It is all digits and dots, so of the title's rule only this much
+    # can be asked of it: no "@" and no link, however they are encoded.
+    probe = _settle(path, percent=True)
+    if probe is None or "@" in probe or _LINK.search(probe):
+        raise ContactInTitle("contact details in an image address")
     return str(url)
 
 
@@ -376,11 +425,6 @@ def _cached_name(work_id: str) -> str | None:
     return next((name for name in names if (image_dir() / name).is_file()), None)
 
 
-# ponytail: the store has no call that takes a handle out of its artists table without also putting the artist
-# and their site on the removal list, so the row is deleted here. Move this to the store when it has one.
-_UNLIST = "DELETE FROM artists WHERE key = ?"
-
-
 def _delete(conn: sqlite3.Connection, column: str, value: str, but: str = "") -> None:
     """Delete the rows with this value in this column from every table in the file that has such a column.
 
@@ -393,16 +437,15 @@ def _delete(conn: sqlite3.Connection, column: str, value: str, but: str = "") ->
         conn.execute(f'DELETE FROM "{quoted}" WHERE {column} = ?', (value,))
 
 
-def _drop_works(conn: sqlite3.Connection, key: str, keep: set[str]) -> int:
-    """Delete the artist's works that are not in `keep`: every cached file of theirs, and their rows in every table.
+def _forget(conn: sqlite3.Connection, key: str) -> int:
+    """Delete an artist's works with their cached files, and every other row under their key in every table: the
+    profile, the marks, the note that they were passed over, and whatever another stage keeps.
 
     Returns how many works are stuck: a file of theirs could not be deleted, so their rows stay to say so, and
     the rest are deleted all the same.
     """
     stuck = 0
     for (work_id,) in conn.execute("SELECT deviation_id FROM works WHERE artist_key = ?", (key,)).fetchall():
-        if work_id in keep:
-            continue
         try:
             if _UUID.fullmatch(work_id):  # checked again: a file to delete is never named by a row taken on trust
                 for path in image_dir().glob(f"{work_id}.*"):
@@ -411,16 +454,37 @@ def _drop_works(conn: sqlite3.Connection, key: str, keep: set[str]) -> int:
             stuck += 1
             continue
         _delete(conn, "deviation_id", work_id)
-    return stuck
-
-
-def _forget(conn: sqlite3.Connection, key: str) -> int:
-    """Delete an artist's works and cached files, and every other row under their key: the profile, the note
-    that they were passed over, and whatever another stage keeps by artist_key. Returns how many works are
-    stuck (see _drop_works)."""
-    stuck = _drop_works(conn, key, set())
     _delete(conn, "artist_key", key, but="works")
+    conn.execute("DELETE FROM artist_marks WHERE same_as = ?", (key,))  # the key is named there too
     return stuck
+
+
+def _mark_works(conn: sqlite3.Connection, key: str, marks: Mapping[str, str | None]) -> int:
+    """Write down what a turn learned about works of this artist that are kept: a reason beside one that no
+    longer qualifies, and for one that still does, that it was seen now and has no mark. Returns how many are
+    marked. A work that is not kept under this key is not touched: there is nothing here to say it about."""
+    marked = 0
+    for work_id, reason in marks.items():
+        theirs = "EXISTS (SELECT 1 FROM works WHERE deviation_id = ? AND artist_key = ?)"
+        if reason is None:
+            conn.execute(f"DELETE FROM work_marks WHERE deviation_id = ? AND {theirs}", (work_id, work_id, key))
+            conn.execute(
+                "UPDATE works SET fetched_at = ? WHERE deviation_id = ? AND artist_key = ?",
+                (store._now(), work_id, key),
+            )
+        else:
+            marked += conn.execute(
+                f"INSERT OR REPLACE INTO work_marks (deviation_id, reason, marked_at) SELECT ?, ?, ? WHERE {theirs}",
+                (work_id, _reason(reason), store._now(), work_id, key),
+            ).rowcount
+    return marked
+
+
+def _reason(reason: object) -> str:
+    """A mark's reason: a few plain words of ours, never a text from the API."""
+    if not isinstance(reason, str) or not re.fullmatch(r"[A-Za-z' -]{1,40}", reason):
+        raise ValueError("not a reason")
+    return reason
 
 
 def store_artist(
@@ -432,61 +496,137 @@ def store_artist(
     level: object,
     website: object,
     works: Iterable[Mapping[str, Any]],
+    marks: Mapping[str, str | None] | None = None,
     db: pathlib.Path | str | None = None,
 ) -> tuple[int, int]:
-    """Replace everything kept about one artist, in one transaction.
+    """Add to what is kept about one artist and bring it up to date, in one transaction. Nothing is deleted.
 
-    The profile is these four public fields and nothing else. `works` are keyword arguments for checked_work();
-    each row names the work's cached image when there is one. The artist's other works go, with their files.
-    So does whatever is kept under another key for the same `user_id`: that is this account under the handle
-    it had before. A removal by the new handle must not leave the old one behind anywhere (hard rule 7), so the
-    old handle also leaves the store's artists table, and the collector stops asking about it.
-    The artist is no longer one that was passed over (see note_skip).
+    The profile is these four public fields and nothing else. A field is brought up to date when it is given as
+    a text, an empty one included: that is the artist's word. Given as anything else, nothing was said about
+    it, and what is kept stays. So does the account hash when no `user_id` is given.
 
-    Returns two counts of what went wrong without stopping the rest: works whose row the database refused (a
-    constraint; the work is then not kept), and works that had to go but have a file that could not be deleted
-    (their row stays, so the next purge finds it).
+    `works` are keyword arguments for checked_work(). Each is added, or brought up to date with the time, and
+    its row names the work's cached image when there is one. A work that is kept and is not among them is left
+    as it is: its fetched_at is when it was last seen and still qualified. A work kept under another artist's
+    key is not taken from them.
+
+    `marks` is what this turn learned about the artist's other kept works (see _mark_works). The artist's own
+    mark goes: their profile was read and stored. A key under which the same `user_id` is kept is this account
+    under the handle it had before; it is marked RENAMED and linked to this one, so that a removal of either
+    finds both (hard rule 7, see same_account). The artist is no longer one that was passed over.
+
+    Returns two counts: works whose row the database refused or that belong to somebody else (the work is then
+    not kept), and kept works that are now marked.
 
     ValueError, and nothing stored, when a work is not acceptable. sqlite3.IntegrityError, and nothing changed,
     when the database refuses the profile row itself.
     """
     key = _key(artist_key)
     user_hash = account(user_id)
-    profile = (key, _text(tagline, 200), _choice(specialty), _choice(level), _website(website), store._now(), user_hash)
+    given = (tagline, specialty, level, website)
+    checked = (_text(tagline, 200), _choice(specialty), _choice(level), _website(website))
     rows = [checked_work(**work) for work in works]
     with _open(db) as conn:
         _upgrade(conn)
+        fields = "SELECT tagline, specialty, level, website, user_hash FROM profiles WHERE artist_key = ?"
+        *before, old_hash = conn.execute(fields, (key,)).fetchone() or (None, None, None, None, None)
+        said = [new if isinstance(value, str) else old for value, new, old in zip(given, checked, before, strict=True)]
+        user_hash = user_hash or old_hash
         # Every column is named, here and below: a row written by position lands in the wrong columns the day
         # the table changes.
         conn.execute(
             "INSERT OR REPLACE INTO profiles (artist_key, tagline, specialty, level, website, fetched_at, user_hash) "
             "VALUES (?, ?, ?, ?, ?, ?, ?)",
-            profile,
+            (key, *said, store._now(), user_hash),
         )
         conn.execute("DELETE FROM skipped WHERE artist_key = ?", (key,))
+        conn.execute("DELETE FROM artist_marks WHERE artist_key = ?", (key,))
+        same_account = "SELECT artist_key FROM profiles WHERE user_hash IN (?, ?) AND artist_key != ?"
+        others = [other for (other,) in conn.execute(same_account, (user_hash, account(user_id, "da-user"), key))]
+        for other in others:
+            conn.execute(
+                "INSERT OR REPLACE INTO artist_marks (artist_key, reason, marked_at, same_as) VALUES (?, ?, ?, ?)",
+                (other, RENAMED, store._now(), key),
+            )
         stored = set()
         for work_id, *rest in rows:
+            owner = conn.execute("SELECT artist_key FROM works WHERE deviation_id = ?", (work_id,)).fetchone()
+            if owner and owner[0] not in (key, *others):
+                continue
             try:
                 conn.execute(
                     "INSERT OR REPLACE INTO works (deviation_id, artist_key, page_url, title, tags, thumb_url, "
                     "published_at, image_file, fetched_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (work_id, key, *rest, _cached_name(work_id), store._now()),
                 )
+                conn.execute("DELETE FROM work_marks WHERE deviation_id = ?", (work_id,))  # stored: it qualifies
                 stored.add(work_id)
             except sqlite3.IntegrityError:  # SQLite undoes that one statement; the transaction and the artist go on
                 pass
-        stuck = _drop_works(conn, key, stored)
-        same_account = "SELECT artist_key FROM profiles WHERE user_hash IN (?, ?) AND artist_key != ?"
-        for (other,) in conn.execute(same_account, (user_hash, account(user_id, "da-user"), key)).fetchall():
-            stuck += _forget(conn, other)
-            conn.execute(_UNLIST, (other,))
-    return len({row[0] for row in rows} - stored), stuck
+        marked = _mark_works(
+            conn, key, {work_id: reason for work_id, reason in (marks or {}).items() if work_id not in stored}
+        )
+    return len({row[0] for row in rows} - stored), marked
 
 
-def has_works(artist_key: str, db: pathlib.Path | str | None = None) -> bool:
-    """True when at least one work is kept for the artist."""
+def mark_works(artist_key: str, marks: Mapping[str, str | None], db: pathlib.Path | str | None = None) -> int:
+    """Mark kept works of this artist as no longer qualifying, or as seen and qualifying again (see _mark_works).
+    Returns how many are marked. For a turn that ends without storing the artist."""
+    key = _key(artist_key)
     with _open(db) as conn:
-        return bool(conn.execute("SELECT 1 FROM works WHERE artist_key = ? LIMIT 1", (_key(artist_key),)).fetchone())
+        return _mark_works(conn, key, marks)
+
+
+def mark_artist(artist_key: str, reason: str, db: pathlib.Path | str | None = None) -> None:
+    """Write beside an artist why they no longer qualify, and when. What is kept about them stays as it is.
+
+    A key that is marked RENAMED keeps that mark, and the link that goes with it: a removal needs the link.
+    """
+    key = _key(artist_key)
+    with _open(db) as conn:
+        conn.execute(
+            "INSERT INTO artist_marks (artist_key, reason, marked_at) VALUES (?, ?, ?) ON CONFLICT(artist_key) "
+            "DO UPDATE SET reason = excluded.reason, marked_at = excluded.marked_at WHERE same_as IS NULL",
+            (key, _reason(reason), store._now()),
+        )
+
+
+def artist_marks(db: pathlib.Path | str | None = None) -> dict[str, tuple[str, str, str | None]]:
+    """Every marked artist: key -> (reason, when, and for RENAMED the key the account goes by now).
+
+    A marked artist is one whose account the API called gone, whose works look mostly AI-made, or whose account
+    took another handle. Their rows are all still here. Whether they are published is for a later stage.
+    """
+    with _open(db) as conn:
+        rows = conn.execute("SELECT artist_key, reason, marked_at, same_as FROM artist_marks")
+        return {key: (reason, marked_at, same_as) for key, reason, marked_at, same_as in rows}
+
+
+def work_marks(db: pathlib.Path | str | None = None) -> dict[str, tuple[str, str]]:
+    """Every marked work: deviation id -> (reason, when). A marked work is kept and no longer qualifies: its
+    entry said it is mature, not a public image, another author's, tagged AI-made, or its title holds contact
+    details. Whether it is published is for a later stage; so is a work whose fetched_at is older than its
+    artist's, which was missing from their latest answer."""
+    with _open(db) as conn:
+        rows = conn.execute("SELECT deviation_id, reason, marked_at FROM work_marks")
+        return {work_id: (reason, marked_at) for work_id, reason, marked_at in rows}
+
+
+def same_account(artist_key: str, db: pathlib.Path | str | None = None) -> list[str]:
+    """The other keys this artist's account is kept under: linked by a RENAMED mark either way, or carrying the
+    same account hash. A removal of one is a removal of all (hard rule 7)."""
+    key = _key(artist_key)
+    query = (
+        "SELECT same_as FROM artist_marks WHERE artist_key = :key AND same_as IS NOT NULL "
+        "UNION SELECT artist_key FROM artist_marks WHERE same_as = :key "
+        "UNION SELECT other.artist_key FROM profiles AS mine JOIN profiles AS other USING (user_hash) "
+        "WHERE mine.artist_key = :key"
+    )
+    with _open(db) as conn:
+        try:
+            return sorted({other for (other,) in conn.execute(query, {"key": key})} - {key})
+        except sqlite3.OperationalError:  # a profiles table from the first version, which kept no hash
+            return []
 
 
 def cached_image(work_id: str, db: pathlib.Path | str | None = None) -> bool:
@@ -515,12 +655,19 @@ def save_image(work_id: str, content_type: str, data: bytes) -> str:
     return name
 
 
-def purge(artist_key: str, db: pathlib.Path | str | None = None) -> None:
-    """Hard rule 7: delete everything kept about the artist. Safe to repeat.
+def review_dir() -> pathlib.Path:
+    """Where other stages put the contact sheets they make from cached images, for a person to look at."""
+    return config.CACHE_DIR / "review"
 
-    That is their profile, their works with every cached image, the note that they were passed over, and every
-    row another stage keeps about them or their works: whatever table of this file has an artist_key or a
-    deviation_id column (see _delete). There is no list of tables to forget to add one to.
+
+def purge(artist_key: str, db: pathlib.Path | str | None = None) -> None:
+    """Hard rule 7: delete everything kept about the artist. Safe to repeat. The only way an artist's rows go.
+
+    That is their profile, their works with every cached image, their marks, the note that they were passed
+    over, and every row another stage keeps about them or their works: whatever table of this file has an
+    artist_key or a deviation_id column (see _delete). There is no list of tables to forget to add one to.
+    Everything under review_dir() goes as well: no row says which contact sheet shows whose work, and the
+    sheets are made again on demand.
 
     One file that cannot be deleted does not stop the rest. OSError once everything else is gone: that work's
     rows stay, so artist_keys() still lists the artist and the purge can be run again.
@@ -528,39 +675,21 @@ def purge(artist_key: str, db: pathlib.Path | str | None = None) -> None:
     key = _key(artist_key)
     with _open(db) as conn:
         stuck = _forget(conn, key)
-    if stuck:
+    shutil.rmtree(review_dir(), ignore_errors=True)
+    if stuck or review_dir().exists():
         raise OSError("a cached file could not be deleted")
 
 
-def unlist(artist_key: str, db: pathlib.Path | str | None = None) -> None:
-    """purge(), and then the handle leaves the collector's queue: its row in the store's artists table goes.
-
-    For a handle whose account, or whose every work, the API has shown gone on two runs. It may be the old
-    handle of an account that was then removed under its new one, and that must not stay anywhere (hard rule
-    7). Unlike a removal this bars nobody: discovery stores the handle again if it finds it again. OSError, and
-    the handle stays queued so the next run tries again, when a file could not be deleted.
-    """
-    purge(artist_key, db)
-    with _open(db) as conn:
-        conn.execute(_UNLIST, (artist_key,))
-
-
-def note_skip(artist_key: str, gone: bool = False, db: pathlib.Path | str | None = None) -> int:
+def note_skip(artist_key: str, db: pathlib.Path | str | None = None) -> None:
     """Note, with the time, that the collector passed this artist over, so that the next run takes them last.
-
-    `gone` says the API called their account suspended, inactive or missing, or showed none of the works kept
-    for them. Returns in how many runs it has been noted so since the artist was last stored. Nothing else
-    moves that number: an answer that says nothing about the account, as every answer does while the API is
-    down, must not count against anybody.
-    """
+    It says when and nothing else: nothing is ever decided on how often an artist was passed over."""
     key = _key(artist_key)
     with _open(db) as conn:
         conn.execute(
-            "INSERT INTO skipped (artist_key, skipped_at, unavailable) VALUES (?, ?, ?) ON CONFLICT(artist_key) "
-            "DO UPDATE SET skipped_at = excluded.skipped_at, unavailable = unavailable + excluded.unavailable",
-            (key, store._now(), int(gone)),
+            "INSERT INTO skipped (artist_key, skipped_at, unavailable) VALUES (?, ?, 0) ON CONFLICT(artist_key) "
+            "DO UPDATE SET skipped_at = excluded.skipped_at",
+            (key, store._now()),
         )
-        return int(conn.execute("SELECT unavailable FROM skipped WHERE artist_key = ?", (key,)).fetchone()[0])
 
 
 def drop_stale_skips(db: pathlib.Path | str | None = None) -> None:

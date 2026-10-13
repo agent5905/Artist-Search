@@ -105,12 +105,11 @@ def database_bytes():
 
 def test_the_tables_hold_what_was_asked_for_and_nothing_else():
     library.artist_keys()
+    ours = ("profiles", "works", "skipped", "work_marks", "artist_marks")
     with closing(sqlite3.connect(config.LOCAL_DB)) as conn:
         columns = {
-            table: [(name, kind) for _, name, kind, *_ in conn.execute(f"PRAGMA table_info({table})")]
-            for table in ("profiles", "works", "skipped")
+            table: [(name, kind) for _, name, kind, *_ in conn.execute(f"PRAGMA table_info({table})")] for table in ours
         }
-        ours = "('profiles', 'works', 'skipped')"
         strict = conn.execute(f"SELECT strict FROM pragma_table_list WHERE name IN {ours}").fetchall()
     assert columns["profiles"] == [
         ("artist_key", "TEXT"),
@@ -133,7 +132,16 @@ def test_the_tables_hold_what_was_asked_for_and_nothing_else():
         ("fetched_at", "TEXT"),
     ]
     assert columns["skipped"] == [("artist_key", "TEXT"), ("skipped_at", "TEXT"), ("unavailable", "INTEGER")]
-    assert strict == [(1,), (1,), (1,)]
+    # Round 5: what an answer says against a kept work or artist is written beside it. In tables of their own,
+    # so that the two tables other stages read are as they were, and opening the file still changes no table.
+    assert columns["work_marks"] == [("deviation_id", "TEXT"), ("reason", "TEXT"), ("marked_at", "TEXT")]
+    assert columns["artist_marks"] == [
+        ("artist_key", "TEXT"),
+        ("reason", "TEXT"),
+        ("marked_at", "TEXT"),
+        ("same_as", "TEXT"),
+    ]
+    assert strict == [(1,)] * 5
     assert "bio" not in inspect.signature(library.store_artist).parameters
 
 
@@ -262,7 +270,7 @@ def test_storing_an_artist_rebuilds_a_table_from_an_earlier_version(earlier):
         assert gone not in stored, gone
     assert b"zz-fake-bravo.art" not in stored
     assert keep(ALPHA, [fields()], tagline="FAKE-TAGLINE-ALPHA") == (0, 0)  # and it is rebuilt once, not every time
-    assert rows("profiles")[2]["tagline"] == "FAKE-TAGLINE-NEW" and len(rows("works")) == 1
+    assert rows("profiles")[2]["tagline"] == "FAKE-TAGLINE-NEW" and len(rows("works")) == 4  # and nothing is dropped
 
 
 def test_todays_table_refuses_a_row_written_by_position_instead_of_storing_it_in_the_wrong_columns():
@@ -312,15 +320,20 @@ def test_a_work_row_the_database_refuses_is_left_out_and_the_rest_of_the_artist_
     two_artists()
     refuse("works", "deviation_id", ID2)
     library.save_image(ID4, "image/jpeg", JPEG)
+    before = rows("works")[1]
     assert keep(ALPHA, [fields(ID1), fields(ID2), fields(ID4)], tagline="FAKE-TAGLINE-NEW") == (1, 0)
     assert [(row["artist_key"], row["deviation_id"]) for row in rows("works")] == [
         (ALPHA, ID1),
+        (ALPHA, ID2),
         (BRAVO, ID3),
         (ALPHA, ID4),
     ]
     assert rows("profiles")[0]["tagline"] == "FAKE-TAGLINE-NEW"
-    # The refused work is not kept in an older form either, and its file goes with it.
-    assert files(tmp_path) == [*(f"cache/images/{work_id}.jpg" for work_id in (ID1, ID3, ID4)), "cache/pipeline.sqlite"]
+    assert rows("works")[1] == before  # the refused work stays as it was kept, with its file
+    assert files(tmp_path) == [
+        *(f"cache/images/{work_id}.jpg" for work_id in (ID1, ID2, ID3, ID4)),
+        "cache/pipeline.sqlite",
+    ]
 
 
 def test_a_profile_row_the_database_refuses_leaves_the_artist_exactly_as_they_were(tmp_path):
@@ -336,19 +349,29 @@ def test_a_profile_row_the_database_refuses_leaves_the_artist_exactly_as_they_we
 # --- storing ---
 
 
-def test_storing_a_profile_twice_keeps_one_row_with_the_latest_fields():
-    profile(tagline="FAKE-TAGLINE-OLD", website="https://zz-fake-alpha.art", user_id="FAKE-USERID-1")
-    stored = profile(tagline="FAKE-TAGLINE-NEW", specialty="FAKE-SPECIALTY", level="FAKE-LEVEL")
+def test_storing_a_profile_twice_keeps_one_row_and_brings_up_to_date_what_was_said():
+    """A field given as a text is the artist's word, an empty one included. A field not given, or given as anything
+    else, says nothing: the critic's finding was that a 200 with nothing in it blanked what was kept."""
+    profile(
+        tagline="FAKE-TAGLINE-OLD", level="FAKE-LEVEL-OLD", website="https://zz-fake-alpha.art", user_id="FAKE-USERID-1"
+    )
+    stored = profile(tagline="FAKE-TAGLINE-NEW", specialty="FAKE-SPECIALTY", level="")
     assert len(rows("profiles")) == 1
     assert {name: value for name, value in stored.items() if name != "fetched_at"} == {
         "artist_key": ALPHA,
         "tagline": "FAKE-TAGLINE-NEW",
         "specialty": "FAKE-SPECIALTY",
-        "level": "FAKE-LEVEL",
-        "website": None,
-        "user_hash": None,
+        "level": None,  # given as an empty text: they have none now
+        "website": "https://zz-fake-alpha.art/",  # not given: nothing was said about it
+        "user_hash": account("FAKE-USERID-1"),  # nor about whose account it is
     }
     assert stored["fetched_at"].endswith("+00:00")
+    for nothing in (None, 7, ["FAKE"], {"FAKE": 1}, b"FAKE"):
+        again = profile(tagline=nothing, specialty=nothing, level=nothing, website=nothing, user_id=nothing)
+        assert {name: again[name] for name in stored if name != "fetched_at"} == {
+            name: stored[name] for name in stored if name != "fetched_at"
+        }
+    assert profile(tagline="FAKE write to zz.fake@mail.invalid")["tagline"] is None  # their word, and not kept
 
 
 def test_storing_a_work_twice_keeps_one_row_that_names_its_cached_image():
@@ -375,19 +398,41 @@ def test_a_deviation_id_is_one_row_however_it_is_cased():
     assert [row["deviation_id"] for row in rows("works")] == [ID1]
 
 
-def test_storing_an_artist_replaces_their_works_and_deletes_the_files_of_those_that_went(tmp_path):
-    keep(ALPHA, [fields(ID1), fields(ID2)], tagline="FAKE-TAGLINE")
-    keep(BRAVO, [fields(ID3)])
+def test_storing_an_artist_again_adds_and_brings_up_to_date_and_deletes_nothing(tmp_path, monkeypatch):
+    """The lead's decision in round 5. A work that is kept and is missing from a later answer stays, with the time
+    it was last seen. Two rounds of guards on when a missing work may be dropped each let an outage drop them."""
+    clock(monkeypatch)
     for work_id in (ID1, ID2, ID3):
         library.save_image(work_id, "image/jpeg", JPEG)
-    keep(ALPHA, [fields(ID2), fields(ID4)])
-    assert [(row["artist_key"], row["deviation_id"], row["image_file"]) for row in rows("works")] == [
-        (ALPHA, ID2, f"{ID2}.jpg"),
-        (BRAVO, ID3, None),  # stored before its image was: only storing the artist again names it
-        (ALPHA, ID4, None),
+    keep(ALPHA, [fields(ID1), fields(ID2)], tagline="FAKE-TAGLINE")
+    keep(BRAVO, [fields(ID3)])
+    before = {row["deviation_id"]: row for row in rows("works")}
+    assert keep(ALPHA, [fields(ID2, title="FAKE-TITLE-NEW"), fields(ID4)]) == (0, 0)
+    after = {row["deviation_id"]: row for row in rows("works")}
+    assert sorted(after) == [ID1, ID2, ID3, ID4]
+    assert after[ID1] == before[ID1] and after[ID3] == before[ID3]  # not in the answer: as they were kept
+    assert after[ID2]["title"] == "FAKE-TITLE-NEW" and after[ID2]["fetched_at"] > before[ID2]["fetched_at"]
+    assert after[ID1]["fetched_at"] < after[ID2]["fetched_at"]  # which is how a reader knows ID1 was missing
+    assert [after[work_id]["image_file"] for work_id in (ID1, ID2, ID3, ID4)] == [
+        f"{ID1}.jpg",
+        f"{ID2}.jpg",
+        f"{ID3}.jpg",
+        None,
     ]
-    assert files(tmp_path) == [f"cache/images/{ID2}.jpg", f"cache/images/{ID3}.jpg", "cache/pipeline.sqlite"]
-    assert len(rows("profiles")) == 2
+    assert files(tmp_path) == [*(f"cache/images/{work_id}.jpg" for work_id in (ID1, ID2, ID3)), "cache/pipeline.sqlite"]
+    assert keep(ALPHA, []) == (0, 0) and len(rows("works")) == 4 and len(rows("profiles")) == 2  # an empty answer
+
+
+def test_a_work_kept_under_another_artists_key_is_not_taken_from_them():
+    two_artists()
+    before = rows("works")
+    assert keep(ALPHA, [fields(ID1), fields(ID3)]) == (1, 0)  # ID3 is kept for BRAVO
+    assert [(row["artist_key"], row["deviation_id"]) for row in rows("works")] == [
+        (ALPHA, ID1),
+        (ALPHA, ID2),
+        (BRAVO, ID3),
+    ]
+    assert rows("works")[2] == before[2]
 
 
 def test_rows_are_written_by_column_name_not_by_position():
@@ -530,6 +575,16 @@ CONTACTS = [  # the plain cases this stage looks for: refused in a tagline and i
     "FAKE discord.gg/zzfake",
     "FAKE zzfake%2Eme/zzfake",  # the dot only once its percent-encoding is undone
     "FAKE Mr.Fox and Vol.II",  # shaped like two domains, and neither is one: in doubt it goes
+    # A link, whatever it links to: the critic's, which have no host with a dot in them.
+    "FAKE skype:zzfake",
+    "FAKE SKYPE:zzfake",
+    "FAKE tg://resolve?domain=zzfake",
+    "FAKE sms:zzfake",
+    "FAKE mailto:zzfake",
+    "FAKE http://10.0.0.7/zzfake",
+    "FAKE skype%3Azzfake",  # the colon only once its percent-encoding is undone
+    "FAKE zzfake&colon;//zzfake",
+    "FAKE ://zzfake",
     # Nine digits or more: no date and no serial number is that long.
     "FAKE +00 (555) 010-9999 now",
     "FAKE 555 010 999",
@@ -574,6 +629,12 @@ LEFT_FOR_ANALYSIS = [
     "FAKE Hotel: the lobby",
     "FAKE at the gates",
     "FAKE Sheet (A)",
+    "FAKE Chapter: the gates",  # a colon and a space: a subtitle, not a link
+    "FAKE 12:30 at night",
+    # Seven digits beside a word the short list for calling does not have: kept in a title, dropped from a tagline.
+    "FAKE cell 555 0199",
+    "FAKE fax 5550199",
+    "FAKE text me 555 0199",
 ]
 NOT_TEXTS = ["   ", "<br>", f"{ZWSP}{SHY}{FILLER}", "FAKE word " * 1001, None, 12345, ["FAKE"], b"FAKE"]
 
@@ -612,8 +673,9 @@ def test_a_work_whose_title_holds_contact_details_is_not_kept_at_all(title):
 def test_what_is_not_a_plain_case_is_kept_and_left_for_the_analysis_stage(given):
     """Round 4, both ways. Seven and eight digits alone are dates and serial numbers, and were being refused. And
     addresses spelled out in words, service names and other languages are no longer chased here at all."""
-    assert profile(tagline=given)["tagline"] == given
     assert work(title=given)["title"] == given
+    # A line an artist writes about themselves is held to more: seven digits in it are a number to call.
+    assert profile(tagline=given)["tagline"] == (given if sum(map(str.isdigit, given)) < 7 else None)
 
 
 @pytest.mark.parametrize("title", [*(text for text in EMBEDDINGS if text is not CHUNKED), *NOT_TEXTS], ids=short)
@@ -632,8 +694,7 @@ def test_an_embedded_image_of_any_size_never_reaches_a_text_column():
         assert [stored[name] for name in ("tagline", "specialty", "level", "website")] == [None] * 4
         assert (rows("works")[0]["title"], rows("works")[0]["tags"]) == (None, '["faketag"]')
         assert b"FAKEBASE64" not in database_bytes() and b"base64" not in database_bytes()
-    with pytest.raises(library.ContactInTitle):  # a title of chunks is all digits to the title rule: the work goes
-        work(title=CHUNKED)
+    assert work(title=CHUNKED)["title"] is None
     assert config.LOCAL_DB.stat().st_size < 100_000  # the empty tables and their indexes are about half of that
 
 
@@ -806,7 +867,7 @@ def test_tags_are_kept_as_a_json_list_of_plain_tag_names():
     given += [EMBEDDED, "<b>fakefive</b>", "", None, 7, ["fakenested"], "x" * 60, "y" * 61, "555010999", "call5550199"]
     given += ["fake5550199", "platemail", "at_the_gates", "polkadot", "data", "no_ai", "fakename_at_host_com"]
     kept = ["fakeone", "FAKE_Two", "fake-three", "フェイク", "fakefive", "x" * 60]
-    kept += ["fake5550199", "platemail", "at_the_gates", "polkadot", "data", "no_ai", "fakename_at_host_com"]
+    kept += ["platemail", "at_the_gates", "polkadot", "data", "no_ai", "fakename_at_host_com"]
     assert json.loads(work(tags=given)["tags"]) == kept
     assert b"zzfake" not in database_bytes()
     assert len(json.loads(work(tags=[f"fake{n}" for n in range(500)])["tags"])) == 60
@@ -932,6 +993,64 @@ def test_a_signature_of_the_real_shape_is_accepted_up_to_the_cap():
         library.image_address(f"https://images-wixmp-zzcdn.wixmp.com/f/FAKE-THUMB-1.jpg?{longest}F")
 
 
+CARRIED = [  # what a page address's title part may not carry, though the title beside it is clean
+    "FAKE-zz.fake%40mail.invalid-1001",
+    "FAKE-zz-fake-alpha.art-1001",
+    "FAKE-call-555-0199-1001",
+    "FAKE-5550109999-1001",
+    "FAKE-skype%3Azzfake-1001",
+    "FAKE-" + "%2525" * 7 + "40-1001",  # under more layers than are undone
+]
+
+
+@pytest.mark.parametrize("slug", CARRIED)
+def test_a_page_address_that_carries_contact_details_under_a_clean_title_is_refused(slug):
+    """The critic's finding: DeviantArt makes the address from the title, and an answer can give either alone."""
+    address = f"https://www.deviantart.com/zz-fake-alpha/art/{slug}"
+    with pytest.raises(library.ContactInTitle):
+        library.page_address(address)
+    with pytest.raises(library.ContactInTitle):
+        library.checked_work(**fields(title="FAKE-TITLE-CLEAN", page_url=address))
+    with pytest.raises(ValueError):
+        keep(ALPHA, [fields(ID1), fields(ID2, page_url=address)])
+    assert rows("works") == [] and b"zzfake" not in database_bytes() and b"0199" not in database_bytes()
+
+
+def test_the_number_deviantart_ends_a_page_address_with_is_not_a_number_to_call():
+    # Nor is a title with a colon in it a link: one real address in twenty-four is written like the last of these.
+    for slug in (
+        "FAKE-TITLE-1234567890",
+        "FAKE-call-me-maybe-987654321",
+        "FAKE-2019-2023-1234567890",
+        "FAKE%3A-the-gates-1001",
+    ):
+        address = f"https://www.deviantart.com/zz-fake-alpha/art/{slug}"
+        assert library.page_address(address) == address
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/f/zz.fake%40mail.invalid.jpg",
+        "/f/zz.fake@mail.invalid.jpg",
+        "/f/skype%3Azzfake.jpg",
+        "/f/FAKE/tg%3A%2F%2Fzzfake.jpg",
+    ],
+)
+def test_an_image_address_that_carries_an_address_or_a_link_is_refused(path):
+    """Of the title's rule only this much can be asked of an image path, which is all digits and dots."""
+    address = f"https://images-wixmp-zzcdn.wixmp.com{path}?{SIGNED}"
+    with pytest.raises(library.ContactInTitle):
+        library.image_address(address)
+    with pytest.raises(ValueError):
+        keep(ALPHA, [fields(thumb_url=address)])
+    assert rows("works") == []
+    plain = (
+        f"https://images-wixmp-zzcdn.wixmp.com/f/FAKE-5550109999/v1/fill/w_300,h_400,q_70,strp/fake_1-350t.jpg?{SIGNED}"
+    )
+    assert library.image_address(plain) == plain
+
+
 def test_an_image_address_has_a_path_of_600_characters_at_most():
     """The critic's finding: a 1,288-byte PNG rode in as base64 in the path of a 1,761-character thumbnail
     address. Real paths are 252 characters at most. With the cap on the signature, the whole address is short."""
@@ -974,7 +1093,7 @@ def test_the_addresses_deviantart_really_gives_are_accepted():
         "https://www.deviantart.com/zz-fake-alpha/art/FAKE-1"
     )
     odd = (
-        "https://www.deviantart.com/zz_fake-Alpha/art/FAKE.Title-%E3%83%95%E3%82%A7-1001"  # a dot, and encoded letters
+        "https://www.deviantart.com/zz_fake-Alpha/art/FAKE._Title-%E3%83%95%E3%82%A7-1001"  # a dot, and encoded letters
     )
     assert library.page_address(odd) == odd and work(page_url=odd)["page_url"] == odd
     assert library.image_address(THUMB) == THUMB and work()["thumb_url"] == THUMB
@@ -1216,40 +1335,36 @@ def test_a_file_that_cannot_be_deleted_does_not_keep_the_rest_of_the_purge_from_
     assert library.artist_keys() == [BRAVO] and files(tmp_path) == [f"cache/images/{ID3}.jpg", "cache/pipeline.sqlite"]
 
 
-def test_storing_an_artist_reports_a_stale_file_it_could_not_delete_after_storing_everything(monkeypatch):
+def test_an_account_under_a_new_handle_is_linked_to_the_old_one_and_nothing_of_either_is_deleted(tmp_path):
+    """Round 5. The same user id under a new handle is still noticed, by its hash. It is written down as a mark on
+    the old key and a link to the new one, so that a removal of either finds both; nothing is purged for it."""
+    renamed = "da:zz-fake-renamed"
     two_artists()
-    with monkeypatch.context() as patch:
-        patch.setattr("pathlib.Path.unlink", locked(f"{ID1}.jpg"))
-        assert keep(ALPHA, [fields(ID2), fields(ID4)], tagline="FAKE-TAGLINE-NEW") == (0, 1)
-    assert [row["deviation_id"] for row in rows("works") if row["artist_key"] == ALPHA] == [ID1, ID2, ID4]
-    assert rows("profiles")[0]["tagline"] == "FAKE-TAGLINE-NEW"
-
-
-def test_an_account_that_changed_its_handle_does_not_leave_its_old_key_behind(tmp_path):
-    """Hard rule 7 across a rename. The same user id under a new handle takes over the works it still has; the
-    old key's profile and its other works go, so removing the new handle later leaves nothing of the old one."""
-    for handle in ("zz-fake-alpha", "zz-fake-bravo", "zz-fake-renamed"):
-        assert store.upsert_artist(handle, f"https://www.deviantart.com/{handle}", [], 3)
-    two_artists()
-    library.note_skip(ALPHA)  # the old handle was asked about once more, and passed over
     library.save_image(ID4, "image/jpeg", JPEG)
     page = "https://www.deviantart.com/zz-fake-renamed/art/FAKE"
     works = [fields(ID2, page_url=page), fields(ID4, page_url=page)]
-    keep("da:zz-fake-renamed", works, tagline="FAKE-TAGLINE-RENAMED", user_id="FAKE-USERID-zz-fake-alpha")
-    # The critic's finding: the old handle stayed in the store's queue and among the skips, and was asked about
-    # on every later run, also after the account was removed under its new handle.
-    assert queued() == [BRAVO, "da:zz-fake-renamed"] and rows("skipped") == []
-    assert [row["artist_key"] for row in rows("profiles")] == [BRAVO, "da:zz-fake-renamed"]
+    assert keep(renamed, works, tagline="FAKE-TAGLINE-RENAMED", user_id="FAKE-USERID-zz-fake-alpha") == (0, 0)
+    assert [row["artist_key"] for row in rows("profiles")] == [ALPHA, BRAVO, renamed]
     assert [(row["artist_key"], row["deviation_id"], row["image_file"]) for row in rows("works")] == [
-        ("da:zz-fake-renamed", ID2, f"{ID2}.jpg"),
+        (ALPHA, ID1, f"{ID1}.jpg"),
+        (renamed, ID2, f"{ID2}.jpg"),  # the work is the account's under either handle: it is brought up to date
         (BRAVO, ID3, f"{ID3}.jpg"),
-        ("da:zz-fake-renamed", ID4, f"{ID4}.jpg"),
+        (renamed, ID4, f"{ID4}.jpg"),
     ]
-    assert files(tmp_path) == [*(f"cache/images/{work_id}.jpg" for work_id in (ID2, ID3, ID4)), "cache/pipeline.sqlite"]
-    assert b"zz-fake-alpha" not in database_bytes()
-    assert store.mark_removed("zz-fake-renamed") == 1  # the removal takes the new handle out of the store's queue
-    library.purge("da:zz-fake-renamed")
-    assert library.artist_keys() == [BRAVO] and b"zz-fake-renamed" not in database_bytes()
+    assert len(files(tmp_path)) == 5
+    marks = library.artist_marks()
+    assert marks.keys() == {ALPHA} and marks[ALPHA][0] == library.RENAMED == "renamed" and marks[ALPHA][2] == renamed
+    assert library.same_account(ALPHA) == [renamed] and library.same_account(renamed) == [ALPHA]
+    assert library.same_account(BRAVO) == [] and library.same_account("da:zz-fake-nobody") == []
+    library.mark_artist(ALPHA, "account gone")  # of the old handle the API now says: no such user. The link stays.
+    assert library.artist_marks()[ALPHA][0] == library.RENAMED and library.same_account(renamed) == [ALPHA]
+    raw("DELETE FROM artist_marks")  # two keys an earlier version left with one hash and no mark are one account
+    assert library.same_account(ALPHA) == [renamed] and library.same_account(renamed) == [ALPHA]
+    keep(renamed, works, user_id="FAKE-USERID-zz-fake-alpha")
+    raw("UPDATE profiles SET user_hash = NULL")  # and the mark alone ties the two as well, either way
+    assert library.same_account(ALPHA) == [renamed] and library.same_account(renamed) == [ALPHA]
+    library.purge(renamed)
+    assert library.artist_marks() == {} and library.same_account(ALPHA) == []  # a mark that names a purged key goes
 
 
 def test_the_user_id_is_kept_only_as_a_hash_and_only_a_real_one_links_two_keys():
@@ -1257,10 +1372,17 @@ def test_the_user_id_is_kept_only_as_a_hash_and_only_a_real_one_links_two_keys()
     keep(BRAVO, [fields(ID3)], user_id="FAKE-USERID-2")
     assert [row["user_hash"] for row in rows("profiles")] == [account("FAKE-USERID-1"), account("FAKE-USERID-2")]
     assert b"FAKE-USERID" not in database_bytes()
-    for missing in (None, "", 7, ["FAKE-USERID-1"], {"FAKE": 1}):  # no id is no link: nobody is purged for it
+    for missing in (None, "", 7, ["FAKE-USERID-1"], {"FAKE": 1}):  # no id says nothing: the hash that is kept stays
         keep(ALPHA, [fields(ID1)], user_id=missing)
         keep(BRAVO, [fields(ID3)], user_id=missing)
-        assert [row["user_hash"] for row in rows("profiles")] == [None, None] and len(rows("works")) == 2
+        assert [row["user_hash"] for row in rows("profiles")][:2] == [
+            account("FAKE-USERID-1"),
+            account("FAKE-USERID-2"),
+        ]
+        keep("da:zz-fake-charlie", user_id=missing)  # and two artists who never had one are not thereby one account
+        keep("da:zz-fake-delta", user_id=missing)
+        assert [row["user_hash"] for row in rows("profiles")][2:] == [None, None] and len(rows("works")) == 2
+        assert library.artist_marks() == {} and library.same_account("da:zz-fake-charlie") == []
 
 
 def account(user_id, spelling="uid"):
@@ -1268,15 +1390,17 @@ def account(user_id, spelling="uid"):
     return hashlib.sha256(f"{spelling}:{user_id}".encode()).hexdigest()
 
 
-def test_a_profile_from_before_the_hash_was_respelled_still_links_the_account():
+def test_a_profile_from_before_the_hash_was_respelled_is_still_linked_to_the_account():
     """The second version hashed 'da-user:<id>'. A row it wrote is still known for the account it is."""
     two_artists()
     raw(
         "UPDATE profiles SET user_hash = ? WHERE artist_key = ?", account("FAKE-USERID-zz-fake-alpha", "da-user"), ALPHA
     )
     keep("da:zz-fake-renamed", user_id="FAKE-USERID-zz-fake-alpha")
-    assert [row["artist_key"] for row in rows("profiles")] == [BRAVO, "da:zz-fake-renamed"]
-    assert [row["artist_key"] for row in rows("works")] == [BRAVO]
+    assert library.same_account("da:zz-fake-renamed") == [ALPHA] and library.same_account(ALPHA) == [
+        "da:zz-fake-renamed"
+    ]
+    assert len(rows("profiles")) == 3 and len(rows("works")) == 3
 
 
 def test_a_removed_account_is_known_by_its_hash_on_the_stores_removal_list():
@@ -1319,21 +1443,16 @@ def at(second):
     return f"2026-10-12T00:{second // 60:02d}:{second % 60:02d}+00:00"
 
 
-def test_a_skip_is_noted_with_its_time_and_counts_the_runs_the_api_called_the_account_gone(monkeypatch):
+def test_a_skip_is_noted_with_its_time_and_nothing_else(monkeypatch):
+    """It puts the artist at the back of the next run. Nothing is ever decided on how often they were passed over."""
     clock(monkeypatch)
-    assert library.note_skip(ALPHA) == 0
-    assert library.note_skip(BRAVO, gone=True) == 1
-    assert library.note_skip(BRAVO, gone=True) == 2
-    assert library.note_skip(BRAVO, gone=True) == 3
-    assert library.last_attempts() == {ALPHA: at(0), BRAVO: at(3)}
+    for key in (ALPHA, BRAVO, BRAVO):
+        assert library.note_skip(key) is None
+    assert library.last_attempts() == {ALPHA: at(0), BRAVO: at(2)}
     assert rows("skipped") == [
         {"artist_key": ALPHA, "skipped_at": at(0), "unavailable": 0},
-        {"artist_key": BRAVO, "skipped_at": at(3), "unavailable": 3},
+        {"artist_key": BRAVO, "skipped_at": at(2), "unavailable": 0},
     ]
-    # Any other skip is noted with its time and moves the number neither way: an answer that says nothing about
-    # the account, as every answer does in an outage, must not count against anybody, nor for them.
-    assert library.note_skip(BRAVO) == 3 and library.last_attempts()[BRAVO] == at(4)
-    assert library.note_skip(BRAVO, gone=True) == 4
     assert library.artist_keys() == []  # a skip is not something kept about an artist's work
     for key in ("zz-fake-alpha", "da:ZZ-Fake-Alpha", "*", None):
         with pytest.raises(ValueError):
@@ -1342,25 +1461,100 @@ def test_a_skip_is_noted_with_its_time_and_counts_the_runs_the_api_called_the_ac
 
 def test_storing_an_artist_ends_their_skip_and_the_last_attempt_is_then_when_they_were_stored(monkeypatch):
     clock(monkeypatch)
-    library.note_skip(ALPHA, gone=True)  # second 0
+    library.note_skip(ALPHA)  # second 0
     library.note_skip(BRAVO)  # second 1
     keep(ALPHA, [fields()], tagline="FAKE-TAGLINE")  # the profile at second 2, the work at second 3
     assert [row["artist_key"] for row in rows("skipped")] == [BRAVO]
     assert library.last_attempts() == {ALPHA: at(2), BRAVO: at(1)}
-    assert library.note_skip(ALPHA, gone=True) == 1  # and the count starts again from one
+    library.note_skip(ALPHA)
     assert library.last_attempts()[ALPHA] == at(4)  # whichever is later: stored, or passed over
 
 
-def test_a_purge_forgets_the_skip_too():
-    """Hard rule 7: nothing stays, the note that names them included."""
+def test_a_purge_forgets_the_skip_and_the_marks_too():
+    """Hard rule 7: nothing stays, the notes that name them included."""
     two_artists()
-    library.note_skip(ALPHA, gone=True)
-    library.note_skip(BRAVO)
+    for key in (ALPHA, BRAVO):
+        library.note_skip(key)
+        library.mark_artist(key, "account gone")
+    library.mark_works(ALPHA, {ID1: "mature"})
+    library.mark_works(BRAVO, {ID3: "mature"})
     library.purge(ALPHA)
     assert library.artist_keys() == [BRAVO] and [row["artist_key"] for row in rows("skipped")] == [BRAVO]
+    assert library.artist_marks().keys() == {BRAVO} and library.work_marks().keys() == {ID3}
     library.purge(BRAVO)
-    assert rows("skipped") == rows("profiles") == rows("works") == []
+    assert rows("skipped") == rows("profiles") == rows("works") == rows("work_marks") == rows("artist_marks") == []
     assert b"zz-fake-alpha" not in database_bytes() and b"zz-fake-bravo" not in database_bytes()
+
+
+def test_a_kept_work_that_no_longer_qualifies_is_marked_and_stays(monkeypatch):
+    """Round 5: what the API says against a kept work is written beside it, with the time. That is all."""
+    clock(monkeypatch)
+    two_artists()
+    before = rows("works")
+    assert library.mark_works(ALPHA, {ID1: "mature", ID3: "mature", ID4: "mature"}) == 1  # BRAVO's, and nobody's
+    marks = library.work_marks()
+    assert marks.keys() == {ID1} and marks[ID1][0] == "mature" and marks[ID1][1].endswith("+00:00")
+    assert rows("works") == before and len(rows("profiles")) == 2  # nothing about the work itself changes
+    assert keep(ALPHA, [fields(ID2)], marks={ID1: "tagged AI-made", ID2: "mature"}) == (0, 1)
+    assert library.work_marks().keys() == {ID1} and library.work_marks()[ID1][0] == "tagged AI-made"  # ID2 was stored
+    assert library.mark_works(ALPHA, {ID2: "mature"}) == 1 and library.work_marks().keys() == {ID1, ID2}
+    seen = rows("works")[1]["fetched_at"]
+    assert library.mark_works(ALPHA, {ID2: None, ID3: None}) == 0  # seen again, and it qualifies
+    assert library.work_marks().keys() == {ID1} and rows("works")[1]["fetched_at"] > seen
+    assert rows("works")[2] == before[2]  # not BRAVO's work: that was not ALPHA's turn to say
+    keep(ALPHA, [fields(ID1)])
+    assert library.work_marks() == {}  # stored again: the mark goes
+    for reason in ("", "x" * 41, "FAKE <b>", "zz.fake@mail.invalid", 7):
+        with pytest.raises(ValueError):
+            library.mark_works(ALPHA, {ID1: reason})
+    for key in ("zz-fake-alpha", "*", None):
+        with pytest.raises(ValueError):
+            library.mark_works(key, {ID1: "mature"})
+
+
+def test_an_artist_is_marked_with_a_reason_and_a_time_and_storing_them_takes_the_mark_off():
+    two_artists()
+    library.mark_artist(ALPHA, "account gone")
+    library.mark_artist("da:zz-fake-nobody", "mostly AI-made")  # an artist of whom nothing is kept can be marked too
+    marks = library.artist_marks()
+    assert {key: mark[0] for key, mark in marks.items()} == {
+        ALPHA: "account gone",
+        "da:zz-fake-nobody": "mostly AI-made",
+    }
+    assert all(mark[1].endswith("+00:00") and mark[2] is None for mark in marks.values())
+    assert len(rows("profiles")) == 2 and len(rows("works")) == 3  # and that is all that happens
+    library.mark_artist(ALPHA, "mostly AI-made")
+    assert library.artist_marks()[ALPHA][0] == "mostly AI-made"
+    keep(ALPHA, tagline="FAKE-TAGLINE")
+    assert library.artist_marks().keys() == {"da:zz-fake-nobody"}
+    for reason in ("", "FAKE <b>", 7):
+        with pytest.raises(ValueError):
+            library.mark_artist(ALPHA, reason)
+    with pytest.raises(ValueError):
+        library.mark_artist("zz-fake-alpha", "account gone")
+
+
+def test_purge_deletes_every_contact_sheet_too(tmp_path, monkeypatch):
+    """The critic's finding: other stages lay cached images out on sheets under cache/review, and a removed
+    artist's work stayed on them. No row says which sheet shows whom, so a purge deletes all of them."""
+    two_artists()
+    review = config.CACHE_DIR / "review"
+    (review / "FAKE-RUN").mkdir(parents=True)
+    (review / "FAKE-SHEET-1.png").write_bytes(PNG)
+    (review / "FAKE-RUN" / "FAKE-SHEET-2.jpg").write_bytes(JPEG)
+    assert library.review_dir() == review
+    library.purge(ALPHA)
+    assert files(tmp_path) == [f"cache/images/{ID3}.jpg", "cache/pipeline.sqlite"] and not review.exists()
+    library.purge(ALPHA)  # safe to repeat, with no sheets there
+    (review / "FAKE-RUN").mkdir(parents=True)
+    (review / "FAKE-RUN" / "FAKE-SHEET-3.png").write_bytes(PNG)
+    with monkeypatch.context() as patch:  # a sheet that cannot be deleted is a purge that is not done
+        patch.setattr("shutil.rmtree", lambda *args, **kwargs: None)
+        with pytest.raises(OSError):
+            library.purge(BRAVO)
+    assert library.artist_keys() == []  # the rows went all the same
+    library.purge(BRAVO)
+    assert not review.exists()
 
 
 OTHER_STAGES = """
@@ -1405,13 +1599,6 @@ def test_purge_deletes_the_artists_rows_from_every_table_whichever_stage_made_it
     assert b"zz-fake-alpha" not in database_bytes() and ID1.encode() not in database_bytes()
 
 
-def test_a_work_that_is_no_longer_kept_takes_its_rows_in_the_other_tables_with_it():
-    other_stages()
-    keep(ALPHA, [fields(ID2)], tagline="FAKE-TAGLINE-NEW")  # ID1 has left the gallery
-    assert left("fake_tags", "deviation_id") == left("fake vectors", "Deviation_ID") == [ID2, ID3]
-    assert left("fake_both", "deviation_id") == [ID2, ID3] and left("fake_summaries", "artist_key") == [ALPHA, BRAVO]
-
-
 def test_a_work_whose_file_is_stuck_keeps_its_rows_everywhere_until_the_purge_is_run_again(monkeypatch):
     other_stages()
     with monkeypatch.context() as patch:
@@ -1421,31 +1608,6 @@ def test_a_work_whose_file_is_stuck_keeps_its_rows_everywhere_until_the_purge_is
     assert left("fake_tags", "deviation_id") == [ID1, ID3] and left("fake_summaries", "artist_key") == [BRAVO]
     library.purge(ALPHA)
     assert left("fake_tags", "deviation_id") == left("fake_both", "deviation_id") == [ID3]
-
-
-def queued():
-    return [key for key, _, _ in store.all_artists()]
-
-
-def test_unlist_purges_and_takes_the_handle_out_of_the_stores_queue_without_barring_it(monkeypatch):
-    """For a handle the API has called gone on two runs: nothing stays, and the collector stops asking about it."""
-    for handle in ("zz-fake-alpha", "zz-fake-bravo"):
-        assert store.upsert_artist(handle, f"https://www.deviantart.com/{handle}", [f"https://{handle}.art/"], 3)
-    two_artists()
-    library.note_skip(ALPHA, gone=True)
-    library.unlist(ALPHA)
-    assert queued() == [BRAVO] and library.artist_keys() == [BRAVO] and library.last_attempts().keys() == {BRAVO}
-    assert b"zz-fake-alpha" not in database_bytes()
-    assert not store.is_removed("zz-fake-alpha") and not store.is_removed("zz-fake-alpha.art")  # nobody is barred
-    assert store.upsert_artist("zz-fake-alpha", "https://www.deviantart.com/zz-fake-alpha", [], 3)  # and may come back
-    with monkeypatch.context() as patch:  # a stuck file: the handle stays queued, so the next run tries again
-        patch.setattr("pathlib.Path.unlink", locked(f"{ID3}.jpg"))
-        with pytest.raises(OSError):
-            library.unlist(BRAVO)
-    assert BRAVO in queued()
-    for key in ("zz-fake-alpha", "da:ZZ-Fake-Alpha", "*", None):
-        with pytest.raises(ValueError):
-            library.unlist(key)
 
 
 def test_drop_orphans_deletes_every_cached_file_that_no_row_names(tmp_path):
