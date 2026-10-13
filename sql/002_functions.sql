@@ -7,6 +7,7 @@
 -- Functions of the previous version whose arguments changed or that are no longer used.
 drop function if exists public.search_artists(text, extensions.halfvec, text[], text[], boolean, int, int);
 drop function if exists public.refresh_style_centroids();
+drop function if exists public.refresh_style_centroids(text[]); -- style is ranked on the owner's machine now
 drop function if exists public.artist_ids();
 drop function if exists public.barring_keys(text, text, jsonb);
 drop function if exists public.is_barred(text, text, jsonb);
@@ -331,46 +332,39 @@ as $$
   order by page.score desc, page.name, page.id
 $$;
 
--- Service role only. Rebuilds artist_styles from works: each artist's first 10 style vectors by
--- position, and the sign bits of their mean. db.load() calls it for each batch it has written
--- (p_slugs), db.after_load() for everyone (null). similar_artists cannot see an artist, as the seed
--- or as a result, until it has run for them. Returns how many rows changed: an artist whose vectors
--- are the same is not rewritten.
-create or replace function public.refresh_style_centroids(p_slugs text[] default null) returns int
+-- Service role only: db.load() calls it. p_rows is a JSON list of
+-- {"artist_slug", "neighbor_slug", "rank", "score"}. Every artist named as an artist_slug ends up with
+-- exactly the listed rows whose two artists are both in the database: what they had at any other rank
+-- is deleted, and a row that already holds the same values is not rewritten. A row naming an artist
+-- who is not in the database (removed, or never loaded) is skipped. Returns how many were skipped.
+-- An artist named in no row keeps the neighbours they have.
+create or replace function public.replace_neighbors(p_rows jsonb) returns int
 language sql set search_path = ''
 as $$
-  with chosen as materialized (
-    select a.id from public.artists a where p_slugs is null or a.slug = any (p_slugs)
+  with listed as materialized (
+    select r.artist_slug, r.neighbor_slug, r.rank, r.score
+    from jsonb_to_recordset(p_rows) as r (artist_slug text, neighbor_slug text, rank smallint, score real)
   ),
-  fresh as (
-    select chosen.id as artist_id, style.first_works, style.centroid_bits
-    from chosen
-    cross join lateral (
-      select array_agg(w.style_embedding order by w.position, w.id) as first_works,
-             extensions.binary_quantize(extensions.avg(extensions.l2_normalize(w.style_embedding))) as centroid_bits
-      from (
-        select style_embedding, position, id from public.works
-        where artist_id = chosen.id order by position, id limit 10
-      ) w
-      where w.style_embedding is not null
-    ) style
-    where style.first_works is not null
+  known as materialized (
+    select a.id as artist_id, b.id as neighbor_id, l.rank, l.score
+    from listed l
+    join public.artists a on a.slug = l.artist_slug
+    join public.artists b on b.slug = l.neighbor_slug
   ),
-  gone as (
-    delete from public.artist_styles s
-    where (p_slugs is null or s.artist_id in (select id from chosen))
-      and not exists (select 1 from fresh where fresh.artist_id = s.artist_id)
-    returning 1
+  stale as (
+    delete from public.artist_neighbors n
+    using public.artists a
+    where a.id = n.artist_id and a.slug in (select artist_slug from listed)
+      and not exists (select 1 from known k where k.artist_id = n.artist_id and k.rank = n.rank)
   ),
   written as (
-    insert into public.artist_styles as s (artist_id, centroid_bits, first_works)
-    select artist_id, centroid_bits, first_works from fresh
-    on conflict (artist_id) do update
-      set centroid_bits = excluded.centroid_bits, first_works = excluded.first_works
-      where s.first_works is distinct from excluded.first_works
-    returning 1
+    insert into public.artist_neighbors as n (artist_id, neighbor_id, rank, score)
+    select artist_id, neighbor_id, rank, score from known
+    on conflict (artist_id, rank) do update
+      set neighbor_id = excluded.neighbor_id, score = excluded.score
+      where (n.neighbor_id, n.score) is distinct from (excluded.neighbor_id, excluded.score)
   )
-  select (select count(*) from gone)::int + (select count(*) from written)::int
+  select (select count(*) from listed)::int - (select count(*) from known)::int
 $$;
 
 -- Service role only. Rebuilds search_words: every plain word of four letters or more in what
@@ -405,62 +399,28 @@ as $$
   select (select count(*) from gone)::int + (select count(*) from written)::int
 $$;
 
--- Other artists ranked by style, in two stages, both read from artist_styles:
---   1. shortlist the 100 artists whose mean style is nearest the seed's, by the sign bits alone;
---   2. score only those exactly: the mean, over the seed's works, of the best cosine match among
---      the candidate's works.
--- Only an artist's first 10 works by position take part, on both sides. An artist with no style
--- vectors yet gets an empty answer. At most 24 are returned, whatever p_limit says.
--- ponytail: sign bits are a coarse measure, and an artist outside the nearest 100 cannot be returned
--- however well one work matches. Ceiling: the style critic (piece 6) finds a miss; then widen the
--- shortlist, or keep the mean vector itself in artist_styles and rank by it.
+-- Other artists nearest in style: the artist's stored neighbours, best first, read by key. Nothing is
+-- computed here, so a call costs a handful of rows whatever the size of the index. An artist with no
+-- stored neighbours gets an empty answer. At most 24 are returned, whatever p_limit says, and a
+-- hidden or removed neighbour takes up none of them.
 create or replace function public.similar_artists(p_slug text, p_limit int default 24) returns setof jsonb
 language sql stable security definer set search_path = ''
 as $$
-  with seed as materialized (
-    select s.artist_id, s.centroid_bits, s.first_works
-    from public.artists a join public.artist_styles s on s.artist_id = a.id
-    where a.slug = p_slug and not a.hidden
-      and not exists (select 1 from public.removed gone where gone.key_hash in (a.da_key, a.site_key))
-  ),
-  wanted as materialized (
-    select w.e, w.n from seed, unnest(seed.first_works) with ordinality as w (e, n)
-  ),
-  shortlist as materialized (
-    select c.artist_id
-    from public.artist_styles c, seed
-    where c.artist_id <> seed.artist_id
-    order by c.centroid_bits operator(extensions.<~>) seed.centroid_bits, c.artist_id
-    limit 100
-  ),
-  candidates as materialized (
-    -- Fenced off on purpose. Reading first_works is the expensive part (15 kB an artist, stored out of
-    -- line) and the planner cannot see that: left free, it may unpack every artist's before it joins.
-    select c.artist_id, c.first_works
-    from shortlist
-    join public.artist_styles c on c.artist_id = shortlist.artist_id
-    join public.artists a on a.id = shortlist.artist_id and not a.hidden
-    where not exists (select 1 from public.removed gone where gone.key_hash in (a.da_key, a.site_key))
-  ),
-  best as (
-    select candidates.artist_id, wanted.n, max(1 - (theirs.e operator(extensions.<=>) wanted.e)) as sim
-    from candidates
-    cross join lateral unnest(candidates.first_works) as theirs (e)
-    cross join wanted
-    group by candidates.artist_id, wanted.n
-  ),
-  scored as (
-    select artist_id, avg(sim) as score from best group by artist_id
-  ),
-  page as materialized (
-    select scored.artist_id, scored.score
-    from scored
-    order by scored.score desc, scored.artist_id
+  with page as materialized (
+    select n.neighbor_id, n.rank
+    from public.artists seed
+    join public.artist_neighbors n on n.artist_id = seed.id
+    join public.artists a on a.id = n.neighbor_id
+    where seed.slug = p_slug and not seed.hidden and not a.hidden
+      and not exists (
+        select 1 from public.removed gone
+        where gone.key_hash in (seed.da_key, seed.site_key, a.da_key, a.site_key))
+    order by n.rank
     limit least(greatest(coalesce(p_limit, 24), 1), 24)
   )
-  select public.artist_card(page.artist_id, 4)
+  select public.artist_card(page.neighbor_id, 4)
   from page
-  order by page.score desc, page.artist_id
+  order by page.rank
 $$;
 
 -- The profile page: the card with every work, the artist's own tags, their site and their DeviantArt page.
@@ -590,7 +550,7 @@ revoke all on function
   public.artist_card(bigint, int),
   public.query_embedding(real[]),
   public.search_artists(text, real[], text[], text[], boolean, int, int),
-  public.refresh_style_centroids(text[]),
+  public.replace_neighbors(jsonb),
   public.refresh_search_words(),
   public.similar_artists(text, int),
   public.get_artist(text),
@@ -624,7 +584,7 @@ grant execute on function
   public.artist_card(bigint, int),
   public.query_embedding(real[]),
   public.search_artists(text, real[], text[], text[], boolean, int, int),
-  public.refresh_style_centroids(text[]),
+  public.replace_neighbors(jsonb),
   public.refresh_search_words(),
   public.similar_artists(text, int),
   public.get_artist(text),

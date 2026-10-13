@@ -34,7 +34,7 @@ NEEDED = (
 if not (ROOT / ".env").exists() or not all(load_env().get(name) for name in NEEDED):
     pytest.skip(".env lacks the Supabase keys", allow_module_level=True)
 
-TABLES = ("artists", "works", "artist_styles", "search_words", "removal_requests", "removal_secret", "removed")
+TABLES = ("artists", "works", "artist_neighbors", "search_words", "removal_requests", "removal_secret", "removed")
 PUBLIC_FUNCTIONS = ["get_artist", "request_removal", "search_artists", "similar_artists", "start_removal_proof"]
 SERVICE_FUNCTIONS = [
     "artist_ids",
@@ -42,9 +42,9 @@ SERVICE_FUNCTIONS = [
     "delete_removed",
     "purge_removed",
     "refresh_search_words",
-    "refresh_style_centroids",
     "reject_removal",
     "remove_artists",
+    "replace_neighbors",
 ]
 HELPER_FUNCTIONS = [
     "artist_card",
@@ -140,7 +140,7 @@ ARTISTS = [
     ),
     artist("delta"),
     artist("epsilon"),
-    artist(  # the best match for every search and every style, and it must never show
+    artist(  # the best match for every search, and it must never show
         "hidden",
         name=f"{WORD} {WORD} {WORD2} Hidden",
         profile=f"{WORD} {WORD} {WORD2}",
@@ -151,7 +151,7 @@ ARTISTS = [
         profile_embedding=QUERY,
         hidden=True,
     ),
-    # Loaded but not analyzed yet: no profile vector, no style vectors. They are found by their own words.
+    # Loaded but not analyzed yet: no profile vector, no neighbours. They are found by their own words.
     artist("dana", name=f"{WORD2} Dana", tagline=f"{WORD2} painter", mediums=[MIXED]),
     artist("drew", search_text=f"studies {WORD2} sketches", mediums=[MIXED]),
     # For the misspelled query: one artist it is really about, one who only matches the word spelled right.
@@ -160,16 +160,8 @@ ARTISTS = [
 ]
 BY_SLUG = {row["slug"]: row for row in ARTISTS}
 
-E1, E2, E3, E4, BLEND = vec(768, 1), vec(768, 0, 1), vec(768, 0, 0, 1), vec(768, 0, 0, 0, 1), vec(768, 1, 1)
-STYLES: dict[str, list[list[float] | None]] = {  # the style vector of each work, in display order
-    "alpha": [E1, E2, *[None] * 8, E3],  # the seed. Its eleventh work is past the cap and must not count.
-    "beta": [E1, E2],  # matches both seed works: 1.0
-    "gamma": [BLEND],  # halfway to each seed work: 0.71
-    "delta": [E1, E3],  # matches one seed work and misses the other: 0.5 (0.67 if the seed's eleventh counted)
-    "epsilon": [*[E4] * 10, E1, E2],  # ten works that match nothing, then two perfect ones past the cap: 0.0
-    "hidden": [E1, E2],
-    "dana": [None, None],  # not analyzed yet
-}
+# How many works each has. Alpha has more than a card shows.
+WORKS_EACH = {"alpha": 11, "beta": 2, "gamma": 1, "delta": 2, "epsilon": 2, "hidden": 2, "dana": 2}
 ON_OWN_SITE = {"alpha", "gone", "keep"}  # whose works are shown on their own site; the others' on DeviantArt
 
 # The removal tests' artists. GONE is removed: a port and a path on a www host show what the site key is not made from.
@@ -205,7 +197,7 @@ select (select count(*) from public.artists where slug like 'zz-test-%')::int as
        (select count(*) from public.works w join public.artists a on a.id = w.artist_id
         where a.slug like 'zz-test-%')::int as works
 """
-SEEDED = [{"artists": len(ARTISTS), "works": sum(map(len, STYLES.values()))}]
+SEEDED = [{"artists": len(ARTISTS), "works": sum(WORKS_EACH.values())}]
 
 
 def thumbnail(name: str, position: int, token: str = "A") -> str:
@@ -217,7 +209,7 @@ def thumbnail(name: str, position: int, token: str = "A") -> str:
     )
 
 
-def works_of(name: str, styles: list[list[float] | None], **owner: Any) -> list[dict[str, Any]]:
+def works_of(name: str, count: int, **owner: Any) -> list[dict[str, Any]]:
     """An artist's works, each with `owner` added: artist_slug for db.load, artist_id for db.upsert."""
     # In reverse display order, so anything sorted by id instead of position would fail.
     own_site = name in ON_OWN_SITE
@@ -234,18 +226,36 @@ def works_of(name: str, styles: list[list[float] | None], **owner: Any) -> list[
                 f"https://zz-test-{name}.invalid/thumb/{position}.jpg" if own_site else thumbnail(name, position)
             ),
             "title": f"{name} {position}",
-            "style_embedding": styles[position],
             "position": position,
         }
-        for position in reversed(range(len(styles)))
+        for position in reversed(range(count))
     ]
 
 
-WORKS = [row for name, styles in STYLES.items() for row in works_of(name, styles, artist_slug=f"zz-test-{name}")]
+WORKS = [row for name, count in WORKS_EACH.items() for row in works_of(name, count, artist_slug=f"zz-test-{name}")]
+
+
+def neighbor(of: str, name: str, rank: int, score: float) -> dict[str, Any]:
+    return {"artist_slug": f"zz-test-{of}", "neighbor_slug": f"zz-test-{name}", "rank": rank, "score": score}
+
+
+# Style neighbours as the owner's machine ranks them, listed out of order. Alpha's are in neither id
+# nor name order; one is hidden, and one is nobody the database knows.
+NEIGHBORS = [
+    neighbor("alpha", "beta", 5, 0.5),
+    neighbor("alpha", "gamma", 1, 0.875),
+    neighbor("alpha", "hidden", 2, 0.75),
+    neighbor("alpha", "delta", 3, 0.625),
+    neighbor("alpha", "nobody", 4, 0.5625),
+    neighbor("beta", "alpha", 1, 0.5),
+    neighbor("hidden", "alpha", 1, 0.75),
+]
+ALPHA_SIMILAR = ["zz-test-gamma", "zz-test-delta", "zz-test-beta"]  # what a visitor is shown for alpha
 
 
 def seed() -> dict[str, int]:
-    db.load(ARTISTS, WORKS)  # the push stage's way in
+    # The push stage's way in. It says how many neighbour rows it skipped: the one that names nobody.
+    assert db.load(ARTISTS, WORKS, NEIGHBORS) == 1
     return db.rpc("artist_ids", {"p_slugs": list(BY_SLUG)}, "secret")
 
 
@@ -276,6 +286,10 @@ def search(**args: Any) -> list[str]:
     found = slugs(db.rpc("search_artists", {"q": "", **args}))
     assert "zz-test-hidden" not in found
     return found
+
+
+def similar(name: str, **args: Any) -> list[str]:
+    return slugs(db.rpc("similar_artists", {"p_slug": f"zz-test-{name}", **args}))
 
 
 def visible(row: dict[str, Any]) -> bool:
@@ -320,7 +334,8 @@ select jsonb_build_object(
   'policies', (select count(*) from pg_policies where schemaname = 'public'),
   'rows', jsonb_build_array((select count(*) from public.artists), (select count(*) from public.works),
                             (select count(*) from public.removal_requests), (select count(*) from public.removed),
-                            (select count(*) from public.removal_secret))
+                            (select count(*) from public.removal_secret),
+                            (select count(*) from public.artist_neighbors))
 ) as snapshot
 """
 
@@ -344,8 +359,10 @@ VERSIONS = """
 select md5(string_agg(w.id || ':' || w.xmin::text || ':' || w.ctid::text, ',' order by w.id)) as of_every_work,
        (select md5(string_agg(id || ':' || xmin::text || ':' || ctid::text, ',' order by id))
         from public.artists where slug like 'zz-test-%') as of_every_artist,
-       (select md5(string_agg(s.artist_id || ':' || s.xmin::text, ',' order by s.artist_id))
-        from public.artist_styles s) as of_every_style_row
+       (select md5(string_agg(n.artist_id || ':' || n.rank || ':' || n.xmin::text || ':' || n.ctid::text, ','
+                              order by n.artist_id, n.rank))
+        from public.artist_neighbors n join public.artists o on o.id = n.artist_id
+        where o.slug like 'zz-test-%') as of_every_neighbour_row
 from public.works w join public.artists a on a.id = w.artist_id
 where a.slug like 'zz-test-%'
 """
@@ -366,7 +383,7 @@ def test_loading_twice_makes_no_duplicates(seeded):
     assert db.upsert("artists", [], "slug") == []
 
     # A work that did change is written and returned; sent again, it is left alone.
-    [retitled, *_] = works_of("delta", STYLES["delta"], artist_id=seeded["zz-test-delta"])
+    [retitled, *_] = works_of("delta", WORKS_EACH["delta"], artist_id=seeded["zz-test-delta"])
     retitled["title"] = "retitled"
     assert db.upsert("works", [retitled], "artist_id,key", "title") == [{"title": "retitled"}]
     assert db.upsert("works", [retitled], "artist_id,key", "title") == []
@@ -380,35 +397,68 @@ def test_load_goes_batch_by_batch(monkeypatch):
     monkeypatch.setattr(db, "VACUUM_EVERY", 2)
     monkeypatch.setattr(db, "LOAD_REST", 0.0)
     monkeypatch.setattr(db, "vacuum_analyze", lambda analyze=True: vacuums.append(analyze))
-    crowd_works = [
-        row
-        for person in CROWD
-        for row in works_of(person["slug"].removeprefix("zz-test-"), [E1], artist_slug=person["slug"])
-    ]
+    names = [person["slug"].removeprefix("zz-test-") for person in CROWD]
+    crowd_works = [row for name in names for row in works_of(name, 1, artist_slug=f"zz-test-{name}")]
+    # Everyone's nearest is the next in line: for the last artist of a batch, somebody a later batch
+    # writes. The first has everyone else after that, last first: more than a visitor is ever shown.
+    ring = [neighbor(name, names[(n + 1) % len(names)], 1, 0.5) for n, name in enumerate(names)]
+    rest = [neighbor(names[0], name, rank, 0.25) for rank, name in enumerate(reversed(names[2:]), start=2)]
     try:
-        db.load(CROWD, crowd_works)
-        # Thirty artists in batches of seven: five batches, a plain vacuum after the second and the fourth,
-        # and one with statistics to finish.
-        assert vacuums == [False, False, True]
+        assert db.load(CROWD, crowd_works, ring + rest) == 0
+        # Thirty artists in batches of seven: five batches, a plain vacuum after the second and the fourth.
+        # The same again for their thirty lists of neighbours, and one vacuum with statistics to finish.
+        assert vacuums == [False, False, False, False, True]
         [loaded] = db.sql("""
-            select count(*)::int as artists, count(s.artist_id)::int as with_style_rows,
+            select (select count(*) from public.artists where slug like 'zz-test-crowd-%')::int as artists,
                    (select count(*) from public.works w join public.artists c on c.id = w.artist_id
-                    where c.slug like 'zz-test-crowd-%')::int as works
-            from public.artists a left join public.artist_styles s on s.artist_id = a.id
-            where a.slug like 'zz-test-crowd-%'
+                    where c.slug like 'zz-test-crowd-%')::int as works,
+                   (select count(*) from public.artist_neighbors n join public.artists c on c.id = n.artist_id
+                    where c.slug like 'zz-test-crowd-%')::int as neighbours
         """)
-        assert loaded == {"artists": 30, "with_style_rows": 30, "works": 30}
-        # Their style rows were made batch by batch, so they are found by style without any other step.
-        assert "zz-test-crowd-01" in slugs(db.rpc("similar_artists", {"p_slug": "zz-test-crowd-00"}))
+        assert loaded == {"artists": 30, "works": 30, "neighbours": 58}
+        # In the stored order, and never more than 24 of the 29, whatever is asked for.
+        stored = [f"zz-test-{name}" for name in (names[1], *reversed(names[2:]))]
+        assert similar("crowd-00", p_limit=100) == stored[:SIMILAR_CAP]
+        assert similar("crowd-29") == ["zz-test-crowd-00"]
     finally:
         db.sql("delete from public.artists where slug like 'zz-test-crowd-%'")
+
+
+def test_a_column_a_load_does_not_send_is_left_as_it_was():
+    # A load may send fewer columns than the table has. An artist needs a slug, a name and a handle; a work
+    # its artist, its source and its two URLs. On a row already here, a column that is not sent keeps its
+    # value: an artist the owner hid stays hidden through a load that does not mention "hidden".
+    whole = artist("partial", tagline="kept", hidden=True)
+    again = {"slug": whole["slug"], "name": "Partial again", "da_username": whole["da_username"]}
+    new = {"slug": "zz-test-minimal", "name": "Minimal", "da_username": "zz-test-minimal"}
+    work = {
+        "artist_slug": new["slug"],
+        "source": "deviantart",
+        "page_url": "https://www.deviantart.com/zz-test-minimal/art/Zz-Test-0-90000000",
+        "image_url": thumbnail("minimal", 0),
+    }
+    try:
+        db.upsert("artists", [whole], "slug", "slug")
+        assert db.load([again, new], [work], []) == 0
+        rows = db.sql("""
+            select a.name, a.tagline, a.hidden, a.top_tags,
+                   (select jsonb_agg(jsonb_build_array(w.position, w.tags, w.title)) from public.works w
+                    where w.artist_id = a.id) as works
+            from public.artists a where a.slug in ('zz-test-partial', 'zz-test-minimal') order by a.slug
+        """)
+        assert rows == [
+            {"name": "Minimal", "tagline": None, "hidden": False, "top_tags": [], "works": [[0, [], None]]},
+            {"name": "Partial again", "tagline": "kept", "hidden": True, "top_tags": [], "works": None},
+        ]
+    finally:
+        db.sql("delete from public.artists where slug in ('zz-test-partial', 'zz-test-minimal')")
 
 
 def test_deviantart_work_is_the_same_work_under_a_new_thumbnail(seeded):
     # A DeviantArt thumbnail URL is long and carries a signed token that changes from one load to the
     # next. The deviation page is what identifies the work, so the row is updated, not doubled.
     dana = seeded["zz-test-dana"]
-    [work] = [row for row in works_of("dana", STYLES["dana"], artist_id=dana) if row["position"] == 0]
+    [work] = [row for row in works_of("dana", WORKS_EACH["dana"], artist_id=dana) if row["position"] == 0]
     longer = (thumbnail("dana", 0, token="B") + "&pad=").ljust(2040, "x")  # near the 2,048 limit, and accepted
     assert db.upsert("works", [{**work, "image_url": longer}], "artist_id,key", "image_url") == [{"image_url": longer}]
     assert db.sql(f"select count(*)::int as n from public.works where artist_id = {dana}") == [{"n": 2}]
@@ -575,22 +625,66 @@ def test_cards_and_the_profile_page():
     assert db.rpc("get_artist", {"p_slug": "zz-test-nobody"}) == []
 
 
-# 4. similar_artists.
+# 4. similar_artists: the stored neighbours, in the stored order.
+
+ALPHA_ROWS = """
+select n.rank::int as rank, b.slug, n.score::float as score
+from public.artist_neighbors n
+join public.artists a on a.id = n.artist_id
+join public.artists b on b.id = n.neighbor_id
+where a.slug = 'zz-test-alpha'
+order by n.rank
+"""
 
 
-def test_similar_artists_ranks_by_style_on_the_first_ten_works():
-    found = slugs(db.rpc("similar_artists", {"p_slug": "zz-test-alpha"}))
-    # Mean over the seed's two counted works of the best match: beta 1.0, gamma 0.71, delta 0.5, epsilon 0.
-    # The order tells the scoring apart from "best single pair" (delta would tie beta) and from
-    # "mean of all pairs" (gamma would win). It also proves both caps: counting the seed's eleventh
-    # work lifts delta to beta's score, and counting epsilon's last two works lifts epsilon to 1.0.
-    assert found[:3] == ["zz-test-beta", "zz-test-gamma", "zz-test-delta"]
-    assert "zz-test-alpha" not in found
-    assert "zz-test-hidden" not in found
-    assert slugs(db.rpc("similar_artists", {"p_slug": "zz-test-alpha", "p_limit": 1})) == ["zz-test-beta"]
-    assert db.rpc("similar_artists", {"p_slug": "zz-test-hidden"}) == []  # a hidden seed gives nothing away
-    assert db.rpc("similar_artists", {"p_slug": "zz-test-nobody"}) == []
-    assert db.rpc("similar_artists", {"p_slug": "zz-test-dana"}) == []  # no style vectors yet: an empty answer
+def test_similar_artists_reads_the_stored_order():
+    # What the load stored for alpha: the row that named nobody was skipped, the hidden artist's was kept.
+    assert db.sql(ALPHA_ROWS) == [
+        {"rank": 1, "slug": "zz-test-gamma", "score": 0.875},
+        {"rank": 2, "slug": "zz-test-hidden", "score": 0.75},
+        {"rank": 3, "slug": "zz-test-delta", "score": 0.625},
+        {"rank": 5, "slug": "zz-test-beta", "score": 0.5},
+    ]
+    # What a visitor is shown: those, by rank, without the hidden one. That is neither the order they
+    # were sent in, nor by id, nor by name.
+    assert similar("alpha") == ALPHA_SIMILAR
+    # A hidden neighbour takes up no place: the two asked for are the two best that may be shown.
+    assert similar("alpha", p_limit=2) == ALPHA_SIMILAR[:2]
+    assert similar("alpha", p_limit=-5) == ALPHA_SIMILAR[:1]  # out of range values are clamped
+    assert similar("alpha", p_limit=None) == ALPHA_SIMILAR
+    assert similar("beta") == ["zz-test-alpha"]
+    assert similar("hidden") == []  # a hidden seed gives nothing away, though a neighbour is stored for it
+    assert similar("nobody") == []
+    assert similar("dana") == []  # no neighbours stored: an empty answer
+
+
+def test_a_load_that_changes_neighbours_leaves_no_stale_row(seeded):
+    try:
+        # Alpha is ranked anew: two neighbours where there were four, at other ranks, with other scores.
+        changed = [neighbor("alpha", "delta", 1, 0.75), neighbor("alpha", "beta", 2, 0.25)]
+        assert db.load([BY_SLUG["zz-test-alpha"]], [], changed) == 0
+        assert db.sql(ALPHA_ROWS) == [
+            {"rank": 1, "slug": "zz-test-delta", "score": 0.75},
+            {"rank": 2, "slug": "zz-test-beta", "score": 0.25},
+        ]
+        assert similar("alpha") == ["zz-test-delta", "zz-test-beta"]
+        assert similar("beta") == ["zz-test-alpha"]  # an artist the load did not list keeps theirs
+        # A list of which nothing can be written still replaces what was there: beta has no neighbours now.
+        nothing = [neighbor("beta", "nobody", 1, 0.5), neighbor("nobody", "beta", 1, 0.5)]
+        assert db.load([], [], nothing) == 2
+        assert similar("beta") == []
+    finally:
+        seed()
+    assert similar("alpha") == ALPHA_SIMILAR and similar("beta") == ["zz-test-alpha"]
+
+
+def test_an_artist_is_never_their_own_neighbour(seeded):
+    alpha = seeded["zz-test-alpha"]
+    own = {"artist_id": alpha, "neighbor_id": alpha, "rank": 9, "score": 1}
+    assert refused(db.data_api("POST", "artist_neighbors", "secret", json=own), "artist_neighbors_not_itself")
+    listed = {"p_rows": [neighbor("beta", "gamma", 1, 0.5), neighbor("beta", "beta", 2, 0.5)]}
+    assert refused(db.data_api("POST", "rpc/replace_neighbors", "secret", json=listed), "artist_neighbors_not_itself")
+    assert similar("beta") == ["zz-test-alpha"]  # a list that is refused changes nothing
 
 
 # 5. The publishable key.
@@ -616,7 +710,7 @@ def test_publishable_key_cannot_touch_tables(seeded):
 def test_publishable_key_runs_the_public_functions_only():
     assert slugs(db.rpc("search_artists", {"q": WORD}, "publishable")) == ["zz-test-alpha", "zz-test-beta"]
     assert slugs(db.rpc("similar_artists", {"p_slug": "zz-test-alpha", "p_limit": 1}, "publishable")) == [
-        "zz-test-beta"
+        "zz-test-gamma"
     ]
     assert slugs(db.rpc("get_artist", {"p_slug": "zz-test-alpha"}, "publishable")) == ["zz-test-alpha"]
     assert db.rpc("request_removal", {"p_slug": "zz-test-nobody"}, "publishable") is True
@@ -631,7 +725,7 @@ def test_publishable_key_runs_the_public_functions_only():
         ("delete_removed", {}),
         ("removal_code", {"p_slug": "zz-test-alpha"}),
         ("artist_ids", {}),
-        ("refresh_style_centroids", {}),
+        ("replace_neighbors", {"p_rows": []}),
         ("refresh_search_words", {}),
         ("artist_card", {"p_artist_id": 1}),
         ("artist_keys", {"p_da_username": "zz-test-alpha", "p_site_domain": None}),
@@ -806,16 +900,22 @@ def test_no_public_call_changes_what_is_shown_or_spoils_a_code(seeded):
 def test_proof_of_control_removes_at_once_and_for_good(seeded):
     fresh(GONE, STAY)
     [gone] = db.sql(f"select id from public.artists where slug = '{GONE['slug']}'")
-    db.upsert("works", works_of("gone", [E1, E2], artist_id=gone["id"]), "artist_id,key", "id")
+    db.upsert("works", works_of("gone", 2, artist_id=gone["id"]), "artist_id,key", "id")
     db.rpc("refresh_search_words", {}, "secret")
+    pair = [neighbor("stay", "gone", 1, 0.5), neighbor("gone", "stay", 1, 0.5)]  # each is the other's neighbour
+    assert db.rpc("replace_neighbors", {"p_rows": pair}, "secret") == 0
+    assert similar("stay") == [GONE["slug"]]
     ask(GONE, "it is me")
     there = f"""
         select (select count(*) from public.artists where slug = '{GONE["slug"]}')::int as gone,
                (select count(*) from public.works where artist_id = {gone["id"]})::int as gone_works,
                (select count(*) from public.artists where slug = '{STAY["slug"]}')::int as stay,
-               (select count(*) from public.search_words where word = 'zzqxgoneword')::int as gone_words
+               (select count(*) from public.search_words where word = 'zzqxgoneword')::int as gone_words,
+               (select count(*) from public.artist_neighbors
+                where {gone["id"]} in (artist_id, neighbor_id))::int as gone_neighbours
     """
-    untouched = [{"gone": 1, "gone_works": 2, "stay": 1, "gone_words": 1}]
+    untouched = [{"gone": 1, "gone_works": 2, "stay": 1, "gone_words": 1, "gone_neighbours": 2}]
+    nothing_left = [{"gone": 0, "gone_works": 0, "stay": 1, "gone_words": 0, "gone_neighbours": 0}]
     hashes = ", ".join(f"'{key_hash}'" for key_hash in GONE_HASHES)
     remembered = f"select key_hash from public.removed where key_hash in ({hashes}) order by key_hash"
 
@@ -831,17 +931,20 @@ def test_proof_of_control_removes_at_once_and_for_good(seeded):
     assert db.sql(there) == untouched and db.sql(remembered) == [] and visible(GONE)
 
     # The verifier confirms the artist's code: the artist and their works are gone at once, with what was
-    # pending for them and the words only they used. Only the hashed keys remain.
+    # pending for them, the words only they used, and every neighbour row they were in. Only the hashed
+    # keys remain.
     assert confirm(GONE, code) is True
-    assert db.sql(there) == [{"gone": 0, "gone_works": 0, "stay": 1, "gone_words": 0}]
+    assert db.sql(there) == nothing_left
+    assert similar("stay") == []  # the artist who had them as a neighbour is still served, without them
     assert [row["key_hash"] for row in db.sql(remembered)] == GONE_HASHES
     assert db.sql(REQUESTS) == []
     assert visible(STAY)
     # The code opens nothing a second time, and the artist cannot be loaded again.
     assert confirm(GONE, code) is False
     assert db.upsert("artists", [GONE], "slug", "slug") == []
-    db.load([GONE], works_of("gone", [E1], artist_slug=GONE["slug"]))  # nor by a load, which skips their works too
-    assert db.sql(there) == [{"gone": 0, "gone_works": 0, "stay": 1, "gone_words": 0}]
+    # Nor by a load, which skips their works and every neighbour row that names them.
+    assert db.load([GONE], works_of("gone", 1, artist_slug=GONE["slug"]), pair) == 2
+    assert db.sql(there) == nothing_left
 
 
 def test_public_functions_answer_alike_for_unknown_hidden_and_visible(seeded):
@@ -903,7 +1006,7 @@ def bar_gone() -> None:
 def test_key_on_the_removal_list_deletes_the_artist_it_bars(seeded):
     fresh(KEEP)
     [keep] = db.sql(f"select id from public.artists where slug = '{KEEP['slug']}'")
-    db.upsert("works", works_of("keep", [E1], artist_id=keep["id"]), "artist_id,key", "id")
+    db.upsert("works", works_of("keep", 1, artist_id=keep["id"]), "artist_id,key", "id")
     db.rpc("refresh_search_words", {}, "secret")
     ask(KEEP)
     left = f"""
@@ -1035,7 +1138,9 @@ def test_a_write_racing_a_removal_does_not_survive_it(seeded):
 
 
 def test_a_removal_does_not_wait_for_a_load(seeded):
-    fresh(HELD)
+    fresh(HELD, STAY)
+    assert db.rpc("replace_neighbors", {"p_rows": [neighbor("stay", "held", 1, 0.5)]}, "secret") == 0
+    assert similar("stay") == [HELD["slug"]]
     code = proof_code(HELD)
     load_failed: list[str] = []
 
@@ -1058,6 +1163,7 @@ def test_a_removal_does_not_wait_for_a_load(seeded):
         assert db.sql(count) == [{"n": 1}]
         assert not visible(HELD)
         assert HELD["slug"] not in slugs(db.rpc("search_artists", {"q": "held"}))
+        assert similar("stay") == []  # nor as anybody's neighbour, though that row is still there too
     finally:
         holder.join()
     # The load's write could not commit onto a removed artist, and the sweep after a load takes the row.
@@ -1192,6 +1298,7 @@ BAD_WORKS = [
     ("41 tags", {"tags": [f"t{n}" for n in range(41)]}, SIZES),
     ("a tag of 61 characters", {"tags": ["t" * 61]}, SIZES),
     ("a source that is neither", {"source": "artstation"}, "works_source_known"),
+    ("a style vector", {"style_embedding": "[0.5,0.5]"}, "style_embedding"),  # the column is gone: vectors stay home
 ]
 
 
@@ -1263,7 +1370,7 @@ def test_work_must_be_clean_short_and_where_it_says(seeded, label: str, fields: 
     response = db.data_api("POST", "works", "secret", json={**GOOD_WORK, "artist_id": alpha, **fields})
     assert refused(response, reason), response.text[:300]
     assert db.sql(f"select count(*)::int as n from public.works where artist_id = {alpha}") == [
-        {"n": len(STYLES["alpha"])}
+        {"n": WORKS_EACH["alpha"]}
     ]
 
 
@@ -1271,7 +1378,7 @@ def test_a_work_cannot_be_on_the_site_of_an_artist_who_has_none(seeded):
     dana = {**GOOD_WORK, "artist_id": seeded["zz-test-dana"]}
     assert refused(db.data_api("POST", "works", "secret", json=dana), OWN_SITE)
     assert db.sql(f"select count(*)::int as n from public.works where artist_id = {seeded['zz-test-dana']}") == [
-        {"n": len(STYLES["dana"])}
+        {"n": WORKS_EACH["dana"]}
     ]
 
 
@@ -1312,9 +1419,9 @@ def test_errors_do_not_echo_secrets(monkeypatch):
     assert not leaked
 
 
-# Full scale, on request: RUN_SCALE=1. Loads 3,000 analyzed artists and 30,000 works, loads them all
-# again with new vectors while a visitor keeps calling, deletes them and compacts the tables (a brief
-# lock). About ten minutes and 200 MB of upload, so it is not part of the normal run.
+# Full scale, on request: RUN_SCALE=1. Loads 3,000 analyzed artists, 30,000 works and 24 neighbours
+# each, loads them all again with new vectors and new neighbours while a visitor keeps calling, deletes
+# them and compacts the tables (a brief lock). Too long for the normal run.
 
 BULK = """
 insert into public.artists
@@ -1333,7 +1440,7 @@ from generate_series(1, 3000) g;
 -- Ten analyzed DeviantArt works each: a deviation page, and a thumbnail URL with a signed token of 800
 -- characters that does not compress (as a real one does not).
 insert into public.works
-  (artist_id, source, page_url, image_url, title, description, tags, style_embedding, position)
+  (artist_id, source, page_url, image_url, title, description, tags, position)
 select a.id, 'deviantart',
        'https://www.deviantart.com/' || a.slug || '/art/Work-' || n,
        'https://images-wixmp-ed30a86b8c4ca887773594c2.wixmp.com/f/0a1b2c3d-4e5f-6071-8293-a4b5c6d7e8f9/d' || a.id
@@ -1343,17 +1450,25 @@ select a.id, 'deviantart',
        'A knight in ornate plate armor stands before a ruined cathedral, painted with loose, textured '
          || 'brushwork and a warm, muted palette. ' || md5(random()::text),
        array['digital painting', 'fantasy', 'armor', 'character', 'painterly', 'knight'],
-       (select array_agg(random() - 0.5) from generate_series(1, 768) where a.id = a.id and n = n
-       )::extensions.halfvec(768),
        n
 from public.artists a cross join generate_series(0, 9) n
+where a.slug like 'zz-test-bulk-%';
+
+-- Twenty-four neighbours each: for artist g, artists g + 37, g + 74 and so on, counting round.
+insert into public.artist_neighbors (artist_id, neighbor_id, rank, score)
+select a.id, b.id, k, 1 - k / 100.0
+from public.artists a
+cross join generate_series(1, 24) k
+join public.artists b
+  on b.slug = 'zz-test-bulk-' || ((substring(a.slug from '[0-9]+$')::int - 1 + k * 37) % 3000 + 1)
 where a.slug like 'zz-test-bulk-%';
 """
 SCALE = """
 select (select count(*) from public.artists where slug like 'zz-test-bulk-%')::int as artists,
        (select count(*) from public.works w join public.artists a on a.id = w.artist_id
         where a.slug like 'zz-test-bulk-%')::int as works,
-       (select count(*) from public.artist_styles)::int as style_rows,
+       (select count(*) from public.artist_neighbors n join public.artists a on a.id = n.artist_id
+        where a.slug like 'zz-test-bulk-%')::int as neighbours,
        round(pg_database_size(current_database()) / 1048576.0)::int as megabytes
 """
 
@@ -1362,10 +1477,10 @@ def random_vector(numbers: random.Random, size: int) -> str:
     return "[" + ",".join(f"{numbers.uniform(-0.5, 0.5):.4f}" for _ in range(size)) + "]"
 
 
-def reload_rows(numbers: random.Random) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+def reload_rows(numbers: random.Random) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
     """Every bulk artist and work again, as the push stage would send them after analyzing everything anew:
-    the same artists and deviation pages, with new vectors and new thumbnail tokens."""
-    artists, works = [], []
+    the same artists and deviation pages, with new vectors, new thumbnail tokens and new neighbours."""
+    artists, works, neighbors = [], [], []
     for g in range(1, 3001):
         slug = f"zz-test-bulk-{g}"
         artists.append(
@@ -1396,11 +1511,13 @@ def reload_rows(numbers: random.Random) -> tuple[list[dict[str, Any]], list[dict
                     "title": f"Work title {n}",
                     "description": f"A knight in ornate plate armor, described again. {g} {n}",
                     "tags": ["digital painting", "fantasy", "armor", "character", "painterly", "knight"],
-                    "style_embedding": random_vector(numbers, 768),
                     "position": n,
                 }
             )
-    return artists, works
+        for k in range(1, 25):  # nobody keeps a neighbour: g + 41, g + 82 and so on, counting round
+            nearest = f"zz-test-bulk-{(g - 1 + k * 41) % 3000 + 1}"
+            neighbors.append({"artist_slug": slug, "neighbor_slug": nearest, "rank": k, "score": 1 - k / 100})
+    return artists, works, neighbors
 
 
 def server_ms(query: str) -> list[float]:
@@ -1443,7 +1560,7 @@ def test_full_scale_fits_the_budget_and_the_public_timeout():
         db.after_load()
         [loaded] = db.sql(SCALE)
         print(f"\nloaded: {loaded}", flush=True)
-        assert (loaded["artists"], loaded["works"], loaded["style_rows"] >= 3000) == (3000, 30_000, True)
+        assert (loaded["artists"], loaded["works"], loaded["neighbours"]) == (3000, 30_000, 72_000)
         assert loaded["megabytes"] < 400
         after_load = {label: as_the_public(label) for label in calls}
         print(
@@ -1453,8 +1570,8 @@ def test_full_scale_fits_the_budget_and_the_public_timeout():
 
         # Everything again, analyzed anew, through db.load, while a visitor keeps calling the public
         # functions and the database's size is watched. No call may fail or outlast the public's limit.
-        artists, works = reload_rows(numbers)
-        seen: list[tuple[str, float]] = []
+        artists, works, neighbors = reload_rows(numbers)
+        seen: list[tuple[str, float, float]] = []  # what was called, how long it took, when it began
         failed: list[str] = []
         sizes = [loaded["megabytes"]]
         loading = threading.Event()
@@ -1462,44 +1579,48 @@ def test_full_scale_fits_the_budget_and_the_public_timeout():
         def visitor() -> None:
             while not loading.is_set():
                 for label in ("similar", "search with an embedding", "search", "profile"):
+                    began = time.perf_counter() - started
                     try:
-                        seen.append((label, as_the_public(label)))
+                        seen.append((label, as_the_public(label), began))
                     except Exception as error:  # every failure is recorded, and the test fails on them below
-                        failed.append(f"{label} at {time.perf_counter() - started:.0f} s: {error}")
+                        failed.append(f"{label} at {began:.0f} s: {error}")
                 sizes.append(megabytes())
 
-        # How long each of the load's own statements takes, to see how near the Data API's 8 s they come.
-        statements: dict[str, list[float]] = {}
-        real_upsert, real_rpc = db.upsert, db.rpc
+        # How long each of the load's own statements takes (to see how near the Data API's 8 s they come)
+        # and when, so that a slow answer to the visitor can be set beside what the load was doing.
+        statements: dict[str, list[tuple[float, float]]] = {}
+        real_upsert, real_rpc, real_vacuum = db.upsert, db.rpc, db.vacuum_analyze
 
         def timed(kind: str, call: Any, *args: Any) -> Any:
             began = time.perf_counter()
             try:
                 return call(*args)
             finally:
-                statements.setdefault(kind, []).append(time.perf_counter() - began)
+                statements.setdefault(kind, []).append((time.perf_counter() - began, began - started))
 
         db.upsert = lambda table, *args: timed(f"upsert {table}", real_upsert, table, *args)  # type: ignore[assignment]
         db.rpc = lambda name, *args: timed(name, real_rpc, name, *args)  # type: ignore[assignment]
+        db.vacuum_analyze = lambda analyze=True: timed("vacuum", real_vacuum, analyze)  # type: ignore[assignment]
         started = time.perf_counter()
         watcher = threading.Thread(target=visitor)
         watcher.start()
         try:
-            db.load(artists, works)
+            assert db.load(artists, works, neighbors) == 0
         finally:
             loading.set()
             watcher.join()
-            db.upsert, db.rpc = real_upsert, real_rpc  # type: ignore[assignment]
+            db.upsert, db.rpc, db.vacuum_analyze = real_upsert, real_rpc, real_vacuum  # type: ignore[assignment]
         took = time.perf_counter() - started
-        for kind in ("upsert artists", "upsert works", "refresh_style_centroids"):
-            took_each = sorted(statements[kind])
+        of_the_load = ("upsert artists", "artist_ids", "upsert works", "replace_neighbors", "vacuum")
+        for kind in of_the_load:
+            took_each = sorted(s for s, _ in statements[kind])
             middle, longest = took_each[len(took_each) // 2], took_each[-1]
             print(
                 f"the load's {len(took_each)} '{kind}' statements: median {middle:.2f} s, slowest {longest:.2f} s",
                 flush=True,
             )
-        slowest = {label: max(s for name, s in seen if name == label) for label in {name for name, _ in seen}}
-        round_trips = sorted(s for _, s in seen)
+        slowest = {label: max(s for name, s, _ in seen if name == label) for label in {name for name, _, _ in seen}}
+        round_trips = sorted(s for _, s, _ in seen)
         median, most = round_trips[len(round_trips) // 2], round_trips[int(len(round_trips) * 0.99)]
         print(
             f"reload through db.load: {took:.0f} s; a visitor made {len(seen) + len(failed)} calls meanwhile",
@@ -1508,6 +1629,14 @@ def test_full_scale_fits_the_budget_and_the_public_timeout():
         print(f"of those, {len(failed)} failed: {failed[:3]}", flush=True)
         print(f"round trips during the reload: median {median:.2f} s, 99 in 100 under {most:.2f} s", flush=True)
         print("slowest of each: " + ", ".join(f"{k} {v:.2f} s" for k, v in slowest.items()), flush=True)
+        for label, s, began in seen:
+            if s > 1:  # every answer that took over a second, with what the load was doing meanwhile
+                meanwhile = sorted(
+                    {kind for kind in of_the_load for t, at in statements[kind] if at < began + s and began < at + t}
+                )
+                print(
+                    f"  {label} took {s:.2f} s at {began:.0f} s, during the load's: {meanwhile or 'rest'}", flush=True
+                )
         print(f"database size during the reload: peak {max(sizes)} MB over {len(sizes)} readings", flush=True)
         # Every call was answered: one that the public's 3 s limit cut off would be among the failures.
         # (A round trip adds the network to the query, so it is held to the limit for 99 calls in 100.)
@@ -1516,7 +1645,8 @@ def test_full_scale_fits_the_budget_and_the_public_timeout():
         assert max(sizes) < 400
         [reloaded] = db.sql(SCALE)
         print(f"after the reload: {reloaded}", flush=True)
-        assert (reloaded["artists"], reloaded["works"]) == (3000, 30_000) and reloaded["megabytes"] < 400
+        assert (reloaded["artists"], reloaded["works"], reloaded["neighbours"]) == (3000, 30_000, 72_000)
+        assert reloaded["megabytes"] < 400
         changed = "select count(*)::int as n from public.works where description like '%described again%'"
         assert db.sql(changed) == [{"n": 30_000}]  # the reload really rewrote every work
 
@@ -1527,7 +1657,8 @@ def test_full_scale_fits_the_budget_and_the_public_timeout():
             flush=True,
         )
         assert max(after_reload.values()) < limit
-        assert len(db.rpc("similar_artists", {"p_slug": "zz-test-bulk-1", "p_limit": 100})) == SIMILAR_CAP
+        # The reload's neighbours, all of them new, in rank order.
+        assert similar("bulk-1", p_limit=100) == [f"zz-test-bulk-{41 * k + 1}" for k in range(1, 25)]
         deep = {"q": "", "p_limit": 100, "p_offset": OFFSET_CAP}
         assert len(db.rpc("search_artists", deep)) == 100  # the deepest page, built for its own rows only
         assert db.rpc("search_artists", {**deep, "p_offset": OFFSET_CAP + 1}) == []  # and past it, nothing
@@ -1555,5 +1686,5 @@ def test_full_scale_fits_the_budget_and_the_public_timeout():
             delete from public.removal_requests where artist_slug like 'zz-test-bulk-%';
             select public.refresh_search_words();
         """)
-        for table in ("works", "artists", "artist_styles", "search_words"):
+        for table in ("works", "artists", "artist_neighbors", "search_words"):
             db.sql(f"vacuum full public.{table}")

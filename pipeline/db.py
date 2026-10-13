@@ -9,6 +9,7 @@ never the request URL (it holds the project ref).
 import itertools
 import sys
 import time
+from collections.abc import Callable, Iterable
 from typing import Any, Literal
 
 import httpx
@@ -94,9 +95,9 @@ def rpc(name: str, args: dict[str, Any], key: Key = "publishable") -> Any:
 
 
 def migrate() -> None:
-    """Apply sql/*.sql in name order. Every statement is idempotent, so rerunning changes nothing."""
-    for path in sorted((ROOT / "sql").glob("*.sql")):
-        sql(path.read_text(encoding="utf-8"))
+    """Apply sql/*.sql in name order, all or nothing. Every statement is idempotent, so rerunning changes nothing."""
+    # One call, so one transaction: no visitor meets tables of one version under functions of another.
+    sql("\n".join(path.read_text(encoding="utf-8") for path in sorted((ROOT / "sql").glob("*.sql"))))
     # The Data API reads the schema asynchronously. Wait until it lists every function it can call.
     sql("notify pgrst, 'reload schema'")
     callable_functions = sql("""
@@ -113,27 +114,55 @@ def migrate() -> None:
     raise RuntimeError("the Data API did not pick up the schema within 30 seconds")
 
 
-def load(artists: list[dict[str, Any]], works: list[dict[str, Any]]) -> None:
-    """Write artists and their works a few at a time, so the public never meets a database in mid-rewrite.
+def load(artists: list[dict[str, Any]], works: list[dict[str, Any]], neighbors: list[dict[str, Any]]) -> int:
+    """Write artists, their works and their style neighbours a few at a time, so the public never
+    meets a database in mid-rewrite. Returns how many neighbour rows were skipped.
 
-    Each work names its artist by "artist_slug" in place of artist_id. For every batch of LOAD_BATCH
-    artists: the artists, their works, then the style rows similar_artists reads, for those artists
-    only. After each batch it rests for as long as the batch took (LOAD_REST at most), so the load uses
+    An artist is a row of the artists table: "slug", "name" and "da_username" are required;
+    "site_url" with "site_domain" (both or neither), "tagline", "top_tags", "search_text", "profile",
+    "specialties", "mediums", "open_for_work", "profile_embedding" and "hidden" are optional.
+    A work names its artist by "artist_slug" and needs "source" ('deviantart' or 'site'), "page_url"
+    and "image_url"; "title", "description", "tags" and "position" are optional.
+    A neighbour is {"artist_slug", "neighbor_slug", "rank", "score"}, rank 1 the nearest.
+    Within one call every artist needs the same keys, and so does every work.
+
+    First the artists with their works, LOAD_BATCH artists at a time. Then the neighbours, by which
+    time every artist they can name is in the database: each artist named as an "artist_slug" has all
+    their previous neighbours replaced, and an artist named in no row keeps theirs. A neighbour row
+    naming an artist who is not in the database (removed, or never loaded) is skipped and counted.
+    A work is written only with its artist: one whose artist is not in `artists`, or whose artist the
+    database skipped (a removed artist), is left out.
+
+    After each batch it rests for as long as the batch took (LOAD_REST at most), so the load uses
     half of what the database can do and visitors get the rest; a slow database is given more room.
     Dead row versions are vacuumed every VACUUM_EVERY batches, without the statistics pass: that one
-    samples whole tables, which is the heaviest reading a load would do. A work whose artist the
-    database skipped (a removed artist) is skipped with them. Safe to repeat: rows that have not
-    changed are not rewritten.
+    samples whole tables, which is the heaviest reading a load would do. Safe to repeat: rows that
+    have not changed are not rewritten.
     """
     by_artist: dict[str, list[dict[str, Any]]] = {}
     for work in works:
         row = {name: value for name, value in work.items() if name != "artist_slug"}
         by_artist.setdefault(work["artist_slug"], []).append(row)
-    for number, batch in enumerate(itertools.batched(artists, LOAD_BATCH), start=1):
+    lists: dict[str, list[dict[str, Any]]] = {}
+    for row in neighbors:
+        lists.setdefault(row["artist_slug"], []).append(row)
+    _paced(itertools.batched(artists, LOAD_BATCH), lambda batch: _load_batch(list(batch), by_artist))
+    skipped = _paced(
+        itertools.batched(lists.values(), LOAD_BATCH),  # an artist's list is never split: it is replaced whole
+        lambda batch: rpc("replace_neighbors", {"p_rows": [row for rows in batch for row in rows]}, "secret"),
+    )
+    after_load()
+    return skipped
+
+
+def _paced(batches: Iterable[Any], write: Callable[[Any], int]) -> int:
+    """Write each batch, rest after it, vacuum every VACUUM_EVERY batches. Returns the sum of what write returns."""
+    total = 0
+    for number, batch in enumerate(batches, start=1):
         began = time.perf_counter()
         for attempt in (1, 2):
             try:
-                _load_batch(list(batch), by_artist)
+                total += write(batch)
                 break
             except RuntimeError as error:
                 # One more try for a batch the database was too busy to finish in time (it is safe to repeat).
@@ -143,28 +172,26 @@ def load(artists: list[dict[str, Any]], works: list[dict[str, Any]]) -> None:
         time.sleep(min(time.perf_counter() - began, LOAD_REST))
         if number % VACUUM_EVERY == 0:
             vacuum_analyze(analyze=False)
-    after_load(refresh_styles=False)  # each batch refreshed its own
+    return total
 
 
-def _load_batch(batch: list[dict[str, Any]], by_artist: dict[str, list[dict[str, Any]]]) -> None:
+def _load_batch(batch: list[dict[str, Any]], by_artist: dict[str, list[dict[str, Any]]]) -> int:
     slugs = [row["slug"] for row in batch]
     upsert("artists", batch, "slug", "slug")
     ids = rpc("artist_ids", {"p_slugs": slugs}, "secret")
     rows = [{**work, "artist_id": ids[slug]} for slug in slugs if slug in ids for work in by_artist.get(slug, [])]
     upsert("works", rows, "artist_id,key", "id")
-    rpc("refresh_style_centroids", {"p_slugs": slugs}, "secret")
+    return 0
 
 
-def after_load(refresh_styles: bool = True) -> None:
+def after_load() -> None:
     """Finish a load: sweep, rebuild what the public functions read, vacuum. load() calls it.
 
     Call it yourself after writing rows with upsert(). The sweep deletes any artist on the removal
-    list that a removal had to leave because a load held the row. The rebuilds go through the
-    Management API, which has no 8 s limit.
+    list that a removal had to leave because a load held the row. Both go through the Management
+    API, which has no 8 s limit.
     """
     sql("select public.delete_removed()")
-    if refresh_styles:
-        sql("select public.refresh_style_centroids()")
     sql("select public.refresh_search_words()")
     vacuum_analyze()
 
@@ -172,7 +199,7 @@ def after_load(refresh_styles: bool = True) -> None:
 def vacuum_analyze(analyze: bool = True) -> None:
     """Clear dead row versions and, unless told not to, refresh the planner's statistics."""
     command = "vacuum (analyze)" if analyze else "vacuum"
-    for table in ("artists", "works", "artist_styles", "search_words"):
+    for table in ("artists", "works", "artist_neighbors", "search_words"):
         sql(f"{command} public.{table}")  # one call each: vacuum cannot share a transaction
 
 

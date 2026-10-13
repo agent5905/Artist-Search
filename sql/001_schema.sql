@@ -114,26 +114,26 @@ create table if not exists public.works (
   title text,
   description text, -- null until the work is analyzed
   tags text[] not null default '{}',
-  -- Kept inline (plain): out of line, every distance pays a TOAST fetch. Null until the work is analyzed.
-  style_embedding extensions.halfvec(768) storage plain,
   position int not null default 0,
   -- What makes a work the same work on the next load. A DeviantArt thumbnail URL carries a signed token
   -- that changes, so there it is the deviation page.
   key text generated always as (case when source = 'deviantart' then page_url else image_url end) stored
 );
 
--- What similar_artists reads, so that a call never walks the works table or the wide artists rows.
--- Derived: refresh_style_centroids() rebuilds it from works, and db.load() calls that for each batch.
--- It exists because of memory, not arithmetic: on the free tier (0.5 GB) the first call after a big
--- write has to bring every page it touches back into memory, and the public role is cut off at 3 s.
-create table if not exists public.artist_styles (
-  artist_id bigint primary key references public.artists (id) on delete cascade,
-  -- The sign of each dimension of the artist's mean style vector: 96 bytes to shortlist by.
-  centroid_bits bit(768) not null,
-  -- The artist's first 10 style vectors by position, to score the shortlist exactly. A second copy of
-  -- them (about 15 kB an artist, 46 MB for 3,000); external: half floats do not compress.
-  first_works extensions.halfvec(768)[] storage external not null check (cardinality(first_works) between 1 and 10)
+-- Each artist's nearest artists by style, best first. The ranking is worked out on the owner's
+-- machine, where the style vectors live (it needs statistics over every artist at once); the database
+-- only stores the result and similar_artists reads it. db.load() writes it; a removed artist's rows
+-- go with them, on either side.
+create table if not exists public.artist_neighbors (
+  artist_id bigint not null references public.artists (id) on delete cascade,
+  neighbor_id bigint not null references public.artists (id) on delete cascade,
+  rank smallint not null, -- 1 is the nearest
+  score real not null,
+  primary key (artist_id, rank),
+  constraint artist_neighbors_not_itself check (neighbor_id <> artist_id)
 );
+-- Deleting an artist finds the rows that name them as a neighbour by this.
+create index if not exists artist_neighbors_neighbor_idx on public.artist_neighbors (neighbor_id);
 
 -- The words visible artists use, for putting a misspelled search word right. Derived:
 -- refresh_search_words() rebuilds it; db.load() and every removal call that.
@@ -143,11 +143,10 @@ create table if not exists public.search_words (
 );
 create index if not exists search_words_trgm_idx on public.search_words using gin (word extensions.gin_trgm_ops);
 
--- ponytail: no vector indexes. search_artists orders every artist by 128 bytes of sign bits and
--- compares exactly only the best 100; similar_artists does the same with a shortlist of 100.
--- Measured numbers are printed by the RUN_SCALE=1 test in tests/test_db.py.
--- Ceiling: both still read one row per artist. Past about 30,000 artists add HNSW on
--- artists.profile_embedding and keep the mean style vector to index as well.
+-- ponytail: no vector index. search_artists orders every artist by 128 bytes of sign bits and
+-- compares exactly only the best 100. Measured numbers are printed by the RUN_SCALE=1 test in
+-- tests/test_db.py. Ceiling: it still reads one row per artist. Past about 30,000 artists add HNSW
+-- on artists.profile_embedding.
 
 -- Removal requests waiting for the owner: logged, never acted on by themselves (owner decision 6).
 -- One row per artist: when it was first and last asked for, how often, and what the first request
@@ -205,6 +204,9 @@ $$;
 alter table public.removal_requests
   add column if not exists last_at timestamptz not null default now(),
   add column if not exists requests bigint not null default 1;
+-- Style vectors stay on the owner's machine now: the database holds only artist_neighbors.
+alter table public.works drop column if exists style_embedding;
+drop table if exists public.artist_styles;
 
 -- Search reads every artist's row, and after a big write each page of them has to come back into
 -- memory before the public's 3 s run out. So the row keeps only what search reads (the keyword
@@ -279,18 +281,18 @@ create index if not exists works_artist_position_idx on public.works (artist_id,
 
 alter table public.artists enable row level security;
 alter table public.works enable row level security;
-alter table public.artist_styles enable row level security;
+alter table public.artist_neighbors enable row level security;
 alter table public.search_words enable row level security;
 alter table public.removal_requests enable row level security;
 alter table public.removal_secret enable row level security;
 alter table public.removed enable row level security;
 
 revoke all on table
-  public.artists, public.works, public.artist_styles, public.search_words,
+  public.artists, public.works, public.artist_neighbors, public.search_words,
   public.removal_requests, public.removal_secret, public.removed
 from public, anon, authenticated;
 revoke all on table public.removal_secret from service_role;
 grant all on table
-  public.artists, public.works, public.artist_styles, public.search_words, public.removal_requests, public.removed
+  public.artists, public.works, public.artist_neighbors, public.search_words, public.removal_requests, public.removed
 to service_role;
 revoke all on sequence public.artists_id_seq, public.works_id_seq from public, anon, authenticated;
