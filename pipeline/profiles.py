@@ -6,7 +6,8 @@
 
 An artist is profiled once every collected work of theirs with a cached image has a verified tag result (the
 result set "<model>+<model>" of pipeline/tagging.py, at its current prompt version) and a reading of its own
-title and tags. Until then the artist waits, and has no row here.
+title and tags. Until then the artist waits: one who has no row gets none, and one who has a row keeps it, so
+that an artist is not gone from the site each time collection brings a new work of theirs.
 
 The facts are counts over the artist's eligible works: analyzed, not flagged or rated explicit, not flagged
 not_artwork, not declared AI-made. Only the verified tags are counted, never the descriptions. What a profile
@@ -1384,7 +1385,7 @@ def run(
 
     Returns counts only: profiled, excluded_<reason> for each of REASONS, unchanged (their row is still what
     this run would write: nothing is asked or written again), waiting_for_tags (not every work of theirs is
-    tagged yet; a row they had is deleted, because it is about works that have changed), left_for_next_run,
+    tagged yet; a row they had stays as it is until they are), left_for_next_run,
     removed (rows of artists the store no longer lists, deleted), open_for_work and written_fallback (of the
     profiled), and seconds_per_artist. Each row is committed as it is made. ValueError before anything is sent
     if the address is not loopback; httpx.HTTPError when Ollama is in trouble, with what was stored kept.
@@ -1456,7 +1457,6 @@ def run(
             works = collected[key]
             if not all(work_id in tagged and work_id in declared for work_id, image, _, _ in works if image):
                 counts["waiting_for_tags"] += 1
-                stale |= {key} & stored.keys()
                 continue
             own = [(work_id, json.loads(tags), at) for work_id, _, tags, at in works]
             facts, reason = facts_of(

@@ -1811,13 +1811,19 @@ def test_an_artist_waits_until_every_work_of_theirs_is_tagged_and_read():
     assert profiles.profiles()[0]["facts"]["eligible"] == 7
 
 
-def test_a_profile_does_not_outlive_the_works_it_was_made_from():
+def test_a_profile_is_kept_while_a_new_work_of_the_artists_waits_for_its_tags():
+    """Collection runs for hours beside this stage: an artist must not vanish each time a work of theirs arrives."""
     artist(ALPHA, [tags()] * 6)
     assert run(Fake()) == {"profiled": 1}
+    before = table()
 
-    artist(ALPHA, [tags()] * 6 + [None])  # collected again with a new work, which has no tags yet
+    ids = artist(ALPHA, [tags()] * 6 + [None])  # collected again with a new work, which has no tags yet
     assert run(Fake()) == {"waiting_for_tags": 1}
-    assert table() == []
+    assert table() == before != []
+
+    tag(ids[6], tags())  # and once it is tagged, the row is made again from all seven
+    assert run(Fake()) == {"profiled": 1}
+    assert profiles.profiles()[0]["facts"]["eligible"] == 7
 
 
 def test_a_work_that_failed_tagging_or_has_no_image_does_not_hold_an_artist_back():
