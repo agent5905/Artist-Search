@@ -342,7 +342,8 @@ def build(
         why = None
         if key in marked_artists:
             why = _marked(marked_artists[key][0])
-        elif key not in written:
+        # A sentence the plain contact rule refuses is no profile to show: the artist waits for another.
+        elif key not in written or library.holds_contact(written[key]["written"]):
             why = "profile_excluded" if key in excluded else "not_profiled"
         # A removed site the store's own links did not show.
         elif site_url and (store.is_removed(site_url, local) or store.covers(removed, site_url)):

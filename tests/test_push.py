@@ -1760,7 +1760,6 @@ def test_a_text_that_fails_the_plain_rule_is_left_out_of_a_row_that_is_sent_and_
     key, word = f"da:{ALPHA}", squashed(ALPHA)
     said = {
         "tagline": "FAKE-TAGLINE mail fake.person@example.invalid",
-        "profile": "FAKE-PROFILE, more at yy-fake-painter.example.",
         "own tag": "zzcall5550199",
         "own word": "zz 555 010 019 942",
         "specialty": "zz@yy-fake",
@@ -1770,17 +1769,14 @@ def test_a_text_that_fails_the_plain_rule_is_left_out_of_a_row_that_is_sent_and_
     with closing(sqlite3.connect(config.LOCAL_DB)) as conn, conn:  # each read "no contact", or never read at all
         conn.execute("UPDATE profiles SET tagline = ? WHERE artist_key = ?", (said["tagline"], key))
         conn.execute("UPDATE works SET tags = ? WHERE deviation_id = ?", (f'["{said["own tag"]}"]', works[0]["id"]))
-        conn.execute(
-            "UPDATE artist_profiles SET written = ?, facts = ? WHERE artist_key = ?",
-            (said["profile"], json.dumps(facts), key),
-        )
+        conn.execute("UPDATE artist_profiles SET facts = ? WHERE artist_key = ?", (json.dumps(facts), key))
     edit_result(works[0], style_words=["painterly", said["style word"]])
 
     counts = push.run(False)
 
     row, first = sent_artists(fake)[ALPHA], fake.loads[-1][1][0]
     assert counts["artists_sent"] == 1 and counts["works_sent"] == 5 and counts["works_held_contact_by_rule"] == 0
-    assert row["tagline"] is None and row["profile"] is None and row["specialties"] == ["character"]
+    assert row["tagline"] is None and row["profile"] and row["specialties"] == ["character"]
     assert row["top_tags"] == [f"zzall{word}", *(f"zzown{word}{n}" for n in range(1, 5))]
     assert row["search_text"].startswith("character dragons digital painting")
     assert first["tags"] == ["digital painting", "character", "fantasy", "realistic", "painterly", "portrait or bust"]
@@ -1788,6 +1784,21 @@ def test_a_text_that_fails_the_plain_rule_is_left_out_of_a_row_that_is_sent_and_
         assert text.lower() not in json.dumps(fake.loads[-1]).lower() and text.lower() not in fake.held()
     # Each text once, and the specialty twice: it is a search filter and a search word.
     assert counts["texts_left_out_for_contact"] == len(said) + 1
+
+
+def test_an_artist_whose_profile_sentence_fails_the_plain_rule_waits_for_one_that_can_be_shown(fake):
+    """The sentence is what a card says. With none to show, the artist is held like any artist without a profile."""
+    artist(ALPHA, 5)
+    artist(BRAVO, 5)
+    assert push.run(False)["artists_sent"] == 2
+    said = "FAKE-PROFILE, more at yy-fake-painter.example."
+    with closing(sqlite3.connect(config.LOCAL_DB)) as conn, conn:
+        conn.execute("UPDATE artist_profiles SET written = ? WHERE artist_key = ?", (said, f"da:{ALPHA}"))
+
+    counts = push.run(False, allow_delete=1)
+
+    assert counts["artists_sent"] == 1 and counts["artists_held_not_profiled"] == 1
+    assert list(sent_artists(fake)) == [BRAVO] and said.lower() not in json.dumps(fake.loads[-1]).lower()
 
 
 def test_a_database_error_is_scrubbed_of_every_key_before_it_is_cut(monkeypatch):
