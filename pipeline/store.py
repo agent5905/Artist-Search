@@ -35,9 +35,9 @@ CREATE TABLE IF NOT EXISTS removed (
     removed_at TEXT NOT NULL         -- ISO-8601 UTC, set once
 );
 -- What each profile that was read lists, in a link of any shape, kept or not. Hashes only: it names no artist
--- and no site, and a link that was dropped never reaches the disk.
+-- and no site, and a link that was dropped never reaches the disk. Only own_site_candidates() reads it.
 CREATE TABLE IF NOT EXISTS listed (
-    domain_hash TEXT NOT NULL,       -- sha256 hex of 'site:<registrable domain>'; '' marks a removed artist's read
+    domain_hash TEXT NOT NULL,       -- sha256 hex of 'site:<registrable domain>'
     artist_hash TEXT NOT NULL,       -- sha256 hex of 'da:<lowercased username>'
     PRIMARY KEY (domain_hash, artist_hash)
 );
@@ -244,54 +244,23 @@ def _removed(conn: sqlite3.Connection, keys: Iterable[str]) -> bool:
 
 
 def _remove(conn: sqlite3.Connection, key_hashes: Iterable[str]) -> int:
-    """Put key hashes on the removal list with everything they reach. Returns how many artists that deleted.
+    """Put key hashes on the removal list and delete the stored artists they name. Returns how many that was.
 
-    A removed artist takes with them every domain their row links to and every domain their profile was seen
-    to list. A removed site takes every artist who links to it or was seen to list it. And so on, until nothing
-    more is reached: a renamed or second account that lists the same site stays out, and so does the first
-    account under a new site. It all works on hashes, so it also works for a site known only as a hash.
+    A hash names an artist by their handle, or by the site their stored link is on. An artist deleted for their
+    site has their handle put on the list too, so that they stay out when the link is gone from their profile.
+    A removal goes no further: a removed handle bars no site, so it never reaches another artist. It works on
+    hashes, so it also works for a site known only as a hash.
     """
     # ponytail: reads every artist row per removal. Fine at a few thousand rows; index the link hosts if it grows.
-    rows = {key: json.loads(links) for key, links in conn.execute("SELECT key, links FROM artists")}
-    reached_by: dict[str, set[str]] = {}  # key hash -> the artists of that key, or who link to that site
-    for key, links in rows.items():
-        for covering in (key, *_link_keys(links)):
-            reached_by.setdefault(_hash(covering), set()).add(key)
-    pending, done, deleted = list(key_hashes), set(), 0
-    while pending:
-        key_hash = pending.pop()
-        if key_hash in done:
-            continue
-        done.add(key_hash)
-        conn.execute("INSERT OR IGNORE INTO removed VALUES (?, ?)", (key_hash, _now()))
-        for key in reached_by.get(key_hash, set()) & rows.keys():
-            domains = _link_domains(rows.pop(key))  # never a platform: that has no registrable domain
-            conn.execute("DELETE FROM artists WHERE key = ?", (key,))
-            deleted += 1
-            pending += [_hash(key), *(_hash(f"site:{domain}") for domain in domains)]
-        domains_listed = "SELECT domain_hash FROM listed WHERE artist_hash = ?"  # if this is an artist
-        artists_listing = "SELECT artist_hash FROM listed WHERE domain_hash = ?"  # if this is a site
-        seen = conn.execute(f"{domains_listed} UNION {artists_listing}", (key_hash, key_hash))
-        pending += [reached for (reached,) in seen if reached]  # '' is not a domain: it marks a read (see _seen)
-    return deleted
-
-
-def _seen(conn: sqlite3.Connection, key: str, hosts: Iterable[str]) -> bool:
-    """Record which registrable domains an artist's profile lists, and say whether the artist is to be left out.
-
-    They are left out when they are on the removal list, or when one of the hosts is (the host, a parent domain
-    or a www. form). Either way the artist and every domain just recorded go on the list.
-    """
-    hosts = list(hosts)
-    domains = {domain for host in hosts if (domain := registrable_domain(host))}
-    listing = [(_hash(f"site:{domain}"), _hash(key)) for domain in domains]
-    left_out = _removed(conn, [key, *(covering for host in hosts for covering in _host_keys(host))])
-    if left_out:
-        listing.append(("", _hash(key)))  # their profile has been read while they are on the list: never again
-    conn.executemany("INSERT OR IGNORE INTO listed VALUES (?, ?)", listing)
-    if left_out:
-        _remove(conn, [_hash(key)])
-    return left_out
+    named = set(key_hashes)
+    rows = conn.execute("SELECT key, links FROM artists").fetchall()
+    gone = [
+        key for key, links in rows if named & {_hash(covering) for covering in (key, *_link_keys(json.loads(links)))}
+    ]
+    conn.executemany("DELETE FROM artists WHERE key = ?", [(key,) for key in gone])
+    barred = sorted(named | {_hash(key) for key in gone})
+    conn.executemany("INSERT OR IGNORE INTO removed VALUES (?, ?)", [(key_hash, _now()) for key_hash in barred])
+    return len(gone)
 
 
 def is_removed(identifier: str, db: pathlib.Path | str | None = None) -> bool:
@@ -305,10 +274,12 @@ def is_removed(identifier: str, db: pathlib.Path | str | None = None) -> bool:
 
 
 def mark_removed(identifier: str, db: pathlib.Path | str | None = None) -> int:
-    """Put an artist or a site on the removal list, with everything stored that it reaches. Safe to repeat.
+    """Put an artist or a site on the removal list. Safe to repeat.
 
-    Returns how many stored artists it deleted, so a removal that matched nobody can be seen. ValueError when
-    the identifier names nothing discovery could store (see normalize): a removal never silently does nothing.
+    A handle bars that handle and deletes that artist's row, and nothing else. A site bars the site, and deletes
+    and bars the artists whose stored link is on it (see _remove). Returns how many stored artists it deleted,
+    so a removal that matched nobody can be seen. ValueError when the identifier names nothing discovery could
+    store (see normalize): a removal never silently does nothing.
     """
     key = normalize(identifier)
     with _open(db) as conn:
@@ -329,30 +300,19 @@ def import_removed(key_hashes: Iterable[str], db: pathlib.Path | str | None = No
         return _remove(conn, hashes)
 
 
-def site_unresolved(username: str, db: pathlib.Path | str | None = None) -> bool:
-    """True for an artist on the removal list of whom no site is known here, and whose profile has not been read
-    since they went on it.
-
-    Discovery then reads that profile once, solely so record_listing() can put the artist's site on the list
-    too. After that this is False for good, whether the profile named a site or not.
-    """
-    key = artist_key(username)
-    with _open(db) as conn:
-        read = conn.execute("SELECT 1 FROM listed WHERE artist_hash = ?", (_hash(key),)).fetchone()
-        return _removed(conn, [key]) and not read
-
-
 def record_listing(username: str, hosts: Iterable[str], db: pathlib.Path | str | None = None) -> bool:
     """Call for every profile read, with every host its website field names, in a link of any shape.
 
     Records, as hashes only, that this artist lists the registrable domain of each host: own_site_candidates()
-    counts those, and a removal follows them. Returns True when the artist is to be left out: they are on the
-    removal list, or one of the hosts is. The artist and the domains they list then go on the list as well
-    (and any row they had is deleted), so they stay out whatever site they list next.
+    counts those. Returns True when one of the hosts is on a removed site (the host, a parent domain or a www.
+    form). That is one answer's word and no proof of anything: nothing is deleted and nobody is barred for it
+    here. The caller leaves the artist as they are and holds them back.
     """
-    key = artist_key(username)
+    key, hosts = artist_key(username), list(hosts)
+    listing = [(_hash(f"site:{domain}"), _hash(key)) for host in hosts if (domain := registrable_domain(host))]
     with _open(db) as conn:
-        return _seen(conn, key, hosts)
+        conn.executemany("INSERT OR IGNORE INTO listed VALUES (?, ?)", listing)
+        return _removed(conn, [covering for host in hosts for covering in _host_keys(host)])
 
 
 def upsert_artist(
@@ -360,16 +320,15 @@ def upsert_artist(
 ) -> bool:
     """Insert one artist, or refresh the row already there. Safe to repeat.
 
-    Returns False and stores nothing when the artist is on the removal list. An artist who links to a removed
-    site is put on the list too (and any row they had is deleted). ValueError for a username that is not a
-    plain handle, or a link that has no public hostname.
+    Returns False and changes nothing when the artist is on the removal list, or a link is on a removed site:
+    a row they have stays as it was, and nobody is barred for it. ValueError for a username that is not a plain
+    handle, or a link that has no public hostname.
     """
     key = artist_key(username)
-    hosts = [_host(link) for link in links]
-    if None in hosts:
+    if None in map(_host, links):
         raise ValueError("a link has no public hostname")
     with _open(db) as conn:
-        if _seen(conn, key, [host for host in hosts if host]):
+        if _removed(conn, [key, *_link_keys(links)]):
             return False
         conn.execute(
             "INSERT INTO artists VALUES (?, ?, ?, ?, ?, ?) "

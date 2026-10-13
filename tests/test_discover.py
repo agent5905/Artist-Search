@@ -763,8 +763,8 @@ def test_max_artists_caps_what_one_run_stores(db, capsys):
 # --- 4: removed artists are skipped and never re-added (hard rule 7) ---
 
 
-def test_a_removed_artist_whose_site_is_known_is_skipped_without_a_lookup(db, capsys):
-    assert run(world(), db) == 0  # ALPHA is stored, so their site is known
+def test_a_removed_artist_is_skipped_without_a_lookup(db, capsys):
+    assert run(world(), db) == 0
     capsys.readouterr()
     assert store.mark_removed("da:ZZ-FAKE-ALPHA", db) == 1  # another case than the API uses
     for _ in range(2):
@@ -775,55 +775,26 @@ def test_a_removed_artist_whose_site_is_known_is_skipped_without_a_lookup(db, ca
         assert "skipped (removed): 1\n" in capsys.readouterr().out
 
 
+@pytest.mark.parametrize("handle", [ALPHA, HOTEL, FOXTROT, JULIET, KILO])  # with a site, and the four without
 @pytest.mark.parametrize("how", ["mark_removed", "import_removed"])
-def test_a_removed_handle_never_seen_here_is_looked_up_once_solely_to_bar_its_site(db, capsys, how):
-    """Without that one lookup, a second account that lists the removed artist's site is stored on the next run."""
+def test_a_removed_handle_never_seen_here_is_never_looked_up_and_bars_only_itself(db, capsys, how, handle):
+    """Round 7. Such a handle used to be read once, solely to put the site it named on the removal list, and the
+    next account to list that site was barred with it. A removal of a handle now bars the handle."""
+    key_hash = hashlib.sha256(f"da:{handle.lower()}".encode()).hexdigest()
     if how == "mark_removed":
-        assert store.mark_removed("da:ZZ-FAKE-ALPHA", db) == 0  # nothing is known about them here
+        assert store.mark_removed(f"da:{handle.upper()}", db) == 0  # nothing is known about them here
     else:  # the removal arrives from the list of record, into a fresh cache
-        assert store.import_removed([hashlib.sha256(b"da:zz-fake-alpha").hexdigest()], db) == 0
-    first = world()
-    assert run(first, db) == 0
-    assert first.looked_up().count(ALPHA) == 1  # read once
-    assert stored(db) == without("da:zz-fake-alpha")  # and nothing of it kept
-    assert "skipped (removed): 1\n" in capsys.readouterr().out
-    assert store.is_removed("site:zz-fake-alpha.art", db)  # their site is on the list now
-    assert "alpha" not in everything_on_disk(db).lower()  # as a hash: no handle, no site, nothing else
-    # The next run: a second account lists that site, and the removed artist shows a new one.
-    second = world({ALPHA: "https://zz-fake-alpha-new.art", BRAVO: "https://www.zz-fake-alpha.art/"})
-    assert run(second, db) == 0
-    assert ALPHA not in second.looked_up()  # never read again
-    assert stored(db) == without("da:zz-fake-alpha", "da:zz-fake-bravo")  # the second account is not stored
-    assert store.is_removed(f"da:{BRAVO}", db)
-    assert "alpha" not in everything_on_disk(db).lower() and "bravo" not in everything_on_disk(db).lower()
-
-
-def test_a_handle_removed_after_being_seen_with_no_site_is_still_looked_up_once(db):
-    """FOXTROT's profile was read before the removal and named no site, so nothing of theirs could be barred."""
-    assert run(world(), db) == 0
-    assert store.mark_removed(f"da:{FOXTROT}", db) == 1  # the row they had, which named no site
-    moved = {FOXTROT: "https://zz-fake-foxtrot.art/folio"}  # by now they have a site
-    after = world(moved)
-    assert run(after, db) == 0
-    assert after.looked_up().count(FOXTROT) == 1
-    assert store.is_removed("site:zz-fake-foxtrot.art", db)
-    again = world(moved | {BRAVO: "https://zz-fake-foxtrot.art"})  # and a second account turns up on it
-    assert run(again, db) == 0
-    assert FOXTROT not in again.looked_up()
-    assert stored(db) == without("da:zz-fake-foxtrot", "da:zz-fake-bravo")
-    assert "foxtrot" not in everything_on_disk(db).lower()
-
-
-@pytest.mark.parametrize("handle", [HOTEL, FOXTROT, JULIET, KILO])  # no profile, no website, a platform, a path
-def test_the_one_lookup_of_a_removed_handle_is_never_repeated_whatever_it_finds(db, handle):
-    store.mark_removed(f"da:{handle}", db)
-    first, second = world(), world()
-    assert run(first, db) == 0 and run(second, db) == 0
-    assert first.looked_up().count(handle) == 1
-    assert handle not in second.looked_up()
-    assert stored(db) == without(f"da:{handle}")  # everybody else is stored, as ever
-    assert not store.is_removed("site:www.artstation.com", db)  # a platform never goes on the list
-    assert store.is_removed("site:zz-fake-kilo.art", db) is (handle == KILO)  # a site of their own does, in any shape
+        assert store.import_removed([key_hash], db) == 0
+    for _ in range(2):
+        fake = world({BRAVO: WEBSITES[ALPHA]})  # and a second account lists the site ALPHA lists
+        assert run(fake, db) == 0
+        assert handle not in fake.looked_up()
+        assert stored(db) == [
+            row if row[1] != BRAVO else expected_row(BRAVO, [WEBSITES[ALPHA]], 3) for row in without(f"da:{handle}")
+        ]
+    with closing(sqlite3.connect(db)) as conn:
+        assert conn.execute("SELECT key_hash FROM removed").fetchall() == [(key_hash,)]  # the handle, and no site
+    assert not hasattr(store, "site_unresolved")
 
 
 def test_artist_removed_after_discovery_is_gone_and_never_readded(db):
@@ -864,7 +835,7 @@ def test_a_removed_site_blocks_every_spelling_of_its_host(db, capsys):
     assert fake.looked_up() == names
     assert all_rows(db) == []
     assert f"skipped (removed): {len(names)}\n" in capsys.readouterr().out
-    assert all(store.is_removed(f"da:{name}", db) for name in names)  # and each of them is barred from now on
+    assert not any(store.is_removed(f"da:{name}", db) for name in names)  # not stored, and nobody is barred for it
     assert "zz-fake-d" not in everything_on_disk(db).lower()
 
 
@@ -883,16 +854,6 @@ def test_site_removal_bars_the_artist_whatever_site_they_list_next(db):
     assert "delta" not in everything_on_disk(db).lower() and "bravo" not in everything_on_disk(db).lower()
 
 
-def test_site_removed_before_discovery_bars_the_artist_too(db):
-    store.mark_removed("site:zz-fake-delta.co.uk", db)
-    assert run(world(), db) == 0  # the profile is read once, the removed site is seen, the handle is barred
-    assert store.is_removed(f"da:{DELTA}", db)
-    fake = world({DELTA: "https://zz-fake-delta-new.art"})
-    assert run(fake, db) == 0
-    assert DELTA not in fake.looked_up()
-    assert stored(db) == without("da:zz-fake-delta")
-
-
 def test_the_store_has_the_last_word_and_an_artist_it_refuses_is_not_counted_as_stored(db, capsys, monkeypatch):
     """Two checks stand between a removed site and the store. This is the second one, with the first one blind."""
     store.mark_removed("site:zz-fake-delta.co.uk", db)
@@ -901,68 +862,91 @@ def test_the_store_has_the_last_word_and_an_artist_it_refuses_is_not_counted_as_
     counts = summary(capsys.readouterr().out)
     assert stored(db) == without("da:zz-fake-delta")
     assert (counts["skipped (removed)"], counts["artists stored"]) == (1, len(EXPECTED) - 1)
-    assert store.is_removed(f"da:{DELTA}", db)
+    assert not store.is_removed(f"da:{DELTA}", db)
 
 
 @pytest.mark.parametrize(
     "website",
     [
+        "https://zz-fake-delta.co.uk/",
         "https://www.zz-fake-delta.co.uk/folio?page=2",  # the own-site rule drops each of these shapes,
         "https://shop.zz-fake-delta.co.uk",  # so the removal has to be checked before it
         "https://zz-fake-delta.co.uk/#/zz-fake-delta",
         "http://zz-fake-delta.co.uk:8080/",
     ],
 )
-def test_a_removed_site_bars_whoever_lists_it_in_a_link_of_any_shape(db, capsys, website):
+@pytest.mark.parametrize("stored_before", [False, True])
+def test_a_profile_that_names_a_removed_site_in_a_link_of_any_shape_is_not_stored_and_nobody_is_barred(
+    db, capsys, website, stored_before
+):
+    """Round 7. One such answer used to delete the artist's row and bar their handle for good. It is one answer's
+    word: an artist who is not stored is not stored on it, and one who is stays exactly as they were."""
+    if stored_before:
+        assert run(world({DELTA: "https://zz-fake-delta-old.art"}), db) == 0
+    before = all_rows(db)
     store.mark_removed("site:zz-fake-delta.co.uk", db)
     fake = world({DELTA: website})
+    capsys.readouterr()
     assert run(fake, db) == 0
     assert DELTA in fake.looked_up()
     assert "skipped (removed): 1\n" in capsys.readouterr().out
-    assert store.is_removed(f"da:{DELTA}", db)  # the handle is barred, though the link was never going to be kept
-    later = world({DELTA: "https://zz-fake-delta-new.art"})
+    assert [row for row in all_rows(db) if row[1] == DELTA] == [row for row in before if row[1] == DELTA]
+    assert len(all_rows(db)) == len(EXPECTED) - (not stored_before)
+    assert not store.is_removed(f"da:{DELTA}", db)
+    with closing(sqlite3.connect(db)) as conn:
+        assert conn.execute("SELECT count(*) FROM removed").fetchone() == (1,)  # the site, as before
+    later = world({DELTA: "https://zz-fake-delta-new.art"})  # an answer that does not name it: stored like anybody
     assert run(later, db) == 0
-    assert DELTA not in later.looked_up()
-    assert stored(db) == without("da:zz-fake-delta")
-    assert "delta" not in everything_on_disk(db).lower()
+    assert [links for _, name, _, links, _ in stored(db) if name == DELTA] == [["https://zz-fake-delta-new.art/"]]
 
 
-def test_removing_one_handle_removes_every_account_that_lists_the_same_site(db):
-    """A renamed or second account: two handles, one site. Removing one by handle removes both, and the site."""
+def test_one_website_answered_for_every_profile_and_then_one_removal_by_handle_removes_only_that_artist(db):
+    """The critic's finding, and the biggest of round 7: one run in which every profile answered the same website,
+    then one legitimate removal, purged and barred six artists of six. With honest data it was two who share a
+    studio's site. A handle that is removed bars that handle."""
     studio = "https://zz-fake-studio.art/"
-    assert run(world({ALPHA: studio, BRAVO: "http://www.zz-fake-studio.art"}), db) == 0
-    assert [key for key, *_ in stored(db)] == [key for key, *_ in EXPECTED]
-    assert store.mark_removed(f"da:{ALPHA}", db) == 2
-    assert stored(db) == without("da:zz-fake-alpha", "da:zz-fake-bravo")
-    assert store.is_removed(f"da:{BRAVO}", db) and store.is_removed("site:zz-fake-studio.art", db)
-    # A later run: both come back under new sites, and a third handle now lists the removed site.
-    later = world({ALPHA: "https://zz-fake-alpha-new.art", BRAVO: "https://zz-fake-bravo-new.art", DELTA: studio})
+    assert run(world(dict.fromkeys(WEBSITES, studio)), db) == 0
+    assert [(key, links) for key, _, _, links, _ in stored(db)] == [(key, [studio]) for key, *_ in EXPECTED]
+    assert store.mark_removed(f"da:{ALPHA}", db) == 1
+    others = [key for key, *_ in without("da:zz-fake-alpha")]
+    assert [key for key, *_ in stored(db)] == others == [key for key, _, _ in store.all_artists(db)]
+    assert not store.is_removed("site:zz-fake-studio.art", db)
+    for _ in range(2):  # and the runs after it bring the one back, and lose none of the others
+        later = world(dict.fromkeys(WEBSITES, studio))
+        assert run(later, db) == 0
+        assert ALPHA not in later.looked_up() and [key for key, *_ in stored(db)] == others
+    assert not any(store.is_removed(name, db) for _, name, *_ in without("da:zz-fake-alpha"))
+    assert store.own_site_candidates(db) == []  # a site that everybody lists is nobody's own, which costs nothing
+
+
+def test_a_removed_site_removes_the_artists_whose_stored_link_it_is_and_they_stay_out(db):
+    studio = "https://zz-fake-studio.art/"
+    assert run(world({ALPHA: studio, BRAVO: "http://www.zz-fake-studio.art", DELTA: f"{studio}zz-fake-delta"}), db) == 0
+    assert store.mark_removed("site:zz-fake-studio.art", db) == 2  # DELTA's link had a path, and was never stored
+    gone = ("da:zz-fake-alpha", "da:zz-fake-bravo")
+    assert [key for key, *_ in stored(db)] == [key for key, *_ in without(*gone)]
+    assert store.is_removed(f"da:{ALPHA}", db) and store.is_removed(f"da:{BRAVO}", db)
+    assert not store.is_removed(f"da:{DELTA}", db)
+    later = world({ALPHA: "https://zz-fake-alpha-new.art", BRAVO: "", DELTA: f"{studio}zz-fake-delta"})
     assert run(later, db) == 0
-    assert later.looked_up() == [HOTEL, DELTA, FOXTROT, GOLF, INDIA, JULIET, KILO]  # the two were not even looked up
-    gone = ("da:zz-fake-alpha", "da:zz-fake-bravo", "da:zz-fake-delta")
-    assert stored(db) == without(*gone)  # and the third handle went the same way, with the row it had
-    assert store.is_removed(f"da:{DELTA}", db)
-    last = world({DELTA: "https://zz-fake-delta-new.art"})
-    assert run(last, db) == 0
-    assert stored(db) == without(*gone)
-    assert "studio" not in everything_on_disk(db).lower() and "delta" not in everything_on_disk(db).lower()
+    assert ALPHA not in later.looked_up() and BRAVO not in later.looked_up()  # whatever site they list next
+    assert [key for key, *_ in stored(db)] == [key for key, *_ in without(*gone)]  # DELTA: skipped, and still there
+    assert "studio" not in everything_on_disk(db).lower()
 
 
 def test_the_removal_list_of_record_keeps_a_removed_artist_out_of_a_fresh_cache(db):
     assert run(world(), db) == 0
     store.mark_removed(f"da:{ALPHA}", db)
+    store.mark_removed("site:zz-fake-delta.co.uk", db)
     with closing(sqlite3.connect(db)) as conn:
         of_record = [key_hash for (key_hash,) in conn.execute("SELECT key_hash FROM removed")]
     db.unlink()  # the local store is a cache: gone
     assert store.import_removed(of_record, db) == 0
-    for expected_lookups in (1, 0):  # a fresh cache does not know their site was barred: one lookup, then none
+    for _ in range(2):
         fake = world()
         assert run(fake, db) == 0
-        assert fake.looked_up().count(ALPHA) == expected_lookups
-        assert stored(db) == without("da:zz-fake-alpha")
-    second_account = world({BRAVO: "https://zz-fake-alpha.art"})
-    assert run(second_account, db) == 0
-    assert stored(db) == without("da:zz-fake-alpha", "da:zz-fake-bravo")
+        assert ALPHA not in fake.looked_up() and DELTA not in fake.looked_up()
+        assert stored(db) == without("da:zz-fake-alpha", "da:zz-fake-delta")
 
 
 def odd_spellings(host):
@@ -1020,15 +1004,14 @@ def test_a_removed_site_is_recognised_however_the_website_field_spells_it(db, ca
     fake, names = small_world(spellings)
     assert run(fake, db) == 0
     assert fake.looked_up() == names
-    not_barred = [spelling for name, spelling in zip(names, spellings, strict=True) if not store.is_removed(name, db)]
-    assert not_barred == []
-    assert all_rows(db) == []
+    assert all_rows(db) == []  # recognised in every spelling: not one of them is stored
     assert f"skipped (removed): {len(names)}\n" in capsys.readouterr().out
-    # The next run: each of them shows a clean site of their own. None is read again, none is stored.
+    assert not any(store.is_removed(name, db) for name in names)  # and nobody is barred on one answer's word
+    assert "zz-fake-d" not in everything_on_disk(db).lower()
+    # The next run: each of them shows a clean site of their own, and is stored like anybody else.
     later, _ = small_world([f"https://zz-fake-new-{n:02d}.art" for n in range(len(names))])
     assert run(later, db) == 0
-    assert later.looked_up() == [] and all_rows(db) == []
-    assert "zz-fake-d" not in everything_on_disk(db).lower()
+    assert later.looked_up() == names and len(all_rows(db)) == len(names)
 
 
 def test_a_removed_site_with_a_name_outside_ascii_is_recognised_too(db):
@@ -1037,8 +1020,7 @@ def test_a_removed_site_with_a_name_outside_ascii_is_recognised_too(db):
     spellings = [f"<https://{name}/folio>", f"{name.upper()} (commissions open)", f"https://www.{name}/?page=2"]
     fake, names = small_world(spellings)
     assert run(fake, db) == 0
-    assert [name for name in names if not store.is_removed(name, db)] == []
-    assert all_rows(db) == []
+    assert all_rows(db) == [] and not any(store.is_removed(name, db) for name in names)
 
 
 def test_only_the_website_field_is_read_for_hosts_never_the_bio_or_the_rest_of_the_profile(db, capsys):

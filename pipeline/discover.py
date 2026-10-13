@@ -8,8 +8,7 @@ optional). Later stages collect and analyze the works. This stage has no use for
 nothing from a response is printed, logged or stored except the handle, the profile URL built from it, the
 front page of the artist's own domain when the profile names one, and a hit count. Output is counts only.
 One more thing is kept, as hashes that name nobody: which registrable domain each profile's website field
-mentions, so that a domain several profiles list is never taken for one artist's own site, and so that a
-removal reaches every account that lists the removed site.
+mentions, so that a domain several profiles list is never taken for one artist's own site.
 
 Endpoints (deviantart.readme.io, read 2026-10-11). Each is documented as accepting a client_credentials token:
     POST /oauth2/token                          grant_type=client_credentials
@@ -222,10 +221,7 @@ def _run(api: _Api, counts: dict[str, int], max_artists: int, db: pathlib.Path |
             counts[NOT_REACHED] = len(candidates) - position
             break
         username = names[key]
-        # Hard rule 7. A removed artist is skipped without a lookup, with one exception: while their site is not
-        # known here, their profile is read once, solely so the site it names goes on the removal list as a hash
-        # and a second account cannot bring them back. Nothing else from that profile is used or kept.
-        if store.is_removed(store.artist_key(username), db) and not store.site_unresolved(username, db):
+        if store.is_removed(store.artist_key(username), db):  # hard rule 7: skipped without a lookup
             counts["skipped (removed)"] += 1
             continue
         response = api.get(f"/user/profile/{username}")
@@ -243,6 +239,9 @@ def _run(api: _Api, counts: dict[str, int], max_artists: int, db: pathlib.Path |
         website = body.get("website") if isinstance(body, dict) else None
         # The removal list is asked about every host the field names, however it is written, before the own-site
         # rule gets to drop the link. The same hosts are recorded as hashes for the shared-domain rule.
+        # A profile that names a removed site is not stored. That is one answer's word, so it deletes nothing
+        # and bars nobody: an artist who is stored already stays as they are, and is read again next run.
+        # ponytail: not marked here. The collect stage reads the same field on the artist's turn and marks them.
         hosts = store.hosts_in(website)
         if store.record_listing(username, hosts, db):
             counts["skipped (removed)"] += 1

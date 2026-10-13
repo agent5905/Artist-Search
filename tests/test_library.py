@@ -350,8 +350,9 @@ def test_a_profile_row_the_database_refuses_leaves_the_artist_exactly_as_they_we
 
 
 def test_storing_a_profile_twice_keeps_one_row_and_brings_up_to_date_what_was_said():
-    """A field given as a text is the artist's word, an empty one included. A field not given, or given as anything
-    else, says nothing: the critic's finding was that a 200 with nothing in it blanked what was kept."""
+    """A field is brought up to date when the answer says something in it. Not given, given as anything but a
+    text, or given empty, it says nothing: the critic's findings were a 200 with nothing in it that blanked what
+    was kept, and in round 7 an empty text that did."""
     profile(
         tagline="FAKE-TAGLINE-OLD", level="FAKE-LEVEL-OLD", website="https://zz-fake-alpha.art", user_id="FAKE-USERID-1"
     )
@@ -361,17 +362,22 @@ def test_storing_a_profile_twice_keeps_one_row_and_brings_up_to_date_what_was_sa
         "artist_key": ALPHA,
         "tagline": "FAKE-TAGLINE-NEW",
         "specialty": "FAKE-SPECIALTY",
-        "level": None,  # given as an empty text: they have none now
-        "website": "https://zz-fake-alpha.art/",  # not given: nothing was said about it
+        "level": "FAKE-LEVEL-OLD",  # given as an empty text: nothing was said about it
+        "website": "https://zz-fake-alpha.art/",  # not given: the same
         "user_hash": account("FAKE-USERID-1"),  # nor about whose account it is
     }
     assert stored["fetched_at"].endswith("+00:00")
-    for nothing in (None, 7, ["FAKE"], {"FAKE": 1}, b"FAKE"):
-        again = profile(tagline=nothing, specialty=nothing, level=nothing, website=nothing, user_id=nothing)
+    # No text, an empty one, one that shows nothing, and the API's word for a specialty or a level that is not given.
+    for nothing in (None, 7, ["FAKE"], {"FAKE": 1}, b"FAKE", "", "  \n", ZWSP, "&nbsp;", "<br>", "None"):
+        choice = {} if nothing == "None" else {"tagline": nothing, "website": nothing}
+        again = profile(**choice, specialty=nothing, level=nothing, user_id=nothing)
         assert {name: again[name] for name in stored if name != "fetched_at"} == {
             name: stored[name] for name in stored if name != "fetched_at"
         }
-    assert profile(tagline="FAKE write to zz.fake@mail.invalid")["tagline"] is None  # their word, and not kept
+    # What these rules refuse is dropped all the same: that is our rule, and not the API's word.
+    assert profile(tagline="FAKE write to zz.fake@mail.invalid")["tagline"] is None
+    assert profile(website="https://wa.me/15550109999")["website"] is None
+    assert profile(level="FAKE call 555 0199")["level"] is None and profile()["specialty"] == "FAKE-SPECIALTY"
 
 
 def test_storing_a_work_twice_keeps_one_row_that_names_its_cached_image():
@@ -871,7 +877,9 @@ def test_tags_are_kept_as_a_json_list_of_plain_tag_names():
     assert json.loads(work(tags=given)["tags"]) == kept
     assert b"zzfake" not in database_bytes()
     assert len(json.loads(work(tags=[f"fake{n}" for n in range(500)])["tags"])) == 60
-    assert [work(tags=tags)["tags"] for tags in (None, "faketag", {"faketag": 1}, 5)] == ["[]"] * 4
+    # What is no list of tags: a new work has none, and a kept one keeps what it has.
+    assert [work(work_id=ID2, tags=tags)["tags"] for tags in (None, "faketag", {"faketag": 1}, 5)] == ["[]"] * 4
+    assert [len(json.loads(work(tags=tags)["tags"])) for tags in (None, "faketag", {"faketag": 1}, 5, [])] == [60] * 5
 
 
 NOT_ADDRESSES = [
@@ -1099,6 +1107,44 @@ def test_the_addresses_deviantart_really_gives_are_accepted():
     assert library.image_address(THUMB) == THUMB and work()["thumb_url"] == THUMB
     plain = "https://zzcdn00.deviantart.net/f/FAKE,w_300,q_70,strp/FAKE-1.jpg"  # no signature at all
     assert library.image_address(plain) == plain
+
+
+def test_a_thumbnail_is_one_only_in_the_shape_deviantart_makes_them():
+    """Round 7: works were stored with thumbnail paths such as /f/abc/whatsapp-5550199123. These are the shapes
+    of all 4,381 thumbnails kept on 2026-10-13, and the collect stage takes an entry with any other as having none."""
+    uuid = "0a1b2c3d-4e5f-6071-8293-a4b5c6d7e8f9"
+    file = f"https://images-wixmp-zzcdn.wixmp.com/f/{uuid}/dfake01-{uuid}"
+    cut = "v1/fit/w_414,h_300,q_70,strp"
+    for good in (
+        f"{file}.jpg/{cut}/fake_title_1_by_zz_fake_dfake01-414w.jpg?{SIGNED}",
+        f"{file}.png/v1/fit/w_414,h_300/fake_title_1_by_zz_fake_dfake01-414w.png?{SIGNED}",
+        f"{file}.gif/{cut},blur_20/_fake__title_by_zzfake_dfake01-414w.jpg?{SIGNED}",
+        f"{file.replace('/f/', '/i/')}.jpg/{cut}/fake_title_1_by_zz_fake_dfake01-414w.jpg",  # not signed
+    ):
+        assert library.is_thumbnail(good) and library.image_address(good) == good
+    assert library.is_thumbnail(f"{file}.jpg?{SIGNED}")  # the file as it is, not cut to a size: one of the 4,381
+    for other in (
+        "https://images-wixmp-zzcdn.wixmp.com/f/abc/whatsapp-5550199123",  # the critic's two
+        "https://images-wixmp-zzcdn.wixmp.com/f/call-5550199123/t_by_zz_d1.jpg",
+        THUMB,  # an image address the library takes, and no thumbnail of DeviantArt's
+        f"{file}.jpg/whatsapp-5550199123",
+        f"{file}.jpg/{cut}/call-5550199123/fake_by_zz_dfake01-414w.jpg",
+        f"{file}.jpg/{cut}/call-555-0199-414w.jpg",
+        f"{file}.jpg/{cut}/Fake Title_by_zz_dfake01-414w.jpg",
+        f"{file}.jpg/{cut}/fake%40mail_by_zz_dfake01-414w.jpg",
+        f"{file}.jpg/{cut}/fake_by_zz_dfake01-414w.jpg/",
+        f"{file}.jpg\n",
+        f"{file.replace('wixmp.com', 'deviantart.net')}.jpg",
+        f"{file.replace('images-wixmp-zzcdn.', '')}.jpg",
+        f"{file.replace('wixmp.com', 'wixmp.com.zz-fake-evil.invalid')}.jpg",
+        f"{file.replace('https:', 'http:')}.jpg",
+        f"{file.upper()}.jpg",
+        "",
+        None,
+        5550199123,
+        [f"{file}.jpg"],
+    ):
+        assert not library.is_thumbnail(other)
 
 
 @pytest.mark.parametrize(
@@ -1436,13 +1482,16 @@ def test_the_size_of_a_works_thumbnail_is_kept_when_both_numbers_are_given_and_s
 
 
 def test_what_an_entry_does_not_give_for_a_kept_work_stays_as_it_is_kept():
+    """Not given, or given empty: round 7's finding was an empty title and an empty tag list blanking what was kept."""
     work(title="FAKE-TITLE-KEPT", published="1700000000")
     kept = rows("works")[0]
-    for title in (None, 7, ["FAKE"]):
-        keep(ALPHA, [fields(title=title, thumb_url=None, published=None)])
+    for title, tags in ((None, None), (7, "faketag"), (["FAKE"], {"FAKE": 1}), ("", []), (" ", []), (ZWSP, [])):
+        keep(ALPHA, [fields(title=title, tags=tags, thumb_url=None, published=None)])
         assert {**rows("works")[0], "fetched_at": None} == {**kept, "fetched_at": None}
-    keep(ALPHA, [fields(title="", published="FAKE")])  # an empty title is the artist's word: there is none now
-    assert rows("works")[0]["title"] is None and rows("works")[0]["published_at"] == kept["published_at"]
+    keep(ALPHA, [fields(title="", published="FAKE", tags=["fakenew"])])
+    assert {**rows("works")[0], "fetched_at": None} == {**kept, "fetched_at": None, "tags": '["fakenew"]'}
+    keep(ALPHA, [fields(title=EMBEDDED, tags=["not a tag name"])])  # what the rules here refuse is dropped all the same
+    assert (rows("works")[0]["title"], rows("works")[0]["tags"]) == (None, "[]")
     with pytest.raises(ValueError):  # and a work that is not kept is not taken without a thumbnail
         keep(BRAVO, [fields(ID2, thumb_url=None)])
     assert len(rows("works")) == 1 and len(rows("profiles")) == 1

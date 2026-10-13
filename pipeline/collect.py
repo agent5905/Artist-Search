@@ -14,8 +14,10 @@ both failed). Two things delete, and nothing else: the removal list (hard rule 7
 again before each artist and each download; and the sweep of cached files that no row refers to.
   - A stored work that is missing from a later answer stays, with the time it was last seen.
   - A stored work, or an artist, that the API shows as no longer qualifying (mature, not a public image,
-    account gone) is marked with the reason and the time. Later stages read the marks
-    (library.work_marks, library.artist_marks) and decide what is published.
+    account gone, a profile that names a removed site) is marked with the reason and the time. Later stages
+    read the marks (library.work_marks, library.artist_marks) and decide what is published.
+  - A removal reaches the artist it names, under every handle of their account, and nobody else: what a
+    profile answers about a site never puts anybody on the removal list.
   - A 200 is believed only in its documented shape. Anything else is the API failing for that artist: nothing
     stored changes, it is counted, and MAX_FAILURES of them in a row stop the run.
   - No verdict is reached on information that is missing: a work is marked only for what its entry says.
@@ -52,7 +54,7 @@ IMAGE_INTERVAL = 0.5  # seconds waited before every image download: two a second
 SERVER_RETRIES = 3  # times a 5XX answer, or an image host's 429, is asked for again. The API docs suggest three.
 _WAITS = (*(2.0**attempt for attempt in range(1, SERVER_RETRIES + 1)), None)  # 2, 4 and 8 seconds, then no more
 MAX_FAILURES = 5  # artists failing one after another before the run gives up: by then it is the API, not them
-MAX_REFUSALS = 3  # works in a row the image host refuses for the rate limit, retries and all, before the run stops
+MAX_REFUSALS = 3  # works in a row, whoever's, that the image host refuses, retries and all, before the run stops
 NOT_IMAGE_KEYS = frozenset(("videos", "flash", "text_content", "excerpt"))  # what a film or a text carries
 
 PROCESSED = "artists processed"
@@ -72,6 +74,7 @@ BAD_NAME = "skipped artists (unreadable handle)"
 REMOVED = "skipped artists (removed)"
 RENAMED = "skipped artists (a removed account under a new handle)"
 UNAVAILABLE = "marked artists (account suspended, inactive or gone)"
+LISTS_REMOVED = "marked artists (their profile names a removed site)"
 MARKED = "marked works (stored, and no longer qualifying)"
 MALFORMED = "skipped works (malformed entry)"
 NOT_OWN = "skipped works (another author's)"
@@ -85,7 +88,7 @@ IMAGE_WRONG_TYPE = "skipped works (image not an accepted type)"
 IMAGE_TOO_LARGE = "skipped works (image over the size cap)"
 _COUNTS = (
     *(PROCESSED, PROFILES, WORKS, DOWNLOADED, CACHED, PURGED, ORPHANS, UNDELETED, BAD_KEY),
-    *(NOT_STORED, ROW_REFUSED, FAILED, API_FAILED, BAD_NAME, REMOVED, RENAMED, UNAVAILABLE, MARKED),
+    *(NOT_STORED, ROW_REFUSED, FAILED, API_FAILED, BAD_NAME, REMOVED, RENAMED, UNAVAILABLE, LISTS_REMOVED, MARKED),
     *(MALFORMED, NOT_OWN, NOT_IMAGE, MATURE, NO_METADATA, TITLE),
     *(IMAGE_FAILED, IMAGE_LIMITED, IMAGE_WRONG_TYPE, IMAGE_TOO_LARGE),
 )
@@ -99,6 +102,7 @@ _MARKS = {
     TITLE: "contact details",
 }
 GONE = "account gone"
+LISTED = "lists a removed site"
 
 
 class _ApiFailed(Exception):
@@ -265,8 +269,15 @@ def _sweep(counts: dict[str, int], db: pathlib.Path | str | None) -> None:
 
 
 def _collect_artist(
-    api: discover._Api, http: httpx.Client, username: str, counts: dict[str, int], db: pathlib.Path | str | None
+    api: discover._Api,
+    http: httpx.Client,
+    username: str,
+    counts: dict[str, int],
+    db: pathlib.Path | str | None,
+    refused: list[int],
 ) -> None:
+    """One artist's turn. `refused` is the run's one count, kept in a list so that it outlives the turn: the
+    works in a row, this artist's and the ones before, whose image the host would not serve, retries and all."""
     key = store.artist_key(username)
     response = _get(api, f"/user/profile/{username}")
     if _gone(response):
@@ -294,13 +305,19 @@ def _collect_artist(
         if marked.get(other, ("",))[0] not in (GONE, library.RENAMED):
             raise _ApiFailed("profile lookup answered with a user id that another artist has")
     # Hard rule 7. An account removed under one handle is the same account under the next: the new handle is
-    # barred through the store, and nothing is collected. So is an artist whose website is a removed site.
-    renamed = library.account_removed(user_id, db)
-    if renamed:
+    # barred through the store, and nothing is collected.
+    if library.account_removed(user_id, db):
         store.mark_removed(username, db)
-    if renamed or store.record_listing(username, store.hosts_in(profile.get("website")), db):
         _remove(key, counts, db, user_id)
-        counts[RENAMED if renamed else REMOVED] += 1
+        counts[RENAMED] += 1
+        return
+    # A profile that names a removed site is one answer's word, and one such answer given for every profile
+    # once purged and barred every artist. So nothing is deleted and nobody is barred for it: the artist is
+    # marked, which holds them back from being published, and the mark goes when they are next stored.
+    if store.record_listing(username, store.hosts_in(profile.get("website")), db):
+        library.mark_artist(key, LISTED, db)
+        library.note_skip(key, db)
+        counts[LISTS_REMOVED] += 1
         return
     page = _body(_get(api, "/gallery/all", username=username, limit=GALLERY_LIMIT), "gallery lookup", "results")
     if not isinstance(page.get("has_more"), bool):
@@ -310,6 +327,7 @@ def _collect_artist(
     # qualifies, None for one that still does. library.store_artist() applies it to the works that are stored.
     marks: dict[str, str | None] = {}
     candidates: dict[str, dict[str, Any]] = {}  # deviation id -> gallery entry
+    turned_away = set()  # an id listed twice qualifies only if every entry for it does
     for entry in page["results"]:
         try:
             work_id = library.deviation_id(entry.get("deviationid") if isinstance(entry, dict) else None)
@@ -319,10 +337,13 @@ def _collect_artist(
         reason = _why_not(entry, username)
         if reason:
             counts[reason[0]] += 1
+            turned_away.add(work_id)
             if reason[1]:
                 marks[work_id] = _MARKS[reason[0]]
         else:
             candidates[work_id] = entry
+    for work_id in turned_away:
+        candidates.pop(work_id, None)
 
     metadata: dict[str, dict[str, Any]] = {}  # deviation id -> its metadata, which is where the tags are
     if candidates:
@@ -330,7 +351,10 @@ def _collect_artist(
         body = _body(_get(api, "/deviation/metadata", **asked), "metadata lookup", "metadata")
         for item in body["metadata"]:
             if isinstance(item, dict) and isinstance(item.get("deviationid"), str):
-                metadata[item["deviationid"].upper()] = item
+                # Of two items for one id, the one that is read is the one that does not say "not mature".
+                work_id = item["deviationid"].upper()
+                if metadata.setdefault(work_id, item).get("is_mature") is False or item.get("is_mature") is True:
+                    metadata[work_id] = item
 
     # Whether a work is AI-made is not asked here. Every first-pass rule on tags that this stage had erred in both
     # directions; the analysis stage reads each work's tags and title, and the push stage holds back what it flags.
@@ -357,21 +381,22 @@ def _collect_artist(
     clean.sort(key=lambda work: library.published_at(work[1].get("published_time")) or "", reverse=True)
     kept_before = library.work_ids(key, db)
     kept: list[dict[str, Any]] = []
-    refused = 0  # works in a row whose image the host would not serve, retries and all
     for work_id, entry, tags in clean:  # newest first
         if len(kept) == MAX_WORKS:
             marks.setdefault(work_id, None)  # seen and still good, though not among the newest this time
             continue
         thumbs = entry.get("thumbs")
-        thumb = thumbs[-1] if isinstance(thumbs, list) and thumbs else None
+        # A thumbnail is one only in the shape DeviantArt makes them. An entry with anything else has none.
+        thumb = thumbs[-1] if isinstance(thumbs, list) and thumbs and library.is_thumbnail(_src(thumbs[-1])) else None
+        # A new work with no thumbnail is shown by its preview. A work that is kept keeps the one it has.
+        shown = _src(thumb or (None if work_id in kept_before else entry["preview"]))
         work = {
             "work_id": work_id,
             "page_url": entry.get("url"),
             "title": entry.get("title"),
             "tags": tags,
-            # A new work with no thumbnail is shown by its preview. A work that is kept keeps the one it has.
-            "thumb_url": _src(entry["preview"]) if thumb is None and work_id not in kept_before else _src(thumb),
-            "thumb_size": (thumb.get("width"), thumb.get("height")) if isinstance(thumb, dict) else None,
+            "thumb_url": shown if library.is_thumbnail(shown) else None,
+            "thumb_size": (thumb.get("width"), thumb.get("height")) if thumb else None,
             "published": entry.get("published_time"),
         }
         try:
@@ -394,11 +419,11 @@ def _collect_artist(
             fetched = _fetch_image(http, preview)
             if isinstance(fetched, str):  # this work is not kept, and the next one is tried
                 counts[fetched] += 1
-                refused = refused + 1 if fetched == IMAGE_LIMITED else 0
-                if refused == MAX_REFUSALS:  # by now it is the host, or us it is refusing, and not these images
+                refused[0] = refused[0] + 1 if fetched == IMAGE_LIMITED else 0
+                if refused[0] == MAX_REFUSALS:  # by now it is the host, or us it is refusing, and not these images
                     raise discover.Stop("the image host is failing or rate limiting")
                 continue
-            refused = 0
+            refused[0] = 0
             try:
                 library.save_image(work_id, *fetched)
             except ValueError:  # the bytes do not begin the way the declared type does
@@ -452,6 +477,7 @@ def _run(
     # instead of standing at the front of every run and in the way of everybody behind them.
     artists = sorted(store.all_artists(db), key=lambda artist: tried.get(artist[0], ""))
     failed_in_a_row = 0
+    refused = [0]  # see _collect_artist: one count for the whole run, or a failing host is never stopped at
     for _, username, _ in artists[: max(max_artists, 0)]:
         try:
             key = store.artist_key(username)
@@ -463,7 +489,7 @@ def _run(
                 counts[REMOVED] += 1
                 continue
             counts[PROCESSED] += 1
-            _collect_artist(api, http, username, counts, db)
+            _collect_artist(api, http, username, counts, db, refused)
             failed_in_a_row = 0
         except discover.Stop:
             # A rate limit, or no token to be had: the next artist would fare no better. The one it stopped at

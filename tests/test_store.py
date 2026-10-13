@@ -107,7 +107,6 @@ def test_default_path_is_config_local_db(tmp_path, monkeypatch):
     assert store.own_site_candidates() == [("da:zz-fake-painter", PAINTER)]
     assert [key for key, _, _ in store.all_artists()] == ["da:zz-fake-painter"]
     assert store.record_listing("zz-fake-fourth", ["zz-fake-fourth.art"]) is False
-    assert store.site_unresolved("zz-fake-fourth") is False
     assert target.exists()
     assert len(rows(target)) == 1
 
@@ -372,44 +371,32 @@ def test_removal_leaves_no_trace_of_the_artist_in_the_file(db):
     assert b"fake-painter" not in db.read_bytes().lower()
 
 
-def test_removing_an_artist_by_handle_bars_the_site_in_their_row(db):
-    """A renamed or second account that lists the same site must not bring the removed artist back."""
-    add(db, username="zz-fake-old", links=("https://zz-fake-studio.art/",))
-    assert store.mark_removed("da:zz-fake-old", db) == 1
-    assert store.is_removed("site:zz-fake-studio.art", db)
-    assert add(db, username="zz-fake-new", links=("https://www.zz-fake-studio.art/",)) is False
-    assert store.is_removed("da:zz-fake-new", db)  # and the new handle is barred, whatever site it lists next
-    assert add(db, username="zz-fake-new", links=("https://zz-fake-elsewhere.art/",)) is False
-    assert rows(db) == []
+def test_removing_a_handle_bars_that_handle_and_no_site_and_touches_no_other_artist(db):
+    """Round 7. A removal by handle used to bar the sites the artist listed, and whoever else listed one was then
+    purged and barred: one website answered for every profile, then one removal, took six artists of six."""
+    for name in ("one", "two", "three"):
+        add(db, username=f"zz-fake-{name}", links=("https://zz-fake-studio.art/",))  # the same site, all three
+    store.record_listing("zz-fake-two", ["users.zz-fake-studio.art", "zz-fake-second.art"], db)
+    assert store.mark_removed("da:zz-fake-one", db) == 1
+    assert keys(db) == ["da:zz-fake-three", "da:zz-fake-two"]
+    assert [row[0] for row in rows(db, "removed")] == [sha("da:zz-fake-one")]  # the handle, and nothing else
+    assert not store.is_removed("site:zz-fake-studio.art", db) and not store.is_removed("da:zz-fake-two", db)
+    assert add(db, username="zz-fake-four", links=("https://www.zz-fake-studio.art/",)) is True
+    assert [key for key, _, _ in store.all_artists(db)] == ["da:zz-fake-four", "da:zz-fake-three", "da:zz-fake-two"]
 
 
-def test_removing_one_of_two_artists_who_list_a_site_removes_both(db):
-    add(db, username="zz-fake-one", links=("https://zz-fake-studio.art/",))
-    add(db, username="zz-fake-two", links=("http://www.zz-fake-studio.art/",))
-    add(db, username="zz-fake-other", links=("https://zz-fake-other.art/",))
-    assert store.mark_removed("da:zz-fake-one", db) == 2
-    assert keys(db) == ["da:zz-fake-other"]
-    assert store.is_removed("da:zz-fake-two", db) and store.is_removed("site:zz-fake-studio.art", db)
-    assert not store.is_removed("da:zz-fake-other", db) and not store.is_removed("site:zz-fake-other.art", db)
-
-
-def test_a_removal_reaches_everything_connected_to_it(db):
+def test_removing_a_site_stops_at_the_artists_whose_stored_link_it_is(db):
+    """They are deleted and their handles barred. Another site in their row is not, nor anybody who lists that."""
     add(db, username="zz-fake-one", links=("https://zz-fake-first.art/",))
     add(db, username="zz-fake-two", links=("https://zz-fake-first.art/", "https://zz-fake-second.art/"))
     add(db, username="zz-fake-three", links=("https://zz-fake-second.art/",))
-    add(db, username="zz-fake-other", links=("https://zz-fake-other.art/",))
-    assert store.mark_removed("da:zz-fake-one", db) == 3
-    assert keys(db) == ["da:zz-fake-other"]
-    assert store.is_removed("site:zz-fake-second.art", db) and store.is_removed("da:zz-fake-three", db)
-
-
-def test_removing_an_artist_never_bars_a_platform_they_linked_to(db):
-    add(db, username="zz-fake-one", links=("https://www.artstation.com/zz-fake-one", "https://zz-fake-one.art/"))
-    add(db, username="zz-fake-two", links=("https://www.artstation.com/zz-fake-two",))
-    assert store.mark_removed("da:zz-fake-one", db) == 1
-    assert keys(db) == ["da:zz-fake-two"]  # sharing a platform is not sharing a site
-    assert not store.is_removed("site:www.artstation.com", db)
-    assert [row[0] for row in rows(db, "removed")] == sorted([sha("da:zz-fake-one"), sha("site:zz-fake-one.art")])
+    store.record_listing("zz-fake-lister", ["users.zz-fake-first.art"], db)  # seen to list it, in a link not kept
+    assert store.mark_removed("site:zz-fake-first.art", db) == 2
+    assert keys(db) == ["da:zz-fake-three"]
+    assert [row[0] for row in rows(db, "removed")] == sorted(
+        [sha("site:zz-fake-first.art"), sha("da:zz-fake-one"), sha("da:zz-fake-two")]
+    )
+    assert not store.is_removed("da:zz-fake-lister", db) and not store.is_removed("site:zz-fake-second.art", db)
 
 
 def test_site_removal_deletes_and_blocks_artists_who_link_to_it(db):
@@ -451,88 +438,33 @@ def test_site_removal_bars_the_handle_of_every_artist_it_deletes(db):
     assert not store.is_removed("da:zz-fake-other", db)
     assert add(db, username="zz-fake-e", links=("https://zz-fake-e-new.art",)) is False  # a new website
     assert keys(db) == ["da:zz-fake-other"]
-    assert store.is_removed("site:zz-fake-e-new.art", db)  # a removed artist seen with a new site: that goes too
-    assert len(rows(db, "removed")) == 3  # the site, the handle and the new site, as hashes
+    assert not store.is_removed("site:zz-fake-e-new.art", db)  # which is not barred for it
+    assert len(rows(db, "removed")) == 2  # the site and the handle, as hashes
 
 
-def test_linking_to_a_removed_site_bars_the_handle_even_if_never_stored(db):
+@pytest.mark.parametrize("stored_before", [False, True])
+def test_naming_a_removed_site_changes_nothing_that_is_stored_and_bars_nobody(db, stored_before):
+    """Round 7: it is one answer's word. It used to delete the artist's row and put their handle on the list."""
+    if stored_before:
+        add(db, username="zz-fake-e", links=("https://zz-fake-e-old.art",))
     store.mark_removed("site:zz-fake-e.art", db)
-    assert add(db, username="zz-fake-e", links=("https://www.zz-fake-e.art./work",)) is False
-    assert store.is_removed("da:zz-fake-e", db)
-    assert add(db, username="zz-fake-e", links=("https://zz-fake-e-new.art",)) is False
-    assert rows(db) == []
-
-
-def test_an_artist_who_moves_to_a_removed_site_is_deleted_and_barred(db):
-    add(db, username="zz-fake-e", links=("https://zz-fake-e-old.art",))
-    store.mark_removed("site:zz-fake-e.art", db)
-    assert keys(db) == ["da:zz-fake-e"]  # not affected yet
-    assert add(db, username="zz-fake-e", links=("https://zz-fake-e.art",)) is False
-    assert rows(db) == []
-    assert store.is_removed("da:zz-fake-e", db)
-    assert b"fake-e" not in db.read_bytes().lower()
-
-
-def test_record_listing_bars_whoever_lists_a_removed_site(db):
-    store.mark_removed("site:zz-fake-e.art", db)
-    add(db, username="zz-fake-e", links=("https://zz-fake-e-other.art/",))
+    before, barred = rows(db), rows(db, "removed")
     assert store.record_listing("zz-fake-f", ["www.artstation.com", "zz-fake-f.art"], db) is False  # never raises
-    assert not store.is_removed("da:zz-fake-f", db)
     assert store.record_listing("ZZ-Fake-E", ["shop.zz-fake-e.art"], db) is True  # any host of the removed site
-    assert store.is_removed("da:zz-fake-e", db)
-    assert rows(db) == []  # the row they had under another site is gone
-    assert store.is_removed("site:zz-fake-e-other.art", db)  # and that other site went with them
-
-
-def test_a_site_removal_reaches_artists_who_only_listed_it_in_a_link_that_was_dropped(db):
-    assert store.record_listing("zz-fake-lister", ["users.zz-fake-e.art"], db) is False  # seen, nothing stored
-    assert store.record_listing("zz-fake-other", ["zz-fake-other.art"], db) is False
-    add(db, username="zz-fake-owner", links=("https://zz-fake-e.art/",))
-    assert store.mark_removed("site:zz-fake-e.art", db) == 1  # one row to delete
-    assert store.is_removed("da:zz-fake-owner", db) and store.is_removed("da:zz-fake-lister", db)
-    assert not store.is_removed("da:zz-fake-other", db) and not store.is_removed("site:zz-fake-other.art", db)
-    assert add(db, username="zz-fake-lister", links=("https://zz-fake-lister-new.art/",)) is False
-
-
-def test_removing_a_handle_bars_every_domain_their_profile_was_seen_to_list(db):
-    assert store.record_listing("zz-fake-x", ["zz-fake-x.art", "www.artstation.com"], db) is False
-    assert store.mark_removed("da:zz-fake-x", db) == 0  # no row to delete, but what they listed is known
-    assert store.is_removed("site:zz-fake-x.art", db)
-    assert not store.is_removed("site:www.artstation.com", db)  # never a platform
-    assert add(db, username="zz-fake-second", links=("https://www.zz-fake-x.art/",)) is False  # a second account
-    assert store.is_removed("da:zz-fake-second", db)
-    assert rows(db) == []
-
-
-def test_only_a_removed_artist_nobody_has_seen_has_an_unresolved_site(db):
-    assert store.site_unresolved("zz-fake-x", db) is False  # not removed
-    store.mark_removed("da:zz-fake-x", db)
-    assert store.site_unresolved("ZZ-Fake-X", db) is True  # removed, and nothing is known of their profile
-    assert store.record_listing("zz-fake-x", [], db) is True  # the one read: it lists nothing
-    assert store.site_unresolved("zz-fake-x", db) is False  # and that is remembered
-    add(db, username="zz-fake-y", links=("https://zz-fake-y.art/",))
-    store.mark_removed("da:zz-fake-y", db)
-    assert store.site_unresolved("zz-fake-y", db) is False  # their site was known, and went with them
-    store.record_listing("zz-fake-z", ["shop.zz-fake-z.art"], db)
-    store.mark_removed("da:zz-fake-z", db)
-    assert store.site_unresolved("zz-fake-z", db) is False
-    # Seen before their removal, but with no site of their own: the one read is still owed.
-    assert store.record_listing("zz-fake-w", ["www.artstation.com"], db) is False
-    store.mark_removed("da:zz-fake-w", db)
-    assert store.site_unresolved("zz-fake-w", db) is True
-    assert store.record_listing("zz-fake-w", ["zz-fake-w.art"], db) is True
-    assert store.site_unresolved("zz-fake-w", db) is False and store.is_removed("site:zz-fake-w.art", db)
+    assert add(db, username="zz-fake-e", links=("https://www.zz-fake-e.art./work",)) is False  # and it is not stored
+    assert rows(db) == before and rows(db, "removed") == barred
+    assert not store.is_removed("da:zz-fake-e", db)
+    assert add(db, username="zz-fake-e", links=("https://zz-fake-e-new.art",)) is True  # an answer without it is
 
 
 def test_what_profiles_list_is_kept_as_hashes_only(db):
     store.record_listing("ZZ-Fake-Lister", ["users.zz-fake-plat.art", "www.artstation.com"], db)
-    store.record_listing("zz-fake-nothing", [], db)  # lists no site, is not removed: nothing to keep
+    store.record_listing("zz-fake-nothing", [], db)  # lists no site: nothing to keep
     assert rows(db, "listed") == [(sha("site:zz-fake-plat.art"), sha("da:zz-fake-lister"))]
-    store.mark_removed("da:zz-fake-nothing", db)
-    assert store.record_listing("zz-fake-nothing", [], db) is True  # read while removed: that is remembered
-    listed = [("", sha("da:zz-fake-nothing")), (sha("site:zz-fake-plat.art"), sha("da:zz-fake-lister"))]
-    assert rows(db, "listed") == sorted(listed)
+    store.mark_removed("da:zz-fake-lister", db)  # a removed handle is not followed to what it listed
+    assert rows(db, "removed") == [(sha("da:zz-fake-lister"), rows(db, "removed")[0][1])]
     assert b"fake-" not in db.read_bytes().lower()
+    assert not hasattr(store, "site_unresolved") and not hasattr(store, "_seen")  # the cascade's machinery is gone
 
 
 def test_a_hash_made_from_another_subdomain_covers_that_host_and_no_more(db):
@@ -567,8 +499,7 @@ def test_an_artist_removed_only_through_imported_hashes_is_deleted_and_never_rea
     assert keys(db) == ["da:zz-fake-stays"]
     assert store.is_removed("da:zz-fake-gone", db)
     assert add(db, username="ZZ-Fake-Gone", links=("https://zz-fake-gone-new.art/",)) is False
-    assert store.is_removed("site:zz-fake-gone.art", db)  # and their site went with them, as in mark_removed
-    assert add(db, username="zz-fake-renamed", links=("https://zz-fake-gone.art/",)) is False
+    assert not store.is_removed("site:zz-fake-gone.art", db)  # a handle bars no site, as in mark_removed
     assert keys(db) == ["da:zz-fake-stays"]
     assert b"fake-gone" not in db.read_bytes().lower()
 
@@ -608,14 +539,17 @@ def test_importing_removals_is_idempotent_and_keeps_hashes_that_match_nobody(db)
 
 def test_a_deleted_cache_is_refilled_and_the_removal_still_holds(db):
     add(db, username="zz-fake-gone", links=("https://zz-fake-gone.art/",))
+    add(db, username="zz-fake-sited", links=("https://zz-fake-sited.art/",))
     store.mark_removed("da:zz-fake-gone", db)
+    store.mark_removed("site:zz-fake-sited.art", db)
     of_record = [row[0] for row in rows(db, "removed")]  # what the database holds: hashes only
     db.unlink()  # the local file is a cache
     assert add(db, username="zz-fake-gone", links=("https://zz-fake-gone.art/",)) is True  # nothing knows, yet
     assert store.import_removed(of_record, db) == 1
     assert rows(db) == []
     assert add(db, username="zz-fake-gone", links=("https://zz-fake-gone.art/",)) is False
-    assert add(db, username="zz-fake-renamed", links=("https://zz-fake-gone.art/",)) is False
+    assert add(db, username="zz-fake-sited", links=()) is False  # barred with their site, and still
+    assert add(db, username="zz-fake-renamed", links=("https://zz-fake-sited.art/",)) is False
 
 
 @pytest.mark.parametrize("bad", ["", "da:zz-fake-gone", "f" * 63, "f" * 65, "g" * 64, sha("da:x")[:-1] + " x"])
@@ -684,10 +618,10 @@ def old_rows(db, *artists):
             conn.execute("INSERT INTO artists VALUES (?, ?, '', ?, 3, '')", (f"da:{name}", name, json.dumps([link])))
 
 
-def test_a_removal_reaches_through_the_links_of_a_row_that_has_no_listing(db):
+def test_a_removal_reaches_the_row_of_an_artist_that_has_no_listing(db):
     old_rows(db, ("zz-fake-old-c", "https://zz-fake-old-c.art/"), ("zz-fake-old-d", "https://www.zz-fake-old-d.art/"))
     assert store.mark_removed("da:zz-fake-old-c", db) == 1
-    assert store.is_removed("site:zz-fake-old-c.art", db)  # removed by handle: the site in their row goes too
+    assert not store.is_removed("site:zz-fake-old-c.art", db)  # removed by handle: the site in their row is not
     assert store.mark_removed("site:zz-fake-old-d.art", db) == 1
     assert store.is_removed("da:zz-fake-old-d", db)  # removed by site: the handle of whoever links to it goes too
     assert keys(db) == ["da:zz-fake-new"]

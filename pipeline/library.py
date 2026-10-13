@@ -86,7 +86,7 @@ CREATE TABLE IF NOT EXISTS work_marks (
 ) STRICT;
 CREATE TABLE IF NOT EXISTS artist_marks (
     artist_key TEXT PRIMARY KEY,
-    reason TEXT NOT NULL,            -- 'account gone', 'mostly AI-made' or 'renamed'
+    reason TEXT NOT NULL,            -- 'account gone', 'lists a removed site', 'mostly AI-made' or 'renamed'
     marked_at TEXT NOT NULL CHECK (marked_at GLOB '{_TIMESTAMP}'),
     same_as TEXT                     -- for 'renamed': the key the same account is kept under now
 ) STRICT;
@@ -139,6 +139,14 @@ _PAGE_PATH = re.compile(r"/[A-Za-z0-9_-]{1,40}/art/[A-Za-z0-9_.%-]{1,200}")  # /
 _IMAGE_TOKEN = re.compile(r"token=(?P<header>[A-Za-z0-9_-]{1,100})\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+")
 MAX_TOKEN = 1000  # characters; the longest real one seen is 639
 MAX_IMAGE_PATH = 600  # characters; the longest real one seen is 252
+# A thumbnail's address as DeviantArt makes it: its image host, the file as /f/<uuid>/<id>-<uuid>.<type>, and when
+# the file is cut to a size, /v1/<how>/<options>/<title>_by_<artist>_<id>-<size>.<type> after it. Then the
+# signature, which image_address() checks. All 4,381 thumbnails kept on 2026-10-13 have this shape.
+_HEX_UUID = "[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}"
+_THUMBNAIL = re.compile(
+    rf"https://[a-z0-9-]{{1,63}}\.wixmp\.com/[fi]/{_HEX_UUID}/[0-9a-z]{{1,12}}-{_HEX_UUID}\.[a-z]{{3,4}}"
+    r"(?:/v1/[a-z]{1,12}/[a-z0-9_,]{1,60}/[a-z0-9_]{1,200}-[0-9a-z]{1,12}\.[a-z]{3,4})?(?:\?.*)?"
+)
 RENAMED = "renamed"  # the mark on the key an account was kept under before it took another handle
 _MARKUP = re.compile(r"<[^<>]*>")
 # Characters that show nothing and are not in Unicode's "other" categories, which _settle removes wholesale:
@@ -244,6 +252,12 @@ def _choice(value: object) -> str | None:
     return None if text == "None" else text
 
 
+def _unsaid(value: object, unset: str = "") -> bool:
+    """True when an answer says nothing in a field: no text there, a text that shows nothing, or `unset`, the
+    API's word for "not given". What is kept is never blanked for that: an empty answer is not the artist's word."""
+    return not isinstance(value, str) or (len(value) <= 10_000 and _settle(value) in ("", unset))
+
+
 def _tags(value: object) -> list[str]:
     """The artist's own tags: plain tag names of 60 characters at most, and 60 of them at most."""
     tags = value if isinstance(value, list) else []
@@ -340,6 +354,17 @@ def image_address(value: object) -> str:
     if _contact(named):
         raise ContactInTitle("contact details in an image address")
     return str(url)
+
+
+def is_thumbnail(value: object) -> bool:
+    """True for an address of the shape DeviantArt's own thumbnails have (see _THUMBNAIL). It says nothing more:
+    image_address() still has to pass it. For the collect stage, where an entry whose thumbnail has any other
+    shape is taken as having none.
+
+    ponytail: asked where the API's answer is read, not in checked_work(): the other stages' tests store works
+    under short made-up addresses. Move it there once their fixtures have DeviantArt's shape.
+    """
+    return isinstance(value, str) and bool(_THUMBNAIL.fullmatch(value))
 
 
 def _signature(query: str) -> bool:
@@ -531,16 +556,17 @@ def store_artist(
 ) -> tuple[int, int]:
     """Add to what is kept about one artist and bring it up to date, in one transaction. Nothing is deleted.
 
-    The profile is these four public fields and nothing else. A field is brought up to date when it is given as
-    a text, an empty one included: that is the artist's word. Given as anything else, nothing was said about
-    it, and what is kept stays. The account hash is written once and never replaced: whose account a handle is
-    does not change, and the caller turns away an answer that says otherwise (see holders).
+    The profile is these four public fields and nothing else. A field is brought up to date when the answer
+    says something in it (see _unsaid). Given empty, or as anything but a text, nothing was said, and what is
+    kept stays. A text that the rules here refuse is dropped: that is our rule, and not the API's word. The
+    account hash is written once and never replaced: whose account a handle is does not change, and the caller
+    turns away an answer that says otherwise (see holders).
 
     `works` are keyword arguments for checked_work(). Each is added, or brought up to date with the time, and
-    its row names the work's cached image when there is one. For a work that is kept, a title that is not given
-    as a text, a publish time or a thumbnail that is not given, and a size that is not given all stay as they
-    are kept. A work that is kept and is not among `works` is left as it is: its fetched_at is when it was last
-    seen and still qualified. A work kept under another artist's key is not taken from them.
+    its row names the work's cached image when there is one. For a work that is kept, a title or a tag list
+    that is empty or not given, a publish time or a thumbnail that is not given, and a size that is not given
+    all stay as they are kept. A work that is kept and is not among `works` is left as it is: its fetched_at is
+    when it was last seen and still qualified. A work kept under another artist's key is not taken from them.
 
     `marks` is what this turn learned about the artist's other kept works (see _mark_works). The artist's own
     mark goes, unless it is the RENAMED mark that ties this key to another. `old_keys` are the keys this
@@ -564,7 +590,10 @@ def store_artist(
         _upgrade(conn)
         fields = "SELECT tagline, specialty, level, website, user_hash FROM profiles WHERE artist_key = ?"
         *before, old_hash = conn.execute(fields, (key,)).fetchone() or (None, None, None, None, None)
-        said = [new if isinstance(value, str) else old for value, new, old in zip(given, checked, before, strict=True)]
+        said = [  # tagline, specialty, level, website: the two in the middle have a word for "not given"
+            old if _unsaid(value, unset) else new
+            for value, unset, new, old in zip(given, ("", "None", "None", ""), checked, before, strict=True)
+        ]
         # Every column is named, here and below: a row written by position lands in the wrong columns the day
         # the table changes.
         conn.execute(
@@ -586,13 +615,14 @@ def store_artist(
         stored = set()
         for (work_id, page, title, tags, thumb, published), work in zip(rows, works, strict=True):
             kept = conn.execute(
-                "SELECT artist_key, title, thumb_url, published_at FROM works WHERE deviation_id = ?", (work_id,)
+                "SELECT artist_key, title, thumb_url, published_at, tags FROM works WHERE deviation_id = ?", (work_id,)
             ).fetchone()
             if kept and kept[0] not in mine:
                 continue
-            if kept:  # what the entry does not give stays as it is kept: a missing field is not an empty one
-                title = title if isinstance(work.get("title"), str) else kept[1]
+            if kept:  # what the entry does not give, or gives empty, stays as it is kept
+                title = kept[1] if _unsaid(work.get("title")) else title
                 thumb, published = thumb or kept[2], published or kept[3]
+                tags = tags if isinstance(work.get("tags"), list) and work["tags"] else kept[4]
             if thumb is None:
                 raise ValueError("a new work with no thumbnail")
             try:
@@ -642,8 +672,9 @@ def mark_artist(artist_key: str, reason: str, db: pathlib.Path | str | None = No
 def artist_marks(db: pathlib.Path | str | None = None) -> dict[str, tuple[str, str, str | None]]:
     """Every marked artist: key -> (reason, when, and for RENAMED the key the account goes by now).
 
-    A marked artist is one whose account the API called gone, whose works look mostly AI-made, or whose account
-    took another handle. Their rows are all still here. Whether they are published is for a later stage.
+    A marked artist is one whose account the API called gone, whose profile names a removed site, whose works
+    look mostly AI-made, or whose account took another handle. Their rows are all still here. Whether they are
+    published is for a later stage.
     """
     with _open(db) as conn:
         rows = conn.execute("SELECT artist_key, reason, marked_at, same_as FROM artist_marks")

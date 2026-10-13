@@ -70,6 +70,7 @@ skipped artists (unreadable handle): 0
 skipped artists (removed): 0
 skipped artists (a removed account under a new handle): 0
 marked artists (account suspended, inactive or gone): 2
+marked artists (their profile names a removed site): 0
 marked works (stored, and no longer qualifying): 0
 skipped works (malformed entry): 0
 skipped works (another author's): 0
@@ -105,8 +106,19 @@ def jpeg(n):
     return b"\xff\xd8\xff" + f"FAKE-IMAGE-BYTES-{n}-".encode() * 40
 
 
+def image_path(n, kind, size):
+    """A path of the shape DeviantArt gives an image's address: the file, how it is cut, and a name made of the
+    title, the artist and DeviantArt's own id for the work."""
+    file = f"/f/{uuid(n).lower()}/d{n:06d}-{uuid(n).lower()}.jpg"
+    return f"{file}/v1/fit/w_{size},h_{size},q_70,strp/fake_{kind}_{n}_by_zz_fake_d{n:06d}-{size}w.jpg"
+
+
 def preview_path(n):
-    return f"/f/FAKE-PREVIEW-{n}.jpg"
+    return image_path(n, "preview", 800)
+
+
+def thumb(n, size=300):
+    return f"{CDN}{image_path(n, 'thumb', size)}?{signed(n)}"
 
 
 HEADER = base64.urlsafe_b64encode(b'{"typ":"JWT","alg":"HS256"}').decode().rstrip("=")
@@ -151,10 +163,7 @@ def deviation(n, username, drop=(), **changes):
         "published_time": str(1_700_000_000 + n * 3600),
         "preview": {"src": f"{CDN}{preview_path(n)}?{signed(n)}", "height": 600, "width": 800},
         "content": {"src": f"{CDN}/f/FAKE-CONTENT-{n}.png?{signed(n)}", "height": 1200, "width": 1600},
-        "thumbs": [
-            {"src": f"{CDN}/f/FAKE-THUMB-{n}-{size}.jpg?{signed(n)}", "height": size, "width": size}
-            for size in (150, 200, 300)
-        ],
+        "thumbs": [{"src": thumb(n, size), "height": size, "width": size} for size in (150, 200, 300)],
     }
     entry.update(changes)
     return {name: value for name, value in entry.items() if name not in drop}
@@ -432,7 +441,7 @@ def work_row(n, username, tags=("fakepainting",)):
         "page_url": f"https://www.deviantart.com/{username.lower()}/art/FAKE-TITLE-{n}-{n}",
         "title": f"FAKE-TITLE-{n}",
         "tags": json.dumps(list(tags)),
-        "thumb_url": f"{CDN}/f/FAKE-THUMB-{n}-300.jpg?{signed(n)}",
+        "thumb_url": thumb(n),
         "published_at": iso(1_700_000_000 + n * 3600),
         "image_file": f"{uuid(n)}.jpg",
     }
@@ -738,7 +747,7 @@ def test_a_page_or_thumbnail_address_that_carries_what_the_title_does_not_costs_
     world = solo(4)
     world.galleries[ALPHA][0]["url"] = f"https://www.deviantart.com/{ALPHA}/art/FAKE-zz.fake%40mail.invalid-1"
     world.galleries[ALPHA][1]["url"] = f"https://www.deviantart.com/{ALPHA}/art/FAKE-call-555-0199-2"
-    world.galleries[ALPHA][2]["thumbs"] = [{"src": f"{CDN}/f/zz.fake%40mail.invalid-3.jpg?{signed(3)}"}]
+    world.galleries[ALPHA][2]["thumbs"] = [{"src": thumb(3).replace("fake_thumb_3_by", "call_555_0199_by")}]
     counts = counts_of(world, capsys)
     assert counts[collect.TITLE] == 3 and kept(ALPHA) == [4]
     stored = config.LOCAL_DB.read_bytes()
@@ -846,23 +855,18 @@ NOT_QUALIFYING = {
         collect.MALFORMED,
     ),
     "no page": ({"drop": ("url",)}, collect.MALFORMED),
-    "a thumbnail that is an embedded image": (
-        {"thumbs": [{"src": "data:image/png;base64,RkFLRQ==", "height": 1, "width": 1}]},
-        collect.MALFORMED,
-    ),
+    # A thumbnail of DeviantArt's shape that is not acceptable. One of any other shape is no thumbnail: see below.
     "a thumbnail with an embedded image in its query": (
-        {"thumbs": [{"src": f"{CDN}/f/FAKE-THUMB-2.jpg?x=data:image/png;base64,RkFLRQ=="}]},
+        {"thumbs": [{"src": f"{thumb(2).partition('?')[0]}?x=data:image/png;base64,RkFLRQ=="}]},
         collect.MALFORMED,
     ),
-    "a thumbnail on another host": ({"thumbs": [{"src": "https://zz-fake-evil.invalid/FAKE.jpg"}]}, collect.MALFORMED),
-    "a thumbnail that is not an object": ({"thumbs": [f"{CDN}/f/FAKE-THUMB-2.jpg"]}, collect.MALFORMED),
     # The critic's two probes for an image kept as text: in the token of a signature, and as a page's title part.
     "a thumbnail with an image riding in its signature": (
-        {"thumbs": [{"src": f"{CDN}/f/FAKE-THUMB-2.jpg?token={HEADER}.{'F' * 1200}.FAKE-SIGNATURE"}]},
+        {"thumbs": [{"src": f"{thumb(2).partition('?')[0]}?token={HEADER}.{'F' * 1200}.FAKE-SIGNATURE"}]},
         collect.MALFORMED,
     ),
     "a thumbnail whose signature has no header": (
-        {"thumbs": [{"src": f"{CDN}/f/FAKE-THUMB-2.jpg?token=FAKE-HEADER.FAKE-CLAIMS.FAKE-SIGNATURE"}]},
+        {"thumbs": [{"src": f"{thumb(2).partition('?')[0]}?token=FAKE-HEADER.FAKE-CLAIMS.FAKE-SIGNATURE"}]},
         collect.MALFORMED,
     ),
     "a page whose title part is an encoded file": (
@@ -895,6 +899,28 @@ def test_a_work_that_does_not_qualify_is_not_stored_and_its_image_is_never_fetch
     assert [request.url.path for request in world.requests("images")] == [preview_path(n) for n in (4, 3, 1)]
     assert counts[label] == 1 and counts[collect.WORKS] == 3 and counts[collect.PROFILES] == 1
     assert sum(count for name, count in counts.items() if name.startswith("skipped")) == 1
+
+
+@pytest.mark.parametrize("good_one_first", [True, False])
+@pytest.mark.parametrize("said", [True, None, "missing"])
+@pytest.mark.parametrize("where", ["gallery", "metadata"])
+def test_a_work_listed_twice_is_not_mature_only_if_every_listing_of_it_says_so(where, said, good_one_first, capsys):
+    """Round 7: one id listed twice, once as mature and once as not, was stored as a new work, whichever of the
+    answer's two lists it was in. Work 2 of three is listed twice here, and one of the two does not say "false"."""
+    world = solo(3)
+    changes = {"drop": ("is_mature",)} if said == "missing" else {"is_mature": said}
+    if where == "gallery":
+        pair = [world.galleries[ALPHA][1], deviation(2, ALPHA, **changes)]
+        world.galleries[ALPHA][1:2] = pair if good_one_first else pair[::-1]
+    else:
+        pair = [world.metadata[uuid(2)], metadata(2, ALPHA, ["fakepainting"], **changes)]
+        items = [world.metadata[uuid(1)], *(pair if good_one_first else pair[::-1]), world.metadata[uuid(3)]]
+        world.detours.append(
+            lambda request: httpx.Response(200, json={"metadata": items}) if request.url.path == METADATA_PATH else None
+        )
+    counts = counts_of(world, capsys)
+    assert kept(ALPHA) == [3, 1] and cached() == image_files([1, 3]) and counts[collect.MATURE] == 1
+    assert [request.url.path for request in world.requests("images")] == [preview_path(3), preview_path(1)]
 
 
 def test_the_ten_most_recent_qualifying_works_are_kept_whatever_order_the_gallery_lists_them_in():
@@ -948,7 +974,7 @@ def test_nothing_image_like_is_written_to_the_database():
             kinds = conn.execute(f"SELECT DISTINCT {', '.join(f'typeof({name})' for name in names)} FROM {table}")
             assert {kind for row in kinds for kind in row} <= {"text", "null"}
     for row in rows("works"):  # addresses and a file name, and that is all there is about the image
-        assert row["thumb_url"].startswith(f"{CDN}/f/FAKE-THUMB-")
+        assert row["thumb_url"].startswith(f"{CDN}/f/") and "fake_thumb_" in row["thumb_url"]
         assert row["page_url"].startswith("https://www.deviantart.com/")
         assert re.fullmatch(r"[0-9A-F-]{36}\.jpg", row["image_file"])
 
@@ -958,7 +984,7 @@ def test_only_the_preview_is_downloaded_never_the_original_or_a_thumbnail():
     assert run(world) == 0
     paths = [request.url.path for request in world.requests("images")]
     assert sorted(paths) == sorted(preview_path(n) for n in ALPHA_KEPT + BRAVO_KEPT)
-    assert not any("CONTENT" in str(request.url) or "THUMB" in str(request.url) for request in world.requests())
+    assert not any("CONTENT" in str(request.url) or "fake_thumb" in str(request.url) for request in world.requests())
     assert {request.url.host for request in world.requests("images")} == {CDN_HOST}
 
 
@@ -1254,7 +1280,7 @@ def test_a_work_that_left_the_gallery_stays_and_one_that_stopped_qualifying_is_m
 
 
 GIVEN = {  # what an entry of the documented shape can give for a field, when it gives nothing that can be kept
-    "title": ["missing", None, 7, ["FAKE"]],
+    "title": ["missing", None, 7, ["FAKE"], "", "  "],
     "published_time": ["missing", None, "FAKE", ["FAKE"]],
     "thumbs": ["missing", None, 7, [], ["FAKE"], [{"FAKE": 1}]],
 }
@@ -1264,7 +1290,7 @@ GIVEN = {  # what an entry of the documented shape can give for a field, when it
 def test_a_field_an_entry_does_not_give_leaves_what_is_kept_for_the_work(field, value, capsys):
     """The critic's finding: entries with no title set the kept title to NULL on 24 of 24 works, the same for the
     publish time, and with no thumbnails the kept thumbnail was replaced by the preview address. Exit 0, nothing
-    counted. A missing field is not an empty one: the profile had that rule, and now a work has it."""
+    counted. Round 7: an empty title did the same, and so did an empty tag list (see the test after this one)."""
     world = solo(3)
     assert run(world) == 0
     before, sizes = rows("works"), library.thumb_sizes()
@@ -1277,22 +1303,65 @@ def test_a_field_an_entry_does_not_give_leaves_what_is_kept_for_the_work(field, 
         map(uuid, (1, 2, 3)), (300, 300)
     )
     assert [{**row, "fetched_at": None} for row in rows("works")] == [{**row, "fetched_at": None} for row in before]
-    assert all(row["title"] and row["published_at"] and "THUMB" in row["thumb_url"] for row in rows("works"))
+    assert all(row["title"] and row["published_at"] and "fake_thumb" in row["thumb_url"] for row in rows("works"))
+
+
+def test_an_empty_title_or_tag_list_leaves_what_is_kept_for_the_work_and_a_new_work_has_neither(capsys):
+    world = solo(3)
+    assert run(world) == 0
+    before = rows("works")
+    for n, entry in enumerate(world.galleries[ALPHA], 1):
+        entry["title"] = ""
+        world.metadata[uuid(n)]["tags"] = []
+    world.work(ALPHA, 4, tags=[], title="")
+    assert counts_of(world, capsys)[collect.WORKS] == 4
+    after = rows("works")
+    assert [{**row, "fetched_at": None} for row in after[:3]] == [{**row, "fetched_at": None} for row in before]
+    assert (after[3]["title"], after[3]["tags"]) == (None, "[]")
 
 
 def test_a_new_work_without_thumbnails_is_shown_by_its_preview_and_a_kept_one_takes_a_thumbnail_when_given(capsys):
     world = solo(2)
     world.galleries[ALPHA][0].pop("thumbs")
     assert run(world) == 0
-    assert "PREVIEW-1" in rows("works")[0]["thumb_url"] and "THUMB-2-300" in rows("works")[1]["thumb_url"]
+    assert [row["thumb_url"] for row in rows("works")] == [f"{CDN}{preview_path(1)}?{signed(1)}", thumb(2)]
     assert library.thumb_sizes() == {uuid(2): (300, 300)}  # the size the API gave for the thumbnail that is kept
-    world.galleries[ALPHA][0]["thumbs"] = [
-        {"src": f"{CDN}/f/FAKE-THUMB-1-400.jpg?{signed(1)}", "width": 400, "height": 250}
-    ]
-    world.galleries[ALPHA][1]["thumbs"] = [{"src": f"{CDN}/f/FAKE-THUMB-2-300.jpg?{signed(2)}", "width": "FAKE"}]
+    world.galleries[ALPHA][0]["thumbs"] = [{"src": thumb(1, 400), "width": 400, "height": 250}]
+    world.galleries[ALPHA][1]["thumbs"] = [{"src": thumb(2), "width": "FAKE"}]
     assert run(world) == 0
-    assert "THUMB-1-400" in rows("works")[0]["thumb_url"]
+    assert rows("works")[0]["thumb_url"] == thumb(1, 400)
     assert library.thumb_sizes() == {uuid(1): (400, 250), uuid(2): (300, 300)}  # both or neither: the old one stays
+
+
+NO_THUMBNAIL = {  # what an entry can give for a thumbnail that is not of the shape DeviantArt's own have
+    "the critic's first": f"{CDN}/f/abc/whatsapp-5550199123",
+    "the critic's second": f"{CDN}/f/call-5550199123/t_by_zz_d1.jpg?{signed(2)}",
+    "a short path": f"{CDN}/f/FAKE-THUMB-2.jpg?{signed(2)}",
+    "a path with one part too many": thumb(2).replace("/v1/", "/v1/call-5550199123/"),
+    "another host": "https://zz-fake-evil.invalid/FAKE.jpg",
+    "another of DeviantArt's hosts": thumb(2).replace(CDN_HOST, "zzcdn00.deviantart.net"),
+    "an embedded image": "data:image/png;base64,RkFLRQ==",
+    "no address": 5550199123,
+}
+
+
+@pytest.mark.parametrize("case", NO_THUMBNAIL)
+def test_an_entry_whose_thumbnail_is_not_of_deviantarts_shape_has_no_thumbnail(case, capsys):
+    """Round 7: new works were stored with thumbnail paths such as /f/abc/whatsapp-5550199123. Such an entry is
+    taken as having no thumbnail. A kept work keeps the one it has, a new work is shown by its preview, and a
+    new work whose preview has not the shape either is not kept."""
+    world = solo(1)
+    assert run(world) == 0
+    world.work(ALPHA, 2)
+    world.work(ALPHA, 3, preview={"src": f"{CDN}/f/FAKE-PREVIEW-3.jpg?{signed(3)}", "height": 600, "width": 800})
+    for entry in world.galleries[ALPHA]:
+        entry["thumbs"] = [{"src": NO_THUMBNAIL[case], "height": 77, "width": 77}]
+    counts = counts_of(world, capsys)
+    assert [row["thumb_url"] for row in rows("works")] == [thumb(1), f"{CDN}{preview_path(2)}?{signed(2)}"]
+    assert counts[collect.MALFORMED] == 1 and counts[collect.WORKS] == 2 and cached() == image_files([1, 2])
+    assert library.thumb_sizes() == {uuid(1): (300, 300)}  # nor is its size taken for the thumbnail that is kept
+    assert not any("PREVIEW-3" in str(request.url) for request in world.requests("images"))
+    assert b"5550199" not in config.LOCAL_DB.read_bytes() and b"FAKE-THUMB" not in config.LOCAL_DB.read_bytes()
 
 
 def test_a_refreshed_profile_is_brought_up_to_date_where_the_answer_says_something():
@@ -1301,9 +1370,15 @@ def test_a_refreshed_profile_is_brought_up_to_date_where_the_answer_says_somethi
     world.profiles[ALPHA] = profile(ALPHA, tagline="FAKE-TAGLINE-NEW", artist_level=None, website="")
     del world.profiles[ALPHA]["artist_specialty"]
     assert run(world) == 0
-    # A new tagline. No website any more: an empty text says so. A level that is null and a specialty that is not
-    # there say nothing, and what is kept stays: the critic's finding was a 200 that blanked every field.
-    assert without_time(rows("profiles")) == [{**profile_row(ALPHA, None), "tagline": "FAKE-TAGLINE-NEW"}]
+    # A new tagline. A website that is an empty text, a level that is null and a specialty that is not there say
+    # nothing, and what is kept stays: the critic's findings were a 200 that blanked every field, and in round 7
+    # an empty text that blanked the one it was given for.
+    kept_as = {**profile_row(ALPHA, "https://www.artstation.com/zz-fake-alpha"), "tagline": "FAKE-TAGLINE-NEW"}
+    assert without_time(rows("profiles")) == [kept_as]
+    world.profiles[ALPHA] = profile(ALPHA, tagline="", artist_level=" ", artist_specialty="None", website="")
+    assert run(world) == 0 and without_time(rows("profiles")) == [kept_as]
+    world.profiles[ALPHA]["website"] = "https://wa.me/15550109999"  # what our own rules refuse is dropped all the same
+    assert run(world) == 0 and without_time(rows("profiles")) == [{**kept_as, "website": None}]
 
 
 def test_max_artists_bounds_a_run_and_the_next_run_takes_up_where_it_stopped(capsys):
@@ -1416,12 +1491,15 @@ def test_a_removal_that_lands_before_the_first_image_means_no_image_is_fetched(p
     assert library.account_removed(f"FAKE-USERID-{ALPHA}")
 
 
-def test_an_artist_removed_for_their_site_in_their_first_turn_leaves_their_account_on_the_list(capsys):
+def test_an_artist_whose_first_answer_names_a_removed_site_is_marked_and_not_collected_and_nobody_is_barred(capsys):
     world = solo(website="https://zz-fake-gone.art/")
     assert store.mark_removed("zz-fake-gone.art") == 0
     counts = counts_of(world, capsys)
-    assert counts[collect.REMOVED] == 1 and library.artist_keys() == [] and store.is_removed(ALPHA)
-    assert library.account_removed(f"FAKE-USERID-{ALPHA}")
+    assert counts[collect.LISTS_REMOVED] == 1 and counts[collect.REMOVED] == counts[collect.PROFILES] == 0
+    assert artist_marks() == {key(ALPHA): "lists a removed site"} and library.artist_keys() == []
+    assert world.requests("images") == [] and [artist[0] for artist in store.all_artists()] == [key(ALPHA)]
+    assert not store.is_removed(ALPHA) and not library.account_removed(f"FAKE-USERID-{ALPHA}")
+    assert key(ALPHA) in library.last_attempts()  # passed over: the next run takes them last
 
 
 def test_a_removal_that_lands_after_the_artist_was_stored_is_honoured_before_the_run_ends(capsys, tmp_path):
@@ -1485,31 +1563,67 @@ def test_the_purge_comes_before_any_request_and_survives_a_run_that_fails(capsys
     assert cached() == image_files(ALPHA_KEPT)
 
 
-def test_an_artist_whose_profile_names_a_removed_site_is_removed_and_purged(capsys):
-    """The site was removed; the artist's row in the store does not link to it, but their profile now does."""
+def test_an_artist_whose_profile_comes_to_name_a_removed_site_is_marked_and_keeps_everything(capsys):
+    """Round 7. The site was removed, and the artist's profile now names it: that is one answer's word. It used to
+    purge them and put their handle and their account on the removal list for good. Now it is written beside
+    them, the push stage holds a marked artist back, and the mark goes when an answer no longer says so."""
     world = base()
     assert run(world) == 0
-    assert kept(BRAVO) == BRAVO_KEPT
+    was, theirs = stored(), (rows("profiles", BRAVO), rows("works", BRAVO))
     assert store.mark_removed("zz-fake-gone.art") == 0
+    barred = raw("SELECT key_hash FROM removed ORDER BY 1")
     world.profiles[BRAVO.lower()] = profile(BRAVO, website="see WWW.ZZ-Fake-Gone.art/folio for more")
     seen = len(world.log)
-    left_when_the_next_artist_is_asked_for = []
-
-    def look(request):
-        if request.url.path == PROFILE_PATH + FOXTROT:  # the artist after BRAVO
-            left_when_the_next_artist_is_asked_for.extend(rows("profiles", BRAVO) + rows("works", BRAVO))
-
-    world.detours.append(look)
-    counts = counts_of(world, capsys)
-    assert counts[collect.REMOVED] == 1 and counts[collect.PURGED] == 0
-    assert left_when_the_next_artist_is_asked_for == []  # purged at once, not when the run ends hours later
-    assert rows("profiles", BRAVO) == rows("works", BRAVO) == [] and cached() == image_files(ALPHA_KEPT)
-    assert store.is_removed(BRAVO) and key(BRAVO) not in [artist[0] for artist in store.all_artists()]
-    assert library.account_removed(f"FAKE-USERID-{BRAVO}")  # the account, and not only the handle
+    for _ in range(2):
+        counts = counts_of(world, capsys)
+        assert counts[collect.LISTS_REMOVED] == 1 and counts[collect.REMOVED] == counts[collect.PURGED] == 0
+        assert stored() == was and (rows("profiles", BRAVO), rows("works", BRAVO)) == theirs  # as they were kept
+        assert artist_marks()[key(BRAVO)] == "lists a removed site"
+        assert raw("SELECT key_hash FROM removed ORDER BY 1") == barred  # nobody was put on the list for it
+        assert not store.is_removed(BRAVO) and not library.account_removed(f"FAKE-USERID-{BRAVO}")
     assert [request.url.path for request in world.since(seen) if "bravo" in str(request.url).lower()] == [
         PROFILE_PATH + BRAVO
-    ]
+    ] * 2  # and nothing of theirs was asked for beyond the profile
     assert b"zz-fake-gone" not in config.LOCAL_DB.read_bytes().lower()
+    world.profiles[BRAVO.lower()] = profile(BRAVO)
+    assert counts_of(world, capsys)[collect.PROFILES] == 3 and key(BRAVO) not in artist_marks()
+
+
+def test_one_website_answered_for_every_profile_and_then_one_removal_takes_only_the_removed(capsys):
+    """The critic's finding, and the biggest of round 7: one run in which every profile answered the same website,
+    then one legitimate removal, purged and barred six artists of six. One wrong website once did it to two, and
+    so did honest data: two artists who list one site. A removal reaches the artist it names."""
+    world, names = many(6)
+    for name in names:
+        world.profiles[name]["website"] = "https://zz-fake-shared.art/"
+    assert run(world) == 0
+    was = stored()
+    store.mark_removed(names[0])
+    assert counts_of(world, capsys)[collect.PURGED] == 1
+    others = set(map(key, names[1:]))
+    assert stored() == (others, was[1] - {uuid(1)}, was[2] - {f"{uuid(1)}.jpg"}, others)
+    assert not any(store.is_removed(name) for name in names[1:]) and artist_marks() == {}
+    assert not store.is_removed("zz-fake-shared.art") and len(raw("SELECT * FROM removed")) == 2  # handle and account
+    assert counts_of(world, capsys)[collect.PROFILES] == 5 and stored()[0] == others  # and the run after it
+
+
+def test_every_profile_naming_a_removed_site_in_one_run_purges_nobody_and_marks_them(capsys):
+    world, names = many(6)
+    assert run(world) == 0
+    was, before = stored(), (rows("profiles"), rows("works"))
+    assert store.mark_removed("zz-fake-gone.art") == 0
+    for name in names:
+        world.profiles[name]["website"] = "https://www.zz-fake-gone.art/"
+    seen = len(world.log)
+    counts = counts_of(world, capsys)
+    assert counts[collect.LISTS_REMOVED] == 6 and counts[collect.PURGED] == counts[collect.REMOVED] == 0
+    assert stored() == was and (rows("profiles"), rows("works")) == before and len(cached()) == 6
+    assert artist_marks() == dict.fromkeys(map(key, names), "lists a removed site")
+    assert not any(store.is_removed(name) for name in names) and len(raw("SELECT * FROM removed")) == 1  # the site
+    assert len(world.since(seen)) == 1 + 6  # a token and six profiles: nothing more is asked of a marked artist
+    for name in names:
+        world.profiles[name]["website"] = ""
+    assert counts_of(world, capsys)[collect.PROFILES] == 6 and artist_marks() == {} and nothing_lost(was)
 
 
 def test_a_removal_noticed_in_the_middle_of_a_run_is_purged_at_once(capsys):
@@ -2124,6 +2238,49 @@ def test_refusals_with_any_other_answer_between_them_do_not_stop_the_run(capsys)
     assert kept(ALPHA) == [10, 5, 4, 3, 2, 1] and kept(BRAVO) == BRAVO_KEPT
 
 
+def two_works_each(count):
+    """A world of this many artists with two good works each: n, and the newer one n + 10."""
+    world, names = many(count)
+    for number, name in enumerate(names, 11):
+        world.work(name, number)
+    return world, names
+
+
+@pytest.mark.parametrize("status", [429, 503])
+def test_an_image_host_that_refuses_everybody_stops_the_run_though_no_artist_has_three_works(status, capsys):
+    """Round 7: the refusals were counted from nothing for every artist, so with two works an artist the count never
+    came to three: ten artists, 80 requests, and nothing stopped. It is one count for the run now."""
+    world, names = two_works_each(10)
+    world.detours.append(lambda request: httpx.Response(status) if request.url.host == CDN_HOST else None)
+    assert run(world) == 1
+    captured = capsys.readouterr()
+    assert captured.err == (
+        "stopped: the image host is failing or rate limiting\nincomplete: the image host was failing. See the counts.\n"
+    )
+    counts = summary(captured.out)
+    assert counts[collect.IMAGE_LIMITED] == collect.MAX_REFUSALS == 3 and counts[collect.PROCESSED] == 2
+    assert len(world.requests("images")) == 3 * (1 + collect.SERVER_RETRIES) and world.asked_about(names[2]) == []
+    # The first artist was stored, with no works. The second, whose first work was the third refused, is noted
+    # as passed over, so that the next run does not begin with them.
+    assert library.artist_keys() == [key(names[0])] and sorted(library.last_attempts()) == [
+        key(names[0]),
+        key(names[1]),
+    ]
+    world.detours.clear()
+    seen = len(world.log)
+    assert run(world, max_artists=1) == 0
+    assert world.since(seen, "api")[1].url.path == PROFILE_PATH + names[2]
+
+
+def test_refusals_count_across_artists_only_while_nothing_is_served_between_them(capsys):
+    """Refused twice for the first artist, served for the second, refused twice for the third: never three running."""
+    world, names = two_works_each(4)
+    world.detours.append(limited(1, 11, 3, 13))
+    counts = counts_of(world, capsys, expect_status=1)
+    assert counts[collect.IMAGE_LIMITED] == 4 and counts[collect.PROFILES] == counts[collect.PROCESSED] == 4
+    assert [kept(name) for name in names] == [[], [12, 2], [], [14, 4]]
+
+
 def test_an_image_served_from_the_apis_own_host_waits_the_apis_interval():
     """It is one more request to that host, and requests to that host are a second apart."""
     world = solo(3)
@@ -2605,6 +2762,28 @@ def test_one_user_object_given_for_every_profile_is_believed_for_nobody_else(cap
     assert summary(captured.out)[collect.API_FAILED] == 3 and stored() == was and artist_marks() == {}
 
 
+@pytest.mark.parametrize("user_id", ["missing", None, "", 7, ["FAKE-USERID"]])
+def test_a_profile_with_no_user_id_is_the_api_failing_for_that_artist_and_nothing_of_it_is_stored(user_id, capsys):
+    """Round 7's test gap: the rule's "there is a user id" could be taken out and every test still passed. A profile
+    stored without one has no account hash: a removal could not follow that account to its next handle (hard
+    rule 7), and nothing would say that two handles are one account. Here for a new artist and for a kept one."""
+    world = trio()
+    assert run(world) == 0
+    world.artist("zz-fake-new")
+    world.work("zz-fake-new", 9)
+    was = stored()
+    for name in ("zz-fake-new", ALPHA):
+        world.profiles[name]["user"]["userid"] = user_id
+        if user_id == "missing":
+            del world.profiles[name]["user"]["userid"]
+    assert run(world) == 1
+    captured = capsys.readouterr()
+    assert captured.err == "skipped an artist: profile lookup answered with a profile that is not theirs\n" * 2
+    assert summary(captured.out)[collect.API_FAILED] == 2 and stored() == was and artist_marks() == {}
+    assert rows("profiles", "zz-fake-new") == [] and library.account_hash(key(ALPHA)) == user_hash(ALPHA)
+    assert len(world.asked_about("zz-fake-new")) == 1  # the profile, and no more
+
+
 SEQUENCE = [  # what one run's answers can be like, endpoint by endpoint: None is the honest answer
     None,
     (PROFILE_PATH, lambda: refusal(403)),
@@ -2879,7 +3058,7 @@ def test_stdout_is_counts_and_nothing_else(capsys):
     world = base()
     assert run(world) == 0
     out = capsys.readouterr().out
-    assert summary(out) and len(out.splitlines()) == len(collect._COUNTS) == 28
+    assert summary(out) and len(out.splitlines()) == len(collect._COUNTS) == 29
     assert not re.search(r"FAKE|zz-fake|https?:|deviantart|wixmp|[0-9A-F]{8}-", out, re.IGNORECASE)
     for word in ("artists processed", "profiles stored", "works stored", "images downloaded", "skipped"):
         assert word in out

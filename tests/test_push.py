@@ -392,15 +392,16 @@ def test_a_removal_made_through_the_site_is_imported_before_any_row_is_built(fak
     assert "purge" in fake.calls and last_removal < first_build
     assert ("removal" in fake.calls) is not dry_run
     assert counts["removals_applied_here"] == 1 and counts["artists_purged_here"] == 1
-    # Nothing of theirs is left here: no row, no image, and the account and the site they listed are barred.
+    # Nothing of theirs is left here: no row, no image, and the handle and account are barred. A handle removal
+    # bars no site (it must not travel to other artists who list the same one).
     assert f"da:{BRAVO}" not in library.artist_keys()
     assert not any(path.name.startswith(work["id"]) for work in removed for path in library.image_dir().iterdir())
-    assert store.is_removed(BRAVO) and store.is_removed(f"{BRAVO}.art")
+    assert store.is_removed(BRAVO) and not store.is_removed(f"{BRAVO}.art")
     assert library.account_removed(f"FAKE-USER-{BRAVO}")
     assert [key for key, _, _ in store.all_artists()] == [f"da:{ALPHA}", f"da:{CHARLIE}"]
-    # What the removal reached here goes back to the list of record: their site, and their account under any handle.
-    reached = {digest(f"site:{BRAVO}.art"), library.account(f"FAKE-USER-{BRAVO}")}
-    assert counts["removals_added_to_database"] == 2
+    # What the removal reached here goes back to the list of record: their account under any handle.
+    reached = {library.account(f"FAKE-USER-{BRAVO}")}
+    assert counts["removals_added_to_database"] == 1
     if dry_run:
         assert fake.loads == [] and counts["artists_sent"] == 2 and fake.removed == [digest(f"da:{BRAVO}")]
         return
@@ -1286,19 +1287,19 @@ def test_a_removal_made_here_is_added_to_the_databases_list(fake, dry_run):
 
     counts = push.run(dry_run)
 
-    # The hashes the store holds, as it holds them: the artist, the site they listed, and their account.
-    wanted = {digest(f"da:{BRAVO}"), digest(f"site:{BRAVO}.art"), library.account(f"FAKE-USER-{BRAVO}")}
+    # The hashes the store holds, as it holds them: the artist and their account (a handle removal bars no site).
+    wanted = {digest(f"da:{BRAVO}"), library.account(f"FAKE-USER-{BRAVO}")}
     assert push._removed_here(None) == wanted
-    assert counts["removals_added_to_database"] == 3 and counts["removed_artists_deleted_from_database"] == 1
+    assert counts["removals_added_to_database"] == 2 and counts["removed_artists_deleted_from_database"] == 1
     assert counts["artists_deleted_from_database"] == 0
     if dry_run:
         assert fake.removed == [] and BRAVO in fake.held()
         return
-    assert set(fake.removed) == wanted and len(fake.removed) == 3
+    assert set(fake.removed) == wanted and len(fake.removed) == 2
     assert not any(word in fake.held() for word in of_artist(BRAVO))
     assert fake.calls[-4:] == ["listing", "removed", "removal", "load"]
     again = push.run(False)  # sent once: the next run finds nothing to add
-    assert again["removals_added_to_database"] == 0 and len(fake.removed) == 3 and "removal" not in fake.calls[-3:]
+    assert again["removals_added_to_database"] == 0 and len(fake.removed) == 2 and "removal" not in fake.calls[-3:]
 
 
 def test_a_removal_that_could_not_be_added_is_added_by_the_next_run_and_nothing_is_built_meanwhile(fake, monkeypatch):
@@ -1417,7 +1418,7 @@ def test_the_guard_never_holds_up_a_removal(fake, capsys):
     assert counts["removed_artists_deleted_from_database"] == 8 and counts["artists_deleted_from_database"] == 6
     # Stopped, and every removal was carried out all the same: the hashes are on the list of record, and the
     # eight artists it bars are gone. The six who only stopped qualifying are still there, and nothing was loaded.
-    assert {digest(f"da:{handles[0]}"), digest(f"site:{handles[0]}.art")} <= set(fake.removed)
+    assert digest(f"da:{handles[0]}") in set(fake.removed)
     assert sorted(row["slug"] for row in fake.artists.values()) == handles[1:]
     assert not any(word in fake.held() for word in of_artist(handles[0])) and "left-fake" not in fake.held()
     assert fake.calls == ["listing", "removed", "removal"] and fake.loads == []
