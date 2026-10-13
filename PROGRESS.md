@@ -1,6 +1,6 @@
 # Artist Search: Progress
 
-**Status, 2026-10-13:** The first blind test against DeviantArt itself is in, and we lost it: its "More Like This" beat our similar-style results on 21 of 29 seed artists, then on 17 of 29 after one fix. The main gap is the size of our pool, 442 artists, so scaling comes next. Collect's round 8 is committed and rerunning on real data. All works are tagged. 119 artists are public and searchable. The site runs locally only; nothing is deployed.
+**Status, 2026-10-13:** Two of the spec's bars were tested today and neither is met yet. Style lost to DeviantArt's "More Like This", 11 seeds to 17 after one fix, mostly for want of a bigger pool. Profiles have had an unsupported claim on 2 of 20 artists for five rounds, so that piece is changing approach. Collection passed its check on real data and the wide discovery is running, toward 3,000-plus artists. 119 artists are public and searchable. The site runs locally only; nothing is deployed.
 
 ## Waiting on the owner
 
@@ -555,3 +555,54 @@ Asked directly whether it would run this code on the real data, for the 442 arti
 **Also done:** a first real README, and the progress log's dates corrected.
 
 **Pipeline counts:** artists discovered 472, collected 442, artists public 119, works public 1,130. **Database:** 16.8 MB of 400 MB.
+
+### Round 12: collection checked on real data; profiles' fifth critic; closest works in the product (2026-10-13)
+
+**Collect, round 8, on real data.** The rerun over every discovered artist finished cleanly.
+
+| | Count |
+|---|---|
+| Artists processed, and profiles stored | 472 of 472 |
+| Works stored | 4,618 |
+| New images downloaded | 745 |
+| Artists purged, files deleted, deletions failed | 0, 0, 0 |
+| Artists skipped for any reason | 0 |
+| Works skipped as mature or unrated | 183 |
+| Works skipped as not a public image | 111 |
+| Works skipped for "contact details" | 397 |
+| Stored works marked as no longer qualifying | 198 |
+
+Nothing was lost. A consistent backup of the local store was taken first.
+
+**A false positive, found and fixed.** 397 works skipped for contact details was ten times the forecast.
+- Of the 198 stored works that were marked, 177 have a clean title and page address.
+- A sample of 25 asked of the API showed why: when DeviantArt serves a preview as the file itself, its name is DeviantArt's own id plus a UUID. A UUID has more than nine digits, and the rule read it as a phone number.
+- The fix is narrow: a file name in exactly that shape holds nothing the artist wrote, so the title's rule is not asked of it. An id that is itself a long number is still refused. The next collection run clears the wrong marks and stores the works.
+- 17 other marks are a second, smaller false positive: a title with a colon in it, such as an emoticon, read as a link. Left as it is, at about 0.3% of works, because that rule is deliberately broad.
+- No hard rule was loosened: the rule exists to keep out what an artist typed, and this name is machine-made.
+
+**Profiles: fifth blind test.**
+
+| | R1 | R2 | R3 | R4 | R5 |
+|---|---|---|---|---|---|
+| Artists with an unsupported claim | 2 | 3 | 3 | 2 | 2, plus 2 borderline |
+| Cards judged useful | not scored | 15 | 18 | 14 | 9 |
+| Groups a studio could tell apart | few | 6 | 12 | 10 | 13 |
+| Cards not fit to print | - | - | - | 4 | 3 |
+| Artists judged unsuitable | - | - | - | 2 | 0, plus 1 borderline |
+
+- Round 5 profiled 415 of 442 artists and excluded 27 (17 with no claim that passed the count).
+- The stricter suitability count worked: it flags 23 artists, and the critic found none clearly unsuitable.
+- The error rate has not moved in five rounds, and 11 of 20 cards are now generic. The two errors: "mostly dark sci-fi cityscapes" where 5 of 10 are cityscapes and 3 are dark; "including concept sketches" on finished colour prop sheets.
+- The critic's biggest gap: "the cards never say what kind of output the artist makes." Design sheets, turnarounds, maps and prop sheets go unnamed.
+- A bug: every card not fit to print repeats a word, and the check written to catch that missed all of them.
+
+**Profiles change approach (round 6, in progress).** Each round's errors had a new cause, so fixing causes one by one is not converging. Both of this round's errors were counted wrongly on one sheet of ten small thumbnails. Now every specific claim is checked on each work at full size, as the tagging stage does, where genre and subject errors went from 12 to 0. The kind of output becomes the head of the card. Cost: up to about 40 seconds an artist, from 14.
+
+**Profiles no longer vanish while a new work waits for its tags.** The stage deleted an artist's profile whenever collection brought a new work, and 99 went that way during the rerun. With collection about to run for hours, artists would have dropped off the site each time they posted. A waiting artist now keeps the profile they have.
+
+**Closest works, in the product.** Push sends, with each similar artist, their four published works closest in style to the artist being viewed, and the database's similar-style function leads with them. The site needed no change. Measured at full scale: 2 seconds more per push and 2.3 MB. The live database got one added column; all 119 artists return identical answers before and after, and carry no picks until the next push. Not yet judged on its own.
+
+**Running now:** the wide discovery (18 tags, 120 pages each, then about 3,500 profile lookups), tagging of the 650 new works, and profiles round 6. Collection of the new artists follows discovery and will take most of a day.
+
+**Pipeline counts:** artists discovered 472, collected 472, works 5,034, artists public 119, works public 1,130. **Database:** 16.8 MB of 400 MB.
