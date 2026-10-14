@@ -110,7 +110,8 @@ seconds spent waiting between requests to the image host: 6
 )
 BASE_REQUESTS = 24  # 1 token, 10 to the API (3 + 3 + 1 + 1 + 2 for the five artists), 13 images
 KEPT = "Everything stored is kept: run again later"
-LIMITED = f"stopped: rate limited: the API answered HTTP 429 12 times in a row, 5 minutes apart. {KEPT}\n"
+WAITS = "60 minutes of waits, each 5 minutes or as long as it asked"  # an hour of them stops a run: discover.Pace
+LIMITED = f"stopped: rate limited: the API kept refusing through {WAITS}. {KEPT}\n"
 ALPHA_KEPT = [12, 11, 10, 9, 8, 7, 6, 5, 4, 3]  # the ten newest of twelve
 BRAVO_KEPT = [23, 22, 21]
 PNG_START = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR"
@@ -459,7 +460,10 @@ def kept(username):
 
 
 def files(root):
-    return sorted(path.relative_to(root).as_posix() for path in root.rglob("*") if path.is_file())
+    """Every file under a folder, but for the two a run keeps for each host it talks to: its lock and its pace,
+    which hold numbers only (discover.Pace) and have tests of their own at the end of this file."""
+    kept = (path for path in root.rglob("*") if path.is_file() and path.suffix not in (".lock", ".pace"))
+    return sorted(path.relative_to(root).as_posix() for path in kept)
 
 
 def cached():
@@ -1581,21 +1585,57 @@ def test_a_removal_that_lands_before_the_first_image_means_no_image_is_fetched(p
         "http://zz-fake-gone.art:8080/",
     ],
 )
-def test_an_artist_whose_first_answer_names_a_removed_site_is_marked_and_not_collected_and_nobody_is_barred(
-    website, capsys
+@pytest.mark.parametrize("removed", ["before discovery", "between discovery and collection"])
+def test_an_artist_of_whom_nothing_is_kept_and_who_alone_names_a_removed_site_is_barred_for_good(
+    website, removed, capsys
 ):
-    """Discovery stores a candidate without reading their profile, so this is where a profile that names a removed
-    site is first met. In a link of any shape: the artist is marked, nothing of theirs is collected, and the
-    site is written into nobody's row."""
+    """The critic's finding, which broke hard rule 7. Discovery stores a handle without reading the profile, so
+    a site removed while its artist was a bare handle matched nobody. The artist was marked and no more: the row
+    stayed, the API was asked about them on every run, and once their website field emptied they were collected,
+    profile, works and images, and handed on. The same removal after they were collected bars them for good.
+    Now it does so here too, in a link of any shape: handle and account barred, the row and every note gone.
+    Nothing that is kept is deleted for it, because nothing is kept, and the site is written into nobody's row."""
+    if removed == "before discovery":
+        assert store.mark_removed("zz-fake-gone.art") == 0
     world = solo(website=website)
-    assert store.mark_removed("zz-fake-gone.art") == 0
+    if removed != "before discovery":
+        assert store.mark_removed("zz-fake-gone.art") == 0  # it matches nobody: the row has a handle and no link
     counts = counts_of(world, capsys)
-    assert counts[collect.LISTS_REMOVED] == 1 and counts[collect.REMOVED] == counts[collect.PROFILES] == 0
-    assert artist_marks() == {key(ALPHA): "lists a removed site"} and library.artist_keys() == []
-    assert world.requests("images") == [] and [artist[0] for artist in store.all_artists()] == [key(ALPHA)]
-    assert not store.is_removed(ALPHA) and not library.account_removed(f"FAKE-USERID-{ALPHA}")
-    assert key(ALPHA) in library.last_attempts()  # passed over: the next run takes them last
-    assert links() == [None] and b"zz-fake-gone" not in config.LOCAL_DB.read_bytes()
+    assert counts[collect.LISTS_REMOVED] == counts[collect.PURGED] == 1 and counts[collect.PROFILES] == 0
+    assert store.is_removed(ALPHA) and library.account_removed(f"FAKE-USERID-{ALPHA}")  # the handle and the account
+    assert store.all_artists() == [] and library.artist_keys() == [] and artist_marks() == {}
+    assert library.last_attempts() == {} and len(raw("SELECT * FROM removed")) == 3  # the site, and those two
+    assert [request.url.path for request in world.requests()] == [TOKEN_PATH, PROFILE_PATH + ALPHA]  # and no more
+    kept_bytes = config.LOCAL_DB.read_bytes()
+    assert b"zz-fake-gone" not in kept_bytes and b"zz-fake-alpha" not in kept_bytes and b"FAKE-USERID" not in kept_bytes
+    world.profiles[ALPHA]["website"] = ""  # whatever the field says afterwards
+    seen = len(world.log)
+    assert counts_of(world, capsys)[collect.PROCESSED] == 0 and world.since(seen) == []  # never asked about again
+    assert store.upsert_artist(ALPHA, f"https://www.deviantart.com/{ALPHA}", None, 9) is False  # nor found again
+
+
+def test_a_removed_site_that_another_profile_lists_puts_nobody_on_the_removal_list_on_a_profiles_word(capsys):
+    """The guard on the rule above: a site that several artists list must not turn one removal into many, and one
+    answer given for every profile must not bar anybody. BRAVO is collected, with a page on the site as website:
+    not a site of their own, so no removal of it finds them. ALPHA is a bare handle whose profile names its front
+    page. BRAVO keeps everything and is marked. ALPHA is marked too, and not barred: the site is not theirs alone.
+    Both are held back for as long as their profile names it, and collected like anybody once it does not."""
+    world = solo(2, website="https://zz-fake-shared.art/")
+    world.artist(BRAVO, website="https://zz-fake-shared.art/folio/bravo")
+    world.work(BRAVO, 21)
+    world.profiles[ALPHA] = refusal(503)  # ALPHA's turn comes to nothing in the first run: nothing of theirs is kept
+    assert run(world) == 1 and library.artist_keys() == [key(BRAVO)]
+    assert store.mark_removed("zz-fake-shared.art") == 0
+    world.profiles[ALPHA] = profile(ALPHA, website="https://zz-fake-shared.art/")
+    was = stored()
+    for _ in range(2):
+        counts = counts_of(world, capsys)
+        assert counts[collect.LISTS_REMOVED] == 2 and counts[collect.PURGED] == counts[collect.REMOVED] == 0
+        assert artist_marks() == dict.fromkeys((key(ALPHA), key(BRAVO)), "lists a removed site")
+        assert stored() == was and not store.is_removed(ALPHA) and not store.is_removed(BRAVO)
+        assert len(raw("SELECT * FROM removed")) == 1  # the site
+    world.profiles[ALPHA]["website"], world.profiles[BRAVO.lower()]["website"] = "", "https://zz-fake-bravo-new.art"
+    assert counts_of(world, capsys)[collect.PROFILES] == 2 and artist_marks() == {} and kept(ALPHA) == [2, 1]
 
 
 def test_a_removal_that_lands_after_the_artist_was_stored_is_honoured_before_the_run_ends(capsys, tmp_path):
@@ -2347,10 +2387,11 @@ def test_an_image_the_host_refuses_for_the_rate_limit_is_asked_for_again_and_the
     """The critic's finding: one work's image always answered 429, and four runs in a row stopped at the same first
     artist with nobody behind them asked, the images before it downloaded again each time. Now it is asked for
     again three times, each after twice as long a wait, then that work is left out, and everybody gets their
-    turn. The run says so with its exit code: the image host was failing."""
+    turn. The run says so with its exit code: the image host was failing. And each run begins at the pace the
+    last one ended with, since the host is still refusing: half a second in the first, five minutes by the fourth."""
     world = trio()
     world.detours.append(limited(3))
-    for nth in range(4):
+    for nth, began in enumerate((0.5, 8 * 0.9**4, 16 * 8 * 0.9**4, 300.0)):
         seen = len(world.log)
         assert run(world) == 1
         captured = capsys.readouterr()
@@ -2360,7 +2401,8 @@ def test_an_image_the_host_refuses_for_the_rate_limit_is_asked_for_again_and_the
         others = [preview_path(n) for n in (4, 2, 1, 21, 41)] if nth == 0 else []  # downloaded once, and never again
         assert sorted(asked) == sorted([preview_path(3)] * (1 + collect.SERVER_RETRIES) + others)
         times = [at for at, request in world.log[seen:] if request.url.path == preview_path(3)]
-        assert [later - earlier for earlier, later in itertools.pairwise(times)] == pytest.approx([1.0, 2.0, 4.0])
+        doubled = [min(began * 2**asking, 300.0) for asking in (1, 2, 3)]  # 1, 2 and 4 seconds in the first run
+        assert [later - earlier for earlier, later in itertools.pairwise(times)] == pytest.approx(doubled)
         assert counts[collect.IMAGE_LIMITED] == 1 and counts[collect.PROFILES] == 3 and counts[collect.ORPHANS] == 0
         assert counts["rate limit answers from the image host"] == 4
         assert kept(ALPHA) == [4, 2, 1] and kept(BRAVO) == [21] and cached() == image_files([1, 2, 4, 21, 41])
@@ -3905,3 +3947,182 @@ def test_a_collection_run_says_where_it_is_in_a_file_while_it_runs_and_the_file_
     last = summary("\n".join(said[-1].splitlines()[1:]))
     assert (last[collect.PROCESSED], last[collect.PROFILES], last[collect.DOWNLOADED]) == (5, 2, 13)
     assert last["requests to the image host"] == 13 and last["requests to the API"] == 11
+
+
+# --- 11. the pace outlives the run, one run talks to a host at a time, and an hour of refusals ends it ---
+
+
+def on_one_clock(world):
+    """The pace reads the world's clock as well as sleeping on it, so that the time between two runs is on it too."""
+    return mock.patch.object(discover, "now", lambda: world.now)
+
+
+def test_a_run_begins_at_the_pace_the_last_one_ended_with_for_the_api_and_for_the_image_host(capsys):
+    """The pace was the memory of one process, so a second run began at the base whatever the hosts had said to
+    the first. Each host's pace is a file now, and the next run's first request waits a whole interval of it."""
+    world = solo(4)
+    world.detours.append(rate_limited(GALLERY_PATH, 3))
+    world.detours.append(rate_limited(preview_path(3), 2))
+    with on_one_clock(world):
+        assert run(world) == 0
+        assert world.waited("api")[-2:] == pytest.approx([16.0, 14.4])  # where the API's pace was when the run ended
+        assert world.waited("images")[-2:] == pytest.approx([1.8, 1.62])  # and the image host's
+        world.artist(BRAVO)  # discovery finds another artist, and the next run begins straight away
+        world.work(BRAVO, 21)
+        seen = len(world.requests("api"))
+        assert counts_of(world, capsys)[collect.DOWNLOADED] == 1
+    eased = [12.96 * 0.9**answered for answered in range(7)]  # on from where it was, a tenth off with every answer
+    assert world.waited("api")[seen:] == pytest.approx(eased) and min(eased) > discover.BASE_INTERVAL
+    assert world.waited("images")[-1] == pytest.approx(1.458)  # 1.62 and a tenth off: not half a second
+
+
+def test_collection_begins_at_the_pace_discovery_ended_with(capsys):
+    """The critic's counterexample: discovery's last gap was 5.8 s, and collection, begun in the same process,
+    sent its first request 0 s later and its second 2 s after that."""
+    world, asked, left = solo(1), [], [3]
+
+    def no_works_under_any_tag(request):  # discovery's API, on the world's clock: its last page is refused three times
+        asked.append(world.now)
+        if request.url.path == TOKEN_PATH:
+            return httpx.Response(200, json={"access_token": "FAKE-TOKEN-0"})
+        if request.url.params["tag"] == discover.NICHE_TAGS[-1] and left[0]:
+            left[0] -= 1
+            return httpx.Response(429, json={"error": "FAKE-RATE-LIMIT"})
+        return httpx.Response(200, json={"has_more": False, "next_offset": None, "results": []})
+
+    with on_one_clock(world):
+        with mock.patch.object(time, "sleep", world.sleep):
+            transport = httpx.MockTransport(no_works_under_any_tag)
+            assert discover.discover(CLIENT_ID, CLIENT_SECRET, max_artists=5, transport=transport) == 0
+        assert asked[-1] - asked[-2] == 16.0  # discovery's last gap, and its pace then comes down a tenth: 14.4
+        assert run(world) == 0
+    assert world.log[0][0] - asked[-1] == pytest.approx(14.4)  # collection's first request, after discovery's last
+    assert world.waited("api") == pytest.approx([14.4, 12.96, 11.664, 10.4976])
+    assert world.waited("images") == [None]  # the image host, which discovery never asks, is asked as ever
+
+
+@pytest.mark.parametrize("host", ["the API", collect.IMAGE_HOST])
+def test_a_run_started_while_another_has_a_host_is_refused_and_touches_nothing(host, capsys):
+    """The critic's counterexample: collection started while discovery was in the middle of a run, and both ran,
+    at one API request a second between them, which is the rate that was limited. The second one stops now,
+    before a request and before a sweep: a sweep would take what the other has downloaded and not yet stored
+    for files that no row accounts for, and the end of a run takes away the file that says a run is on."""
+    world = base()
+    assert run(world) == 0
+    capsys.readouterr()
+    unstored = library.image_dir() / f"{uuid(77)}.jpg"  # as the other run has it: downloaded, its row not written yet
+    unstored.write_bytes(jpeg(77))
+    discover.tell("collect", {collect.PROCESSED: 1})  # and where the other run says it is
+    store.mark_removed(BRAVO)
+    seen = len(world.log)
+    with discover.Pace(collect.IMAGE_INTERVAL, host):  # the other run, which holds this host
+        assert run(world) == 1
+    captured = capsys.readouterr()
+    assert captured.err == f"stopped: another run is talking to {host}, and one at a time is the rule\n"
+    assert summary(captured.out)[collect.PURGED] == 0 and world.since(seen) == []  # no request, to either host
+    assert unstored.exists() and (config.CACHE_DIR / "collect.status").exists() and kept(BRAVO) == BRAVO_KEPT
+    discover.tell("collect")  # the other run ends, and the next one is let in and does it all
+    counts = counts_of(world, capsys)
+    assert counts[collect.PURGED] == 1 and counts[collect.ORPHANS] == 1 and kept(BRAVO) == []
+
+
+def test_an_image_host_that_serves_every_image_at_the_fourth_asking_is_stopped_at_after_an_hour_of_it(capsys):
+    """The critic's counterexample: every image refused three times and served the fourth: twelve images in 3.0
+    hours, no stop, exit 0 and nothing on standard error, because each image served set the count back to
+    nothing. The image host's hour is counted as the API's is, and one image among the refusals does not end it."""
+    world, names = two_works_each(6)
+    left = {}
+
+    def three_refusals_then_served(request):
+        if request.url.host == CDN_HOST and left.setdefault(request.url.path, 3):
+            left[request.url.path] -= 1
+            return httpx.Response(429, text="FAKE-SLOW-DOWN")
+
+    world.detours.append(three_refusals_then_served)
+    assert run(world) == 1
+    captured = capsys.readouterr()
+    assert captured.err == f"stopped: rate limited: the image host kept refusing through {WAITS}. {KEPT}\n"
+    climb = [None, 1.0, 2.0, 4.0, 3.6, 7.2, 14.4, 28.8, 25.92, 51.84, 103.68, 207.36, 186.624]  # three images
+    at_the_ceiling = [300.0, 300.0, 300.0, 270.0]  # three refusals five minutes apart, and the image, served
+    assert world.waited("images") == pytest.approx(climb + at_the_ceiling * 4)  # twelve waits for a refusal there
+    counts = summary(captured.out)
+    assert counts[collect.DOWNLOADED] == 7 and counts["rate limit answers from the image host"] == 22
+    assert sum(world.waited("images")[1:]) == pytest.approx(5316.4, abs=0.1)  # 89 minutes, and not 3 hours and on
+    # Everything stored is kept: three artists whole. The fourth, whom the run stopped at, is noted as passed over.
+    assert library.artist_keys() == list(map(key, names[:3])) and len(cached()) == 6
+    assert key(names[3]) in library.last_attempts()
+
+
+def test_a_retry_after_of_an_hour_on_every_429_from_the_image_host_stops_the_run_after_that_hour(capsys):
+    """The critic's counterexample: with `Retry-After: 3600` on every 429 the image host was asked for 11.0 hours."""
+    world = solo(4)
+    world.detours.append(
+        lambda request: (
+            httpx.Response(429, headers={"Retry-After": "3600"}, text="FAKE-SLOW-DOWN")
+            if request.url.host == CDN_HOST
+            else None
+        )
+    )
+    assert run(world) == 1
+    assert capsys.readouterr().err == f"stopped: rate limited: the image host kept refusing through {WAITS}. {KEPT}\n"
+    assert world.waited("images") == [None, 3600.0] and library.artist_keys() == []
+
+
+def test_a_retry_after_on_a_5xx_from_the_image_host_is_waited_as_on_a_429():
+    """The critic's thirty-fifth break, which no test caught: Retry-After read on a 429 and not on a 5XX."""
+    world, left = solo(3), [1]
+
+    def once(request):
+        if request.url.path == preview_path(2) and left[0]:
+            left[0] = 0
+            return httpx.Response(503, headers={"Retry-After": "30"}, text="FAKE-DOWN")
+
+    world.detours.append(once)
+    assert run(world) == 0 and kept(ALPHA) == [3, 2, 1]
+    assert world.waited("images") == [None, 0.5, 30.0, pytest.approx(0.9)]
+
+
+def test_a_retry_after_too_long_to_be_a_number_ends_no_run_and_a_removal_during_it_is_honoured(capsys):
+    """The critic's counterexample: a Retry-After of 400 digits became infinity, rounding it up for the summary
+    raised inside the `finally`, and the sweep after it never ran: an artist removed during the run still had
+    a profile, a work and an image when the run exited. Such a value says nothing now, and is not read."""
+    world, left = trio(), [1]
+    assert run(world) == 0
+
+    def removed_then_refused(request):
+        if request.url.path == PROFILE_PATH + ALPHA and left[0]:
+            left[0] = 0
+            store.mark_removed(BRAVO)  # a removal lands while the run is on
+            return httpx.Response(429, json={"error": "FAKE-RATE-LIMIT"}, headers={"Retry-After": "9" * 400})
+
+    world.detours.append(removed_then_refused)
+    seen = len(world.requests("api"))
+    counts = counts_of(world, capsys)  # which exits 0, with nothing on standard error
+    assert world.waited("api")[seen : seen + 4] == pytest.approx([2.0, 2.0, 4.0, 3.6])  # the doubled interval
+    assert counts[collect.REMOVED] == counts[collect.PURGED] == 1 and kept(BRAVO) == []
+    assert library.artist_keys() == [key(ALPHA), key(DELTA)] and cached() == image_files([1, 2, 3, 4, 41])
+    assert not (config.CACHE_DIR / "collect.status").exists()
+
+
+def test_an_error_in_the_pace_itself_skips_neither_the_closing_sweep_nor_the_end_of_the_status_file(
+    monkeypatch, capsys
+):
+    """Whatever goes wrong where the run's closing lines read the pace, the two things after them still happen:
+    the file that says a run is on goes, and a removal that landed during the run is honoured before exit."""
+    world = trio()
+    assert run(world) == 0
+    capsys.readouterr()
+    counts, calls = discover.Pace.counts, []
+
+    def breaks(pace):
+        calls.append(pace)
+        if len(calls) > 4:  # two requests in: the file that says where the run is has been written
+            store.mark_removed(BRAVO)
+            raise OverflowError("FAKE-OVERFLOW")
+        return counts(pace)
+
+    monkeypatch.setattr(discover.Pace, "counts", breaks)
+    assert run(world) == 1
+    assert "stopped: OverflowError at collect.py line " in capsys.readouterr().err
+    assert not (config.CACHE_DIR / "collect.status").exists()
+    assert key(BRAVO) not in library.artist_keys() and kept(BRAVO) == [] and cached() == image_files([1, 2, 3, 4, 41])

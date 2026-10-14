@@ -16,9 +16,12 @@ again before each artist and each download; and the sweep of cached files that n
   - A stored work, or an artist, that the API shows as no longer qualifying (mature, not a public image,
     account gone, a profile that names a removed site) is marked with the reason and the time. Later stages
     read the marks (library.work_marks, library.artist_marks) and decide what is published.
-  - A removal reaches the artist it names, under every handle of their account, and nobody else: what a
-    profile answers about a site never puts anybody on the removal list. An own site that is kept for an
-    artist is written into the store's row too, which is where the removal of a site looks.
+  - A removal reaches the artist it names, under every handle of their account, and nobody else. An own site
+    that is kept for an artist is written into the store's row too, which is where the removal of a site looks.
+    What a profile answers about a site puts one kind of artist on the removal list and no other: one of whom
+    nothing is kept, whose profile names a removed site that no other profile has been seen to list (_bar).
+    Nothing kept is deleted for it, since nothing is kept, and they are not collected later whatever their
+    profile says then. Anybody else whose profile names a removed site is marked for as long as it does.
   - Nothing that is kept is replaced by nothing. An answer that is empty, or that the library's rules refuse,
     leaves what is kept, and for a refused one the artist or the work is marked.
   - A kept work whose thumbnail has come to show another file (library.own_file: not another size or
@@ -43,7 +46,9 @@ front page of a domain of their own (_external_links), and the summary says whic
 profile's field was.
 
 Requests to the API wait their turn in discover.Pace, and downloads from the image host in a Pace of their own:
-either host asking us to slow down slows every later request to it, not only the one that is asked again.
+either host asking us to slow down slows every later request to it, not only the one that is asked again, and
+either host refusing through an hour of the slowest pace stops the run. A run holds both hosts while it lasts:
+one that finds another run talking to either stops before it touches anything, the closing sweep included.
 
 Endpoints (deviantart.readme.io, read 2026-10-12). Each is documented under the security scheme
 "oauth2AuthorizationCodeOrClientCredentials" with scope "browse", so a client_credentials token is accepted:
@@ -246,7 +251,8 @@ def _fetch_once(http: httpx.Client, url: str, pace: discover.Pace) -> tuple[str,
     Sent without the API token. The type is checked before the body is read, and the body is read only as far
     as the size cap. A redirect is not followed, so the image is not served. A 429, a 5XX or no answer at all
     is the host refusing or failing: IMAGE_LIMITED, and the host's pace is told, so that every later download
-    waits longer. Any other answer lets the pace ease.
+    waits longer, and so that a host which has refused through its hour stops the run (discover.Stop, from
+    discover.Pace). Any other answer lets the pace ease.
     """
     try:
         with http.stream("GET", url) as response:
@@ -331,6 +337,21 @@ def _sweep(counts: dict[str, int], db: pathlib.Path | str | None) -> None:
     counts[UNDELETED] += failed
 
 
+def _bar(named: list[tuple[str, object, set[str]]], counts: dict[str, int], db: pathlib.Path | str | None) -> None:
+    """Hard rule 7, for the artists of whom nothing is kept and whose profile named a removed site in this run:
+    (handle, API user id, the hosts the profile named). Whoever names such a site alone (store.lists_alone) goes
+    on the removal list, handle and account, and their row and the notes about them go: what the removal would
+    have done had it come after they were collected. The others stay as their turn left them, marked.
+
+    At the end of the run and not on the artist's turn, because only then has every profile of the run been
+    read: one website answered for every profile bars nobody. However the run ended.
+    """
+    for username, user_id, hosts in named:
+        if store.lists_alone(username, hosts, db):
+            store.mark_removed(username, db)
+            counts[PURGED] += _remove(store.artist_key(username), counts, db, user_id)
+
+
 def _collect_artist(
     api: discover._Api,
     http: httpx.Client,
@@ -339,10 +360,11 @@ def _collect_artist(
     counts: dict[str, int],
     db: pathlib.Path | str | None,
     refused: list[int],
+    named: list[tuple[str, object, set[str]]],
 ) -> None:
     """One artist's turn. `images` is the image host's pace. `refused` is the run's one count, kept in a list so
     that it outlives the turn: the works in a row, this artist's and the ones before, whose image the host would
-    not serve, retries and all."""
+    not serve, retries and all. `named` is the run's list for _bar()."""
     key = store.artist_key(username)
     response = api.get(f"/user/profile/{username}")
     if _gone(response):
@@ -379,8 +401,9 @@ def _collect_artist(
     # The removal list is asked about every host the website field names, however it is written, and the same
     # hosts are recorded as hashes for the shared-domain rule. A profile that names a removed site is one
     # answer's word, and one such answer given for every profile once purged and barred every artist. So
-    # nothing is deleted and nobody is barred for it: the artist is marked, which holds them back from being
-    # published, and the mark goes when they are next stored.
+    # nothing is deleted and nobody is barred for it here: the artist is marked, which holds them back from
+    # being published, and the mark goes when they are next stored. An artist of whom nothing is kept, under
+    # this handle or an older one, is judged again when the run ends (_bar).
     # ponytail: the website field is the only link the profile response documents. Links typed into the bio
     # are not read, because that means parsing DeviantArt text. Revisit if too few artists have a website.
     website = profile.get("website")
@@ -389,6 +412,8 @@ def _collect_artist(
         library.mark_artist(key, LISTED, db)
         library.note_skip(key, db)
         counts[LISTS_REMOVED] += 1
+        if not old_keys and key not in library.artist_keys(db):
+            named.append((username, user_id, hosts))
         return
     page = _body(api.get("/gallery/all", username=username, limit=GALLERY_LIMIT), "gallery lookup", "results")
     if not isinstance(page.get("has_more"), bool):
@@ -570,6 +595,7 @@ def _run(
     counts: dict[str, int],
     max_artists: int,
     db: pathlib.Path | str | None,
+    named: list[tuple[str, object, set[str]]],
 ) -> None:
     tried = library.last_attempts(db)
     # Whoever has never had a turn comes first, then whoever had theirs longest ago. A run that was cut short
@@ -589,7 +615,7 @@ def _run(
                 counts[REMOVED] += 1
                 continue
             counts[PROCESSED] += 1
-            _collect_artist(api, http, images, username, counts, db, refused)
+            _collect_artist(api, http, images, username, counts, db, refused, named)
             failed_in_a_row = 0
         except discover.Stop:
             # A rate limit, or no token to be had: the next artist would fare no better. The one it stopped at
@@ -632,13 +658,22 @@ def collect(
             api, images = discover._Api(http, client_id, client_secret), discover.Pace(IMAGE_INTERVAL, IMAGE_HOST)
             # Before every request to either host, the run says where it is (see discover.tell).
             api.pace.tell = images.tell = lambda: discover.tell("collect", counts | api.pace.counts() | images.counts())
-            _sweep(counts, db)
-            try:
-                _run(api, http, images, counts, max_artists, db)
-            finally:
-                counts.update(api.pace.counts() | images.counts())
-                discover.tell("collect")
-                _sweep(counts, db)  # however the run ended: a removal that landed during it is honoured before exit
+            named: list[tuple[str, object, set[str]]] = []  # see _bar
+            # Both hosts are this run's from here on. Another run that has either is found out before anything
+            # of its is touched: a sweep would take the images it has downloaded and not yet stored for orphans.
+            with api.pace, images:
+                _sweep(counts, db)
+                try:
+                    _run(api, http, images, counts, max_artists, db, named)
+                finally:
+                    try:
+                        discover.tell("collect")  # first: whatever follows, no file is left that says a run is on
+                        _bar(named, counts, db)
+                        counts.update(api.pace.counts() | images.counts())
+                    finally:
+                        # However the run ended, and whatever went wrong just above: a removal that landed
+                        # during the run is honoured before exit.
+                        _sweep(counts, db)
     except discover.Stop as stop:
         print(f"stopped: {stop}", file=sys.stderr)
         status = 1
