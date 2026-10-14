@@ -4,20 +4,13 @@
 
 ## Waiting on the owner
 
-**One decision is yours, because it means accepting a gate that has not been passed.** Nothing is blocked while you decide: no push can happen until the push stage passes its critic anyway.
+Nothing is blocking. Three things to weigh when convenient, each with a default in place:
 
-1. **Are the profile cards good enough?** Seven critic rounds. The spec's bar is that every sampled claim is supported; the best the local model has reached, under a strict critic, is 1 clear and 2 marginal unsupported claims in 20 cards, with plain wording. Round 15 and Round 17 have the detail. The choices:
-   - **A (recommended).** Stop here. A card is one plain sentence from the checked tags. The artist's own tags stay on the card as chips labelled as theirs, which the site already shows, and come out of the sentence. One small round fixes wording faults ("partly" where most works show it, "Artwork" as filler).
-   - **B.** One more round on specifics: quote only reviewed subject words ("dragon", "dinosaur", "mech") that also agree with the checked tags.
-   - **C.** Keep looping until a sample of 20 has no unsupported claim.
+1. **When is collect good enough?** Default: it runs now on the rebuilt pacing, whose second critic said it would run it (Round 18).
+2. **How strict should the content filter be?** Default in place: works rated suggestive or explicit are held back, and an artist is held back at 30% or more. On today's data that holds back 70 of 470 artists.
+3. **Brief slow-downs during a data load.** Default: the site retries a failed call once.
 
-Three smaller things, each with a default in place:
-
-2. **When is collect good enough?** Default: run it once its pacing passes a critic (Round 16).
-3. **How strict should the content filter be?** Default in place: works rated suggestive or explicit are held back, and an artist is held back at 30% or more. On today's data that holds back 70 of 470 artists.
-4. **Brief slow-downs during a data load.** Default: the site retries a failed call once.
-
-The first public deployment will be asked for separately when the site reaches its preview stage.
+The GPU work is paused at the owner's request; `uv run python scripts/gpu.py resume` carries on. The first public deployment will be asked for separately when the site reaches its preview stage.
 
 ## Owner decisions (these amend the spec)
 
@@ -33,6 +26,7 @@ Made 2026-10-11, after the DeviantArt terms were read.
 8. **A/B references (2026-10-12, default).** With critics able to view DeviantArt content, pieces 5 and 6 return to the spec's bars: DeviantArt's own search and "more like this". The reference is captured from the public website, not through the API, because the API License bars using the API for benchmarking. This supersedes decision 3.
 9. **Cloudflare (2026-10-12).** The owner replaced the API token; it verifies, and Pages, Workers and Workers AI are reachable. The Pages project name `artist-search` is approved. Approving the name is not approval to deploy.
 10. **GPU time (2026-10-13).** Several days of full GPU use for tagging is fine. The owner needs to be able to pause the work, see its status and start it again, to use the PC in between. Built the same day: `scripts/gpu.py` with `status`, `pause`, `resume`, `start` and `stop`. Tried for real: a pause took the GPU from 23 GB in use to 4 GB within 25 seconds and held; a resume carried on with the same work.
+11. **Profile cards are good enough at option A (2026-10-13).** After seven critic rounds the owner chose A: a card is one plain sentence from the checked per-work tags; the artist's own tags stay on the card as chips labelled as theirs and come out of the sentence; one small round fixes the wording faults the seventh critic found. This accepts the best level reached, about one clear unsupported claim in 20 cards under a strict critic, in place of the spec's "every sampled claim supported". The owner also paused the GPU work the same evening.
 
 ## The plan
 
