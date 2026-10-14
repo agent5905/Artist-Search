@@ -851,3 +851,13 @@ What failed:
 The critic would not run push at scale while anything else writes to the store, until the build reads one snapshot. Push round 6 is under way on all of the above. A push is days away in any case, since the new artists' works still need analysing.
 
 **Collection stopped once at scale, on our own rule.** After 100 artists it stopped with "the image host is failing or rate limiting", but the host had sent no refusal and no error. Three images in a row from one artist were over our 10 MB cap, and an earlier rule counted any image not kept toward the host's stop. An image over the cap was served whole and refused by us; it says nothing about the host, so it no longer counts. Collection resumed at 23:21, carrying on from where it stopped.
+
+**Push round 6: merged.**
+- **One snapshot:** the build copies the whole store into memory in one read (a quarter of a second for 61 MB) and works from the copy; if something was written meanwhile it builds once more. The critic's random sequences: 0 violations, from 49.
+- **A card is current only while every work it counted still stands.** 81 artists are held until their cards are remade, which needs the GPU.
+- **Removals:** the public database's own removal list is honoured on every run whatever the guard says. The guard counts people, not hashes, so three removals made here and one through the site go through in one run. A removed site that more than two artists link bars none of them; the site stays barred for good, and nobody who links it is sent.
+- **Descriptions that name a messaging or social service are dropped**; the work still goes.
+- **A dry run leaves the store byte for byte as it was.**
+- **The body-and-dress list** was rebuilt by reading all 2,299 tags that three or more artists use: 123 entries, from 40. It is deliberately broad and drops some legitimate tags, "costume design" among them; it only affects which of an artist's tags show as chips.
+- 82 of 83 of the critic's probes pass; the one that fails expected the old hub-site behaviour that this round replaced. All 66 of its deliberate breaks are caught across the test files. 2,000-plus tests pass.
+- A dry build today would send 285 artists and 2,721 works. Push stays closed until a third critic and until the new artists are analysed.
