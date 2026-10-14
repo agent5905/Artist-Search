@@ -1,6 +1,6 @@
 # Artist Search: Progress
 
-**Status, 2026-10-13, night:** Discovery on the rebuilt pacing found 3,899 artists, with no rate-limit answer from the API. Collection of their profiles and works is running and will take about 16 hours. The GPU work is paused at the owner's request, so tagging the new works waits for it. Profile cards follow owner decision 11 (option A). Push stays closed until its critic passes it again. 119 artists are public; nothing is deployed.
+**Status, 2026-10-14:** Collection is done: 3,969 artists and 39,744 works, against 472 artists two days ago. The GPU is tagging, rating and profiling them, roughly four days of work. Push stays closed until a third critic, once enough artists are fully analysed. Profile cards follow owner decision 11 (option A). 119 artists are public; nothing is deployed.
 
 ## Waiting on the owner
 
@@ -861,3 +861,19 @@ The critic would not run push at scale while anything else writes to the store, 
 - **The body-and-dress list** was rebuilt by reading all 2,299 tags that three or more artists use: 123 entries, from 40. It is deliberately broad and drops some legitimate tags, "costume design" among them; it only affects which of an artist's tags show as chips.
 - 82 of 83 of the critic's probes pass; the one that fails expected the old hub-site behaviour that this round replaced. All 66 of its deliberate breaks are caught across the test files. 2,000-plus tests pass.
 - A dry build today would send 285 artists and 2,721 works. Push stays closed until a third critic and until the new artists are analysed.
+
+### Round 21: collection at scale, and a crash (2026-10-14)
+
+**Collection: done.**
+- 3,969 of the 3,970 discovered artists collected, with 39,744 works and their images. One artist was mid-collection when the machine crashed and will be picked up on a later run.
+- On the way in: about 2,000 works left out as mature or unrated, about 900 as not public images, about 300 for contact details in a title or address, about 200 malformed, and about 60 over the size cap.
+- About 290 rate-limit answers in some 10,000 requests to the API, all absorbed by the pacing. The interval rose to 16 seconds at most, and no run stopped on it.
+- No artist was skipped or lost.
+
+**The machine crashed at about 16:25**, a Windows stop error 0x3B (a driver read memory it should not have), with collection and the GPU worker both running.
+- The same stop code is in the system log on 27 August and 20 September, before this project began, and a different one on 4 September. No hardware error and no graphics-driver reset was logged before it.
+- The project's work did not create the problem. Whether the GPU load set it off this time is not known; the crash dump would name the driver.
+- **The data came through intact.** The crash interrupted one write to the local store. The store and its journal were copied aside unchanged, then SQLite's standard recovery rolled the unfinished write back. The integrity check passes.
+- The owner chose to restart the GPU work, and it is running again.
+
+**Analysis: under way.** Style vectors 19,381 of 39,744; tags and ratings about 7,900 each; profile cards 728 of 3,948. Tagging and rating run at roughly 400 works an hour each, so about four days remain.
