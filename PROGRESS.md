@@ -780,3 +780,28 @@ Push had four unjudged rounds. It is the last gate before the public, so it was 
 **Where this leaves the piece.** Seven rounds have tried four ways of getting specifics: per-work tags, a count on a contact sheet, a per-work yes-or-no check, and the artist's own tags. The first sentence is reliable and plain. Every way of adding specifics has added errors. That is the practical ceiling for this model on this task, and whether it is good enough is the owner's decision (see "Waiting on the owner").
 
 **What a push would send today,** by a dry build: 358 artists and 3,359 works, of 470 artists collected. Held back: 70 for the share of suggestive or explicit work, 40 with no profile for a stated reason, 2 with too few works, 2 not yet profiled.
+
+### Round 18: the pacing's second critic; discovery running again (2026-10-13, evening)
+
+**Pacing round 10, judged: 6 of 12 properties pass outright; A to F each fail on a narrower case than before.**
+
+What held:
+- No wait under its base in 50 fuzzed runs.
+- A kill at any of 44 points resumed identically.
+- Nothing private on disk, including the new pace, lock and status files.
+- Only bare front pages kept as an artist's link, in 27 hostile spellings.
+- User-Agent and compression on every request.
+- 40 of 40 deliberate breaks caught by the tests.
+- The lock: 24 races of two to four processes, each with exactly one sender; a killed holder releases it.
+
+What failed, and why it matters:
+- **A server error counts for nothing toward the stop.** An API answering 503 to nine requests in ten never stops a run; at about 12 requests an hour it would take weeks. The same for an image host, silently. The critic called this the one root cause behind two failures.
+- **The refusal that stops a run is not recorded.** A `Retry-After: 3600` on the last 429 is lost, so a rerun five seconds later starts at a 4-second interval. A pace file cut mid-number also starts fast.
+- **The style-reference capture script makes requests outside the shared pace and lock.** Two separate checkouts can also run together; one checkout only is the operating rule.
+- **Removal by site has three corners left.** One wrong answer from the API in a short run could remove an innocent artist for good. A person with two accounts listing their site could come back by emptying both website fields. A website field that is a page on the removed site, not its front page, was matched by nothing.
+
+**The critic's plain answer: it would run discovery and collection on this code now**, on conditions: one checkout, no reference capture alongside, an hour's wait after any rate-limit stop, a watch on the status file. The removal corners must be closed before publishing, not before collecting.
+
+**So discovery is running again**, started at 20:16, about five hours after the last request to the API. The pace file was seeded so the run starts at its slowest: a five-minute wait, then a five-minute interval easing to two seconds over about 50 minutes. Its progress is in `cache/discover.status` and in `scripts/gpu.py status`.
+
+**Pacing round 11 (in progress, in a separate copy of the repo):** server errors count toward the stop and are reported; the stopping refusal is recorded; the pace file is written so it is never seen half-written; every script goes through the shared pace and lock; and a removal rule that reaches every account that has named a site, without letting one wrong answer remove an innocent artist for good.
