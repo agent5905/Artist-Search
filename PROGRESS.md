@@ -4,11 +4,18 @@
 
 ## Waiting on the owner
 
-Nothing is blocking. Three things to weigh when convenient; each has a default in place:
+**One decision is yours, because it means accepting a gate that has not been passed.** Nothing is blocked while you decide: no push can happen until the push stage passes its critic anyway.
 
-1. **When is collect good enough?** It has failed seven critics, each on narrower cases, and the seventh said it would run this code on the real data. Default: fix that critic's three findings, then run and scale without another full critic round, and record the remaining limits (Round 10).
-2. **How strict should the content filter be?** Default in place: works rated suggestive or explicit are held back, and an artist is held back when 30% or more of their works are. The profile critic still found 2 of 20 artists it judged unsuitable for a studio-facing site, so the count is being tightened to include sexualised framing and dress.
-3. **Brief slow-downs during a data load.** Default: the site retries a failed call once, and loads run at quiet hours. The last three test runs had no failed visitor calls.
+1. **Are the profile cards good enough?** Seven critic rounds. The spec's bar is that every sampled claim is supported; the best the local model has reached, under a strict critic, is 1 clear and 2 marginal unsupported claims in 20 cards, with plain wording. Round 15 and Round 17 have the detail. The choices:
+   - **A (recommended).** Stop here. A card is one plain sentence from the checked tags. The artist's own tags stay on the card as chips labelled as theirs, which the site already shows, and come out of the sentence. One small round fixes wording faults ("partly" where most works show it, "Artwork" as filler).
+   - **B.** One more round on specifics: quote only reviewed subject words ("dragon", "dinosaur", "mech") that also agree with the checked tags.
+   - **C.** Keep looping until a sample of 20 has no unsupported claim.
+
+Three smaller things, each with a default in place:
+
+2. **When is collect good enough?** Default: run it once its pacing passes a critic (Round 16).
+3. **How strict should the content filter be?** Default in place: works rated suggestive or explicit are held back, and an artist is held back at 30% or more. On today's data that holds back 70 of 470 artists.
+4. **Brief slow-downs during a data load.** Default: the site retries a failed call once.
 
 The first public deployment will be asked for separately when the site reaches its preview stage.
 
@@ -748,3 +755,28 @@ Push had four unjudged rounds. It is the last gate before the public, so it was 
 **Round 10 (in progress):** the pace and the time of the last request are kept in a file per host, with a lock so one process talks to a host at a time; the stop is measured in time spent refused, and a 401 is not progress; `Retry-After` is bounded and cannot raise; the image host gets the same stop; an artist whose profile names a removed site is barred whether or not anything of theirs was collected. A critic re-judges the six before any real run.
 
 **Process note.** The critic worked in a temporary copy of the repo, and most of its probe files were deleted with that copy when it finished. Two survived. Critics that write probes will keep them in the main checkout from now on.
+
+### Round 17: profiles' seventh critic (2026-10-13)
+
+**Round 7's cards: one sentence from the checked tags, one quoting the artist's own tags.**
+
+| | R5 | R6 | R7 |
+|---|---|---|---|
+| Unsupported claim about the pictures | 2, plus 2 marginal | 9, plus 3 marginal | 1, plus 2 marginal |
+| Understated | not counted | 10 | 5 |
+| Cards judged useful | 9 | 14 | 11 |
+| Groups a studio could tell apart | 13 | 12 | 13 |
+| Not fit to print | 3 | 6 | 5 |
+
+- **Sentence one is back to its best level** under the stricter brief. The clear error: "Fantasy" stated flat where 3 of 10 works are fantasy. "Partly" understated on all four cards that used it.
+- **The tags sentence was true as worded on all 18 cards that had one,** and it is what made every useful card useful. "Sentence one alone separates nobody."
+- **Five cards quote a tag that misleads:** "anime" on work that is not anime; "darksouls" and "movie" with nothing on the works to back them, which a studio would read as credits; "cinematic", a selling word; "adventure" and "rpg" from one block pasted on every post.
+- **The critic's view on quoting tags, asked directly:** "It meets the letter and is partly a way round the spirit." Tags are metadata, not the work; a pasted tag block defeats the count; a franchise name backed by logos on the works prints the same as one backed by nothing. Subject and genre words the pictures bear out are safe, on about 11 of 18 cards.
+- **The one artist judged unsuitable** (3 of 10 works near-nude pin-ups) is already held back by the push stage. Samples for this test will be drawn from artists who would be published, as the style test's are.
+- **Biggest gap, again:** the first sentence does not name the genre and rendering style the pictures plainly show.
+
+**An idea tested and dropped.** Counting the words that recur across an artist's checked work descriptions, which involves no leading question, named dragons for a dragon artist. For a dinosaur artist it gave "creature" and "head", and for a matte painter "sky" and "rocky". The descriptions are too plain to supply specifics.
+
+**Where this leaves the piece.** Seven rounds have tried four ways of getting specifics: per-work tags, a count on a contact sheet, a per-work yes-or-no check, and the artist's own tags. The first sentence is reliable and plain. Every way of adding specifics has added errors. That is the practical ceiling for this model on this task, and whether it is good enough is the owner's decision (see "Waiting on the owner").
+
+**What a push would send today,** by a dry build: 358 artists and 3,359 works, of 470 artists collected. Held back: 70 for the share of suggestive or explicit work, 40 with no profile for a stated reason, 2 with too few works, 2 not yet profiled.
