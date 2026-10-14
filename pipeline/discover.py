@@ -74,7 +74,7 @@ MAX_INTERVAL = 300.0  # seconds: the ceiling that refusals raise the interval to
 EASE = 0.9  # what an answered request multiplies a raised interval by: down gradually, never below the base
 IDLE_HALVING = 3600.0  # seconds with no request to a host that halve the interval the next run begins with
 SERVER_RETRIES = 3  # times a 5XX answer is asked for again. The API docs suggest three for a 500.
-MAX_AT_CEILING = 12  # waits at the ceiling, each of them for a 429, before the run stops
+MAX_AT_CEILING = 12  # waits at the ceiling, each of them for a refusal of any kind, before the run stops
 PATIENCE = MAX_AT_CEILING * MAX_INTERVAL  # the same in seconds, an hour: also the longest wait a host is given
 _KEPT = "Everything stored is kept: run again later"
 
@@ -89,6 +89,14 @@ def now() -> float:
     return time.time()
 
 
+def on_api_site(url: str) -> bool:
+    """True for an address on DeviantArt's own site, with www. or without: a request there is one more to the API's
+    host, and waits the API's pace. Anything else DeviantArt serves from is its image host, with a pace of its own.
+    Every stage and script asks this which pace a request waits."""
+    host = httpx.URL(url).host
+    return host == "deviantart.com" or host.endswith(".deviantart.com")
+
+
 class Pace:
     """The interval between requests to one host: for the life of the client, and for the run after it,
     whichever process that is. The one place for the pacing rule.
@@ -99,29 +107,32 @@ class Pace:
     it, and never below the base. A Retry-After that asks for longer than the interval is waited, once. How
     often an answer is asked for again is the caller's rule, not this one's.
 
-    The stop is about time spent refused. Two kinds of wait are counted: the one for a 429 once the interval is
-    at the ceiling, and whatever a Retry-After asks for. PATIENCE seconds of them stop the run: an hour of
-    asking as slowly as we go, or as slowly as we were told to, has not helped by then. One thing starts the
-    count again: the interval coming all the way back down to the base, which takes some seven answers to
-    every refusal. An answer or two among the refusals does not, and neither does a 401. A Retry-After that
-    asks for more than is left of that hour stops the run there and then.
+    The stop is about time spent refused, and a 5XX or no answer is a refusal as much as a 429. Two kinds of
+    wait are counted: the one for a refusal once the interval is at the ceiling, and whatever a Retry-After
+    asks for. PATIENCE seconds of them stop the run: an hour of asking as slowly as we go, or as slowly as we
+    were told to, has not helped by then. One thing starts the count again: the interval coming all the way
+    back down to the base, which takes some seven answers to every refusal. So "mostly refused" means more
+    than about one request in eight, for long enough that twelve of the refusals come at the ceiling. An
+    answer or two among the refusals does not start it again, and neither does a 401. A Retry-After that asks
+    for more than is left of that hour stops the run there and then. The refusal that stops a run is written
+    down, Retry-After and all, before the run stops, so the next run keeps to it.
 
     As a context manager it holds the host for this process and remembers the pace for the next run, in two
     files in the cache folder that hold numbers and nothing else:
       <host>.lock  held through the operating system for as long as the run lasts. A second run that finds it
                    held stops before it does anything. A process that died holds nothing, whatever it left.
-      <host>.pace  the interval, and the time before which the next request should not go: written before
-                   every request and after every answer. The next run begins with that interval, halved for
-                   every IDLE_HALVING seconds that have passed since that time. A run that begins before it
-                   waits what is left, and no less than one whole interval. No file means no run before this
-                   one. A file that is not those two numbers means start slow: at the ceiling, after a wait
-                   of the ceiling.
+      <host>.pace  the interval, and the time before which the next request should not go: written whole,
+                   before every request and after every answer. The next run begins with that interval,
+                   halved for every IDLE_HALVING seconds that have passed since that time. A run that begins
+                   before it waits what is left, and no less than one whole interval. No file means no run
+                   before this one. A file that is not exactly what _save() writes means start slow: at the
+                   ceiling, after a wait of the ceiling. A file that cannot be written stops the run.
     """
 
     def __init__(self, base: float, host: str) -> None:
         self.base = self.interval = self.longest = base
         self.host = host  # a name of ours for the summary, such as "the API"
-        self.requests = self.limited = 0
+        self.requests = self.limited = self.failed = 0  # requests sent; answered 429; answered 5XX or not at all
         # Seconds: waited so far, asked for before the next request, and counted towards the hour that stops a run.
         self.waited = self._asked = self._refused = 0.0
         self._lock: int | None = None
@@ -132,6 +143,9 @@ class Pace:
 
     def __enter__(self) -> "Pace":
         config.CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        # ponytail: the lock is a file in this checkout's cache folder, so two checkouts with cache folders of
+        # their own can both talk to a host at once. One checkout runs the stages: that is the operating rule.
+        # A lock somewhere every checkout shares (the user's home folder) is the upgrade if that ever changes.
         lock = os.open(self._file("lock"), os.O_RDWR | os.O_CREAT)
         try:
             if sys.platform == "win32":
@@ -143,9 +157,13 @@ class Pace:
             raise Stop(f"another run is talking to {self.host}, and one at a time is the rule") from None
         self._lock = lock
         try:
-            interval, ready = map(float, self._file("pace").read_text(encoding="ascii").split())
+            text = self._file("pace").read_text(encoding="ascii")
+            interval, ready = map(float, text.split())
             late = now() - ready
-            if not (0 <= interval <= MAX_INTERVAL and -PATIENCE <= late < math.inf):
+            # Exactly what _save() writes, or not believed: a file cut short anywhere is not one it wrote.
+            if text != f"{interval!r} {ready!r}\n" or not (
+                0 <= interval <= MAX_INTERVAL and -PATIENCE <= late < math.inf
+            ):
                 raise ValueError("not numbers a run could have left")
         except FileNotFoundError:
             return self
@@ -161,10 +179,15 @@ class Pace:
             self._lock = None
 
     def _save(self) -> None:
-        """Write the pace down for the next run. It only remembers: a file that cannot be written ends no run."""
-        with contextlib.suppress(OSError):
-            ready = now() + max(self.interval, self._asked)
-            self._file("pace").write_text(f"{self.interval!r} {ready!r}\n", encoding="ascii")
+        """Write the pace down for the next run, whole: into a file of its own, which then takes the place of the
+        last one. A pace that cannot be written stops the run, rather than leave the next run an older pace."""
+        ready = now() + max(self.interval, self._asked)
+        part = self._file("next.pace")
+        try:
+            part.write_text(f"{self.interval!r} {ready!r}\n", encoding="ascii")
+            part.replace(self._file("pace"))
+        except OSError:
+            raise Stop(f"the pace for {self.host} cannot be written in the cache folder. {_KEPT}") from None
 
     def wait(self) -> None:
         """Call before every request to the host. It waits the interval; before the first request of a run,
@@ -187,12 +210,12 @@ class Pace:
         self._save()
 
     def slow(self, response: httpx.Response | None = None) -> None:
-        """Call after an answer that is a 429 or a 5XX, and with nothing after no answer at all."""
+        """Call after an answer that is a 429 or a 5XX, and with nothing after no answer at all. The refusal is
+        written down for the next run first, and only then does it stop this one, when it does."""
         limited = response is not None and response.status_code == 429
         self.limited += limited
-        if self._refused >= PATIENCE:
-            said = f"{PATIENCE / 60:.0f} minutes of waits, each {MAX_INTERVAL / 60:.0f} minutes or as long as it asked"
-            raise Stop(f"rate limited: {self.host} kept refusing through {said}. {_KEPT}")
+        self.failed += not limited
+        stopped = self._refused >= PATIENCE
         # ponytail: Retry-After as a number of seconds only. Given as a date it is not read, and the doubled
         # interval is what is waited. Read the date too if a host is ever seen to send one.
         asked = response.headers.get("retry-after", "") if response is not None else ""
@@ -202,11 +225,13 @@ class Pace:
         self.longest = max(self.longest, self.interval)
         too_long = self._asked > PATIENCE - self._refused
         self._asked = min(self._asked, PATIENCE)  # what the next run is left to wait, when this one will not
-        # What counts towards the hour: what a Retry-After asks for, and the wait for a 429 once the interval is
-        # at the ceiling. A 5XX with no Retry-After counts for nothing: it is asked for again a few times at the
-        # slower pace, and then it is the caller's to judge.
-        self._refused += max(self._asked, MAX_INTERVAL * (limited and self.interval == MAX_INTERVAL))
+        # What counts towards the hour: what a Retry-After asks for, and the wait for a refusal of any kind, a 429,
+        # a 5XX or no answer, once the interval is at the ceiling.
+        self._refused += max(self._asked, MAX_INTERVAL * (self.interval == MAX_INTERVAL))
         self._save()
+        if stopped:
+            said = f"{PATIENCE / 60:.0f} minutes of waits, each {MAX_INTERVAL / 60:.0f} minutes or as long as it asked"
+            raise Stop(f"rate limited: {self.host} kept refusing through {said}. {_KEPT}")
         if too_long:
             raise Stop(f"rate limited: {self.host} asks for a wait of {asked} seconds, more than a run waits. {_KEPT}")
 
@@ -215,6 +240,7 @@ class Pace:
         return {
             f"requests to {self.host}": self.requests,
             f"rate limit answers from {self.host}": self.limited,
+            f"server errors or no answer from {self.host}": self.failed,  # the refusals of every other kind
             f"longest interval between requests to {self.host}, in seconds": math.ceil(self.longest),
             f"interval between requests to {self.host} now, in seconds": math.ceil(max(self.interval, self._asked)),
             f"seconds spent waiting between requests to {self.host}": round(self.waited),

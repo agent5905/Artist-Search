@@ -74,6 +74,7 @@ EXPECTED_STDOUT = (
     + """\
 requests to the API: 20
 rate limit answers from the API: 0
+server errors or no answer from the API: 0
 longest interval between requests to the API, in seconds: 2
 interval between requests to the API now, in seconds: 2
 seconds spent waiting between requests to the API: 38
@@ -1109,6 +1110,24 @@ def test_only_the_interval_back_at_its_base_starts_the_hour_again(db, capsys, se
     assert len(fake.log) == (76 if stopped else 117 + 1 + 32)  # the eleventh 429 of the second stretch, or the end
 
 
+def test_a_5xx_three_times_for_every_page_stops_the_run_after_an_hour_of_it_and_the_summary_counts_them(db, capsys):
+    """The critic's counterexample: 503 three times and then the page, for every page, 75% refused. It never
+    stopped: 1,500 requests in 122 hours. A 5XX counted for nothing towards the hour, and the summary's only
+    count of refusals was of 429s. A 5XX at the ceiling counts as a 429 does now, and has a count of its own."""
+    fake = world()
+    fake.before = lambda index, request: None if index % 4 == 3 else 503
+    assert run(fake, db) == 1
+    out, err = capsys.readouterr()
+    assert err == LIMITED
+    climb = [4.0, 8.0, 16.0, 14.4, 28.8, 57.6, 115.2, 103.68, 207.36]  # the token, at its fourth asking; a page
+    # Three refusals five minutes apart and the page, answered: four times. Then the twelfth at the ceiling, and
+    # the refusal after it ends the run.
+    assert fake.gaps() == pytest.approx(climb + [300.0, 300.0, 270.0] + [300.0, 300.0, 300.0, 270.0] * 3 + [300.0])
+    counts = summary(out)
+    assert counts["server errors or no answer from the API"] == 20 and counts["rate limit answers from the API"] == 0
+    assert counts["requests to the API"] == 26 and sum(fake.gaps()) < 2 * 3600
+
+
 TOO_LONG = f"stopped: rate limited: the API asks for a wait of 299 seconds, more than a run waits. {KEPT}\n"
 
 
@@ -1160,12 +1179,13 @@ NOT_SECONDS = ["9" * 400, "9" * 5000, "9999999999", "nan", "inf", "-1", "+120", 
 def test_a_retry_after_that_is_not_a_plain_number_of_seconds_is_not_read(asked, monkeypatch):
     """Nine ASCII digits are the most that is read as a number of seconds. Anything else says nothing: the
     doubled interval is what is waited, and the summary's numbers can still be worked out."""
-    waits, pace = [], discover.Pace(discover.BASE_INTERVAL, "the API")
+    waits = []
     monkeypatch.setattr(time, "sleep", waits.append)
-    pace.wait()
-    pace.slow(httpx.Response(429, headers={"Retry-After": asked.encode()}))
-    pace.wait()
-    assert waits == [4.0] and list(pace.counts().values()) == [2, 1, 4, 4, 4]
+    with discover.Pace(discover.BASE_INTERVAL, "the API") as pace:  # which makes the folder its file is written in
+        pace.wait()
+        pace.slow(httpx.Response(429, headers={"Retry-After": asked.encode()}))
+        pace.wait()
+    assert waits == [4.0] and list(pace.counts().values()) == [2, 1, 0, 4, 4, 4]
 
 
 def test_a_retry_after_of_400_digits_ends_no_run_and_leaves_no_file_that_says_one_is_on(db, capsys):
@@ -1286,16 +1306,47 @@ BROKEN = [b"", b"slow", b"300", b"300.0\n", b"2.0 soon", b"2 0 0", b"nan 0", b"2
 BROKEN += [b"2.0 -inf", b"-1 0", b"1e999 0", b"301 0", b"2.0 99999999999", b"\xff\xfe2\x00 \x000\x00", b"2.0 \x00"]
 
 
-@pytest.mark.parametrize("left", [*BROKEN, None], ids=[*map(str, range(len(BROKEN))), "a folder"])
+@pytest.mark.parametrize("left", BROKEN, ids=map(str, range(len(BROKEN))))
 def test_a_pace_file_that_is_not_two_numbers_a_run_could_have_left_means_start_slow(left, monkeypatch):
     """Half written, garbage, or not to be read at all: never a crash and never a fast start. Five minutes
     before the first request, and five minutes between requests from there."""
     config.CACHE_DIR.mkdir()
-    if left is None:
-        (config.CACHE_DIR / "the-API.pace").mkdir()  # nothing can read it, and nothing can write it either
-    else:
-        (config.CACHE_DIR / "the-API.pace").write_bytes(left)
+    (config.CACHE_DIR / "the-API.pace").write_bytes(left)
     assert first_waits(monkeypatch, 0.0) == [300.0, 300.0]
+
+
+def test_every_prefix_of_a_pace_file_a_stopped_run_left_means_start_slow(db, capsys, monkeypatch):
+    """The critic's counterexample: a file cut inside its second number, "300.0 18", read as a pace due in 1970,
+    and so as a start at the base with no wait, for 9 of the 21 prefixes of the file a stopped run left. Only
+    the whole file is believed now, and it is written whole: into a file of its own, which then replaces it."""
+    fake = world()
+    fake.clock = 1_800_000_000.0  # a wall-clock time like a real one, so that the file's second number is long
+    with on_one_clock(fake):
+        stopped_at_the_ceiling(fake, db, capsys)
+    whole = (config.CACHE_DIR / "the-API.pace").read_bytes()
+    assert len(whole) > 15 and sorted(path.name for path in config.CACHE_DIR.iterdir()) == [
+        "the-API.lock",
+        "the-API.pace",
+    ]
+    for cut in range(len(whole)):
+        (config.CACHE_DIR / "the-API.pace").write_bytes(whole[:cut])
+        assert first_waits(monkeypatch, fake.clock) == [300.0, 300.0], whole[:cut]
+
+
+@pytest.mark.parametrize("when", ["from the start", "after a 429"])
+def test_a_pace_file_that_cannot_be_written_stops_the_run_before_its_next_request(db, capsys, monkeypatch, when):
+    """The critic's counterexample: a pace file that could not be written failed in silence, and the next run
+    began at whatever an older run had left there. Now the run stops, and says so, before another request."""
+    config.CACHE_DIR.mkdir()
+    if when == "from the start":
+        (config.CACHE_DIR / "the-API.next.pace").mkdir()  # nothing can be written where the file is written first
+    fake = world()
+    fake.before = lambda index, request: (
+        (config.CACHE_DIR / "the-API.next.pace").mkdir() or 429 if when != "from the start" and index == 3 else None
+    )
+    assert run(fake, db) == 1
+    assert capsys.readouterr().err == f"stopped: the pace for the API cannot be written in the cache folder. {KEPT}\n"
+    assert len(fake.log) == (0 if when == "from the start" else 4)  # nothing sent after it
 
 
 @pytest.mark.parametrize(("asked", "left"), [("1800", 1200.0), ("7200", 3000.0)])
@@ -1307,6 +1358,23 @@ def test_a_wait_the_api_asked_for_is_left_for_the_next_run_and_an_hour_of_it_at_
         pace.wait()
         pace.slow(httpx.Response(429, headers={"Retry-After": asked}))
     assert first_waits(monkeypatch, 600.0) == [left, 4.0]  # ten minutes later: the rest of it, then the interval
+
+
+@pytest.mark.parametrize(("asked", "requests", "then"), [("3600", 2, 7.2), ("400", 10, 270.0)])
+def test_the_refusal_that_stops_a_run_is_written_down_retry_after_and_all(db, capsys, asked, requests, then):
+    """The critic's counterexample: every 429 carries `Retry-After: 3600`. The run sent two requests and stopped,
+    and the file said what it had said before the second one: 4 s, due 4 s after it. A run begun 5 s later sent
+    at once. The refusal that stops a run is written down now, Retry-After and all, before the run stops."""
+    fake = world()
+    headers = {"Retry-After": asked}
+    fake.before = lambda index, request: httpx.Response(429, json={"error": "FAKE-RATE-LIMIT"}, headers=headers)
+    with on_one_clock(fake):
+        assert run(fake, db) == 1 and capsys.readouterr().err == LIMITED and len(fake.log) == requests
+        fake.clock += 5.0  # run again five seconds after the stop, and the API answers
+        fake.before = lambda index, request: None
+        assert run(fake, db, afresh=False) == 0
+    # The last refusal asked for this long, and the next run waits it; then the interval it was left, a tenth off.
+    assert fake.gaps()[requests - 1 : requests + 1] == pytest.approx([float(asked), then])
 
 
 def test_a_word_in_the_pace_file_is_how_to_make_a_run_start_slow(db, capsys):
@@ -1405,11 +1473,18 @@ def test_a_run_says_where_it_is_in_a_file_while_it_runs_and_the_file_goes_when_i
 
 
 def test_a_status_file_that_cannot_be_written_or_deleted_does_not_end_a_run(db, monkeypatch):
-    def locked(*args, **kwargs):
-        raise PermissionError("FAKE-LOCKED")
+    """It only informs. The pace file is another matter: see the test of one that cannot be written."""
 
-    monkeypatch.setattr(pathlib.Path, "write_text", locked)
-    monkeypatch.setattr(pathlib.Path, "unlink", locked)
+    def locked(real):
+        def call(path, *args, **kwargs):
+            if path.suffix == ".status":
+                raise PermissionError("FAKE-LOCKED")
+            return real(path, *args, **kwargs)
+
+        return call
+
+    monkeypatch.setattr(pathlib.Path, "write_text", locked(pathlib.Path.write_text))
+    monkeypatch.setattr(pathlib.Path, "unlink", locked(pathlib.Path.unlink))
     assert run(world(), db) == 0 and stored(db) == EXPECTED
 
 

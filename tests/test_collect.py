@@ -98,11 +98,13 @@ EXPECTED_STDOUT = (
     + """\
 requests to the API: 11
 rate limit answers from the API: 0
+server errors or no answer from the API: 0
 longest interval between requests to the API, in seconds: 2
 interval between requests to the API now, in seconds: 2
 seconds spent waiting between requests to the API: 20
 requests to the image host: 13
 rate limit answers from the image host: 0
+server errors or no answer from the image host: 0
 longest interval between requests to the image host, in seconds: 1
 interval between requests to the image host now, in seconds: 1
 seconds spent waiting between requests to the image host: 6
@@ -1614,28 +1616,74 @@ def test_an_artist_of_whom_nothing_is_kept_and_who_alone_names_a_removed_site_is
     assert store.upsert_artist(ALPHA, f"https://www.deviantart.com/{ALPHA}", None, 9) is False  # nor found again
 
 
-def test_a_removed_site_that_another_profile_lists_puts_nobody_on_the_removal_list_on_a_profiles_word(capsys):
+def test_a_removed_site_that_three_profiles_list_puts_nobody_on_the_removal_list_on_a_profiles_word(capsys):
     """The guard on the rule above: a site that several artists list must not turn one removal into many, and one
-    answer given for every profile must not bar anybody. BRAVO is collected, with a page on the site as website:
-    not a site of their own, so no removal of it finds them. ALPHA is a bare handle whose profile names its front
-    page. BRAVO keeps everything and is marked. ALPHA is marked too, and not barred: the site is not theirs alone.
-    Both are held back for as long as their profile names it, and collected like anybody once it does not."""
+    answer given for every profile must not bar anybody. BRAVO and DELTA are collected, each with a page on the
+    site as website: not a site of their own, so no removal of it finds them by their row. ALPHA is a bare handle
+    whose profile names its front page. Three profiles list the site, one more than store.OWNERS: it is shared,
+    and nobody's to answer for. All three are held for as long as their profile names it, keep everything, and
+    are collected like anybody once it does not."""
     world = solo(2, website="https://zz-fake-shared.art/")
-    world.artist(BRAVO, website="https://zz-fake-shared.art/folio/bravo")
-    world.work(BRAVO, 21)
+    for name, n in ((BRAVO, 21), (DELTA, 41)):
+        world.artist(name, website=f"https://zz-fake-shared.art/folio/{name.lower()}")
+        world.work(name, n)
     world.profiles[ALPHA] = refusal(503)  # ALPHA's turn comes to nothing in the first run: nothing of theirs is kept
-    assert run(world) == 1 and library.artist_keys() == [key(BRAVO)]
+    assert run(world) == 1 and library.artist_keys() == [key(BRAVO), key(DELTA)]
     assert store.mark_removed("zz-fake-shared.art") == 0
     world.profiles[ALPHA] = profile(ALPHA, website="https://zz-fake-shared.art/")
     was = stored()
     for _ in range(2):
         counts = counts_of(world, capsys)
-        assert counts[collect.LISTS_REMOVED] == 2 and counts[collect.PURGED] == counts[collect.REMOVED] == 0
-        assert artist_marks() == dict.fromkeys((key(ALPHA), key(BRAVO)), "lists a removed site")
-        assert stored() == was and not store.is_removed(ALPHA) and not store.is_removed(BRAVO)
+        assert counts[collect.LISTS_REMOVED] == 3 and counts[collect.PURGED] == counts[collect.REMOVED] == 0
+        assert artist_marks() == dict.fromkeys(map(key, (ALPHA, BRAVO, DELTA)), "lists a removed site")
+        assert stored() == was and not any(store.is_removed(name) for name in (ALPHA, BRAVO, DELTA))
         assert len(raw("SELECT * FROM removed")) == 1  # the site
     world.profiles[ALPHA]["website"], world.profiles[BRAVO.lower()]["website"] = "", "https://zz-fake-bravo-new.art"
-    assert counts_of(world, capsys)[collect.PROFILES] == 2 and artist_marks() == {} and kept(ALPHA) == [2, 1]
+    world.profiles[DELTA]["website"] = ""
+    assert counts_of(world, capsys)[collect.PROFILES] == 3 and artist_marks() == {} and kept(ALPHA) == [2, 1]
+
+
+def test_a_removed_site_two_profiles_list_removes_both_for_good_and_emptying_the_fields_brings_neither_back(capsys):
+    """The critic's counterexample: one person with two accounts, both bare handles, both listing their site.
+    The site was removed, and neither was barred, since the site was not either's alone; once they emptied both
+    website fields both were collected. Two profiles are as many as can list one site and it still be somebody's
+    own (store.OWNERS): a run that read every stored artist removes both, handle, account and all."""
+    world, names = many(2)
+    for name in names:
+        world.profiles[name]["website"] = "https://zz-fake-gone.art/"
+    assert store.mark_removed("zz-fake-gone.art") == 0
+    counts = counts_of(world, capsys)
+    assert counts[collect.LISTS_REMOVED] == counts[collect.PURGED] == 2 and counts[collect.PROFILES] == 0
+    assert all(store.is_removed(name) and library.account_removed(f"FAKE-USERID-{name}") for name in names)
+    assert library.artist_keys() == store.all_artists() == [] and cached() == []
+    for name in names:
+        world.profiles[name]["website"] = ""  # the person takes the site off both profiles
+    seen = len(world.log)
+    assert counts_of(world, capsys)[collect.PROCESSED] == 0 and world.since(seen) == []  # and nobody comes back
+
+
+@pytest.mark.parametrize("short", ["--max-artists 1", "stopped by the rate limit after the first artist"])
+def test_one_removed_website_answered_for_every_profile_in_a_short_run_removes_nobody(short, capsys):
+    """The critic's counterexample: one removed site answered for every profile, in a run that read one profile,
+    barred that artist for good: theirs was the only listing of the site the run had seen. A run that read no
+    more than store.OWNERS profiles, and not every stored artist's, removes nobody now. The artist it held stays
+    held, and is read again; the run that reads the others too finds the site listed by three: shared."""
+    world, names = many(3)
+    for name in names:
+        world.profiles[name]["website"] = "https://zz-fake-gone.art/"  # the API's one wrong answer, for everybody
+    assert store.mark_removed("zz-fake-gone.art") == 0
+    if short == "--max-artists 1":
+        assert run(world, max_artists=1) == 0
+    else:
+        world.detours.append(rate_limited(PROFILE_PATH + names[1], 99))
+        assert run(world) == 1
+    capsys.readouterr()
+    assert not any(store.is_removed(name) for name in names) and len(raw("SELECT * FROM removed")) == 1  # the site
+    assert artist_marks() == {key(names[0]): "lists a removed site"} and len(store.all_artists()) == 3
+    world.detours.clear()
+    counts = counts_of(world, capsys)
+    assert counts[collect.LISTS_REMOVED] == 3 and counts[collect.PURGED] == 0
+    assert not any(store.is_removed(name) for name in names) and len(store.all_artists()) == 3
 
 
 def test_a_removal_that_lands_after_the_artist_was_stored_is_honoured_before_the_run_ends(capsys, tmp_path):
@@ -1700,30 +1748,32 @@ def test_the_purge_comes_before_any_request_and_survives_a_run_that_fails(capsys
     assert cached() == image_files(ALPHA_KEPT)
 
 
-def test_an_artist_whose_profile_comes_to_name_a_removed_site_is_marked_and_keeps_everything(capsys):
-    """Round 7. The site was removed, and the artist's profile now names it: that is one answer's word. It used to
-    purge them and put their handle and their account on the removal list for good. Now it is written beside
-    them, the push stage holds a marked artist back, and the mark goes when an answer no longer says so."""
+def test_a_collected_artist_whose_profile_comes_to_name_a_page_on_a_removed_site_is_removed_for_good(capsys):
+    """The critic's counterexample. A collected artist's website field is a page on their site, not its front
+    page, so the store's row has no link and the removal of the site matched nobody. Their next profile named it,
+    and they were marked and kept everything; once the field changed, the mark went and they were published
+    again. Round 7 made it a mark because one answer given for every profile once purged and barred every
+    artist. That is guarded now by the count of profiles that list the site, so the profile's word holds them at
+    once, and the end of a run that read three profiles removes them: handle, account and everything kept."""
     world = base()
     assert run(world) == 0
-    was, theirs = stored(), (rows("profiles", BRAVO), rows("works", BRAVO))
     assert store.mark_removed("zz-fake-gone.art") == 0
-    barred = raw("SELECT key_hash FROM removed ORDER BY 1")
     world.profiles[BRAVO.lower()] = profile(BRAVO, website="see WWW.ZZ-Fake-Gone.art/folio for more")
     seen = len(world.log)
-    for _ in range(2):
-        counts = counts_of(world, capsys)
-        assert counts[collect.LISTS_REMOVED] == 1 and counts[collect.REMOVED] == counts[collect.PURGED] == 0
-        assert stored() == was and (rows("profiles", BRAVO), rows("works", BRAVO)) == theirs  # as they were kept
-        assert artist_marks()[key(BRAVO)] == "lists a removed site"
-        assert raw("SELECT key_hash FROM removed ORDER BY 1") == barred  # nobody was put on the list for it
-        assert not store.is_removed(BRAVO) and not library.account_removed(f"FAKE-USERID-{BRAVO}")
+    counts = counts_of(world, capsys)
+    assert counts[collect.LISTS_REMOVED] == counts[collect.PURGED] == 1 and counts[collect.PROFILES] == 2
+    assert rows("profiles", BRAVO) == rows("works", BRAVO) == [] and cached() == image_files(ALPHA_KEPT)
+    assert (
+        store.is_removed(BRAVO) and library.account_removed(f"FAKE-USERID-{BRAVO}") and key(BRAVO) not in artist_marks()
+    )
     assert [request.url.path for request in world.since(seen) if "bravo" in str(request.url).lower()] == [
         PROFILE_PATH + BRAVO
-    ] * 2  # and nothing of theirs was asked for beyond the profile
+    ]  # and nothing of theirs was asked for beyond the profile
     assert b"zz-fake-gone" not in config.LOCAL_DB.read_bytes().lower()
-    world.profiles[BRAVO.lower()] = profile(BRAVO)
-    assert counts_of(world, capsys)[collect.PROFILES] == 3 and key(BRAVO) not in artist_marks()
+    world.profiles[BRAVO.lower()] = profile(BRAVO)  # whatever the field says afterwards
+    seen = len(world.log)
+    assert counts_of(world, capsys)[collect.PROCESSED] == 4  # barred, and out of the store: never asked about again
+    assert not [request for request in world.since(seen) if "bravo" in str(request.url).lower()]
 
 
 def test_one_website_answered_for_every_profile_and_then_one_removal_takes_only_the_removed(capsys):
@@ -1765,26 +1815,21 @@ def test_an_own_site_kept_with_the_profile_is_in_the_stores_row_too_and_its_remo
     assert b"zz-fake-alpha" not in config.LOCAL_DB.read_bytes()
 
 
-def test_the_mark_stays_for_as_long_as_the_website_that_is_kept_is_on_a_removed_site(capsys):
+@pytest.mark.parametrize("website", ["https://zz-fake-alpha.art/", "", "N/A", "https://zz-fake-alpha-new.art"])
+def test_the_website_kept_for_an_artist_holds_them_for_a_removed_site_whatever_their_profile_says_now(website, capsys):
     """Round 8. A profile an earlier version kept, whose own site the store's row does not have, and the site
-    removed before her next turn: no removal found her. Whatever she answers next, the website that is kept is
-    still the removed one until an answer replaces it, and for that long she stays marked and held back."""
+    removed before her next turn: no removal found her. The website that is kept is what her profile has said,
+    and emptying the field, or changing it to another site, takes none of it back: she is held as if the field
+    still named the site, and removed for good when the run ends, since nobody else lists it."""
     world = solo(2, website="https://zz-fake-alpha.art/")
     assert run(world) == 0
     raw("UPDATE artists SET links = '[]'")  # as the earlier version left it: the site is with the profile only
     assert store.mark_removed("site:zz-fake-alpha.art") == 0
-    was = stored()
-    for website in ("https://zz-fake-alpha.art/", "", "N/A"):  # it names the site, says nothing, is refused
-        world.profiles[ALPHA]["website"] = website
-        counts = counts_of(world, capsys)
-        assert counts[collect.LISTS_REMOVED] == 1 and artist_marks() == {key(ALPHA): "lists a removed site"}
-        assert stored() == was and rows("profiles", ALPHA)[0]["website"] == "https://zz-fake-alpha.art/"
-        assert raw("SELECT links FROM artists") == [("[]",)]  # a removed site is written into nobody's row
-        assert not store.is_removed(ALPHA)
-    world.profiles[ALPHA]["website"] = "https://zz-fake-alpha-new.art"  # an answer with another site of her own
+    world.profiles[ALPHA]["website"] = website  # it names the site, says nothing, is refused, or names another
     counts = counts_of(world, capsys)
-    assert counts[collect.LISTS_REMOVED] == 0 and artist_marks() == {} and kept(ALPHA) == [2, 1]
-    assert raw("SELECT links FROM artists") == [('["https://zz-fake-alpha-new.art/"]',)]
+    assert counts[collect.LISTS_REMOVED] == counts[collect.PURGED] == 1 and counts[collect.PROFILES] == 0
+    assert store.is_removed(ALPHA) and library.account_removed(f"FAKE-USERID-{ALPHA}")
+    assert library.artist_keys() == store.all_artists() == [] and cached() == []
 
 
 def test_every_profile_naming_a_removed_site_in_one_run_purges_nobody_and_marks_them(capsys):
@@ -2516,11 +2561,13 @@ def test_refusals_count_across_artists_only_while_nothing_is_served_between_them
     assert library.artist_keys() == [key(names[1]), key(names[3])]
 
 
-def test_an_image_served_from_the_apis_own_host_waits_the_apis_interval():
-    """It is one more request to that host, and requests to that host wait the pace of the API."""
+@pytest.mark.parametrize("host", [API_HOST, "deviantart.com"])
+def test_an_image_served_from_the_apis_own_site_waits_the_apis_interval(host):
+    """It is one more request to that host, and requests to that host wait the pace of the API. The critic's note:
+    a preview on deviantart.com, without the www., was paced as the image host, at half a second."""
     world = solo(3)
     for entry in world.galleries[ALPHA]:
-        entry["preview"]["src"] = entry["preview"]["src"].replace(CDN, f"https://{API_HOST}")
+        entry["preview"]["src"] = entry["preview"]["src"].replace(CDN, f"https://{host}")
 
     def served_by_the_api_host(request):
         if request.url.path in world.images:
@@ -2528,9 +2575,9 @@ def test_an_image_served_from_the_apis_own_host_waits_the_apis_interval():
 
     world.detours.append(served_by_the_api_host)
     assert run(world) == 0
-    images = [request for request in world.requests("api") if request.url.path in world.images]
-    assert kept(ALPHA) == [3, 2, 1] and len(images) == 3 and world.requests("images") == []
-    assert set(world.gaps("api")) == {discover.BASE_INTERVAL} and len(world.gaps("api")) == 3 + 3
+    images = [request for request in world.requests() if request.url.path in world.images]
+    assert kept(ALPHA) == [3, 2, 1] and [request.url.host for request in images] == [host] * 3
+    assert [request.extensions["waited"] for request in world.requests()] == [None] + [discover.BASE_INTERVAL] * 6
     assert not any("authorization" in request.headers for request in images)  # and the token does not go with it
 
 
@@ -2757,14 +2804,16 @@ def many(count):
 
 
 def test_several_artists_failing_in_a_row_stop_the_run_because_then_it_is_the_api(capsys):
+    """With an answer that is not a refusal. Five artists of 5XX answers are twenty refusals, and the twentieth
+    ends the run by the pace's hour first: see the next test but one."""
     world, names = many(7)
     world.detours.append(
-        lambda request: httpx.Response(503, text="FAKE-DOWN") if request.url.path.startswith(PROFILE_PATH) else None
+        lambda request: httpx.Response(403, text="FAKE-DOWN") if request.url.path.startswith(PROFILE_PATH) else None
     )
     assert run(world) == 1
     captured = capsys.readouterr()
     assert captured.err == (
-        "skipped an artist: profile lookup answered HTTP 503\n" * 5
+        "skipped an artist: profile lookup answered HTTP 403\n" * 5
         + "stopped: 5 artists in a row failed: the API seems to be down\n"
     )
     counts = summary(captured.out)
@@ -2773,21 +2822,52 @@ def test_several_artists_failing_in_a_row_stop_the_run_because_then_it_is_the_ap
 
 
 def test_failures_that_are_not_in_a_row_do_not_stop_the_run(capsys):
-    """Four artists fail, one is collected, four more fail: eight failures, and never five running."""
+    """Four artists fail, one is collected, four more fail: eight failures, and never five running. With an
+    answer that is not a refusal: 5XX answers this many are an hour of refusals, which is the next test."""
     world, names = many(9)
     world.detours.append(
         lambda request: (
-            httpx.Response(500, text="FAKE-DOWN")
+            httpx.Response(403, text="FAKE-DOWN")
             if request.url.path.startswith(PROFILE_PATH) and not world.concerns(request, names[4])
             else None
         )
     )
     assert run(world) == 1
     captured = capsys.readouterr()
-    assert captured.err == "skipped an artist: profile lookup answered HTTP 500\n" * 8
+    assert captured.err == "skipped an artist: profile lookup answered HTTP 403\n" * 8
     counts = summary(captured.out)
     assert counts[collect.API_FAILED] == 8 and counts[collect.PROFILES] == 1 and counts[collect.PROCESSED] == 9
     assert library.artist_keys() == [key(names[4])]
+
+
+def test_an_api_that_answers_503_to_all_but_every_fifth_artist_stops_after_an_hour_of_it(capsys):
+    """The critic's counterexample: every API request but the token answered 503, with no Retry-After, except
+    every fifth artist's profile and gallery, answered at the fourth asking. 91.7% refused, and it never
+    stopped: 60 artists took 23.3 hours, because a 5XX counted for nothing towards the hour, and every fifth
+    artist ended the row of five. A 5XX at the ceiling counts as a 429 there does, and the hour ends the run in
+    the fifth artist's turn, an answer among the refusals or not."""
+    world = World()
+    names = [f"zz-fake-c{n:02d}" for n in range(10)]
+    for name in names:
+        world.artist(name)  # an empty gallery: a profile and a gallery lookup each, when they are answered
+    asked: dict[str, int] = {}
+
+    def refused(request):
+        if request.url.path == TOKEN_PATH:
+            return None
+        asked[str(request.url)] = asked.get(str(request.url), 0) + 1
+        name = request.url.params.get("username") or request.url.path.removeprefix(PROFILE_PATH)
+        return None if names.index(name) % 5 == 4 and asked[str(request.url)] == 4 else httpx.Response(503)
+
+    world.detours.append(refused)
+    assert run(world) == 1
+    captured = capsys.readouterr()
+    assert captured.err == "skipped an artist: profile lookup answered HTTP 503\n" * 4 + LIMITED
+    climb = [2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0, 256.0]  # four artists' profiles, each asked four times
+    assert world.gaps("api") == climb + [300.0] * 12 + [270.0]  # and the fifth's, answered; its gallery, refused
+    counts = summary(captured.out)
+    assert counts["server errors or no answer from the API"] == 20 and counts["rate limit answers from the API"] == 0
+    assert counts[collect.PROCESSED] == 5 and counts[collect.API_FAILED] == 4 and world.now / 3600 < 1.5
 
 
 def ticking(monkeypatch):
@@ -3307,7 +3387,7 @@ def test_stdout_is_counts_and_nothing_else(capsys):
     world = base()
     assert run(world) == 0
     out = capsys.readouterr().out
-    assert summary(out) and len(out.splitlines()) == len(collect._COUNTS) == 46
+    assert summary(out) and len(out.splitlines()) == len(collect._COUNTS) == 48
     assert not re.search(r"FAKE|zz-fake|https?:|deviantart|wixmp|[0-9A-F]{8}-", out, re.IGNORECASE)
     for word in ("artists processed", "profiles stored", "works stored", "images downloaded", "skipped"):
         assert word in out
@@ -4026,17 +4106,25 @@ def test_a_run_started_while_another_has_a_host_is_refused_and_touches_nothing(h
     assert counts[collect.PURGED] == 1 and counts[collect.ORPHANS] == 1 and kept(BRAVO) == []
 
 
-def test_an_image_host_that_serves_every_image_at_the_fourth_asking_is_stopped_at_after_an_hour_of_it(capsys):
+@pytest.mark.parametrize(
+    ("status", "counted"),
+    [(429, "rate limit answers from the image host"), (503, "server errors or no answer from the image host")],
+)
+def test_an_image_host_that_serves_every_image_at_the_fourth_asking_is_stopped_at_after_an_hour_of_it(
+    status, counted, capsys
+):
     """The critic's counterexample: every image refused three times and served the fourth: twelve images in 3.0
     hours, no stop, exit 0 and nothing on standard error, because each image served set the count back to
-    nothing. The image host's hour is counted as the API's is, and one image among the refusals does not end it."""
+    nothing. The image host's hour is counted as the API's is, and one image among the refusals does not end it.
+    And the round after, with 503 for the refusal: a 5XX counted for nothing towards the hour, and the summary
+    said "rate limit answers from the image host: 0". It counts as a 429 does now, and the summary has it."""
     world, names = two_works_each(6)
     left = {}
 
     def three_refusals_then_served(request):
         if request.url.host == CDN_HOST and left.setdefault(request.url.path, 3):
             left[request.url.path] -= 1
-            return httpx.Response(429, text="FAKE-SLOW-DOWN")
+            return httpx.Response(status, text="FAKE-SLOW-DOWN")
 
     world.detours.append(three_refusals_then_served)
     assert run(world) == 1
@@ -4046,7 +4134,7 @@ def test_an_image_host_that_serves_every_image_at_the_fourth_asking_is_stopped_a
     at_the_ceiling = [300.0, 300.0, 300.0, 270.0]  # three refusals five minutes apart, and the image, served
     assert world.waited("images") == pytest.approx(climb + at_the_ceiling * 4)  # twelve waits for a refusal there
     counts = summary(captured.out)
-    assert counts[collect.DOWNLOADED] == 7 and counts["rate limit answers from the image host"] == 22
+    assert counts[collect.DOWNLOADED] == 7 and counts[counted] == 22
     assert sum(world.waited("images")[1:]) == pytest.approx(5316.4, abs=0.1)  # 89 minutes, and not 3 hours and on
     # Everything stored is kept: three artists whole. The fourth, whom the run stopped at, is noted as passed over.
     assert library.artist_keys() == list(map(key, names[:3])) and len(cached()) == 6

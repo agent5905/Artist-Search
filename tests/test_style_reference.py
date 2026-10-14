@@ -3,6 +3,12 @@
 import json
 import pathlib
 import sys
+import time
+
+import httpx
+import pytest
+
+from pipeline import collect, config, discover
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "eval"))
 import style_reference  # noqa: E402
@@ -54,3 +60,26 @@ def test_other_artists_works_in_page_order() -> None:
     assert [(row["artist"], row["page_url"].rsplit("-", 1)[-1]) for row in rows] == [("Third", "15"), ("Other", "11")]
     assert rows[0]["thumb"] == "https://images.example/f/15.jpg/v1/fit/w_375,h_375/piece_15-375w.jpg"
     assert rows[1]["thumb"] == "https://images.example/f/11.jpg/v1/fit/w_375,h_375/piece_11-375w.jpg?token=second"
+
+
+def test_every_request_waits_its_hosts_turn_in_the_pipelines_pace_and_takes_its_lock(tmp_path, monkeypatch) -> None:
+    """The critic's finding: this script sent to www.deviantart.com and to the image host every 3 s, with no lock,
+    no pace and no backoff on an image's 429. It goes through discover.Pace now, the pipeline's own: the API's
+    2 s for DeviantArt's site, www. or not, half a second for the image host and twice that after a 429, and a
+    discovery or collection run that holds either host keeps it out."""
+    monkeypatch.setattr(config, "CACHE_DIR", tmp_path / "cache")
+    waits: list[float] = []
+    monkeypatch.setattr(time, "sleep", waits.append)
+    page, image = "https://www.deviantart.com/morelikethis/someone/1", "https://images-zzfake.wixmp.com/f/1.jpg"
+
+    def host(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(429 if request.url.path == "/f/refused.jpg" else 200, text="FAKE")
+
+    with style_reference.client(httpx.MockTransport(host)) as http:
+        for url in (page, page, image, image.replace("1.jpg", "refused.jpg"), image, page.replace("www.", "")):
+            http.get(url)
+    assert waits == [discover.BASE_INTERVAL, collect.IMAGE_INTERVAL, 2 * collect.IMAGE_INTERVAL, discover.BASE_INTERVAL]
+    assert sorted(path.name for path in config.CACHE_DIR.glob("*.pace")) == ["the-API.pace", "the-image-host.pace"]
+    with discover.Pace(discover.BASE_INTERVAL, "the API"), pytest.raises(discover.Stop, match="another run"):
+        with style_reference.client(httpx.MockTransport(host)):
+            pass
