@@ -1,6 +1,6 @@
 # Artist Search: Progress
 
-**Status, 2026-10-13, evening:** Scaling is paused on the API side: DeviantArt rate-limited our client after a day at one request a second, and our pacing was wrong for its adaptive limit. No API requests are being made while that clears, and the client is being rebuilt to slow down when asked. Push stays closed until a critic passes it; two of its three fix rounds are in. Style lost to DeviantArt's "More Like This", 11 seeds to 17. Profiles changed approach in round 6 and await their critic. The GPU work continues and can be paused. 119 artists are public; nothing is deployed.
+**Status, 2026-10-13, night:** Discovery on the rebuilt pacing found 3,899 artists, with no rate-limit answer from the API. Collection of their profiles and works is running and will take about 16 hours. The GPU work is paused at the owner's request, so tagging the new works waits for it. Profile cards follow owner decision 11 (option A). Push stays closed until its critic passes it again. 119 artists are public; nothing is deployed.
 
 ## Waiting on the owner
 
@@ -799,3 +799,26 @@ What failed, and why it matters:
 **So discovery is running again**, started at 20:16, about five hours after the last request to the API. The pace file was seeded so the run starts at its slowest: a five-minute wait, then a five-minute interval easing to two seconds over about 50 minutes. Its progress is in `cache/discover.status` and in `scripts/gpu.py status`.
 
 **Pacing round 11 (in progress, in a separate copy of the repo):** server errors count toward the stop and are reported; the stopping refusal is recorded; the pace file is written so it is never seen half-written; every script goes through the shared pace and lock; and a removal rule that reaches every account that has named a site, without letting one wrong answer remove an innocent artist for good.
+
+### Round 19: 3,899 artists discovered; collection under way; profiles at option A (2026-10-13, night)
+
+**Discovery, on the rebuilt pacing: done.**
+
+| | |
+|---|---|
+| Browse pages read | 1,659 of 2,160 possible; some tags ran out first |
+| Works counted | 61,329, by 43,263 authors |
+| Artists stored (three or more works under the niche tags) | 3,899 |
+| Rate-limit answers from the API | 0 |
+| Requests to the API | 1,664 |
+
+- It started about five hours after the last request of the afternoon, waited five minutes, and eased from a five-minute interval down to two seconds over about 50 minutes. It then held one request every two seconds for about an hour and a half.
+- 3,899 artists is enough for the 2,000-public target, even with a third held back for content or too few works.
+
+**Pacing round 11: merged.** Server errors now count toward the stop, so the critic's "503 except every fifth artist" case stops after 1.2 hours instead of running for weeks. The refusal that stops a run is recorded with its `Retry-After`. The pace file is written so it is never seen half-written. Every script goes through the shared pace and lock, the reference capture included. A removal by site reaches every account whose profile has named the site; a short run removes nobody, so one wrong answer cannot remove an innocent artist for good. 2,170 tests pass. Not yet judged a third time; the second critic already judged the code fit to collect with.
+
+**Collection: running**, network only. About 15 seconds an artist, so roughly 16 hours for all 3,899. Its progress is in `cache/collect.status` and `scripts/gpu.py status`.
+
+**Profiles: owner decision 11, option A.** A card is one plain sentence from the checked per-work tags. The artist's own tags stay on the site, titled "The artist's own tags", and now pass the same rules the quoted tags did. The round that fixes the seventh critic's wording faults was cut off by a weekly usage limit on the account and has been resumed.
+
+**The GPU is paused and the worker stopped,** at the owner's request. A check at 22:30 found no model loaded in Ollama and no process of this project connected to it.
