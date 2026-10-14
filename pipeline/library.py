@@ -187,6 +187,16 @@ _INVISIBLE = re.compile(
 _ENCODED = re.compile(r"[A-Za-z0-9+/=_-]{100,}")  # no word is this long; a base64 file is
 # What makes seven or eight digits a number to call and not a date or a serial number.
 _CALLING = re.compile(r"call|tel|phone|whatsapp|\+", re.IGNORECASE)
+# Messaging, social and payment services: a model's words that name one say how to reach somebody, where the plain
+# rule sees nothing ("Discord fakepainter#1234"). See names_service.
+# ponytail: a hand list, matched as whole words. "X", "Line", "Signal", "Threads", "Bluesky" and "Mastodon" are
+# left out, being words a picture is described in; x.com and bsky.app are domains, which the plain rule refuses.
+SERVICES = (
+    *("discord", "telegram", "snapchat", "whatsapp", "wechat", "skype", "kik", "viber", "email", "gmail", "hotmail"),
+    *("instagram", "twitter", "tiktok", "facebook", "tumblr", "reddit", "youtube", "twitch", "pixiv", "vgen"),
+    *("patreon", "kofi", "paypal", "venmo", "cashapp", "onlyfans", "fansly", "gumroad", "fanbox", "boosty"),
+)
+_SERVICE = re.compile(r"\b(?:" + "|".join(r"[\W_]*".join(name) for name in SERVICES) + r")\b", re.IGNORECASE)
 # A link, whatever it links to and whether or not a host with a dot is in it: "skype:name", "tg://name",
 # "sms:5550199", "http://10.0.0.7/x". A word, a colon, and something right after it. "Title: subtitle" is none.
 _LINK = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*:(?=\S)|://")
@@ -252,6 +262,19 @@ def holds_contact(value: object) -> bool:
         return False
     shown, probe = (_settle(value), _settle(value, percent=True)) if len(value) <= 10_000 else (None, None)
     return shown is None or probe is None or _contact(shown) or _contact(probe)
+
+
+def names_service(value: object) -> bool:
+    """True when a text names a messaging, social or payment service (SERVICES), as it is written or once its
+    percent-encoding is undone, as a word of its own whose letters may be set apart ("t e l e g r a m",
+    "Ko-fi"); and when it will not settle, or is too long to read. Anything that is not a text names nothing.
+
+    For what a model wrote, which no model reads for contacts: "Discord fakepainter#1234" passes the plain rule.
+    """
+    if not isinstance(value, str):
+        return False
+    texts = (_settle(value), _settle(value, percent=True)) if len(value) <= 10_000 else (None, None)
+    return any(text is None or _SERVICE.search(text) for text in texts)
 
 
 def _text(value: object, limit: int) -> str | None:

@@ -84,7 +84,8 @@ _IDNA_2003_ONLY = "".join(map(chr, (0xDF, 0x1E9E, 0x3C2, 0x200C, 0x200D)))  # sh
 _SHA256 = re.compile(r"[0-9a-f]{64}")
 _OTHERS = "SELECT 1 FROM listed WHERE domain_hash = ? AND artist_hash != ?"  # is a domain listed by anybody else
 # The most profiles that can list one site and it still be somebody's own, for a removal of it: two accounts of
-# one person. A site more profiles list is shared, and nobody's alone to answer for (see removed_site_of_few).
+# one person. A site more profiles list is shared, and nobody's alone to answer for (see removed_site_of_few and
+# _named_by).
 OWNERS = 2
 
 
@@ -245,19 +246,66 @@ def _now() -> str:
     return datetime.now(UTC).isoformat(timespec="seconds")
 
 
+class Snapshot(str):
+    """The store's path, standing for one copy of the whole file made at one moment (see snapshot). Given it for
+    `db`, every function here, in pipeline/library.py and in the stages that open the file through them reads
+    that copy."""
+
+    conn: sqlite3.Connection  # the copy
+    _file: sqlite3.Connection | None  # the file, asked only whether it has changed since
+    _version: int
+
+    def changed(self) -> bool:
+        """True when something has been committed to the file since the copy was made."""
+        return self._file is not None and self._file.execute("PRAGMA data_version").fetchone()[0] != self._version
+
+
+@contextlib.contextmanager
+def snapshot(db: pathlib.Path | str | None = None) -> Iterator[Snapshot]:
+    """The store as it is at this moment, for reading: a copy of the whole file, made in one read transaction
+    that ends when the copy is made, so that a stage that writes waits on it no longer than that. What is read
+    through it all comes from that one moment, and nothing done to it reaches the file: a table the file has not
+    got is made in the copy, empty, by whichever reader opens it. No file is made when there is none.
+
+    ponytail: the whole file in memory, 61 MB in 0.24 s on 2026-10-13. Past a few hundred MB, hold one read
+    transaction on the file instead, in WAL mode so that the stages that write do not wait on it.
+    """
+    path = pathlib.Path(db or config.LOCAL_DB)
+    held = Snapshot(path)
+    held.conn, held._file = sqlite3.connect(":memory:"), None
+    try:
+        if path.is_file():
+            held._file = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True, timeout=60)
+            held._file.execute("BEGIN")
+            held._file.execute("SELECT 1 FROM sqlite_master").fetchone()  # the moment: from here the file holds still
+            held._version = held._file.execute("PRAGMA data_version").fetchone()[0]
+            held._file.backup(held.conn)
+            held._file.commit()
+        yield held
+    finally:
+        held.conn.close()
+        if held._file is not None:
+            held._file.close()
+
+
 @contextlib.contextmanager
 def _open(db: pathlib.Path | str | None) -> Iterator[sqlite3.Connection]:
-    """One transaction on the store: committed on success, rolled back on error, always closed."""
-    path = pathlib.Path(db or config.LOCAL_DB)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(path, timeout=60)  # several stages write to this file; wait for a lock, do not fail
+    """One transaction on the store: committed on success, rolled back on error, always closed. Given a
+    Snapshot, one on its copy, which stays open for the next reader."""
+    if isinstance(db, Snapshot):
+        conn = db.conn
+    else:
+        path = pathlib.Path(db or config.LOCAL_DB)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(path, timeout=60)  # several stages write to this file; wait for a lock, do not fail
     try:
         conn.execute("PRAGMA secure_delete = ON")  # a removed artist's row is zeroed in the file, not just unlinked
         conn.executescript(_SCHEMA)
         with conn:
             yield conn
     finally:
-        conn.close()
+        if not isinstance(db, Snapshot):
+            conn.close()
 
 
 @contextlib.contextmanager
@@ -276,19 +324,32 @@ def _removed(conn: sqlite3.Connection, keys: Iterable[str]) -> bool:
 
 
 def _named_by(conn: sqlite3.Connection, named: set[str]) -> list[str]:
-    """The keys of the stored artists these key hashes name: by their handle, or by the site their stored link is on."""
+    """The keys of the stored artists these key hashes name: by their handle, or by the site their stored link is
+    on when it is a site of few. A site that more than OWNERS artists list (in the profiles the collect stage
+    read, as removed_site_of_few counts them) or link to here is shared: it names none of them. They stay out
+    while they link to it (all_artists), and the push stage holds back whoever's profile names it."""
     # ponytail: reads every artist row per removal. Fine at a few thousand rows; index the link hosts if it grows.
-    rows = conn.execute("SELECT key, links FROM artists").fetchall()
-    return [
-        key for key, links in rows if named & {_hash(covering) for covering in (key, *_link_keys(json.loads(links)))}
-    ]
+    rows = [(key, json.loads(links)) for key, links in conn.execute("SELECT key, links FROM artists")]
+    found = {key for key, _ in rows if _hash(key) in named}
+    linking: dict[str, set[str]] = {}  # a removed site's registrable domain -> the stored artists who link to it
+    for key, links in rows:
+        for host in filter(None, map(_host, links)):
+            if named & {_hash(covering) for covering in _host_keys(host)}:
+                linking.setdefault(registrable_domain(host) or host, set()).add(key)
+    listing = "SELECT artist_hash FROM listed WHERE domain_hash = ?"
+    for domain, keys in linking.items():
+        listers = {artist_hash for (artist_hash,) in conn.execute(listing, (_hash(f"site:{domain}"),))}
+        if len(listers | {_hash(key) for key in keys}) <= OWNERS:
+            found |= keys
+    return sorted(found)
 
 
 def _remove(conn: sqlite3.Connection, key_hashes: Iterable[str]) -> int:
     """Put key hashes on the removal list and delete the stored artists they name. Returns how many that was.
 
-    A hash names an artist by their handle, or by the site their stored link is on. An artist deleted for their
-    site has their handle put on the list too, so that they stay out when the link is gone from their profile.
+    A hash names an artist by their handle, or by the site their stored link is on when few link to it (see
+    _named_by). An artist deleted for their site has their handle put on the list too, so that they stay out
+    when the link is gone from their profile.
     A removal goes no further: a removed handle bars no site, so it never reaches another artist. It works on
     hashes, so it also works for a site known only as a hash.
     """
@@ -328,7 +389,8 @@ def mark_removed(identifier: str, db: pathlib.Path | str | None = None) -> int:
     """Put an artist or a site on the removal list. Safe to repeat.
 
     A handle bars that handle and deletes that artist's row, and nothing else. A site bars the site, and deletes
-    and bars the artists whose stored link is on it (see _remove). Returns how many stored artists it deleted,
+    and bars the artists whose stored link is on it, unless it is shared (see _remove). Returns how many stored
+    artists it deleted,
     so a removal that matched nobody can be seen. ValueError when the identifier names nothing discovery could
     store (see normalize): a removal never silently does nothing.
     """

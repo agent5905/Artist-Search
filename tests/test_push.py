@@ -1051,7 +1051,10 @@ def test_running_twice_sends_the_same_rows_and_an_artist_who_stops_qualifying_is
     assert len(sent_works) == 5 + 6 and [row["position"] for row in sent_works[:5]] == list(range(5))
 
 
-@pytest.mark.parametrize("error", [None, ConnectionError("FAKE"), KeyError("FAKE"), Exception("FAKE")])
+QUOTED = RuntimeError("HTTP 400: FAKE " + "-" * 120 + f" the row it refused: {ALPHA}")  # a database error quotes rows
+
+
+@pytest.mark.parametrize("error", [None, ConnectionError("FAKE"), KeyError("FAKE"), Exception("FAKE"), QUOTED])
 @pytest.mark.parametrize("fail", ["listing", "removed", "delete", "load"])
 def test_a_failure_part_way_leaves_the_local_stores_untouched_and_exits_non_zero(fake, capsys, fail, error):
     artist(ALPHA)
@@ -1067,7 +1070,7 @@ def test_a_failure_part_way_leaves_the_local_stores_untouched_and_exits_non_zero
     with pytest.raises(SystemExit) as stopped:
         push.main([])
 
-    assert stopped.value.code not in (0, None)
+    assert stopped.value.code not in (0, None) and "yy-fake" not in str(stopped.value.code)  # the kind, and a start
     assert local_state() == before
     output = capsys.readouterr()
     assert output.out == "" and "yy-fake" not in output.err
@@ -1708,35 +1711,94 @@ def test_an_artist_the_stores_table_lacks_is_nobodys_removal(fake, dry_run):
     assert again == first and fake.held() == held
 
 
-def test_many_new_removals_at_once_stop_the_run_until_it_is_told_they_are_real(fake, capsys):
-    handles = [f"yy-fake-m{n}" for n in range(8)]
+def test_a_few_removals_made_here_go_through_at_once_with_one_made_through_the_site(fake):
+    """The second critic's case: three here the same day (seven hashes with the one there), and every run stopped."""
+    handles = [f"yy-fake-m{n}" for n in range(6)]
     for n, handle in enumerate(handles):
         artist(handle, 4, angle=0.1 * n)
     push.run(False)
-    for handle in handles[:3]:  # three at once, each a handle and an account: 6 hashes, and 5 is a handful
+    fake.sql(push._removed_sql({digest(f"da:{handles[5]}")}))  # through the site: the hash joins the list, the row goes
+    for handle in handles[:3]:  # and three here: three people, each a handle and an account
         store.mark_removed(handle)
-    before, held = local_state(), fake.held()
-    capsys.readouterr()
 
+    counts = push.run(False)
+
+    assert counts["artists_purged_here"] == 4 and counts["removals_added_to_database"] == 3 * 2 + 1
+    accounts = {library.account(f"FAKE-USER-{handle}") for handle in (*handles[:3], handles[5])}
+    assert set(fake.removed) == {digest(f"da:{handle}") for handle in (*handles[:3], handles[5])} | accounts
+    assert library.artist_keys() == [f"da:{handle}" for handle in handles[3:5]]
+    assert sorted(row["slug"] for row in fake.artists.values()) == handles[3:5]
+
+
+def test_many_new_removals_at_once_stop_the_run_and_the_databases_own_list_is_honoured_all_the_same(fake, capsys):
+    handles = [f"yy-fake-m{n}" for n in range(10)]
+    for n, handle in enumerate(handles):
+        artist(handle, 4, angle=0.1 * n)
+    push.run(False)
+    fake.sql(push._removed_sql({digest(f"da:{handles[9]}")}))  # removed through the site
+    for handle in handles[:6]:  # six at once here: six people, and five is a handful
+        store.mark_removed(handle)
+    capsys.readouterr()
+    there = {digest(f"da:{handles[9]}"), library.account(f"FAKE-USER-{handles[9]}")}
+
+    done = False
     for arguments in (["--dry-run"], [], ["--allow-delete", "5"], ["--dry-run", "--allow-delete", "5"]):
         with pytest.raises(SystemExit) as stopped:
             push.main(arguments)
         said = str(stopped.value.code)
-        assert "add 6 key hashes" in said and "purge 3 artists here" in said and "--allow-delete 6" in said
-        assert "yy-fake" not in said and capsys.readouterr().out == ""
-        # Nothing was done, here or there.
-        assert local_state() == before and fake.held() == held and fake.removed == []
-        assert fake.calls[-2:] == ["listing", "removed"] and len(fake.loads) == 1
+        assert "bar 6 people" in said and "add 12 key hashes" in said and "purge 6 artists here" in said
+        assert "--allow-delete 6" in said and "yy-fake" not in said and capsys.readouterr().out == ""
+        # What the database's list asks is done, here and there, from the first run that is not a dry one; none
+        # of the six is, and nothing is built.
+        done = done or "--dry-run" not in arguments
+        assert set(fake.removed) == (there if done else {digest(f"da:{handles[9]}")})
+        assert library.artist_keys() == [f"da:{handle}" for handle in handles[: 9 if done else 10]]
+        assert sorted(row["slug"] for row in fake.artists.values()) == handles[:9] and len(fake.loads) == 1
 
     push.main(["--allow-delete", "6"])  # they are real: all of it goes through
     counts = json.loads(capsys.readouterr().out)
-    assert counts["removals_added_to_database"] == 6 and counts["artists_purged_here"] == 3
-    assert len(fake.removed) == 6 and sorted(row["slug"] for row in fake.artists.values()) == handles[3:]
-    assert library.artist_keys() == [f"da:{handle}" for handle in handles[3:]]
+    assert counts["removals_added_to_database"] == 12 and counts["artists_purged_here"] == 6
+    assert len(fake.removed) == 14 and sorted(row["slug"] for row in fake.artists.values()) == handles[6:9]
+    assert library.artist_keys() == [f"da:{handle}" for handle in handles[6:9]]
 
-    store.mark_removed(handles[3])  # one more, as removals come: it goes through whatever a run is told
+    store.mark_removed(handles[6])  # one more, as removals come: it goes through whatever a run is told
     push.main(["--allow-delete", "0"])
-    assert len(fake.removed) == 8 and sorted(row["slug"] for row in fake.artists.values()) == handles[4:]
+    assert len(fake.removed) == 16 and sorted(row["slug"] for row in fake.artists.values()) == handles[7:9]
+
+
+def test_many_hashes_of_nobody_here_are_as_many_people(fake):
+    """A broken store need not bar anybody kept here: hashes of handles nobody here has go on the list for good."""
+    artist(ALPHA)
+    push.run(False)
+    store.import_removed([digest(f"da:yy-fake-nobody-{n}") for n in range(6)])
+    with pytest.raises(push.Stop, match="bar 6 people"):
+        push.run(False)
+    assert fake.removed == [] and library.artist_keys() == [f"da:{ALPHA}"]
+
+
+@pytest.mark.parametrize("linked", ["in_the_stores_row", "in_the_profile_only"])
+def test_a_removed_site_that_several_artists_name_bars_none_of_them_and_none_of_them_is_sent(fake, linked):
+    """A site more than store.OWNERS artists name is shared (store._named_by): its removal never takes them all,
+    and never stops a run. Whoever asked is honoured all the same: the site is on both lists for good and is
+    never shown, and every artist who names it is held back, not collected and not sent, while they do."""
+    hub = "https://yy-fake-hub.art/"
+    artist(ALPHA, angle=0.0)
+    named = [BRAVO, CHARLIE, DELTA]
+    for n, handle in enumerate(named):
+        artist(handle, angle=0.1 * (n + 1), website=hub, links=None if linked == "in_the_stores_row" else [])
+    push.run(False)
+    assert sorted(sent_artists(fake)) == [ALPHA, *named] and "yy-fake-hub" not in fake.sent()
+    fake.sql(push._removed_sql({digest("site:yy-fake-hub.art")}))  # removed through the site, by its domain
+
+    counts = push.run(False)
+
+    assert fake.removed == [digest("site:yy-fake-hub.art")] and counts["removals_added_to_database"] == 0
+    assert counts["artists_purged_here"] == 0 and library.artist_keys() == [f"da:{h}" for h in (ALPHA, *named)]
+    assert not any(store.is_removed(handle) for handle in named) and store.is_removed("yy-fake-hub.art")
+    assert list(sent_artists(fake)) == [ALPHA] and [row["slug"] for row in fake.artists.values()] == [ALPHA]
+    listed = [ALPHA] if linked == "in_the_stores_row" else [ALPHA, *named]  # not listed while they link to it
+    assert [key for key, _, _ in store.all_artists()] == [f"da:{handle}" for handle in listed]
+    assert counts["artists_held_site_removed"] == len(listed) - 1  # nor sent while their profile names it
 
 
 def test_a_dry_run_changes_nothing_anywhere_and_says_what_the_run_then_does(fake, capsys):
@@ -2196,3 +2258,179 @@ def test_the_migration_ties_a_whole_store_to_what_was_read_and_what_changed_sinc
 
     settled = local_state()
     assert tagging.migrate(backup)["stores migrated"] == 0 and local_state() == settled  # again: nothing
+
+
+# What the second critic of this stage found (round 14).
+
+TITLE = "Commission sheet - telegram fakepainter or whatsapp five five five"
+TAGLINE = "Commissions open, message me on Discord fakepainter_77"
+# Every read build() makes of the store, through whatever module makes it.
+READS = [
+    *((store, "all_artists"), (library, "artist_marks"), (library, "work_marks"), (library, "thumb_sizes")),
+    *((profiles, "profiles"), (profiles, "excluded"), (tagging, "results"), (tagging, "contacts")),
+    *((push, "_collected"), (style, "all_neighbors"), (style, "all_closest_works")),
+]
+
+
+def lands_during(monkeypatch, module, name, change):
+    """A commit of another stage that lands while the rows are built: just before `module.name` reads the store,
+    the first time it does. Nothing else about the read changes."""
+    real, done = getattr(module, name), []
+
+    def reading(*args, **kwargs):
+        if not done:
+            done.append(change())
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(module, name, reading)
+
+
+def everything_at_once(made):
+    """What collection does to ALPHA and BRAVO in one go: a new title, a new thumbnail and a new tagline, none of
+    them read yet; a work marked mature; and BRAVO's account gone."""
+
+    def change():
+        collected_again(ALPHA, made, tagline=TAGLINE, titles={1: TITLE}, thumbs={0: ANOTHER})
+        library.mark_works(f"da:{ALPHA}", {made[2]["id"]: "mature"})
+        library.mark_artist(f"da:{BRAVO}", "account gone")
+
+    return change
+
+
+@pytest.mark.parametrize(("module", "name"), READS, ids=[name for _, name in READS])
+def test_every_read_of_one_build_is_of_the_same_moment_of_the_store(fake, monkeypatch, module, name):
+    """Built once, whatever lands meanwhile: what goes is the store as it was when the build began, every part of
+    it. Never a new title under the reading of the old one, a new thumbnail under the old image's rating, a work
+    or an artist marked since and sent all the same, or a card of works a mark has since taken away."""
+    made = artist(ALPHA, 8)
+    artist(BRAVO, angle=0.3)
+    artist(CHARLIE, angle=0.6)
+    push.run(False)
+    first = fake.loads[-1]
+    monkeypatch.setattr(push, "TRIES", 1)
+    lands_during(monkeypatch, module, name, everything_at_once(made))
+
+    push.run(False)
+
+    assert fake.loads[-1] == first
+
+
+@pytest.mark.parametrize(("module", "name"), READS, ids=[name for _, name in READS])
+def test_a_change_that_lands_while_the_rows_are_built_is_in_what_goes(fake, monkeypatch, module, name):
+    """The store changed under the build, so it is built again from what is there now."""
+    made = artist(ALPHA, 8)
+    artist(BRAVO, angle=0.3)
+    artist(CHARLIE, angle=0.6)
+    push.run(False)
+    lands_during(monkeypatch, module, name, everything_at_once(made))
+
+    counts = push.run(False)
+
+    assert sorted(sent_artists(fake)) == [ALPHA, CHARLIE] and counts["artists_held_marked_account_gone"] == 1
+    assert counts["works_held_words_not_read"] == counts["works_held_not_tagged"] == 1
+    assert counts["works_held_marked_mature"] == 1 and counts["works_sent"] == 5 + 5
+    assert sent_artists(fake)[ALPHA]["tagline"] is None  # the new one is not read yet, and the old one is gone
+    for text in ("fakepainter", ANOTHER.lower(), *(made[n]["page"].lower() for n in range(3)), BRAVO):
+        assert text not in json.dumps(fake.loads[-1]).lower() and text not in fake.held()
+
+
+@pytest.mark.parametrize("how", ["marked", "taken_down"])
+def test_a_card_counted_from_works_that_have_since_fallen_waits_for_one_counted_from_those_that_stand(fake, how):
+    """The second critic's: a card counted from 8 works, 4 of which are another author's, or taken down, since."""
+    made = artist(ALPHA, 8, counted=8)
+    artist(BRAVO, angle=0.3)
+    push.run(False)
+    fallen, standing = made[4:], made[:4]
+    if how == "marked":
+        library.mark_works(f"da:{ALPHA}", {work["id"]: "another author" for work in fallen})
+    else:  # missing from the artist's latest answer: last seen before it
+        with closing(sqlite3.connect(config.LOCAL_DB)) as conn, conn:
+            conn.executemany("UPDATE works SET fetched_at = ? WHERE deviation_id = ?", [(AT, w["id"]) for w in fallen])
+    assert profiles.current() == {f"da:{BRAVO}"}
+
+    counts = push.run(False)
+
+    assert counts["artists_held_profile_out_of_date"] == 1 and list(sent_artists(fake)) == [BRAVO]
+    assert not any(word in fake.held() for word in of_artist(ALPHA))
+    # The profile stage makes the card again, from the works that stand (profiles.run counts no other).
+    counted = sorted(work["id"] for work in standing)
+    with closing(sqlite3.connect(config.LOCAL_DB)) as conn, conn:
+        (facts,) = conn.execute("SELECT facts FROM artist_profiles WHERE artist_key = ?", (f"da:{ALPHA}",)).fetchone()
+        rests = tagging.read_as(counted, library.image_prints(), tagging.declared_ai(profiles.TAGGER))
+        made_again = (json.dumps(json.loads(facts) | {"counted": counted}), "FAKE-BASIS" + rests, f"da:{ALPHA}")
+        conn.execute("UPDATE artist_profiles SET facts = ?, basis = ? WHERE artist_key = ?", made_again)
+    assert push.run(False)["artists_sent"] == 2
+    assert [row["page_url"] for row in fake.loads[-1][1] if row["artist_slug"] == ALPHA] == [
+        w["page"] for w in standing
+    ]
+
+
+SERVICES_SAID = [
+    "A knight in armour. Text in the corner reads Discord fakepainter#1234.",
+    "A knight in armour, with a caption that says telegram: fakepainter.",
+    "A knight in armour; the banner says add me on Snapchat fakepainter.",
+    "A knight in armour, signed T E L E G R A M fakepainter.",
+    "A knight in armour, and Ko-fi fakepainter in the corner.",
+    "A knight in armour, with &#68;iscord fakepainter on a shield.",  # what the plain rule undoes, this undoes
+    "A knight in armour, with ＷｈａｔｓＡｐｐ fakepainter on a banner.",  # fullwidth
+    "A knight in armour, with e-mail fakepainter on a scroll.",
+]
+
+
+@pytest.mark.parametrize("said", SERVICES_SAID)
+def test_a_description_that_names_a_messaging_social_or_payment_service_is_not_sent_and_its_work_is(fake, said):
+    works = artist(ALPHA, 5)
+    edit_result(works[0], description=said)
+    assert not library.holds_contact(said)  # the plain rule sees nothing in it
+
+    counts = push.run(False)
+
+    assert counts["works_sent"] == 5 and counts["texts_left_out_for_contact"] == 1
+    assert fake.loads[-1][1][0]["description"] is None and "fakepainter" not in fake.sent()
+    assert fake.loads[-1][1][1]["description"] == works[1]["description"]  # the others go as they are
+
+
+def test_what_else_a_model_wrote_is_left_out_when_it_names_a_service(fake):
+    works = artist(ALPHA, 5)
+    key = f"da:{ALPHA}"
+    edit_result(works[0], style_words=["painterly", "patreon exclusive"])
+    facts = FACTS | {"style_words": ["painterly", "discord style"], "specialties": ["character", "tiktok art"]}
+    written = "FAKE-PROFILE, on Instagram too."
+    with closing(sqlite3.connect(config.LOCAL_DB)) as conn, conn:
+        conn.execute(
+            "UPDATE artist_profiles SET facts = ?, written = ? WHERE artist_key = ?", (json.dumps(facts), written, key)
+        )
+
+    counts = push.run(False)
+
+    row = sent_artists(fake)[ALPHA]
+    assert counts["artists_sent"] == 1 and row["profile"] is None and row["specialties"] == ["character"]
+    tags = ["digital painting", "character", "fantasy", "realistic", "painterly", "portrait or bust"]
+    assert fake.loads[-1][1][0]["tags"] == tags
+    for text in ("patreon", "discord", "tiktok", "instagram"):
+        assert text not in fake.sent()
+
+
+@pytest.mark.parametrize("state", ["collected_not_yet_tagged", "discovered_only", "of_an_old_shape"])
+def test_a_dry_run_leaves_the_store_byte_for_byte_as_it_was_whatever_state_it_is_in(fake, state):
+    """The second critic's: a dry run on a store collected and not yet tagged added eleven tables to it."""
+    artist(ALPHA)
+    artist(BRAVO, angle=0.3)
+    push.run(False)
+    gone = (*tagging.TABLES, "artist_profiles", "style_vectors")
+    if state == "discovered_only":  # the library's tables too: only discovery has run
+        gone += ("works", "profiles", "skipped", "work_marks", "artist_marks", "work_sizes", "work_images")
+    with closing(sqlite3.connect(config.LOCAL_DB)) as conn:
+        if state == "of_an_old_shape":  # readings without fingerprints: every stage stops on it
+            conn.execute("PRAGMA user_version = 0")
+        else:
+            conn.executescript("".join(f"DROP TABLE {table};" for table in gone))
+        conn.commit()
+    before = config.LOCAL_DB.read_bytes()
+
+    try:
+        push.run(True, allow_delete=99)
+    except (push.Stop, SystemExit):  # nobody to send, or a store of the old shape: it stops where a run would
+        pass
+
+    assert config.LOCAL_DB.read_bytes() == before and not config.LOCAL_DB.with_name("pipeline.sqlite-journal").exists()
