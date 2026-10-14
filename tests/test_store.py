@@ -457,6 +457,23 @@ def test_naming_a_removed_site_changes_nothing_that_is_stored_and_bars_nobody(db
     assert add(db, username="zz-fake-e", links=("https://zz-fake-e-new.art",)) is True  # an answer without it is
 
 
+def test_who_names_a_removed_site_alone_is_asked_of_the_listings_and_asking_changes_nothing(db):
+    """For the one case in which a profile's word puts an artist on the removal list: nothing of theirs is kept,
+    and the removed site their profile names is one no other profile was seen to list, in a link of any shape.
+    A site two profiles list is not either's alone: one removal must not take many artists."""
+    store.mark_removed("site:zz-fake-gone.art", db)
+    store.record_listing("zz-fake-one", ["www.zz-fake-gone.art"], db)
+    store.record_listing("zz-fake-two", ["zz-fake-two.art"], db)
+    before = (rows(db), rows(db, "removed"), rows(db, "listed"))
+    assert store.lists_alone("ZZ-Fake-One", ["www.artstation.com", "shop.zz-fake-gone.art"], db) is True
+    assert store.lists_alone("zz-fake-two", ["zz-fake-two.art"], db) is False  # a site that nobody removed
+    assert store.lists_alone("zz-fake-two", [], db) is False
+    assert (rows(db), rows(db, "removed"), rows(db, "listed")) == before
+    store.record_listing("zz-fake-three", ["users.zz-fake-gone.art"], db)  # a second profile lists it
+    assert store.lists_alone("zz-fake-one", ["zz-fake-gone.art"], db) is False
+    assert store.lists_alone("zz-fake-three", ["users.zz-fake-gone.art"], db) is False
+
+
 def test_what_profiles_list_is_kept_as_hashes_only(db):
     store.record_listing("ZZ-Fake-Lister", ["users.zz-fake-plat.art", "www.artstation.com"], db)
     store.record_listing("zz-fake-nothing", [], db)  # lists no site: nothing to keep

@@ -13,10 +13,11 @@ import logging
 import pathlib
 import re
 import sqlite3
+import subprocess
 import sys
 import threading
 import time
-from contextlib import closing
+from contextlib import closing, suppress
 from datetime import UTC, datetime, timedelta
 from unittest import mock
 from urllib.parse import parse_qs
@@ -84,7 +85,8 @@ BASE_REQUESTS = 20
 GAMEART = 6
 LONG_AGO = "2020-01-01T00:00:00+00:00"
 KEPT = "Everything stored is kept: run again later"
-LIMITED = f"stopped: rate limited: the API answered HTTP 429 12 times in a row, 5 minutes apart. {KEPT}\n"
+WAITS = "60 minutes of waits, each 5 minutes or as long as it asked"  # an hour of them stops a run: see Pace
+LIMITED = f"stopped: rate limited: the API kept refusing through {WAITS}. {KEPT}\n"
 
 
 def without(*keys):
@@ -800,8 +802,7 @@ def test_429s_at_the_ceiling_that_stop_short_of_an_hour_do_not_stop_the_run(db, 
     limited(fake, set(range(2, 21)))  # nineteen in a row: eleven of them at the ceiling
     assert run(fake, db) == 0 and capsys.readouterr().err == ""
     assert fake.gaps()[9:22] == [300.0] * 12 + [270.0]  # and from the first success the interval comes down
-    limited(again := world(), set(range(2, 14)) | set(range(15, 25)))  # ten more after one success: not in a row
-    assert run(again, db) == 0 and stored(db) == EXPECTED
+    assert stored(db) == EXPECTED
 
 
 @pytest.mark.parametrize(
@@ -830,7 +831,8 @@ def test_a_retry_after_of_more_than_an_hour_stops_the_run_and_what_is_stored_is_
     fake = world()
     limited(fake, {4}, {"Retry-After": "3601"})
     assert run(fake, db) == 1
-    assert capsys.readouterr().err == (f"stopped: rate limited: the API asks for a wait of more than an hour. {KEPT}\n")
+    said = "the API asks for a wait of 3601 seconds, more than a run waits"  # and it says how long that was
+    assert capsys.readouterr().err == f"stopped: rate limited: {said}. {KEPT}\n"
     assert len(fake.log) == 5 and len(stored(db)) == 3
 
 
@@ -1048,6 +1050,326 @@ def test_every_request_sends_the_user_agent_accepts_compression_and_keeps_secret
                 assert CLIENT_SECRET.encode() not in request.content
                 assert CLIENT_SECRET not in str(request.headers)
     assert config.CONTACT_URL in config.USER_AGENT
+
+
+# --- 4b: the hour that stops a run is time spent refused, and only the pace back at its base starts it again ---
+
+
+def test_a_401_for_a_token_that_expired_while_the_api_was_refusing_does_not_start_the_hour_again(db, capsys):
+    """The critic's counterexample. A token lasts 60 minutes and the stop takes 68.5, so the token always expires
+    first. An API that answers the expired token with a 401 while it goes on refusing set the count back to
+    nothing every time: discovery ran for 2.2 hours and ended on "browse failed with HTTP 401"."""
+    fake, issued = world(), []
+
+    def refusing(index, request):
+        if request.url.path == TOKEN_PATH:
+            issued.append(fake.clock)  # the token endpoint is not limited: a new token is there for the asking
+        elif fake.clock - issued[-1] >= 3600:
+            fake.valid.clear()  # expired, and the API looks at the token before it looks at the rate: a 401
+        else:
+            return 429
+
+    fake.before = refusing
+    assert run(fake, db) == 1
+    assert capsys.readouterr().err == LIMITED
+    assert [status for _, _, status in fake.log] == [200] + [429] * 18 + [401, 200] + [429] * 2
+    climb = [2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0, 256.0]
+    # Eleven waits at the ceiling, the 401, the new token, and the twelfth: the 401 took a tenth off the
+    # interval, as any answer does, and nothing off the hour.
+    assert fake.gaps() == pytest.approx(climb + [300.0] * 11 + [270.0, 243.0, 300.0])
+    assert fake.log[-1][0] == pytest.approx(4623.0)  # 77 minutes in, and not 2.2 hours
+
+
+def test_one_answer_among_the_refusals_does_not_start_the_hour_again(db, capsys):
+    """The critic's counterexample: twelve 429s and one page served, over and over. It never stopped, at three
+    requests in ten minutes: twelve in a row was the rule, and one answer set the count back to nothing."""
+    fake = world()
+    fake.page_size = 1  # pages enough for the run not to end by itself
+    fake.before = lambda index, request: 429 if index >= 2 and (index - 2) % 13 != 12 else None
+    assert run(fake, db) == 1
+    assert capsys.readouterr().err == LIMITED
+    climb = [4.0, 8.0, 16.0, 32.0, 64.0, 128.0, 256.0]
+    # Five waits at the ceiling, the one page served, and seven more: twelve of them, an hour.
+    assert fake.gaps() == [2.0, 2.0] + climb + [300.0] * 5 + [270.0] + [300.0] * 7
+    assert [status for _, _, status in fake.log].count(200) == 3 and sum(fake.gaps()) == 4382.0  # 73 minutes
+
+
+@pytest.mark.parametrize(("second_stretch", "stopped"), [(66, False), (65, True)])
+def test_only_the_interval_back_at_its_base_starts_the_hour_again(db, capsys, second_stretch, stopped):
+    """What counts as progress. Sixteen 429s, nine of them waited for at the ceiling: 45 minutes. Then answers.
+    The forty-eighth brings the interval back to its base, and the sixteen 429s after it have an hour of their
+    own. One answer fewer, and the two stretches are one: three more waits at the ceiling, and the run stops."""
+    fake = world()
+    fake.page_size = 1
+    limited(fake, set(range(2, 18)) | set(range(second_stretch, second_stretch + 16)))
+    assert run(fake, db) == int(stopped)
+    assert capsys.readouterr().err == (LIMITED if stopped else "")
+    assert fake.gaps()[17:65] == pytest.approx([300.0 * 0.9**answered for answered in range(48)])  # down to 2.12
+    assert fake.gaps()[65] == pytest.approx(2 * 300.0 * 0.9**47 if stopped else 2.0)  # doubled again, or at the base
+    assert len(fake.log) == (76 if stopped else 117 + 1 + 32)  # the eleventh 429 of the second stretch, or the end
+
+
+TOO_LONG = f"stopped: rate limited: the API asks for a wait of 299 seconds, more than a run waits. {KEPT}\n"
+
+
+HOUR_OF_299 = [299.0] * 7 + [300.0] * 5  # what is asked for while the interval is shorter, and then the interval
+
+
+@pytest.mark.parametrize(("asked", "waits", "said"), [("3600", [3600.0], LIMITED), ("299", HOUR_OF_299, TOO_LONG)])
+def test_a_retry_after_on_every_429_stops_the_run_within_the_hour_it_would_have_had_anyway(
+    db, capsys, asked, waits, said
+):
+    """The critic's counterexample: `Retry-After: 3600` on every 429 took 19.0 hours to stop. Only a wait at the
+    ceiling counted, and a wait the API had asked for by name did not. Whatever a Retry-After asks for counts
+    now: an hour asked for at once, or just under five minutes at a time."""
+    fake = world()
+    fake.before = lambda index, request: (
+        httpx.Response(429, json={"error": "FAKE-RATE-LIMIT"}, headers={"Retry-After": asked}) if index >= 4 else None
+    )
+    assert run(fake, db) == 1
+    assert capsys.readouterr().err == said
+    assert fake.gaps()[3:] == [2.0, *waits] and sum(waits) <= discover.PATIENCE  # and nothing is sent afterwards
+    assert len(stored(db)) == 3  # and what was stored is kept
+
+
+@pytest.mark.parametrize(("asked", "waited"), [("2100", 2100.0), ("2101", None), ("999999999", None)])
+def test_a_retry_after_that_asks_for_more_than_is_left_of_the_hour_stops_the_run_and_says_how_long(
+    db, capsys, asked, waited
+):
+    """After five waits at the ceiling, 25 minutes, 35 are left. A Retry-After of that is waited. A longer one
+    is not: the run ends there, and says what the API asked for."""
+    fake = world()
+    limited(fake, set(range(4, 16)))  # seven that double the interval, and five at the ceiling
+    plain = fake.before
+    fake.before = lambda index, request: (
+        httpx.Response(429, json={"error": "FAKE-RATE-LIMIT"}, headers={"Retry-After": asked})
+        if index == 16
+        else plain(index, request)
+    )
+    assert run(fake, db) == (0 if waited else 1)
+    said = f"the API asks for a wait of {asked} seconds, more than a run waits"
+    assert capsys.readouterr().err == ("" if waited else f"stopped: rate limited: {said}. {KEPT}\n")
+    assert fake.gaps()[11:16] == [300.0] * 5 and len(fake.log) == (BASE_REQUESTS + 13 if waited else 17)
+    assert waited is None or fake.gaps()[16:18] == pytest.approx([waited, 270.0])
+
+
+NOT_SECONDS = ["9" * 400, "9" * 5000, "9999999999", "nan", "inf", "-1", "+120", "1_20", "120.0", "0x78", "120, 240", ""]
+
+
+@pytest.mark.parametrize("asked", NOT_SECONDS, ids=[str(n) for n in range(len(NOT_SECONDS))])
+def test_a_retry_after_that_is_not_a_plain_number_of_seconds_is_not_read(asked, monkeypatch):
+    """Nine ASCII digits are the most that is read as a number of seconds. Anything else says nothing: the
+    doubled interval is what is waited, and the summary's numbers can still be worked out."""
+    waits, pace = [], discover.Pace(discover.BASE_INTERVAL, "the API")
+    monkeypatch.setattr(time, "sleep", waits.append)
+    pace.wait()
+    pace.slow(httpx.Response(429, headers={"Retry-After": asked.encode()}))
+    pace.wait()
+    assert waits == [4.0] and list(pace.counts().values()) == [2, 1, 4, 4, 4]
+
+
+def test_a_retry_after_of_400_digits_ends_no_run_and_leaves_no_file_that_says_one_is_on(db, capsys):
+    """The critic's counterexample: a value of 400 digits became infinity, and rounding infinity up for the
+    summary raised inside the `finally`: "stopped: OverflowError at discover.py line 130", and the file that
+    says a run is on was left behind."""
+    fake = world()
+    limited(fake, {4}, {"Retry-After": b"9" * 400})
+    assert run(fake, db) == 0 and capsys.readouterr().err == ""
+    assert fake.gaps()[3:7] == pytest.approx([2.0, 4.0, 3.6, 3.24])  # the doubled interval is what is waited
+    assert stored(db) == EXPECTED and not (config.CACHE_DIR / "discover.status").exists()
+
+
+def test_a_retry_after_on_a_5xx_is_waited_as_on_a_429(db):
+    """The critic's thirty-fifth break, which no test caught: Retry-After read on a 429 and not on a 5XX."""
+    fake = world()
+    fake.before = lambda index, request: httpx.Response(503, headers={"Retry-After": "100"}) if index == 3 else None
+    assert run(fake, db) == 0 and stored(db) == EXPECTED
+    assert fake.gaps()[2:6] == pytest.approx([2.0, 100.0, 3.6, 3.24])
+
+
+def test_an_error_where_the_run_reads_its_pace_leaves_no_file_that_says_a_run_is_on(db, capsys, monkeypatch):
+    counts, calls = discover.Pace.counts, []
+
+    def breaks(pace):
+        calls.append(pace)
+        if len(calls) > 3:  # three requests in: the file has been written
+            raise OverflowError("FAKE-OVERFLOW")
+        return counts(pace)
+
+    monkeypatch.setattr(discover.Pace, "counts", breaks)
+    assert run(world(), db) == 1
+    assert capsys.readouterr().err.startswith("stopped: OverflowError at discover.py line ")
+    assert len(calls) == 5 and not (config.CACHE_DIR / "discover.status").exists()
+
+
+@pytest.mark.parametrize("status", [400, 403, 404])
+def test_a_tag_the_api_refuses_is_noted_and_passed_over_and_the_run_goes_on_to_the_next(db, capsys, status):
+    """From the critic's notes: a tag answering 4XX stopped every run there, and the fifteen tags after it were
+    never reached. It is asked for once, noted, and left for the next run to ask for again."""
+    fake = world()
+    fake.before = lambda index, request: status if request.url.params.get("tag") == "characterconcept" else None
+    assert run(fake, db) == 1
+    out, err = capsys.readouterr()
+    assert err == f"skipped the tag characterconcept: browse answered HTTP {status}\n"
+    assert fake.browsed() == [("conceptart", 0), ("conceptart", 40), *((tag, 0) for tag in discover.NICHE_TAGS[1:])]
+    assert stored(db) == EXPECTED and summary(out)["pages fetched"] == 18  # every other tag, as ever
+    again = world()
+    assert run(again, db, afresh=False) == 0 and again.browsed() == [("characterconcept", 0)]
+
+
+# --- 4c: the pace outlives the run and the process, and one run talks to the API at a time ---
+
+
+def on_one_clock(fake):
+    """The pace reads the fake's clock as well as sleeping on it, so that the time between two runs is on it too."""
+    return mock.patch.object(discover, "now", lambda: fake.clock)
+
+
+def stopped_at_the_ceiling(fake, db, capsys):
+    """A run that is refused from its sixth request on and stops, an hour later, at an interval of 300 seconds.
+    Returns how many requests that was. The fake answers again afterwards, from wherever the next run begins."""
+    fake.before = lambda index, request: 429 if 5 <= index < 25 else None
+    assert run(fake, db) == 1 and capsys.readouterr().err == LIMITED
+    assert len(fake.log) == 25 and fake.gaps()[-12:] == [300.0] * 12
+    return len(fake.log)
+
+
+def test_a_run_after_a_stop_begins_at_the_pace_the_stopped_one_ended_with(db, capsys):
+    """The critic's counterexample: 429 from request 5 on, a stop at an interval of 300 s, and discovery run
+    again in the same process: its first request went 0 s after the last 429, and its interval was back at
+    2 s. The pace was one process's memory. It is a file now, and the next run begins where this one ended."""
+    fake = world()
+    with on_one_clock(fake):
+        last = stopped_at_the_ceiling(fake, db, capsys)
+        fake.before = lambda index, request: 429 if index < last + 3 else None  # still refusing when it comes back
+        assert run(fake, db, afresh=False) == 0
+    # Five minutes after the last 429 and not at once; five minutes after each of three more; then down a tenth.
+    assert fake.gaps()[last - 1 : last + 5] == pytest.approx([300.0, 300.0, 300.0, 300.0, 270.0, 243.0])
+    assert stored(db) == EXPECTED
+
+
+def first_waits(monkeypatch, at):
+    """The waits before the first two requests of a run that begins at this time, by the pace's own clock."""
+    waits, pace = [], discover.Pace(discover.BASE_INTERVAL, "the API")
+    monkeypatch.setattr(time, "sleep", waits.append)
+    monkeypatch.setattr(discover, "now", lambda: at)
+    with pace:
+        pace.wait()
+        pace.wait()
+    return waits
+
+
+@pytest.mark.parametrize(
+    ("later", "waits"),
+    [
+        (0.0, [300.0, 300.0]),  # at once: the whole of the wait the last run left, and then its interval
+        (100.0, [300.0, 300.0]),  # in the middle of that wait: a whole interval from now, never the rest of one
+        (300.0, [300.0]),  # as that wait ends: nothing to wait for, and nothing off the interval yet
+        (3900.0, [150.0]),  # an hour after it ended: the interval is half what it was
+        (7500.0, [75.0]),  # two hours: a quarter
+        (86700.0, [2.0]),  # a day: back at the base
+    ],
+)
+def test_the_pace_a_run_begins_with_is_the_last_ones_halved_for_every_hour_nobody_asked(later, waits, monkeypatch):
+    """The rule for the time between two runs, a minute or a day, in the same process or another. The file says
+    when the next request was due. A run that begins sooner waits; one that begins later has the interval
+    halved for every hour past that time. Either way its first request goes no sooner after the last request
+    anybody made than the interval it begins with."""
+    config.CACHE_DIR.mkdir()
+    # As a run leaves it whose last request went at 0, at the ceiling: the interval, and when the next is due.
+    (config.CACHE_DIR / "the-API.pace").write_text("300.0 300.0\n", encoding="ascii")
+    assert first_waits(monkeypatch, later) == waits
+    assert later + sum(waits[:-1]) >= waits[-1]  # when the first request goes, and the interval the run begins with
+
+
+BROKEN = [b"", b"slow", b"300", b"300.0\n", b"2.0 soon", b"2 0 0", b"nan 0", b"2.0 nan", b"inf 0", b"2.0 inf"]
+BROKEN += [b"2.0 -inf", b"-1 0", b"1e999 0", b"301 0", b"2.0 99999999999", b"\xff\xfe2\x00 \x000\x00", b"2.0 \x00"]
+
+
+@pytest.mark.parametrize("left", [*BROKEN, None], ids=[*map(str, range(len(BROKEN))), "a folder"])
+def test_a_pace_file_that_is_not_two_numbers_a_run_could_have_left_means_start_slow(left, monkeypatch):
+    """Half written, garbage, or not to be read at all: never a crash and never a fast start. Five minutes
+    before the first request, and five minutes between requests from there."""
+    config.CACHE_DIR.mkdir()
+    if left is None:
+        (config.CACHE_DIR / "the-API.pace").mkdir()  # nothing can read it, and nothing can write it either
+    else:
+        (config.CACHE_DIR / "the-API.pace").write_bytes(left)
+    assert first_waits(monkeypatch, 0.0) == [300.0, 300.0]
+
+
+@pytest.mark.parametrize(("asked", "left"), [("1800", 1200.0), ("7200", 3000.0)])
+def test_a_wait_the_api_asked_for_is_left_for_the_next_run_and_an_hour_of_it_at_most(asked, left, monkeypatch):
+    """A run that is killed while it waits out a Retry-After, or that stops because the wait is longer than a run
+    waits, leaves the wait in the file, and the next run does not ask sooner. An hour is the most a file says."""
+    monkeypatch.setattr(discover, "now", lambda: 0.0)
+    with discover.Pace(discover.BASE_INTERVAL, "the API") as pace, suppress(discover.Stop):
+        pace.wait()
+        pace.slow(httpx.Response(429, headers={"Retry-After": asked}))
+    assert first_waits(monkeypatch, 600.0) == [left, 4.0]  # ten minutes later: the rest of it, then the interval
+
+
+def test_a_word_in_the_pace_file_is_how_to_make_a_run_start_slow(db, capsys):
+    """For the first run after a rate limit that no run of this code saw: five minutes before the first request,
+    and then down a tenth with every answer, as from any ceiling."""
+    config.CACHE_DIR.mkdir()
+    (config.CACHE_DIR / "the-API.pace").write_text("slow")
+    fake = world()
+    with on_one_clock(fake):
+        assert run(fake, db) == 0
+    assert capsys.readouterr().err == "" and stored(db) == EXPECTED
+    assert fake.log[0][0] == 300.0 and fake.gaps()[:3] == pytest.approx([270.0, 243.0, 218.7])
+
+
+def test_no_pace_file_means_no_run_before_this_one_and_a_run_leaves_two_files_that_hold_numbers_only(db):
+    fake = world()
+    with on_one_clock(fake):
+        assert run(fake, db) == 0
+    assert fake.log[0][0] == 0.0 and set(fake.gaps()) == {2.0}  # the base, and no wait before the first request
+    left = {path.name: path.read_text(encoding="ascii") for path in config.CACHE_DIR.iterdir()}
+    assert left == {"the-API.lock": "", "the-API.pace": f"2.0 {fake.clock + 2.0!r}\n"}  # the interval, and when next
+
+
+def test_a_second_run_started_while_one_is_on_is_refused_and_touches_nothing(db, capsys):
+    """The critic's counterexample: two discovery runs at once on one store both ran, each at the full pace, and
+    the pages of the first tag were counted twice. The second one stops now, before it asks for anything."""
+    fake, other, seen = world(), world(), []
+    told = config.CACHE_DIR / "discover.status"
+
+    def meanwhile(index, request):
+        if index == 3:  # the first run is between two requests
+            seen.append((run(other, db, afresh=False), told.exists()))
+
+    fake.before = meanwhile
+    assert run(fake, db) == 0
+    assert seen == [(1, True)] and other.log == []  # refused, and the first run's file is still there
+    out, err = capsys.readouterr()
+    assert err == "stopped: another run is talking to the API, and one at a time is the rule\n"
+    assert out.endswith(EXPECTED_STDOUT) and stored(db) == EXPECTED and fake.gaps() == [2.0] * (BASE_REQUESTS - 1)
+
+
+HOLDER = """
+import pathlib, sys
+from pipeline import config, discover
+config.CACHE_DIR = pathlib.Path(sys.argv[1])
+with discover.Pace(discover.BASE_INTERVAL, "the API"):
+    print("held", flush=True)
+    sys.stdin.read()
+"""
+
+
+def test_another_process_that_has_the_api_keeps_a_run_out_and_one_that_died_does_not(db, capsys):
+    """Two processes, which is what two stages started from two terminals are. The lock is the operating
+    system's, so a process that is killed lets go of it by dying: the file it leaves behind is no lock."""
+    command = [sys.executable, "-c", HOLDER, str(config.CACHE_DIR)]
+    with subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, cwd=config.ROOT) as holder:
+        assert holder.stdout.readline().strip() == b"held"
+        fake = world()
+        assert run(fake, db) == 1 and fake.log == []
+        assert capsys.readouterr().err == "stopped: another run is talking to the API, and one at a time is the rule\n"
+        holder.kill()  # as a crash or the task manager would: it cleans nothing up
+    assert (config.CACHE_DIR / "the-API.lock").exists()
+    assert run(world(), db) == 0 and stored(db) == EXPECTED
 
 
 # --- 5: a long run is not a black box ---

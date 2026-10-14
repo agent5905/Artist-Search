@@ -15,8 +15,12 @@ one, and an artist reaches the store on the page that gives them works enough. A
 for PASS_VALID after its first page. A run that finds an older one forgets it and browses afresh, and nothing
 else does: a run that finds a finished pass younger than that has nothing to browse and makes no request.
 
-Every request waits its turn in one place, Pace, which slows down for the rest of the run when the API asks.
+Every request waits its turn in one place, Pace, which slows down when the API asks: for the rest of the run,
+and for the run after it, which begins at the pace this one ended with. One run talks to the API at a time.
 While a run is on, tell() keeps a file in the cache folder that says where it is.
+
+A tag the API refuses with a 4XX is noted on standard error and passed over: the run goes on to the next tag,
+exits non-zero, and the next run asks for that tag again. A 401 that outlasts a new token still stops the run.
 
 Endpoints (deviantart.readme.io, read 2026-10-11). Each is documented as accepting a client_credentials token:
     POST /oauth2/token                          grant_type=client_credentials
@@ -27,6 +31,7 @@ import argparse
 import contextlib
 import logging
 import math
+import os
 import pathlib
 import sys
 import time
@@ -38,6 +43,11 @@ from typing import Any
 import httpx
 
 from pipeline import config, store
+
+if sys.platform == "win32":  # the lock a run holds on a host (see Pace) is the operating system's own
+    import msvcrt
+else:
+    import fcntl
 
 ENV_NAMES = ("DEVIANT_ART_ID", "DEVIANT_ART_SECRET")  # the client id and secret, as .env.example names them
 TOKEN_URL = "https://www.deviantart.com/oauth2/token"
@@ -60,10 +70,12 @@ PAGES_PER_TAG = 120
 PASS_VALID = timedelta(days=7)  # how long after its first page a saved browsing pass is carried on from
 # The pacing rule's numbers (see Pace). The base is half the rate the API limited us at after most of a day.
 BASE_INTERVAL = 2.0  # seconds between two requests to the API while nothing has asked for more
-MAX_INTERVAL = 300.0  # seconds: the ceiling that 429s raise the interval to
+MAX_INTERVAL = 300.0  # seconds: the ceiling that refusals raise the interval to
 EASE = 0.9  # what an answered request multiplies a raised interval by: down gradually, never below the base
+IDLE_HALVING = 3600.0  # seconds with no request to a host that halve the interval the next run begins with
 SERVER_RETRIES = 3  # times a 5XX answer is asked for again. The API docs suggest three for a 500.
-MAX_AT_CEILING = 12  # 429s in a row, each after a wait at the ceiling, before the run stops: an hour of them
+MAX_AT_CEILING = 12  # waits at the ceiling, each of them for a 429, before the run stops
+PATIENCE = MAX_AT_CEILING * MAX_INTERVAL  # the same in seconds, an hour: also the longest wait a host is given
 _KEPT = "Everything stored is kept: run again later"
 
 
@@ -71,55 +83,132 @@ class Stop(Exception):
     """The run cannot go on. The message is safe to print: it never carries response data or credentials."""
 
 
+def now() -> float:
+    """The time a pace file is written with and read against, in seconds. The one clock for that, so that a
+    test can replace it as it replaces time.sleep."""
+    return time.time()
+
+
 class Pace:
-    """The interval between requests to one host, for the life of the client. The one place for the pacing rule.
+    """The interval between requests to one host: for the life of the client, and for the run after it,
+    whichever process that is. The one place for the pacing rule.
 
     It starts at `base`. A 429 or a 5XX doubles it, up to MAX_INTERVAL, for every request that follows and not
     only for the one that is asked again: the API docs call a 429 "a request to slow down", and say that a
     client which keeps to a fixed rate after one stays limited for longer. Any other answer takes a tenth off
-    it, and never below the base. A Retry-After that asks for longer than the interval is waited, once.
-    MAX_AT_CEILING 429s in a row, each after a wait at the ceiling, stop the run: an hour of slowing down has
-    not helped by then. How often an answer is asked for again is the caller's rule, not this one's.
+    it, and never below the base. A Retry-After that asks for longer than the interval is waited, once. How
+    often an answer is asked for again is the caller's rule, not this one's.
+
+    The stop is about time spent refused. Two kinds of wait are counted: the one for a 429 once the interval is
+    at the ceiling, and whatever a Retry-After asks for. PATIENCE seconds of them stop the run: an hour of
+    asking as slowly as we go, or as slowly as we were told to, has not helped by then. One thing starts the
+    count again: the interval coming all the way back down to the base, which takes some seven answers to
+    every refusal. An answer or two among the refusals does not, and neither does a 401. A Retry-After that
+    asks for more than is left of that hour stops the run there and then.
+
+    As a context manager it holds the host for this process and remembers the pace for the next run, in two
+    files in the cache folder that hold numbers and nothing else:
+      <host>.lock  held through the operating system for as long as the run lasts. A second run that finds it
+                   held stops before it does anything. A process that died holds nothing, whatever it left.
+      <host>.pace  the interval, and the time before which the next request should not go: written before
+                   every request and after every answer. The next run begins with that interval, halved for
+                   every IDLE_HALVING seconds that have passed since that time. A run that begins before it
+                   waits what is left, and no less than one whole interval. No file means no run before this
+                   one. A file that is not those two numbers means start slow: at the ceiling, after a wait
+                   of the ceiling.
     """
 
     def __init__(self, base: float, host: str) -> None:
         self.base = self.interval = self.longest = base
         self.host = host  # a name of ours for the summary, such as "the API"
-        self.requests = self.limited = self._at_ceiling = 0
-        self.waited = self._asked = 0.0  # seconds waited so far, and seconds the last Retry-After asked for
+        self.requests = self.limited = 0
+        # Seconds: waited so far, asked for before the next request, and counted towards the hour that stops a run.
+        self.waited = self._asked = self._refused = 0.0
+        self._lock: int | None = None
         self.tell: Callable[[], None] = lambda: None  # called before every request: see tell()
 
+    def _file(self, kind: str) -> pathlib.Path:
+        return config.CACHE_DIR / f"{self.host.replace(' ', '-')}.{kind}"
+
+    def __enter__(self) -> "Pace":
+        config.CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        lock = os.open(self._file("lock"), os.O_RDWR | os.O_CREAT)
+        try:
+            if sys.platform == "win32":
+                msvcrt.locking(lock, msvcrt.LK_NBLCK, 1)
+            else:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            os.close(lock)
+            raise Stop(f"another run is talking to {self.host}, and one at a time is the rule") from None
+        self._lock = lock
+        try:
+            interval, ready = map(float, self._file("pace").read_text(encoding="ascii").split())
+            late = now() - ready
+            if not (0 <= interval <= MAX_INTERVAL and -PATIENCE <= late < math.inf):
+                raise ValueError("not numbers a run could have left")
+        except FileNotFoundError:
+            return self
+        except (OSError, ValueError):  # unreadable, half written, or anything else: slow is the safe reading
+            interval, late = MAX_INTERVAL, -MAX_INTERVAL
+        self.interval = self.longest = max(self.base, interval * 0.5 ** (max(late, 0.0) / IDLE_HALVING))
+        self._asked = max(self.interval, -late) if late < 0 else 0.0
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        if self._lock is not None:
+            os.close(self._lock)  # which lets the lock go, as the end of the process would
+            self._lock = None
+
+    def _save(self) -> None:
+        """Write the pace down for the next run. It only remembers: a file that cannot be written ends no run."""
+        with contextlib.suppress(OSError):
+            ready = now() + max(self.interval, self._asked)
+            self._file("pace").write_text(f"{self.interval!r} {ready!r}\n", encoding="ascii")
+
     def wait(self) -> None:
-        """Call before every request to the host. It waits the interval, except before the first one."""
+        """Call before every request to the host. It waits the interval; before the first request of a run,
+        only what the run before it left to wait."""
         self.tell()
-        if self.requests:
-            seconds = max(self.interval, self._asked)
+        seconds = max(self.interval, self._asked) if self.requests else self._asked
+        if seconds:
             # Not injectable, on purpose: the tests replace time.sleep, so this is the line they prove.
             time.sleep(seconds)
             self.waited += seconds
         self.requests += 1
         self._asked = 0.0
+        self._save()
 
     def ease(self) -> None:
         """Call after an answer that is neither a 429 nor a 5XX."""
-        self.interval, self._at_ceiling = max(self.base, self.interval * EASE), 0
+        self.interval = max(self.base, self.interval * EASE)
+        if self.interval == self.base:
+            self._refused = 0.0
+        self._save()
 
     def slow(self, response: httpx.Response | None = None) -> None:
         """Call after an answer that is a 429 or a 5XX, and with nothing after no answer at all."""
-        if response is not None and response.status_code == 429:
-            self.limited += 1
-            self._at_ceiling += self.interval == MAX_INTERVAL
-        if self._at_ceiling == MAX_AT_CEILING:
-            said = f"{MAX_AT_CEILING} times in a row, {MAX_INTERVAL / 60:.0f} minutes apart"
-            raise Stop(f"rate limited: {self.host} answered HTTP 429 {said}. {_KEPT}")
+        limited = response is not None and response.status_code == 429
+        self.limited += limited
+        if self._refused >= PATIENCE:
+            said = f"{PATIENCE / 60:.0f} minutes of waits, each {MAX_INTERVAL / 60:.0f} minutes or as long as it asked"
+            raise Stop(f"rate limited: {self.host} kept refusing through {said}. {_KEPT}")
         # ponytail: Retry-After as a number of seconds only. Given as a date it is not read, and the doubled
         # interval is what is waited. Read the date too if a host is ever seen to send one.
         asked = response.headers.get("retry-after", "") if response is not None else ""
-        self._asked = float(asked) if asked.isascii() and asked.isdigit() else 0.0
-        if self._asked > MAX_AT_CEILING * MAX_INTERVAL:
-            raise Stop(f"rate limited: {self.host} asks for a wait of more than an hour. {_KEPT}")
+        # Up to nine ASCII digits are a number of seconds. Anything else says nothing: a sign, a word, 400 digits.
+        self._asked = float(asked) if asked.isascii() and asked.isdigit() and len(asked) < 10 else 0.0
         self.interval = min(self.interval * 2, MAX_INTERVAL)
         self.longest = max(self.longest, self.interval)
+        too_long = self._asked > PATIENCE - self._refused
+        self._asked = min(self._asked, PATIENCE)  # what the next run is left to wait, when this one will not
+        # What counts towards the hour: what a Retry-After asks for, and the wait for a 429 once the interval is
+        # at the ceiling. A 5XX with no Retry-After counts for nothing: it is asked for again a few times at the
+        # slower pace, and then it is the caller's to judge.
+        self._refused += max(self._asked, MAX_INTERVAL * (limited and self.interval == MAX_INTERVAL))
+        self._save()
+        if too_long:
+            raise Stop(f"rate limited: {self.host} asks for a wait of {asked} seconds, more than a run waits. {_KEPT}")
 
     def counts(self) -> dict[str, int]:
         """What the pace has done so far, for the summary and for tell(): counts, and whole seconds rounded up."""
@@ -226,16 +315,24 @@ def _http_logs_off() -> Iterator[None]:
             logger.setLevel(level)
 
 
-def _run(api: _Api, counts: dict[str, int], max_artists: int, db: pathlib.Path | str | None) -> None:
+def _run(api: _Api, counts: dict[str, int], max_artists: int, db: pathlib.Path | str | None) -> int:
+    """Browse, from where the saved pass has got to. Returns how many tags the API refused and the run passed over."""
     progress = store.browsing_pass(datetime.now(UTC) - PASS_VALID, db)
     # The pass as it is saved, first: a run that stops at its first request still says where the pass is.
     counts.update(zip(_TALLY, store.tally(MIN_HITS, db), strict=True))
     known = {key for key, _, _ in store.all_artists(db)}
     added = 0  # artists this run has stored who were not in the store before it
+    refused = 0
     for tag in NICHE_TAGS:
         offset, pages = progress.get(tag, (0, 0))
         while offset is not None and pages < PAGES_PER_TAG:
             response = api.get("/browse/tags", tag=tag, offset=offset, limit=PAGE_SIZE)
+            if 400 <= response.status_code < 500 and response.status_code != 401:  # a 429 never gets here
+                # The API will not serve this tag, and that says nothing of the next one. The tag is ours, so it
+                # can be named. The page is not noted as read: the next run asks for it again.
+                print(f"skipped the tag {tag}: browse answered HTTP {response.status_code}", file=sys.stderr)
+                refused += 1
+                break
             if response.status_code != 200:
                 raise Stop(f"browse failed with HTTP {response.status_code}")
             page = response.json()
@@ -273,7 +370,8 @@ def _run(api: _Api, counts: dict[str, int], max_artists: int, db: pathlib.Path |
                 store.note_browsed(tag, offset, db)
             counts.update(zip(_TALLY, store.tally(MIN_HITS, db), strict=True))
             if capped:
-                return
+                return refused
+    return refused
 
 
 def discover(
@@ -298,11 +396,14 @@ def discover(
         ):
             api = _Api(http, client_id, client_secret)
             api.pace.tell = lambda: tell("discover", counts | api.pace.counts())
-            try:
-                _run(api, counts, max_artists, db)
-            finally:
-                counts.update(api.pace.counts())
-                tell("discover")
+            # Another run that has the API is found out here, before anything of its is touched: not the saved
+            # pass, and not the file that says where it is.
+            with api.pace:
+                try:
+                    status = int(_run(api, counts, max_artists, db) > 0)
+                finally:
+                    tell("discover")  # first: whatever follows, no file is left that says a run is on
+                    counts.update(api.pace.counts())
     except Stop as stop:
         print(f"stopped: {stop}", file=sys.stderr)
         status = 1
