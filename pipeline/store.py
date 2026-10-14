@@ -83,6 +83,9 @@ _SPACED_DOT = re.compile(f" ?{_MARK} ?")
 _IDNA_2003_ONLY = "".join(map(chr, (0xDF, 0x1E9E, 0x3C2, 0x200C, 0x200D)))  # sharp s twice, final sigma, two joiners
 _SHA256 = re.compile(r"[0-9a-f]{64}")
 _OTHERS = "SELECT 1 FROM listed WHERE domain_hash = ? AND artist_hash != ?"  # is a domain listed by anybody else
+# The most profiles that can list one site and it still be somebody's own, for a removal of it: two accounts of
+# one person. A site more profiles list is shared, and nobody's alone to answer for (see removed_site_of_few).
+OWNERS = 2
 
 
 def canonical_host(host: str) -> str | None:
@@ -363,23 +366,26 @@ def record_listing(username: str, hosts: Iterable[str], db: pathlib.Path | str |
         return _removed(conn, [covering for host in hosts for covering in _host_keys(host)])
 
 
-def lists_alone(username: str, hosts: Iterable[str], db: pathlib.Path | str | None = None) -> bool:
-    """True when one of these hosts is on a removed site that no other profile was seen to list.
+def removed_site_of_few(username: str, hosts: Iterable[str], db: pathlib.Path | str | None = None) -> bool:
+    """True when one of these hosts is on a removed site that the profiles of no more than OWNERS artists, this
+    one among them, were seen to list.
 
-    For the collect stage, after record_listing() has been called for every profile of its run: the one case in
-    which a profile's word puts an artist on the removal list, and only one of whom nothing is kept. A site that
-    a second profile lists, in a link of any shape, is not this artist's alone to answer for: that is the guard
-    against one removal, or one wrong answer given for every profile, taking many artists. It changes nothing.
+    For the collect stage, after record_listing() has been called for every profile of its run: the case in
+    which a profile's word puts an artist on the removal list. A site that more profiles list, in a link of any
+    shape, is shared and nobody's to answer for: that is the guard against one removal, or one wrong answer
+    given for every profile, taking many artists. It changes nothing.
 
     ponytail: a listing is only known once the collect stage has read the profile (see own_site_candidates),
-    so an artist whose turn has not come yet is not counted as another one who lists the site.
+    so an artist whose turn has not come yet is not counted as one who lists the site; and artists are counted
+    by handle, so an account that took a new handle counts twice.
     """
     key, hosts = _hash(artist_key(username)), list(hosts)
+    others = "SELECT count(DISTINCT artist_hash) FROM listed WHERE domain_hash = ? AND artist_hash != ?"
     with _open(db) as conn:
         return any(
             _removed(conn, _host_keys(host))
             and (domain := registrable_domain(host)) is not None
-            and not conn.execute(_OTHERS, (_hash(f"site:{domain}"), key)).fetchone()
+            and conn.execute(others, (_hash(f"site:{domain}"), key)).fetchone()[0] < OWNERS
             for host in hosts
         )
 

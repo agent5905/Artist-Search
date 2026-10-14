@@ -457,21 +457,25 @@ def test_naming_a_removed_site_changes_nothing_that_is_stored_and_bars_nobody(db
     assert add(db, username="zz-fake-e", links=("https://zz-fake-e-new.art",)) is True  # an answer without it is
 
 
-def test_who_names_a_removed_site_alone_is_asked_of_the_listings_and_asking_changes_nothing(db):
-    """For the one case in which a profile's word puts an artist on the removal list: nothing of theirs is kept,
-    and the removed site their profile names is one no other profile was seen to list, in a link of any shape.
-    A site two profiles list is not either's alone: one removal must not take many artists."""
+def test_who_names_a_removed_site_of_few_is_asked_of_the_listings_and_asking_changes_nothing(db):
+    """For the case in which a profile's word puts an artist on the removal list: the removed site their profile
+    names is one no more than two profiles were seen to list, in a link of any shape, theirs among them: two
+    accounts of one person. A site three profiles list is shared: one removal must not take many artists."""
     store.mark_removed("site:zz-fake-gone.art", db)
     store.record_listing("zz-fake-one", ["www.zz-fake-gone.art"], db)
     store.record_listing("zz-fake-two", ["zz-fake-two.art"], db)
     before = (rows(db), rows(db, "removed"), rows(db, "listed"))
-    assert store.lists_alone("ZZ-Fake-One", ["www.artstation.com", "shop.zz-fake-gone.art"], db) is True
-    assert store.lists_alone("zz-fake-two", ["zz-fake-two.art"], db) is False  # a site that nobody removed
-    assert store.lists_alone("zz-fake-two", [], db) is False
+    assert store.removed_site_of_few("ZZ-Fake-One", ["www.artstation.com", "shop.zz-fake-gone.art"], db) is True
+    assert store.removed_site_of_few("zz-fake-two", ["zz-fake-two.art"], db) is False  # a site nobody removed
+    assert store.removed_site_of_few("zz-fake-two", [], db) is False
     assert (rows(db), rows(db, "removed"), rows(db, "listed")) == before
     store.record_listing("zz-fake-three", ["users.zz-fake-gone.art"], db)  # a second profile lists it
-    assert store.lists_alone("zz-fake-one", ["zz-fake-gone.art"], db) is False
-    assert store.lists_alone("zz-fake-three", ["users.zz-fake-gone.art"], db) is False
+    assert store.removed_site_of_few("zz-fake-one", ["zz-fake-gone.art"], db) is True
+    assert store.removed_site_of_few("zz-fake-three", ["users.zz-fake-gone.art"], db) is True
+    store.record_listing("zz-fake-four", ["zz-fake-gone.art"], db)  # and a third: shared
+    assert store.removed_site_of_few("zz-fake-one", ["zz-fake-gone.art"], db) is False
+    assert store.removed_site_of_few("zz-fake-four", ["zz-fake-gone.art"], db) is False
+    assert store.OWNERS == 2
 
 
 def test_what_profiles_list_is_kept_as_hashes_only(db):
