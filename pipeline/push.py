@@ -13,8 +13,11 @@ In this order, and the order is the point:
      deleted there. Only after that is what is kept here about them purged. A file that cannot be deleted is
      counted, and the next run tries again: the removal stands meanwhile, here and there, and the run goes on
      (it ends with a status that is not zero, and says why). When writing it down fails the run stops: nothing
-     is purged and nothing is built.
-  2. The rows are built (see build) from what is left, and only from artists the store still lists.
+     is purged and nothing is built. A site that more than store.OWNERS artists list or link to is shared: its
+     removal bars none of them, as the collect stage holds it (store._named_by); they are not collected while
+     they link to it, and not sent while their profile names it (site_removed).
+  2. The rows are built (see build) from what is left, and only from artists the store still lists, from one
+     copy of the store made at one moment.
   3. The database is brought to exactly those rows: an artist or a work it has that is not among them is
      deleted, then db.load writes the rest. So an artist who stops qualifying leaves on the next run. An artist
      who loses a work has the words of their works taken out of their own row in the same call that deletes
@@ -23,9 +26,12 @@ In this order, and the order is the point:
 Four things stop a run, each with a message and a status that is not zero:
   - the database holds a slug that begins "zz-". Those are another builder's test rows, and this stage would
     delete them. It is the first thing looked at, before anything is done here or there;
-  - more than DELETE_FLOOR key hashes would be added to the database's removal list, where they stay for good.
-    Removals come one at a time, so many at once is a broken local store and nobody's wish. Nothing is done,
-    here or there, and `--allow-delete N` lets N of them through;
+  - the removals made here would bar more than DELETE_FLOOR people that the database's list does not bar
+    already: each artist kept here whom they bar, and each of their hashes that is no handle or account of one
+    of those artists (a site, a handle nobody here has). Removals come one at a time, a person each, so many at
+    once is a broken local store and nobody's wish. What the database's own list asks is done all the same,
+    here and there: it is the list of record, and it puts nobody new on itself. Nothing else is done, and
+    `--allow-delete N` lets N of them through;
   - the local library has no artists. An empty or a new file is no reason to empty the database;
   - more would be deleted than a run is believed about: more than DELETE_PERCENT of the artists the database
     holds, of their works or of their neighbour rows, and more than DELETE_FLOOR. A changed prompt version, a
@@ -33,8 +39,9 @@ Four things stop a run, each with a message and a status that is not zero:
     Artists on the removal list are not counted: step 1 is never held up by this.
 The last two stop a run after step 1 and before step 3 writes anything.
 
-`--dry-run` changes nothing: not the database, not the local store, not a file. It reads both, works out what a
-run would do and prints the same counts, and stops where a run would stop.
+`--dry-run` changes nothing: not the database, not the local store, not a file, whatever state they are in. It
+reads both, the store only through copies of it (store.snapshot), works out what a run would do and prints the
+same counts, and stops where a run would stop.
 
 The collect stage deletes nothing on DeviantArt's say-so: it leaves a mark, or lets a work's last sighting grow
 old. What that means for the public is decided here (see build): nothing marked is sent, and neither is a work
@@ -47,24 +54,26 @@ them and found no private contact. A work's page address is made from its title,
 contact, or were not read, is not sent at all. And every text that is sent, whoever wrote it, is held to the
 collect stage's plain rule as it goes (library.holds_contact): a description is a model's words about an image,
 and an image can show an address. A text that fails is left out, and a work whose title or description fails is
-not sent. The handle is the one text that is not asked: it is the name the artist is listed under.
+not sent. What a model wrote (a description, verified tags, the profile and its facts) is also left out when it
+names a messaging, social or payment service (library.names_service): no model reads it for contacts, and "Discord
+fakepainter#1234" passes the plain rule. A work whose description names one goes without it. The handle is the
+one text that is not asked: it is the name the artist is listed under.
 A reading is tied to what was read: every reader this stage builds from gives a reading only while it is of the
 words or the image as they are now (pipeline/library.py, pipeline/tagging.py). So a tagline, a title or tags
 that changed after they were read are words that were not read; a work whose image the artist replaced is not
 tagged and not rated until the new image is fetched and read, and its new thumbnail is not sent under the old
 one's rating; a style vector of the old image is none; and an artist whose profile was made from a reading that
-has since gone stale is held back (profile_out_of_date) until the profile rests on what the works are now.
+has since gone stale, or from a work since marked or taken down, is held back (profile_out_of_date) until the
+profile rests on what the works are now (profiles.current).
 Stdout is one JSON object of counts. This stage keeps no table of its own, and writes to the local stores only
 through store.import_removed and library.purge.
 """
 
 import argparse
-import contextlib
 import json
 import math
 import pathlib
 import re
-import sqlite3
 import sys
 from collections import Counter
 from collections.abc import Collection
@@ -88,12 +97,15 @@ PICKS = 4
 # Of the artists the database holds, of their works or of their neighbour rows: more than this going at once is
 # not believed.
 DELETE_PERCENT = 10
-# Deletions of each kind that a run may always make, however little the database holds. And the key hashes a run
-# may always add to the database's removal list: one removal is two or three (each handle, the account, a site).
+# Deletions of each kind that a run may always make, however little the database holds. And the people the
+# removals made here may always bar (see run).
 DELETE_FLOOR = 5
 TEST_SLUG = "zz-"  # how the other builders' test rows begin. Never sent, and a database that has one is left alone
 STYLE_MODEL, STYLE_RULE = "csd", "local"  # round 7's blind test chose them
 MAX_SEARCH_TEXT = 4000  # sql/001_schema.sql: artists_own_words_sizes
+# Builds a run makes when the store changes under them (see build); the last is sent. ponytail: two, because with
+# collection running a commit lands in nearly every build (10 s on 2026-10-13), and a third would be as stale.
+TRIES = 2
 
 # Besides these, one reason for each mark the collect stage has left: "marked_<its reason>" (see _marked).
 ARTIST_REASONS = (
@@ -228,25 +240,17 @@ def _too_many(part: int, whole: int) -> bool:
     return whole > 0 and 100 * part >= ADULT_PERCENT * whole
 
 
-def _reader(local: pathlib.Path | str | None) -> contextlib.closing[sqlite3.Connection]:
-    """A connection to the local file that cannot write. It knows own_file(), which library.IMAGE asks."""
-    path = pathlib.Path(local or config.LOCAL_DB).resolve()
-    conn = sqlite3.connect(f"{path.as_uri()}?mode=ro", uri=True, timeout=60)
-    conn.create_function("own_file", 1, library.own_file, deterministic=True)
-    return contextlib.closing(conn)
-
-
 def _removed_here(local: pathlib.Path | str | None) -> set[str]:
     """Every key hash on the store's removal list: artists, their sites, and the accounts the collect stage adds.
     ponytail: the store has no reader for its list, so it is selected here. Move it there when it has."""
-    with _reader(local) as conn:
+    with store._open(local) as conn:
         return {key_hash for (key_hash,) in conn.execute("SELECT key_hash FROM removed")}
 
 
 def _collected(
     local: pathlib.Path | str | None,
 ) -> tuple[dict[str, list[tuple[Any, ...]]], dict[str, tuple[str | None, str | None, str]]]:
-    """What the library holds, read through a connection that cannot write.
+    """What the library holds.
 
     Each artist's works, the most recently published first, as (deviation id, page, title, the artist's tags as
     JSON, thumbnail, when it was last seen and still qualified, whether it has a cached image, its rating from
@@ -256,7 +260,7 @@ def _collected(
     work that has no tags, so they are selected here. Move it there when they have.
     """
     works: dict[str, list[tuple[Any, ...]]] = {}
-    with _reader(local) as conn:
+    with tagging._open(local) as conn:  # the library's tables and the tagging stage's, with own_file() for IMAGE
         for key, *work, sorted_as in conn.execute(
             "SELECT w.artist_key, w.deviation_id, w.page_url, w.title, w.tags, w.thumb_url, w.fetched_at, "
             "w.image_file IS NOT NULL, f.result FROM works w LEFT JOIN work_format f "
@@ -299,8 +303,24 @@ def build(
     neighbour is always an artist who is sent too. A neighbour's row says which of their works to show beside
     the artist: the PICKS closest in style to the artist's (style.all_closest_works), best first, counting only
     works that are sent on either side. An artist who goes and has no neighbour gets one row that names no
-    neighbour (see the end of this function). Reads the local stores and changes nothing.
+    neighbour (see the end of _build).
+
+    Every read is of one copy of the store made at one moment (store.snapshot), so the rows are all of that
+    moment: no title goes under the reading of another, and no card is sent of works a mark made since has
+    taken away. When the store changed while the rows were built, they are built again from a new copy, up to
+    TRIES times, and the last is what goes: still one moment, and the next run catches up with the rest. Reads
+    the local stores and changes nothing, not even a table.
     """
+    for _ in range(TRIES):
+        with store.snapshot(local) as now:
+            built = _build(now, removed)
+            if not now.changed():
+                break
+    return built
+
+
+def _build(local: store.Snapshot, removed: Collection[str]) -> tuple[Rows, Rows, Rows, Counter[str]]:
+    """build(), from one copy of the store."""
     listed = {key: username for key, username, _ in store.all_artists(local) if not store.covers(removed, key)}
     marked_artists, marked_works = library.artist_marks(local), library.work_marks(local)
     sizes = library.thumb_sizes(local)  # of the thumbnails the works' rows name; a work stored before sizes has none
@@ -313,9 +333,10 @@ def build(
     works_of, fields = _collected(local)
     counts: Counter[str] = Counter()
 
-    def plain(texts: list[str]) -> list[str]:
-        """Of these texts, the ones the plain rule finds no contact in. The others are left out, and counted."""
-        kept = [text for text in texts if not library.holds_contact(text)]
+    def plain(texts: list[str], model: bool = False) -> list[str]:
+        """Of these texts, the ones the plain rule finds no contact in, and of a `model`'s words the ones that
+        name no service either (library.names_service). The others are left out, and counted."""
+        kept = [text for text in texts if not (library.holds_contact(text) or model and library.names_service(text))]
         counts["texts_left_out_for_contact"] += len(texts) - len(kept)
         return kept
 
@@ -392,7 +413,9 @@ def build(
         shown = plain([tag for tag in profile["own_words"] if re.sub(r"[\s_-]", "", tag) in on_sent and len(tag) <= 60])
         # An older row may lack a kind. Its own_words are of works that may not go: of those that do, every tag is
         # in most_used, and the ones shown are in top_tags, which keyword search reads too.
-        facts = plain([value for field in profiles.STATED if field != "own_words" for value in profile.get(field, [])])
+        facts = plain(
+            [value for field in profiles.STATED if field != "own_words" for value in profile.get(field, [])], True
+        )
         # ponytail: the specialty the artist picked on DeviantArt is not in it: nothing has read that field
         # for a private contact. Add it when the tagging stage does.
         # ponytail: every part of it has passed the plain rule as a text of its own, and the text they make is
@@ -413,9 +436,9 @@ def build(
                 "tagline": next(iter(plain([tagline])), None) if tagline and contacts.get(key) == "no" else None,
                 "top_tags": shown,
                 "search_text": search_text or None,
-                "profile": next(iter(plain([profile["written"]])), None),
-                "specialties": plain(profile["specialties"]),
-                "mediums": plain(profile["mediums"]),
+                "profile": next(iter(plain([profile["written"]], True)), None),
+                "specialties": plain(profile["specialties"], True),
+                "mediums": plain(profile["mediums"], True),
                 "open_for_work": profile["open_for_work"],
                 "profile_embedding": profile["embedding"],
             }
@@ -430,8 +453,8 @@ def build(
                     "page_url": page_url,
                     "image_url": image_url,
                     "title": title,
-                    "description": result["description"],
-                    "tags": plain([tag for tag in dict.fromkeys(verified) if tag != "unclear"]),
+                    "description": next(iter(plain([result["description"]], True)), None),
+                    "tags": plain([tag for tag in dict.fromkeys(verified) if tag != "unclear"], True),
                     "position": position,
                     # The thumbnail's size, when the collect stage has it. Every work carries both keys either
                     # way, because the database wants one shape a load: two numbers, or two Nones.
@@ -493,15 +516,15 @@ def _removed_sql(key_hashes: set[str]) -> str:
 
 
 def _removal(
-    remote: set[str], there: Rows, kept: set[str], local: pathlib.Path | str | None
+    listed: set[str], there: Rows, kept: set[str], local: pathlib.Path | str | None
 ) -> tuple[set[str], set[str], int]:
-    """What hard rule 7 asks of this run, worked out with nothing changed: every key hash the two removal lists
-    must hold when the run is over, the keys of the artists those bar that are stored or kept here, and how many
-    of them the store will stop listing.
+    """What hard rule 7 asks of this run for these key hashes, worked out with nothing changed: every key hash
+    the two removal lists must hold for them, the keys of the artists those bar that are stored or kept here,
+    and how many of them the store will stop listing.
 
-    Only a removal list says who is removed: `remote`, the database's, and the store's own. An artist the
-    store's `artists` table merely lacks is nobody's removal. That table was emptied once, and the run that
-    followed purged the whole library and barred every account.
+    Only a removal list says who is removed: `listed` is the database's, with or without the store's own. An
+    artist the store's `artists` table merely lacks is nobody's removal. That table was emptied once, and the
+    run that followed purged the whole library and barred every account.
 
     A hash bars the stored artists it names, by their handle or by the site of their stored link
     (store.named_by), and the artists kept here (`kept`, the library's keys) under a handle it names. A removal
@@ -513,12 +536,8 @@ def _removal(
     An artist the database (`there`, its listing) shows with a removed site is removed under their handle as
     well, which is what the store does for the artists it lists: they stay out when their profile names
     another site.
-
-    ValueError when the database's list holds something that is not a sha256 hex digest.
     """
-    if not all(_SHA256.fullmatch(key_hash) for key_hash in remote):
-        raise ValueError("the database's removal list holds something that is not a sha256 hex digest")
-    hashes = _removed_here(local) | remote
+    hashes = set(listed)
     hashes |= {row["da_key"] for row in there if row["site_key"] in hashes}
     barred: set[str] = set()
     while True:  # until a pass finds nobody new: each pass but the last bars somebody
@@ -549,9 +568,9 @@ def run(dry_run: bool, allow_delete: int | None = None, local: pathlib.Path | st
 
     Stop, and nothing more is done, in the four cases the module's docstring names; when too much would be
     deleted it carries the counts. `allow_delete` is how many artists, how many works and how many neighbour
-    rows this one run may delete instead, and how many key hashes it may add to the database's removal list
-    when that is more than DELETE_FLOOR. RuntimeError when the database fails, ValueError when a removal list
-    cannot be read: whichever comes, nothing after it is done.
+    rows this one run may delete instead, and how many people the removals made here may bar (see the module's
+    docstring) when that is more than DELETE_FLOOR. RuntimeError when the database fails, ValueError when a
+    removal list cannot be read: whichever comes, nothing after it is done.
     """
     there = db.sql(LISTING_SQL)
     if any(str(row["slug"]).startswith(TEST_SLUG) for row in there):
@@ -560,10 +579,22 @@ def run(dry_run: bool, allow_delete: int | None = None, local: pathlib.Path | st
             "it, and a push would delete them. Nothing was done. Run it again when they have finished."
         )
     remote = {row["key_hash"] for row in db.sql(REMOVED_SQL)}
+    if not all(_SHA256.fullmatch(key_hash) for key_hash in remote):
+        raise ValueError("the database's removal list holds something that is not a sha256 hex digest")
     if dry_run and not pathlib.Path(local or config.LOCAL_DB).is_file():
         raise Stop(NO_ARTISTS)  # a run would make the file and find nothing in it: a dry run makes no file
-    kept = set(library.artist_keys(local))
-    hashes, removed, applied = _removal(remote, there, kept, local)
+    with store.snapshot(local) as now:
+        kept = set(library.artist_keys(now))
+        # What the database's own list asks, and what it asks with the removals made here.
+        theirs, whole = _removal(remote, there, kept, now), _removal(remote | _removed_here(now), there, kept, now)
+        # The people the removals made here bar that the database's list does not: each artist, and each hash
+        # that is no handle or account of one of them.
+        new = whole[1] - theirs[1]
+        own = {store._hash(key) for key in new} | {hash_ for key in new if (hash_ := library.account_hash(key, now))}
+        people = len(new) + len(whole[0] - theirs[0] - own)
+    may_add = max(DELETE_FLOOR, allow_delete or 0)  # a handful always goes through, whatever a run is told
+    flood = people > may_add  # then only the database's own list is honoured, and the run stops after it
+    hashes, removed, applied = theirs if flood else whole
     purge = sorted(removed & kept)
     # What the database's list lacks is added, so that another machine, or this file made again, hears of it.
     # The artists the list bars go with it, whatever happens further down: the database deletes them itself when
@@ -571,15 +602,6 @@ def run(dry_run: bool, allow_delete: int | None = None, local: pathlib.Path | st
     unlisted = hashes - remote
     barred = {int(row["artist_id"]) for row in there if hashes & {row["da_key"], row["site_key"]}}
     removal = ([_removed_sql(unlisted)] if unlisted else []) + ([_delete_sql("artists", barred)] if barred else [])
-    may_add = max(DELETE_FLOOR, allow_delete or 0)  # a handful always goes through, whatever a run is told
-    if len(unlisted) > may_add:
-        raise Stop(
-            f"this run would add {len(unlisted)} key hashes to the database's removal list, where they stay for "
-            f"good (it may add {may_add}), delete the {len(barred)} artists there that the list bars, and purge "
-            f"{len(purge)} artists here. Removals come one at a time, so this many at once looks like a broken "
-            "local store. Nothing was done, here or there. If they are real removals, run it again with "
-            f"--allow-delete {len(unlisted)}."
-        )
     stuck = 0
     if not dry_run:
         store.import_removed(hashes, local)  # here first, then there, and only then is a file deleted
@@ -590,6 +612,15 @@ def run(dry_run: bool, allow_delete: int | None = None, local: pathlib.Path | st
                 library.purge(key, local)
             except OSError:  # a file somebody holds open: the rows that name it stay, and the next run finds them
                 stuck += 1
+    if flood:
+        done = "would be" if dry_run else "was"
+        raise Stop(
+            f"the removals made here would bar {people} people (it may bar {may_add}): add "
+            f"{len(whole[0] - theirs[0])} key hashes to the database's removal list, where they stay for good, and "
+            f"purge {len(whole[1] & kept) - len(purge)} artists here. Removals come one at a time, so this many at "
+            f"once looks like a broken local store. What the database's own list asks {done} done, here and there, "
+            f"and nothing else. If they are real removals, run it again with --allow-delete {people}."
+        )
     if not kept - removed:
         raise Stop(NO_ARTISTS)
     artists, works, neighbours, held = build(local, hashes)
@@ -672,7 +703,7 @@ def main(argv: list[str] | None = None) -> None:
         metavar="N",
         help="let this one run delete up to N artists who no longer qualify, and up to N works and N neighbour rows "
         f"of artists who stay (without it: {DELETE_PERCENT} percent of what the database has, and never fewer than "
-        f"{DELETE_FLOOR}); and add up to N key hashes to the database's removal list (without it: {DELETE_FLOOR})",
+        f"{DELETE_FLOOR}); and let the removals made here bar up to N people (without it: {DELETE_FLOOR})",
     )
     args = parser.parse_args(argv)
     try:

@@ -390,13 +390,32 @@ def test_removing_a_site_stops_at_the_artists_whose_stored_link_it_is(db):
     add(db, username="zz-fake-one", links=("https://zz-fake-first.art/",))
     add(db, username="zz-fake-two", links=("https://zz-fake-first.art/", "https://zz-fake-second.art/"))
     add(db, username="zz-fake-three", links=("https://zz-fake-second.art/",))
-    store.record_listing("zz-fake-lister", ["users.zz-fake-first.art"], db)  # seen to list it, in a link not kept
+    store.record_listing("zz-fake-lister", ["users.zz-fake-second.art"], db)  # seen to list the other one
     assert store.mark_removed("site:zz-fake-first.art", db) == 2
     assert keys(db) == ["da:zz-fake-three"]
     assert [row[0] for row in rows(db, "removed")] == sorted(
         [sha("site:zz-fake-first.art"), sha("da:zz-fake-one"), sha("da:zz-fake-two")]
     )
     assert not store.is_removed("da:zz-fake-lister", db) and not store.is_removed("site:zz-fake-second.art", db)
+
+
+@pytest.mark.parametrize("third", ["links_to_it", "was_seen_to_list_it"])
+def test_removing_a_site_more_than_owners_artists_have_bars_none_of_them(db, third):
+    """A shared site, as the collect stage holds it (removed_site_of_few): its removal stands, and bars nobody.
+    Its artists stay out while their link is on it, and nobody else is touched."""
+    add(db, username="zz-fake-one", links=("https://zz-fake-hub.art/",))
+    add(db, username="zz-fake-two", links=("https://www.zz-fake-hub.art/about",))
+    if third == "links_to_it":
+        add(db, username="zz-fake-three", links=("https://zz-fake-hub.art/",))
+    else:  # in a link the store did not keep
+        store.record_listing("zz-fake-three", ["users.zz-fake-hub.art"], db)
+    add(db, username="zz-fake-four", links=("https://zz-fake-other.art/",))
+    assert store.OWNERS == 2 and store.mark_removed("site:zz-fake-hub.art", db) == 0
+    assert [row[0] for row in rows(db, "removed")] == [sha("site:zz-fake-hub.art")]
+    stored = ["da:zz-fake-four", "da:zz-fake-one", "da:zz-fake-two"] + ["da:zz-fake-three"] * (third == "links_to_it")
+    assert keys(db) == sorted(stored)
+    assert [key for key, _, _ in store.all_artists(db)] == ["da:zz-fake-four"]
+    assert not any(store.is_removed(f"da:zz-fake-{n}", db) for n in ("one", "two", "three", "four"))
 
 
 def test_site_removal_deletes_and_blocks_artists_who_link_to_it(db):

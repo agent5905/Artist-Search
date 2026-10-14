@@ -197,17 +197,36 @@ _NOT_THE_WORK = re.compile(
     r"photoshop|procreate|blender|clipstudio|krita|zbrush|corelpainter|paintstorm|ipad|wacom|noai|notai|humanmade|"
     r"humanart|challenge|epic|beaut|amazing|awesome|badass|detail|\d{4}|lovecraft|tolkien|frankherbert|giger"
 )
-# Dress or body. The site never describes either, however many works are tagged so: a tag with one of these in
-# it is not shown. "cape" is no part of "landscape", nor "heels" of "wheels".
-# ponytail: a short hand list, matched anywhere in a tag, so "butterfly" and "detail" go with the rest. A crude
-# tag that is not on it is shown as the artist wrote it; pictures like that are still counted as UNSUITABLE,
-# and the push stage holds back an artist who has many. The upgrade is to ask the language model which of the
-# tags the site may not print.
+# Dress or body, and sex. The site never describes any of them, however many works are tagged so: a tag with one of
+# these in it is not shown ("musclegirl", "bikiniarmor"). Made by reading every tag that SHARED artists in the
+# store used on 2026-10-13 (2,299 of them), and each pattern held against all 13,685: "cape" is no part of
+# "landscape", "hips" of "spaceships", "wings" of "drawings", "horn" of "thorn", "robe" of "probe", "hair" of
+# "chair", nor "butt" of "butterfly".
+# ponytail: a hand list, matched anywhere in a tag. A crude tag that is not on it is shown as the artist wrote it;
+# pictures like that are still counted as UNSUITABLE, and the push stage holds back an artist who has many. The
+# upgrade is to ask the language model which of the tags the site may not print.
 _BODY = re.compile(
-    r"revealing|skimpy|scantily|lingerie|bikini|swimsuit|swimwear|underwear|nude|naked|topless|busty|boobs|tits|"
-    r"booty|breast|cleavage|curvy|thicc|voluptuous|thigh|feet|foot|butt|sexy|seductive|sensual|erotic|pinup|nsfw|"
-    r"waifu|fetish|bondage|dominatrix|latex|mouth|jaw|maw|tongue|drool|saliva|belly|bellies|outfit|dress|skirt|"
-    r"(?<!s)cape|cloak|stockings|corset|(?<!w)heels|uniform|tail"
+    # sex, nudity and fetish
+    r"revealing|skimpy|scantily|(?<!me)nud(?:e|ity|ist|ism)|naked|topless|^bare|(?<!u)sex|seduc|sensual|erotic|"
+    r"pinup|nsfw|hentai|ecchi|lewd|porn|smut|(?<!c)kink|bdsm|fetish|bondage|shibari|spank|dominatrix|femdom|latex|"
+    r"spandex|ahegao|^futa|giantess|inflation|^vore|(?<!e)milf|waifu|husbando|succub|femboy|bunnygirl|mature|r18|"
+    r"rule34|stripp|striptease|temptress|harem|handsome|"
+    # the body and its shape
+    r"busty|boob|tits|booty|breast|cleavage|nipple|curvy|curves|thicc(?!h)|chubby|plussize|bbw|voluptuous|"
+    r"butt(?!er|on|ress)|thigh|(?<![sc])hips|legs$|waist|navel|belly|bellies|crotch|groin|genital|penis|vagina|"
+    r"pussy|armpit|(?<!long)neck|muscle|muscular|^abs$|sixpack|^body$|bodysuit|bodypaint|bodybuild|"
+    r"feet|foot(?!age)|mouth|jaw|maw|tongue|drool|saliva|teeth|(?<!tu)lips$|lipstick|eye(?!nd)|^ears$|kemonomimi|"
+    r"(?:cat|fox|elf|bunny|wolf|dog|pointy)ears|^faces?$|^hands?$|(?<!c)hair(?!craft)|blond|brunette|redhead|"
+    r"braid(?!er)|beard|^scars?$|scarred|tattoo|piercing|makeup|"
+    r"(?<!dra)wings$|^winged|(?<!t)horns?$|^horned|claws?$|fangs$|^fang$|paws?$|pawprint|antler|scales$|scalie|"
+    r"feathers$|^fur$|(?<!fairy)tail|"
+    # dress
+    r"lingerie|bikini|swimsuit|swimwear|underwear|pant(?:y|ies|ie|su)|^pants$|^bras?$|sportsbra|bralette|"
+    r"(?<!ara)thong|garter|stockings|tights|leggings|socks?$|leotard|catsuit|corset|outfit|dress|skirt|gown|"
+    r"kimono|yukata|qipao|cheongsam|hanfu|kilt|^togas?$|shirt|(?<!p)robes?$|wardrobe|^hoods?$|hoodie|jacket|"
+    r"(?<!3d)coats?$|sweater|^vests?$|^suits?$|uniform|(?<!s)cape|cloak|scarf|collar|choker|gloves?$|boots$|"
+    r"(?<!horse)shoes?$|sneaker|sandal|(?<!w)heels|jeans|shorts$|^hats?$|tophat|witchhat|jewel|earring|tiara|"
+    r"cloth|costume|cosplay|fashion"
 )
 # Two claims counted on every sheet and never stated: the push stage's to weigh.
 UNSUITABLE = "sexualised or gory"
@@ -255,6 +274,13 @@ _CLOSED_TAG = re.compile(rf"{_C}.*clos|clos.*{_C}|no{_C}|{_C}(?:full|onhold|paus
 OPEN_SENTENCE = {"commissions": "Open for commissions.", "hire": "Available for hire."}
 
 REASONS = ("mostly_ai_declared", "mostly_explicit", "too_few_works", "nothing_clear")  # why there is no profile
+# The works that no longer stand as the artist's public works: marked by the collect stage (another author's,
+# mature, no longer public...), or missing from the artist's latest answer, which is how one taken down shows
+# (pipeline/library.py). Nothing is counted over them, and a row counted over one is out of date (see current).
+_FALLEN = (
+    "SELECT deviation_id FROM work_marks UNION SELECT w.deviation_id FROM works w "
+    "JOIN profiles p ON p.artist_key = w.artist_key WHERE w.fetched_at < p.fetched_at"
+)
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS artist_profiles (
@@ -323,7 +349,7 @@ def _own_tags(works: list[dict[str, Any]], handle: str, shared: Collection[str] 
         as its singular: "digitalart", and after "dark fantasy" "dark art";
       - selling, the site, the software, a statement about AI, praise, a year (_NOT_THE_WORK), and dress or body
         (_BODY);
-      - the artist's `handle`, a part of it, or a tag it is part of;
+      - the artist's `handle`, a part of it, or a tag it is part of, the handle compared as a tag is (_plain);
       - a tag that fewer than SHARED artists in the store use (`shared` has those that enough of them do; None
         is no store to ask): a name, the artist's or somebody else's, is seldom anyone else's tag;
       - one the plain contact rule refuses (library.holds_contact), alone or with those taken before it;
@@ -347,6 +373,7 @@ def _own_tags(works: list[dict[str, Any]], handle: str, shared: Collection[str] 
                 spelled[tag] = written
     quoted: dict[str, int] = {}
     taken: list[str] = []
+    handle = _plain(handle)  # "yy-dark-raven" is the tag "yydarkraven"
     # The words that add nothing, each without its plural ending: "elf", then "elves".
     nothing = {_single(word) for word in _SAYS_NOTHING}
     for tag in sorted(used, key=lambda tag: (-used[tag], late[tag], tag)):
@@ -442,7 +469,7 @@ def facts_of(
         else:
             worlds, manners = ([kept for kept in terms if kept != term] for terms in (worlds, manners))
     mediums = _leading(have, clear, MEDIUM_FORMS, 1)
-    shown = _own_tags(counted, _plain(handle), shared)
+    shown = _own_tags(counted, handle, shared)
     share = {term: len(together) for term in subjects} | {term: have[term] for term in manners}
     styles = Counter(
         {
@@ -736,7 +763,8 @@ def run(
     def read(conn: sqlite3.Connection) -> tuple[list[Any], dict[str, str | None], set[str], dict[str, str]]:
         return (
             conn.execute(
-                "SELECT artist_key, deviation_id, image_file, tags, published_at FROM works ORDER BY 1, 2"
+                "SELECT artist_key, deviation_id, image_file, tags, published_at, "
+                f"deviation_id IN ({_FALLEN}) FROM works ORDER BY 1, 2"
             ).fetchall(),
             dict(conn.execute("SELECT artist_key, tagline FROM profiles").fetchall()),
             {
@@ -773,8 +801,8 @@ def run(
         rows, taglines, tagged, stored = _transact(db, read)
         collected: dict[str, list[Any]] = {}
         users: dict[str, set[str]] = {}  # an own tag, as it is compared -> the artists who use it
-        for key, *work in rows:
-            collected.setdefault(key, []).append(work)
+        for key, *work, fell in rows:
+            collected.setdefault(key, []).extend([] if fell else [work])  # what is counted, of works that stand
             for tag in json.loads(work[2]):
                 users.setdefault(_plain(tag), set()).add(key)
         shared = {tag for tag, who in users.items() if len(who) >= SHARED}
@@ -858,15 +886,19 @@ def _rows(db: pathlib.Path | str | None, where: str) -> list[Any]:
 
 
 def current(db: pathlib.Path | str | None = None) -> set[str]:
-    """The artists whose row still rests on what it was made from: each work it counted is read as it was then,
-    from the same image and with the same word on AI (tagging.read_as, kept at the end of the row's basis).
+    """The artists whose row still rests on what it was made from: each work it counted still stands (_FALLEN)
+    and is read as it was then, from the same image and with the same word on AI (tagging.read_as, kept at the
+    end of the row's basis). A work that has fallen counts as one with no image.
 
     The others are waiting: for the tagging stage to read again a work whose image or words have changed, and
-    then, when that reading comes out otherwise, for this stage to make the row again. Their row stays, so that
-    a reading that comes out the same costs nothing; but it says what nobody has read of the work as it is, and
-    the push stage holds the artist back meanwhile (see profiles).
+    then, when that reading comes out otherwise, for this stage to make the row again; or for this stage to make
+    it again without the works that fell. Their row stays, so that a reading that comes out the same costs
+    nothing; but it says what nobody has read of the work as it is, and the push stage holds the artist back
+    meanwhile (see profiles).
     """
     images, declared = library.image_prints(db), tagging.declared_ai(TAGGER, db)
+    fallen = {work_id for (work_id,) in _transact(db, lambda conn: conn.execute(_FALLEN).fetchall())}
+    images = {work_id: image for work_id, image in images.items() if work_id not in fallen}
     rows = _transact(db, lambda conn: conn.execute("SELECT artist_key, basis, facts FROM artist_profiles").fetchall())
     return {
         key

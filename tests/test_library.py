@@ -1889,6 +1889,35 @@ def test_holds_contact_is_the_plain_rule_a_title_is_held_to_for_any_text_a_later
     assert not any(library.holds_contact(value) for value in (None, 12345, ["FAKE"]))  # no text, nothing held
 
 
+@pytest.mark.parametrize(
+    ("text", "names"),
+    [
+        # the second critic of the push stage: what a model wrote reading the text in an image
+        ("Text in the corner reads Discord fakepainter#1234.", True),
+        ("A caption that says telegram: fakepainter.", True),
+        ("The banner says add me on Snapchat fakepainter.", True),
+        # letters set apart, and what the plain rule undoes: entities, percent-encoding, fullwidth, invisible marks
+        ("Signed T E L E G R A M fakepainter.", True),
+        ("Signed d.i.s.c.o.r.d fakepainter.", True),
+        ("Support me on Ko-fi, or ko fi, or KOFI.", True),
+        ("On a shield: &#68;iscord fakepainter.", True),
+        ("On a shield: %57hatsApp fakepainter.", True),
+        ("On a banner: Ｉｎｓｔａｇｒａｍ fakepainter.", True),
+        ("On a banner: Pat​reon fakepainter.", True),
+        ("Write by e-mail or by email.", True),
+        ("A tip jar: PayPal, Venmo, Cash App.", True),
+        ("FAKE word " * 1001, True),  # too long to read, so not passed
+        # words a picture is described in, which only look like one
+        ("Discordant colours, a knight in plate mail and a female figure.", False),
+        ("A clear blue sky over an X-wing; a line of soldiers; a signal fire.", False),
+        ("A twitching tail, a kick, and a youthful face.", False),
+        (None, False),
+    ],
+)
+def test_names_service_finds_a_messaging_social_or_payment_service_however_it_is_spelled(text, names):
+    assert library.names_service(text) is names
+
+
 # --- a reading is tied to what was read: which image a work has, and the store's shape ---
 
 FILE = "d00000a-00000000-0000-4000-a000-00000000000a.jpg"  # a file as DeviantArt names it: <id>-<uuid>.<type>

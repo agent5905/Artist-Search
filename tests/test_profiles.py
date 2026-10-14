@@ -707,6 +707,48 @@ def test_the_artists_own_handle_or_name_is_not_shown():
 
     assert shown((10, DRAGON, own), handle=ALPHA) == ["paleoart"]
     assert shown((10, DRAGON, own)) == ["zzfakealpha", "paleoart"]
+    # a handle with "-" or "_" in it is compared as a tag is, without them (the second critic of the push stage)
+    assert shown((10, DRAGON, ["yydarkraven", "darkraven", "paleoart"]), handle="yy-dark-raven") == ["paleoart"]
+    assert shown((10, DRAGON, ["yy_dark_raven", "paleoart"]), handle="YY_Dark-Raven") == ["paleoart"]
+
+
+# What the second critic of the push stage found shown, and what the list made from the store's real tags catches.
+@pytest.mark.parametrize(
+    "own",
+    [
+        ["kimono", "shirtless", "musclegirl", "hips", "widehips", "panties", "ballgown"],
+        ["catears", "blondehair", "glowingeyes", "tshirtdesign", "bunnygirl", "femboy", "succubusgirl", "hentai"],
+        ["costumedesign", "fashion", "cosplay", "angelwings", "horns", "claws", "tattoo", "makeup", "redhead"],
+    ],
+)
+def test_a_dress_body_or_sex_word_anywhere_in_a_tag_is_not_shown(own):
+    assert shown((10, FANTASY, own)) == []
+
+
+def test_a_word_that_only_looks_like_one_of_dress_or_body_is_shown():
+    own = ["butterfly", "spaceships", "thorns", "armchair", "fairytail", "blackink", "sportscar", "tombraider"]
+    own += ["stealthaircraft", "longneck"]
+
+    assert [tag.replace(" ", "") for tag in shown((10, SCENERY, own))] == own
+
+
+@pytest.mark.parametrize("how", ["marked", "taken_down"])
+def test_a_work_that_no_longer_stands_is_not_counted_and_a_card_counted_over_it_waits(how):
+    """The second critic of the push stage: a card counted from works that are another author's since, or that
+    the artist took down, is out of date; the next run counts the works that stand, and nothing else."""
+    ids = artist(ALPHA, [DRAGON] * 10)
+    assert run(Fake()) == {"profiled": 1} and profiles.current() == {f"da:{ALPHA}"}
+    if how == "marked":
+        library.mark_works(f"da:{ALPHA}", dict.fromkeys(ids[7:], "another author"))
+    else:  # missing from the artist's latest answer: last seen before it
+        with closing(sqlite3.connect(config.LOCAL_DB)) as conn, conn:
+            old = [("2026-01-01T00:00:00+00:00", work_id) for work_id in ids[7:]]
+            conn.executemany("UPDATE works SET fetched_at = ? WHERE deviation_id = ?", old)
+
+    assert profiles.current() == set()
+    assert run(Fake()) == {"profiled": 1} and profiles.current() == {f"da:{ALPHA}"}
+    (profile,) = profiles.profiles()
+    assert profile["facts"]["counted"] == ids[:7] and profile["facts"]["works"] == 7
 
 
 def test_a_tag_that_few_artists_in_the_store_use_is_not_shown():
