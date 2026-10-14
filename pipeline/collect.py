@@ -31,7 +31,9 @@ sweep of cached files that no row refers to.
     is saved in its place; when the new one cannot be had, the work stays as it was kept, image and all. What
     the analysis stages read from the old image is stale from then on, and they read the new one.
   - An image that could not be had counts, whatever the host answered: MAX_REFUSALS works in a row stop the
-    run, and an artist none of whose images was served is passed over, not stored as one with no works.
+    run, and an artist none of whose images was served is passed over, not stored as one with no works. One
+    over the size cap is the exception: the host served it, our cap refused it, and that says nothing of the
+    host. The first run at scale stopped on three of those in a row.
   - A 200 is believed only in its documented shape. Anything else is the API failing for that artist: nothing
     stored changes, it is counted, and MAX_FAILURES of them in a row stop the run.
   - No verdict is reached on information that is missing: a work is marked only for what its entry says.
@@ -537,6 +539,8 @@ def _collect_artist(
             if isinstance(fetched, str):  # no image to keep, whatever was answered: the next work is tried
                 counts[fetched] += 1
                 unserved += 1
+                if fetched == IMAGE_TOO_LARGE:  # served whole and refused by our own cap: no word on the host
+                    continue
                 refused[0] += 1
                 if refused[0] == MAX_REFUSALS:  # by now it is the host, or us it is refusing, and not these images
                     raise discover.Stop("the image host is failing or rate limiting")

@@ -1114,6 +1114,26 @@ def test_an_image_over_the_size_cap_is_given_up_on_without_reading_it_all(capsys
     assert files(tmp_path) == [*(f"cache/images/{name}" for name in image_files([1, 3, 4])), "cache/pipeline.sqlite"]
 
 
+JPEG_START = bytes([0xFF, 0xD8, 0xFF])
+
+
+def test_images_over_the_size_cap_do_not_stop_the_run_however_many_come_in_a_row(capsys):
+    """The first run at scale stopped on three of them in a row from one artist. The host served each one whole;
+    our cap refused it. That says nothing of the host, so it is not a refusal toward MAX_REFUSALS."""
+    world = solo(n_works=5)
+
+    def huge(request):
+        if request.url.path in {preview_path(n) for n in (1, 2, 3, 4)}:
+            body = JPEG_START + bytes(11 << 20)  # past the 10 MB cap
+            return httpx.Response(200, headers={"content-type": "image/jpeg"}, content=body)
+        return None
+
+    world.detours.append(huge)
+    counts = counts_of(world, capsys)  # exit 0 and nothing on stderr: the run was not stopped
+    assert counts[collect.IMAGE_TOO_LARGE] == 4 > collect.MAX_REFUSALS and counts[collect.IMAGE_LIMITED] == 0
+    assert counts[collect.DOWNLOADED] == 1 and kept(ALPHA) == [5]
+
+
 def test_the_body_of_a_download_of_the_wrong_type_is_not_read_at_all(capsys):
     """The type is checked on the headers. Not one byte of a page, a script or an archive is pulled in."""
     world = solo()
