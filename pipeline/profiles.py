@@ -1,4 +1,4 @@
-"""A profile for each artist: the facts about their work, two plain sentences, and a vector for search.
+"""A profile for each artist: the facts about their work, one plain sentence, and a vector for search.
 
     uv run python -m pipeline.profiles --max-artists 500
     uv run python -m pipeline.profiles --sample 20 --seed 3     one JSON object a line, for the critic
@@ -19,21 +19,19 @@ again when the readings come out otherwise. When they come out the same, it is c
 The facts are counts over the artist's eligible works: analyzed, not flagged or rated explicit, not flagged
 not_artwork, not declared AI-made. Only the verified tags are counted, never the descriptions, and which works
 have each value is kept (`tagged`). They come from fixed lists and each was checked against its image, so they
-are all the first sentence of a card is made of: a subject, a genre, a drawing manner and a medium, each worded
-by its share of the works and never on fewer than MIN_SUPPORT of them:
-  - flat from CLEAR_PERCENT ("Fantasy character art in traditional media");
-  - "mostly" from more than half ("Artwork, mostly characters"; a manner is "mainly in an anime style");
-  - behind a hedge from PART_PERCENT ("and some creatures", "including environments", "partly in an anime style");
+are all a card is made of: a subject, a genre, a drawing manner and a medium, each worded by its share of the
+works and never on fewer than MIN_SUPPORT of them. The subjects are counted together, by the works that show
+any of them:
+  - flat from CLEAR_PERCENT ("Fantasy character and creature art in traditional media");
+  - "mostly" from more than half ("Mostly character art"; a manner is "mainly in an anime style");
+  - behind a hedge from PART_PERCENT ("character art, among other things", "often in an anime style");
   - below that, nothing. A genre and a medium are said flat or not at all: "with fantasy themes" was filler,
     and wrong both ways. The text leaves out "digital painting", which nearly every artist has.
 A style word is still counted, for search, and no longer said.
 
-What sets one artist apart from the next is said in the artist's own words: the second sentence quotes the
-tags they put on the most of those works, as theirs ('Tags their work "dinosaur" and "paleoart".'). That is a
-count of what is stored, and no model's judgement: six rounds of asking the vision model what recurs, by sheet
-and then by work, did not converge (asked whether a picture shows a dragon, it agrees for a dinosaur). See
-_own_tags for which tags are quoted. An artist of whom the first sentence can name no subject, genre or manner
-has no profile ("nothing_clear"), whatever their tags say: a card must rest on what was checked.
+The artist's own tags are no part of the card (owner decision 11): the site shows them apart, as theirs, and
+they are in the facts for search (`own_words`, see _own_tags). An artist of whom the card can name no subject,
+genre or manner has no profile ("nothing_clear"), whatever their tags say: a card must rest on what was checked.
 
 The eligible works still go on one contact sheet, held in memory (hard rule 2), for two counts that are never
 stated and that the push stage weighs: the pictures that are sexualised or gory, and those of the one narrow
@@ -42,8 +40,8 @@ subject the artist repeats most. An artist whose pictures will not open has no s
 Open for work is True only on the artist's own words (see open_evidence), and otherwise unknown. Never False.
 
 One text is kept, built by code (template) and held to the print check's rules (unfit). The model's own
-sentence, "written", was the same text for most artists and never beat it, and with a quotation in the card it
-could only reword what must stay as it is; the column is still filled, with the same text, for the push stage.
+sentence, "written", was the same text for most artists and never beat it; the column is still filled, with
+the same text, for the push stage.
 
 One table, artist_profiles, in the local SQLite file. Hard rule 7: a row is written only for an artist the
 store still lists, rows of artists it no longer lists go at the start of every run, and no read returns one.
@@ -84,20 +82,19 @@ QUERIES = config.ROOT / "eval" / "queries.jsonl"
 
 MIN_WORKS = 5  # eligible works; with fewer an artist cannot be characterised
 MIN_SUPPORT = 4  # works: nothing is stated on fewer, whatever share they are
-PART_PERCENT = 40  # of the eligible works: a subject or a manner is said with a hedge, a tag of the artist's is quoted
+PART_PERCENT = 40  # of the eligible works: a subject or a manner is said with a hedge
 CLEAR_PERCENT = 70  # anything is stated flat; a genre, a medium or a verified colour word is a fact at all
 NEARLY_ALL_PERCENT = 90  # any other style word is a fact
 MAX_MODIFIERS = 3  # manner and genre words before the kind of art
-AT_MOST = {"specialties": 3, "worlds": 2, "manners": 1, "own_words": 3, "style_words": 2}
-SHARED = 3  # artists in the store who use a tag, the artist among them, before a card quotes it
+AT_MOST = {"specialties": 3, "worlds": 2, "manners": 1, "own_words": 12, "style_words": 2}
+SHARED = 3  # artists in the store who use a tag, the artist among them, before it is shown as the artist's
 CELL, PER_ROW, LABEL = 300, 5, 34  # the contact sheet: pixels a picture, pictures a row, pixels for its number
 RECENT_DAYS = 180  # a work's own tags say something about commissions for this long
-TEMPLATE_VERSION = 9  # bump when template(), or what facts_of() makes a fact, changes
+TEMPLATE_VERSION = 10  # bump when template(), or what facts_of() makes a fact, changes
 SHEET_VERSION = 7  # bump when the sheet or COUNT_PROMPT changes
 
-# Every value a profile may state, and its spellings. The first is the template's; by any of them a tag of the
-# artist's own says what the card has said already (see _own_tags). "photo" and "unclear" are not here: neither
-# says what the art is made with.
+# Every value a profile may state, and its spellings. The first is the template's. "photo" and "unclear" are not
+# here: neither says what the art is made with.
 MEDIUM_FORMS = {
     "digital painting": ("digital painting", "digital paintings"),
     "digital line art": ("digital line work", "digital line art", "digital linework"),  # after "character art"
@@ -158,13 +155,13 @@ COLOUR_WORDS = dict.fromkeys(("saturated", "vibrant", "vivid"), "saturated") | {
 _WIDER = {"dark fantasy": "fantasy", "cyberpunk": "science fiction"}
 GENRE_FORMS = WORLD_FORMS | MANNER_FORMS
 FORMS = MEDIUM_FORMS | SUBJECT_FORMS | GENRE_FORMS | STYLE_FORMS
-# The fields of the facts that search reads, in the order the vector's text lists them. `own_words` are the tags
-# the second sentence quotes, as it prints them. `formats` is a kind of output, which only a row made before
-# round 7 has: the push stage reads it from such a row until the row is made again.
+# The fields of the facts that search reads, in the order the vector's text lists them. `own_words` are the
+# artist's own tags that the site shows as theirs, as it prints them. `formats` is a kind of output, which only a
+# row made before round 7 has: the push stage reads it from such a row until the row is made again.
 STATED = ("specialties", "own_words", "mediums", "genres", "formats", "style_words")
 
 # The artist's own tags (see _own_tags). The catch-alls every artist uses, and words that tell a studio nothing
-# of what the artist makes: a tag made of these, and of words the card has said already, is not quoted.
+# of what the artist makes: a tag made of these, and of words a tag shown before it has, is not shown.
 _SAYS_NOTHING = frozenset(
     "art arts artwork artworks artist artists artistic digital digitally 2d drawing drawings draw drawn painting "
     "paintings paint painted illustration illustrations illustrator illustrated design designs designer concept "
@@ -176,23 +173,36 @@ _SAYS_NOTHING = frozenset(
 # discovery searches by (pipeline/discover.py), and three that the artists join to another most often.
 _WORDS = _SAYS_NOTHING | {word for forms in FORMS.values() for form in forms for word in form.lower().split()}
 _WORDS |= frozenset("weapon mech icons monster armor costume scifi original fan".split())
+# Long names that artists also write short, and one word they spell two ways: a tag is compared as the second,
+# so the site shows one of the two. ponytail: the pairs that several artists in the store use both of. Another
+# is shown beside its other spelling, as two of the artist's tags.
+_SHORT = {
+    "dungeonsanddragons": "dnd",
+    "sciencefiction": "scifi",
+    "magicthegathering": "mtg",
+    "lordoftherings": "lotr",
+    "tabletoprpg": "ttrpg",
+    "tradingcardgame": "tcg",
+    "colour": "color",
+}
+_LONG = re.compile("|".join(_SHORT))
 # Tags that are not about the work: selling and availability (open_evidence reads those, by stricter rules),
 # where it is posted, what it was made with, whether a machine made it, praise, and a year or a serial number.
 # Matched anywhere in a tag, so each is spelled to leave "soldier", "salem", "sapphire" and "psychedelic" alone.
 # And the name of a real person, which is no fact about an artist's work.
 # ponytail: for names, only the authors that several artists in the store tag their fan art with. Another name
-# that SHARED artists use is quoted: see _own_tags.
+# that SHARED artists use is shown: see _own_tags.
 _NOT_THE_WORK = re.compile(
-    r"comm?iss?ion|open|closed|sale$|auction|paypal|price|^ych|forhire|freelanc|deviant|artstation|insta|oftheday|"
+    r"comm?iss?ion|open|closed|sale$|auction|paypal|price|^ych|adopt|forhire|freelanc|deviant|artstation|insta|oftheday|"
     r"photoshop|procreate|blender|clipstudio|krita|zbrush|corelpainter|paintstorm|ipad|wacom|noai|notai|humanmade|"
     r"humanart|challenge|epic|beaut|amazing|awesome|badass|detail|\d{4}|lovecraft|tolkien|frankherbert|giger"
 )
-# Dress or body. A card never describes either, however many works are tagged so: a tag with one of these in it
-# is not quoted. "cape" is no part of "landscape", nor "heels" of "wheels".
+# Dress or body. The site never describes either, however many works are tagged so: a tag with one of these in
+# it is not shown. "cape" is no part of "landscape", nor "heels" of "wheels".
 # ponytail: a short hand list, matched anywhere in a tag, so "butterfly" and "detail" go with the rest. A crude
-# tag that is not on it is quoted as the artist wrote it; pictures like that are still counted as UNSUITABLE,
+# tag that is not on it is shown as the artist wrote it; pictures like that are still counted as UNSUITABLE,
 # and the push stage holds back an artist who has many. The upgrade is to ask the language model which of the
-# tags a card may not print.
+# tags the site may not print.
 _BODY = re.compile(
     r"revealing|skimpy|scantily|lingerie|bikini|swimsuit|swimwear|underwear|nude|naked|topless|busty|boobs|tits|"
     r"booty|breast|cleavage|curvy|thicc|voluptuous|thigh|feet|foot|butt|sexy|seductive|sensual|erotic|pinup|nsfw|"
@@ -291,35 +301,34 @@ def _ways(tag: str) -> list[list[str]]:
     return [[word, *rest] for word in _WORDS if tag.startswith(word) for rest in _ways(tag[len(word) :])]
 
 
-def _reads(tag: str, written: str) -> str:
+def _reads(written: str) -> str:
     """A tag as a reader expects it, where that is certain: with the spaces the artist put in it themselves
     ("character_design"), or split where it is words of the fixed lists joined, in the one way there is to
     split it ("creaturedesign"). Otherwise as the artist wrote it: no word is made up."""
     if re.search("[_-]", written):
         return " ".join(written.lower().replace("_", " ").split())
-    ways = _ways(tag)
-    return " ".join(ways[0]) if len(ways) == 1 else tag
+    ways = _ways(_plain(written))
+    return " ".join(ways[0]) if len(ways) == 1 else _plain(written)
 
 
-def _own_tags(
-    works: list[dict[str, Any]], need: int, said: Collection[str], handle: str, shared: Collection[str] | None
-) -> dict[str, int]:
-    """The tags of the artist's own that a card quotes, as it prints them -> how many of `works` carry each.
+def _own_tags(works: list[dict[str, Any]], handle: str, shared: Collection[str] | None) -> dict[str, int]:
+    """The artist's own tags that the site shows as theirs, as it prints them -> how many of `works` carry each.
 
-    A tag is compared without its case, "_" and "-" (_plain), and qualifies when the artist put it on `need` of
-    the works. The most used come first, and of two as often used the one the artist writes earlier among a
-    work's tags; AT_MOST["own_words"] are kept. Left out, because it says nothing or is not about the work:
-      - a tag made only of catch-all words (_SAYS_NOTHING), of `said`, the words of the first sentence, and of
-        the tags quoted before it, a plural as its singular: after "Fantasy character art", "digitalart",
-        "characterdesign" and "fantasyart" add nothing, and "creaturedesign" does. So a tag that discovery
-        searches by is quoted only where it names what the sentence does not;
+    The one rule for them: the push stage sends these, of those on a work it sends, and no other tag of the
+    artist's as theirs. A tag is compared without its case, "_" and "-" (_plain), and in one of the two ways
+    artists write some names (_SHORT). The most used come first, and of two as often used the one the artist
+    writes earlier among a work's tags; AT_MOST["own_words"] are kept. Left out, because it says nothing, is
+    not about the work, or says again what one before it says:
+      - a tag made only of catch-all words (_SAYS_NOTHING) and of the words of those taken before it, a plural
+        as its singular: "digitalart", and after "dark fantasy" "dark art";
       - selling, the site, the software, a statement about AI, praise, a year (_NOT_THE_WORK), and dress or body
         (_BODY);
       - the artist's `handle`, a part of it, or a tag it is part of;
       - a tag that fewer than SHARED artists in the store use (`shared` has those that enough of them do; None
         is no store to ask): a name, the artist's or somebody else's, is seldom anyone else's tag;
-      - one the plain contact rule refuses (library.holds_contact), alone or with those quoted before it;
-      - one that has a tag already taken in it, or is in one: "dragon", and then "dragonart".
+      - one the plain contact rule refuses (library.holds_contact), alone or with those taken before it;
+      - one that has a tag already taken in it, or is in one: "dragon", and then "dragonart"; "dnd", and then
+        "dungeonsanddragons".
     ponytail: a tag that names a real person passes when SHARED artists use it, and a word for what the artist
     draws is lost when their handle has it ("dragon" under a handle with "dragon" in it). The upgrade for both
     is the language model's word on each tag.
@@ -330,7 +339,7 @@ def _own_tags(
     for work in works:
         own: dict[str, str] = {}
         for written in work.get("tags", ()):
-            own.setdefault(_plain(written), written)
+            own.setdefault(_LONG.sub(lambda name: _SHORT[name[0]], _plain(written)), written)
         for place, (tag, written) in enumerate(own.items()):
             used[tag] += 1
             late[tag] += place
@@ -338,12 +347,12 @@ def _own_tags(
                 spelled[tag] = written
     quoted: dict[str, int] = {}
     taken: list[str] = []
-    # The words that add nothing to the card as it stands, each without its plural ending: "elf", then "elves".
-    nothing = {_single(word) for word in (*said, *_SAYS_NOTHING)}
+    # The words that add nothing, each without its plural ending: "elf", then "elves".
+    nothing = {_single(word) for word in _SAYS_NOTHING}
     for tag in sorted(used, key=lambda tag: (-used[tag], late[tag], tag)):
-        if used[tag] < need or len(quoted) == AT_MOST["own_words"]:
+        if len(quoted) == AT_MOST["own_words"]:
             break
-        reads = _reads(tag, spelled[tag])
+        reads = _reads(spelled[tag])
         parts = [_single(part) for part in reads.replace("-", " ").split()]
         if not (
             all(part in nothing or any(nothing.issuperset(map(_single, way)) for way in _ways(part)) for part in parts)
@@ -352,7 +361,7 @@ def _own_tags(
             or (handle and (tag in handle or handle in tag))
             or (shared is not None and tag not in shared)
             or any(tag in other or other in tag for other in taken)
-            or library.holds_contact(" ".join(["3D", *quoted, reads]))  # with the one digit the card may have
+            or library.holds_contact(" ".join([*quoted, reads]))
         ):
             taken.append(tag)
             quoted[reads] = used[tag]
@@ -372,10 +381,10 @@ def facts_of(
     of the wider genre too (_WIDER), and a card names one of the two: the narrower when the works are clearly
     that. Its description is never read. `tagged` says which works have each value a card can state, by their
     place among the counted works, from 1, and the module's docstring says what share of them makes a fact.
-    `mostly` lists the subjects and manners that most works have and not CLEAR_PERCENT of them, and `hedged`
-    those that hold for part of the works only: neither may be stated flat. `own_words` are the artist's own
-    tags that the card quotes, as it prints them, with their counts in counts["own_words"]: see _own_tags,
-    which `handle` and `shared` are for.
+    `mostly` lists the subjects (by the works that show any of them) and the manner that most works have and
+    not CLEAR_PERCENT of them, and `hedged` those that hold for part of the works only: neither may be stated
+    flat. `own_words` are the artist's own tags that the site shows as theirs, as it prints them, with their
+    counts in counts["own_words"]: see _own_tags, which `handle` and `shared` are for.
     """
 
     def explicit(result: dict[str, Any]) -> bool:
@@ -420,9 +429,12 @@ def facts_of(
     # One of a genre and its wider one: "dark fantasy" where the works are clearly that, and "fantasy" otherwise.
     worlds = [world for world in worlds if world not in {_WIDER.get(near) for near in worlds}][: AT_MOST["worlds"]]
     manners = _leading(have, part, MANNER_FORMS, AT_MOST["manners"])
+    # The subjects are named together, as the kind of art, by the share of the works that show any of them:
+    # "character and creature art" where seven works in ten are characters or creatures.
+    together = set().union(*(tagged[term] for term in subjects))
     # What stands flat before the kind of art is one statement, "fantasy character art": most works must bear
-    # all of it out at once. A genre or a manner that does not hold together with the subject is not said.
-    led = set().union(*(tagged[term] for term in subjects if have[term] >= clear)) or set(range(1, len(counted) + 1))
+    # all of it out at once. A genre or a manner that does not hold together with the subjects is not said.
+    led = set(together) if len(together) >= clear else set(range(1, len(counted) + 1))
     flat = [term for term in (*worlds, *manners) if have[term] >= clear]
     for term in sorted(flat, key=lambda term: -len(led & set(tagged[term]))):
         if len(led & set(tagged[term])) >= most:
@@ -430,13 +442,8 @@ def facts_of(
         else:
             worlds, manners = ([kept for kept in terms if kept != term] for terms in (worlds, manners))
     mediums = _leading(have, clear, MEDIUM_FORMS, 1)
-    said = {  # the words of the first sentence, in every spelling, and each spelling as a tag would join it
-        word
-        for term in (*subjects, *worlds, *manners, *mediums)
-        for form in map(str.lower, FORMS[term])
-        for word in (_plain(form).replace(" ", ""), *form.replace("-", " ").split())
-    }
-    quoted = _own_tags(counted, part, said, _plain(handle), shared)
+    shown = _own_tags(counted, _plain(handle), shared)
+    share = {term: len(together) for term in subjects} | {term: have[term] for term in manners}
     styles = Counter(
         {
             word: count
@@ -457,15 +464,15 @@ def facts_of(
             field: dict(sorted(counter.items(), key=lambda item: (-item[1], item[0])))
             for field, counter in counts.items()
         }
-        | {"own_words": quoted},
+        | {"own_words": shown},
         "tagged": dict(sorted(tagged.items())),
         "specialties": subjects,
-        "own_words": list(quoted),
+        "own_words": list(shown),
         "mediums": mediums,
         "genres": worlds + manners,
         "style_words": _leading(styles, 1, STYLE_FORMS, AT_MOST["style_words"]),
-        "mostly": [term for term in (*subjects, *manners) if most <= have[term] < clear],
-        "hedged": [term for term in (*subjects, *manners) if have[term] < most],
+        "mostly": [term for term, count in share.items() if most <= count < clear],
+        "hedged": [term for term, count in share.items() if count < most],
     }
     if 2 * ai > len(works):
         return facts, "mostly_ai_declared"
@@ -586,42 +593,39 @@ def _and(items: list[str]) -> str:
 
 
 def template(facts: dict[str, Any]) -> str:
-    """The card, the same way for every artist: what the verified tags count, then the artist's own tags.
+    """The card, one sentence the same way for every artist, of what the verified tags count.
 
-    The first sentence is built on the kind of art: the subjects that are flat ("character and creature art"),
-    or "artwork" when none is. Before it stand the manner and the genres that are flat; after it what it is
-    made in ("in 3D"; a medium that is itself a kind of art takes the place of that word: "character pixel
-    art"). Then the subjects that are not flat, each behind the word for its share: "mostly" for what most works
-    are ("mostly with" beside a subject that leads: those works have both), "and some" for a part of them, or
-    "including" where nothing has been named before it. Last the manner that is not flat: "mainly", so that no
-    card says "mostly" twice, or "partly". The second sentence quotes the artist's own tags as theirs, and is
-    left out when there is none to quote.
+    It is built on the kind of art: the subjects, named together ("character and creature art"). Before it stand
+    the manner and the genres that are flat; after it what it is made in ("in 3D"; a medium that is itself a kind
+    of art takes the place of that word: "character pixel art"). The subjects are said by the share of the works
+    that show any of them: flat, "mostly character art", or "character art, among other things". Where a manner
+    or a genre is flat and the subjects are not, that leads and they follow: "fantasy art, mostly characters", or
+    "including characters". Last the manner that is not flat: "mainly", so that no card says "mostly" twice, or
+    "often". With no subject and nothing flat, that manner is the one named: "cartoon art, among other things".
     """
     after = (*facts["hedged"], *facts["mostly"])
-    manners, worlds, subjects = (
-        [FORMS[term][0] for term in facts[field] if term in forms and term not in after]
-        for field, forms in (("genres", MANNER_FORMS), ("genres", WORLD_FORMS), ("specialties", SUBJECT_FORMS))
+    manners, worlds = (
+        [FORMS[term][0] for term in facts["genres"] if term in forms and term not in after]
+        for forms in (MANNER_FORMS, WORLD_FORMS)
     )
+    lead = list(filter(None, [*manners, _and(worlds)]))
+    styles = [term for term in facts["genres"] if term in MANNER_FORMS and term in after]
+    named = facts["specialties"] or ([] if lead else styles)
+    share = next((share for share in ("mostly", "hedged") if set(named) & set(facts[share])), "")
+    words = "" if share and lead else _and([FORMS[term][0] for term in named])
     media = [FORMS[medium][0] for medium in facts["mediums"] if medium != COMMON_MEDIUM]
-    if subjects and media and media[0].endswith(" art"):
-        noun = f"{_and(subjects)} {media.pop()}"
-    else:
-        noun = f"{_and(subjects)} art" if subjects else "artwork"
-    text = " ".join(filter(None, [*manners, _and(worlds), noun])) + (f" in {media[0]}" if media else "")
-    most, some = (
-        _and([FORMS[term][1] for term in facts[share] if term in SUBJECT_FORMS]) for share in ("mostly", "hedged")
-    )
-    if most:
-        text += f", mostly {'with ' if subjects else ''}{most}"
-    if some and (subjects or most):  # after a comma where what it is made in stands between: those are no medium
-        text += f"{', and' if media and not most else ' and'} some {some}"
-    elif some:
-        text += f", including {some}"
-    for share, terms in (("mainly", facts["mostly"]), ("partly", facts["hedged"])):
-        for manner in (FORMS[term][0] for term in terms if term in MANNER_FORMS):
-            text += f", {share} in {'an' if manner[0] in 'aeiou' else 'a'} {manner} style"
-    quoted = _and([f'"{tag}"' for tag in facts["own_words"]])
-    return text[0].upper() + text[1:] + "." + (f" Tags their work {quoted}." if quoted else "")
+    noun = f"{words} {media.pop()}" if media and media[0].endswith(" art") else f"{words} art"
+    text = " ".join([*lead, noun.strip()]) + (f" in {media[0]}" if media else "")
+    if words and share == "mostly":
+        text = "mostly " + text
+    elif words and share:
+        text += ", among other things"
+    elif share:
+        text += f", {'mostly' if share == 'mostly' else 'including'} {_and([FORMS[term][1] for term in named])}"
+    for word, kind in (("mainly", "mostly"), ("often", "hedged")):
+        for manner in (FORMS[term][0] for term in styles if term in facts[kind] and term not in named):
+            text += f", {word} in {'an' if manner[0] in 'aeiou' else 'a'} {manner} style"
+    return text[0].upper() + text[1:] + "."
 
 
 # The print check: what a card may not read like, true or not.
@@ -651,8 +655,6 @@ def unfit(text: str) -> str | None:
       - it names a kind of art, not only what is drawn, and does not open with what the art is made in;
       - MAX_MODIFIERS manner and genre words at most are stacked before the kind of art;
       - it is a whole phrase, and does not break off on a small word or on a subject in the singular.
-    What stands in quotation marks is the artist's word, and may say a word of the first sentence again when it
-    says another with it: a tag that adds nothing, or repeats another tag, is left out before this (_own_tags).
     """
     whole = text.split(". ")[0].rstrip(".").lower()
     words = re.findall(r"[a-z0-9-]+", whole)
@@ -693,8 +695,8 @@ def _embed(client: httpx.Client, texts: list[str]) -> list[list[float]]:
 def embedded_text(profile: str, facts: dict[str, Any]) -> str:
     """What an artist's vector is made of: the profile, then every fact by its name, as search filters on it.
 
-    The second part does not depend on how a sentence happens to be worded, and has what the sentences leave
-    out: the medium everybody has, and the style words.
+    The second part does not depend on how the sentence happens to be worded, and has what it leaves out: the
+    artist's own tags, the medium everybody has, and the style words.
     """
     names = {"specialties": "Specialties", "own_words": "In the artist's words", "mediums": "Mediums"}
     names |= {"genres": "Genres", "style_words": "Style"}
@@ -720,7 +722,7 @@ def run(
     this run would write: nothing is asked or written again), waiting_for_tags (not every work of theirs is
     tagged yet; a row they had stays as it is until they are), left_for_next_run,
     removed (rows of artists the store no longer lists, deleted), open_for_work and with_own_tags (of the
-    profiled: the cards with a second sentence), and seconds_per_artist. Each row is committed as it is made.
+    profiled: those with tags of their own to show), and seconds_per_artist. Each row is committed as it is made.
     ValueError before anything is sent if the address is not loopback; httpx.HTTPError when Ollama is in
     trouble, with what was stored kept.
     """
@@ -878,8 +880,8 @@ def profiles(db: pathlib.Path | str | None = None) -> list[dict[str, Any]]:
 
     Each has artist_key, the text as `template` and again as `written`, with its version (written_by_model is
     False), the search filters mediums and specialties, the genres, style_words and own_words (the artist's own
-    tags that the text quotes), hedged (which of those hold for part of the works only) and mostly (which most
-    works have, and not clearly enough to be said flat), open_for_work (True, or None for unknown) with its
+    tags that the site shows as theirs), hedged (which of those hold for part of the works only) and mostly
+    (which most works have, and not clearly enough to be said flat), open_for_work (True, or None for unknown) with its
     open_evidence, the facts with their counts, and the embedding as 1,024 numbers. And `current`: False for a
     profile made from a reading that has gone stale or been made again since (see current), which is not one to
     publish.
@@ -923,8 +925,8 @@ def sample(count: int, seed: int, db: pathlib.Path | str | None = None) -> list[
     """A random sample of the profiles for the critic, each with the paths of the artist's cached images.
 
     `images` are the works the facts were counted over; `images_left_out` are the artist's other cached works
-    (flagged or declared AI-made). `own_tags` are the artist's own tags that the second sentence quotes, as it
-    prints them, each with the number of those works that carry it: the support a claim has that no image shows.
+    (flagged or declared AI-made). `own_tags` are the artist's own tags that the site shows as theirs, as it
+    prints them, each with the number of those works that carry it.
     The order is a hash of the seed and the artist, as in tagging.sample(). Only profiles that are current, and
     made as this version makes them: the critic holds each against the images as they are now.
     """
