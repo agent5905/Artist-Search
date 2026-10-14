@@ -830,3 +830,24 @@ What failed, and why it matters:
 - 787 of 793 previously quoted tags still reach search.
 - No model was called; the GPU is paused. The cards are remade, in about 35 minutes, when it is resumed.
 - Known gaps: "Fantasy" stated flat where the critic saw 3 of 10 comes from the genre tags and is left; the synonym list is hand-made ("landscape" and "scenery" still both show).
+
+### Round 20: push's second critic; collection's first stop at scale (2026-10-13, night)
+
+**Push, judged a second time: much better, still not fit to run at scale.**
+- All 72 of the first critic's probes pass; none of its counterexamples stands.
+- Emptied or corrupted local tables, a missing or unmigrated store, a flood of removals: each stops the run or deletes nothing.
+- A rerun changes nothing; similar artists and their picked works are only ones that are sent; no secret leaks on any failure path.
+- 64 of 66 deliberate breaks are caught by tests.
+- In 360 runs with 372 changes between them, no change made **between** runs produced a violation.
+
+What failed:
+- **Changes that land during a push** (the critic's biggest gap). The build reads the store in about a dozen separate steps while collection writes to it, so a new tagline, title or thumbnail landing between two steps can go out under the previous reading. All 49 violations found were this. The fix is one consistent snapshot for the whole build.
+- **A card that outlives its works:** if half the works it was counted from are later taken down, it still counts as current.
+- **The deletion guard can hold back real removals:** three made here plus one through the site stop every push until it is allowed by hand. A removed site that nine artists link forces a choice between holding a real removal and barring nine unrelated people.
+- **A model description can carry a handle** ("Text in the corner reads Discord ..."). No real description does today.
+- **The body-and-dress list for the artist's own tags is too short:** "panties", "shirtless" and "musclegirl" would show if three artists used them. Nothing like that would be sent from today's data.
+- **A dry run on a partly analysed store adds empty tables to it.**
+
+The critic would not run push at scale while anything else writes to the store, until the build reads one snapshot. Push round 6 is under way on all of the above. A push is days away in any case, since the new artists' works still need analysing.
+
+**Collection stopped once at scale, on our own rule.** After 100 artists it stopped with "the image host is failing or rate limiting", but the host had sent no refusal and no error. Three images in a row from one artist were over our 10 MB cap, and an earlier rule counted any image not kept toward the host's stop. An image over the cap was served whole and refused by us; it says nothing about the host, so it no longer counts. Collection resumed at 23:21, carrying on from where it stopped.
