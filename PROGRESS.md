@@ -822,3 +822,11 @@ What failed, and why it matters:
 **Profiles: owner decision 11, option A.** A card is one plain sentence from the checked per-work tags. The artist's own tags stay on the site, titled "The artist's own tags", and now pass the same rules the quoted tags did. The round that fixes the seventh critic's wording faults was cut off by a weekly usage limit on the account and has been resumed.
 
 **The GPU is paused and the worker stopped,** at the owner's request. A check at 22:30 found no model loaded in Ollama and no process of this project connected to it.
+
+**Profiles round 8 (option A): merged.**
+- Recomputed from stored facts for all 430 profiled artists: no card opens "Artwork" (75 did), none says "partly" (35 did), none quotes tags, and none fails the print check.
+- **The "partly" cards were not a wording bug in the share rule.** The checked tags count fewer works than a person sees: one artist's anime is 5 of 11 by tags and 9 of 11 to the critic. The hedge now says "often", which does not deny more. Subjects are named together by how many works show any of them: "Character and environment art." in place of "Artwork, including characters and environments."
+- **Chips:** the artist's own tags pass one shared rule, used by both the profile stage and push, so the two cannot disagree. Before: "artstation", "artstationchallenge", "digitalart", "2d". After: "elf", "fantasy", "character design", "creature", "cowboy". "dnd" and "dungeonsanddragons" showed together for 10 artists before, none after.
+- 787 of 793 previously quoted tags still reach search.
+- No model was called; the GPU is paused. The cards are remade, in about 35 minutes, when it is resumed.
+- Known gaps: "Fantasy" stated flat where the critic saw 3 of 10 comes from the genre tags and is left; the synonym list is hand-made ("landscape" and "scenery" still both show).
