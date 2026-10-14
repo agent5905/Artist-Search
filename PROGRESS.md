@@ -716,3 +716,35 @@ Push had four unjudged rounds. It is the last gate before the public, so it was 
 - One point left for the lead: an artist who lists a site that was removed before they were ever stored now gets a bare handle row, marked and never collected. The old lookup stored nothing for them.
 
 **Pipeline counts:** artists discovered 472, collected 472, works 5,126; profiles 433, left out 37 (30 mostly AI-declared); artists public 119. **Database:** 16.8 MB of 400 MB.
+
+### Round 16: the pacing rebuild's critic (2026-10-13)
+
+**Verdict: 7 of 13 properties pass, 6 fail.** About 710 sequences against a stand-in API with a fake clock. No real request was made.
+
+**What held**
+- Inside one run the client never sent faster than its base interval: 40 fuzzed discovery runs and 1,096 collection requests.
+- Under constant 429s it sends 20 requests in 68 minutes and stops, with everything stored kept. The worst ten minutes hold 8 requests.
+- A stop loses nothing: killed at each of 419 points, every rerun ended identical to an uninterrupted run.
+- Nothing private is saved. A handle is written only at the threshold; the database bytes were checked, not just the columns.
+- Removal by handle holds through the new tables: removed at each of 67 points, never stored again, never named on disk.
+- The rules the old profile lookup enforced hold in collection: of 72 spellings of a website field, only a bare front page is kept.
+- 34 of 35 deliberate breaks were caught by the tests.
+
+**What failed**
+
+| Property | Counterexample |
+|---|---|
+| The pace outlives the run | It does not. After a stop at a five-minute interval, a rerun sends its first request at once and is back at 2 seconds |
+| Two stages cannot run at once | They can. Nothing stops collection starting beside discovery; together they send one request a second, the rate that got us limited |
+| The stop cannot be dodged | The token expires before the stop is reached, and a 401 resets the count. Discovery ran 2.2 hours and collection 7 hours against an API that was refusing |
+| `Retry-After` is safe | 3600 on every 429 stretches a run to 19 hours. A 400-digit value raises an error that skips collection's closing removal sweep |
+| A refusing image host is called out | Each image refused three times, served on the fourth: 12 images in 3 hours, exit 0, no message |
+| Removal by site | An artist who is only a bare handle when their site is removed is never barred, and is collected later if their website field changes. This breaks hard rule 7 |
+
+- **The critic's biggest gap:** "The pace lives in one process's memory and nothing ties processes together."
+- **Would it run this against the real API?** Yes, on three conditions the code does not enforce: one stage at a time, an hour's wait after any stop, and no site removal pending.
+- The removal-by-site case is the one the builder flagged and left to the lead. The critic settled it: bar the handle and keep nothing.
+
+**Round 10 (in progress):** the pace and the time of the last request are kept in a file per host, with a lock so one process talks to a host at a time; the stop is measured in time spent refused, and a 401 is not progress; `Retry-After` is bounded and cannot raise; the image host gets the same stop; an artist whose profile names a removed site is barred whether or not anything of theirs was collected. A critic re-judges the six before any real run.
+
+**Process note.** The critic worked in a temporary copy of the repo, and most of its probe files were deleted with that copy when it finished. Two survived. Critics that write probes will keep them in the main checkout from now on.
