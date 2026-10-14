@@ -31,7 +31,6 @@ AT = "2026-01-01T00:00:00+00:00"
 PUBLISHED = 1_780_000_000  # work 0 of every artist; each later work is a day older
 FACTS = {
     "specialties": ["character"],
-    "own_words": ["dragons"],
     "mediums": ["digital painting"],
     "genres": ["fantasy"],
     "formats": ["portrait or bust"],
@@ -294,6 +293,8 @@ def artist(
         texts = texts if profile == "excluded" else (*texts, vector)
         reason = "nothing_clear" if profile == "excluded" else None
         facts = FACTS | ({"sheet": {"pictures": sheet[0], "unsuitable": sheet[1]}} if sheet else {})
+        # The artist's own tags the site shows as theirs, as the profile stage picks them: the most used first.
+        facts |= {"own_words": [f"zzall{word}", *(work["tags"][0] for work in made)]}
         # What the profile rests on, as the profile stage keeps it: the works it counted, each as it was read.
         facts |= {"counted": sorted(work["id"] for work in made[: counted or 0])}
         said = {work["id"]: edits.get(n, {}).get("declared", "no") for n, work in enumerate(made)}
@@ -691,6 +692,33 @@ def test_a_title_and_tags_with_a_contact_or_with_no_reading_are_not_sent(fake, r
     assert "fake-specialty" not in fake.sent()  # a field of the artist's own that nothing has read for a contact
 
 
+def test_a_tag_shown_as_the_artists_is_one_the_profile_stage_picked_on_a_work_that_goes(fake):
+    """Round 8: the site's chips go through the profile stage's one rule (profiles._own_tags), and are always a
+    tag the artist put on a work that is sent, as they wrote it or with the spaces put in where it is certain."""
+    works, word = artist(ALPHA, 5, edits={4: {"rating": "suggestive"}}), squashed(ALPHA)
+    picked = ["dungeons and dragons", f"zzown{word}0", f"zzown{word}4", "zzinvented"]
+    with closing(sqlite3.connect(config.LOCAL_DB)) as conn, conn:
+        tags = json.dumps(["Dungeons_And_Dragons", "dnd", "digitalart", f"zzall{word}"])
+        conn.execute("UPDATE works SET tags = ? WHERE deviation_id = ?", (tags, works[1]["id"]))
+        conn.execute(
+            "UPDATE artist_profiles SET facts = ? WHERE artist_key = ?",
+            (json.dumps(FACTS | {"own_words": picked}), f"da:{ALPHA}"),
+        )
+    read_again(works[1], handle=ALPHA)
+
+    push.run(False)
+
+    row = sent_artists(fake)[ALPHA]
+    # not one on a work held back, not one on no work, and not one the rule left out however much it is used
+    assert row["top_tags"] == ["dungeons and dragons", f"zzown{word}0"]
+    with closing(sqlite3.connect(config.LOCAL_DB)) as conn:
+        query = "SELECT tags FROM works WHERE deviation_id IN (?, ?, ?, ?)"
+        stored = [json.loads(tags) for (tags,) in conn.execute(query, [work["id"] for work in works[:4]])]
+    on_sent = {re.sub(r"[_-]", "", tag.lower()) for tags in stored for tag in tags}
+    assert all(re.sub(r"\s", "", tag) in on_sent for tag in row["top_tags"])
+    assert "dnd" in row["search_text"]  # still searched by
+
+
 # What a row is.
 
 
@@ -718,7 +746,7 @@ def test_the_rows_are_exactly_these(fake):
         "top_tags": [f"zzall{word}", *(f"zzown{word}{n}" for n in range(5))],
         "search_text": " ".join(
             [
-                *("character", "dragons", "digital painting", "fantasy", "portrait or bust", "painterly"),
+                *("character", "digital painting", "fantasy", "portrait or bust", "painterly"),
                 *(work["title"] for work in works),
                 *(f"zzall{word}", *(f"zzown{word}{n}" for n in range(5))),
             ]
@@ -1803,10 +1831,12 @@ def test_a_text_that_fails_the_plain_rule_is_left_out_of_a_row_that_is_sent_and_
         "specialty": "zz@yy-fake",
         "style word": "tg://yyfakepainter",
     }
-    facts = FACTS | {"own_words": ["dragons", said["own word"]], "specialties": ["character", said["specialty"]]}
+    own_words = [said["own word"], f"zzall{word}", *(work["tags"][0] for work in works)]
+    facts = FACTS | {"own_words": own_words, "specialties": ["character", said["specialty"]]}
+    tags = json.dumps([said["own tag"], said["own word"].replace(" ", "_")])
     with closing(sqlite3.connect(config.LOCAL_DB)) as conn, conn:  # each read "no contact", or never read at all
         conn.execute("UPDATE profiles SET tagline = ? WHERE artist_key = ?", (said["tagline"], key))
-        conn.execute("UPDATE works SET tags = ? WHERE deviation_id = ?", (f'["{said["own tag"]}"]', works[0]["id"]))
+        conn.execute("UPDATE works SET tags = ? WHERE deviation_id = ?", (tags, works[0]["id"]))
         conn.execute("UPDATE artist_profiles SET facts = ? WHERE artist_key = ?", (json.dumps(facts), key))
     read_again(works[0], handle=ALPHA)
     edit_result(works[0], style_words=["painterly", said["style word"]])
@@ -1817,12 +1847,13 @@ def test_a_text_that_fails_the_plain_rule_is_left_out_of_a_row_that_is_sent_and_
     assert counts["artists_sent"] == 1 and counts["works_sent"] == 5 and counts["works_held_contact_by_rule"] == 0
     assert row["tagline"] is None and row["profile"] and row["specialties"] == ["character"]
     assert row["top_tags"] == [f"zzall{word}", *(f"zzown{word}{n}" for n in range(1, 5))]
-    assert row["search_text"].startswith("character dragons digital painting")
+    assert row["search_text"].startswith("character digital painting")
     assert first["tags"] == ["digital painting", "character", "fantasy", "realistic", "painterly", "portrait or bust"]
     for text in said.values():
         assert text.lower() not in json.dumps(fake.loads[-1]).lower() and text.lower() not in fake.held()
-    # Each text once, and the specialty twice: it is a search filter and a search word.
-    assert counts["texts_left_out_for_contact"] == len(said) + 1
+    # Each text once; the specialty twice, a search filter and a search word; and the own word twice, a tag as
+    # the site prints it and as the artist wrote it.
+    assert counts["texts_left_out_for_contact"] == len(said) + 2
 
 
 def test_an_artist_whose_profile_sentence_fails_the_plain_rule_waits_for_one_that_can_be_shown(fake):
@@ -2017,7 +2048,8 @@ def test_a_work_whose_title_or_tags_changed_after_they_were_read_is_held_until_t
 
     read_again(made[1], made[2])  # read, and found to hold no contact: now they are words that were read
     assert push.run(False)["works_sent"] == 11
-    assert title in sent_artists(fake)[ALPHA]["search_text"] and tag in sent_artists(fake)[ALPHA]["top_tags"]
+    # the tag is searched by; it is shown as the artist's once the profile stage has picked it (profiles._own_tags)
+    assert title in sent_artists(fake)[ALPHA]["search_text"] and tag in sent_artists(fake)[ALPHA]["search_text"]
 
 
 def test_a_work_whose_image_the_artist_replaced_is_held_until_the_new_image_is_fetched_and_read(fake):

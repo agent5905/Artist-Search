@@ -305,9 +305,9 @@ def test_the_facts_are_counted_from_the_verified_tags_and_from_nothing_else():
     assert (profile["specialties"], profile["mediums"], profile["genres"]) == (
         *(["character", "creature"], ["digital painting"], ["fantasy"]),
     )
-    assert (profile["style_words"], profile["own_words"], profile["hedged"]) == ([], [], ["creature"])
+    assert (profile["style_words"], profile["own_words"], profile["hedged"]) == ([], [], [])
     # one text, in both columns: nothing of a description, nothing below its threshold, and no style word
-    assert profile["template"] == profile["written"] == "Fantasy character art and some creatures."
+    assert profile["template"] == profile["written"] == "Fantasy character and creature art."
     assert (profile["template_version"], profile["written_version"]) == (profiles.TEMPLATE_VERSION,) * 2
     assert profile["written_by_model"] is False
 
@@ -424,18 +424,14 @@ def test_the_medium_nearly_everyone_has_is_a_fact_to_filter_on_and_is_never_said
         ([(10, tags("pixel art", genres=[], style_words=[]))], "Character pixel art."),
         # line art is said once, as the medium, and by a word the card has not used
         ([(10, tags("digital line art", genres=[], style_words=["lineart"]))], "Character art in digital line work."),
-        # what it is made in stands between the kind of art and what comes after: a comma, so those are no medium
+        # and after a subject that is said by its share
         (
-            [(6, tags("3d render", genres=[], style_words=[])), (4, tags("3d render", ["environment"], [], []))],
-            "Artwork in 3D, mostly characters and some environments.",
+            [(6, tags("3d render", genres=[], style_words=[])), (4, tags("3d render", [], [], []))],
+            "Mostly character art in 3D.",
         ),
         (
-            [
-                (6, tags("3d render", genres=[], style_words=[])),
-                (1, tags("3d render", ["character", "environment"], [], [])),
-                (3, tags("3d render", ["environment"], [], [])),
-            ],
-            "Character art in 3D, and some environments.",
+            [(5, tags("3d render", genres=[], style_words=[])), (5, tags("3d render", [], [], []))],
+            "Character art in 3D, among other things.",
         ),
     ],
 )
@@ -449,24 +445,29 @@ def test_a_medium_is_said_only_when_it_is_distinctive_and_a_clear_majority(group
         # round 6's critic: "mostly dragons" at 14 of 14. What most works show is never behind a hedge.
         ([(14, DRAGON)], "Creature art."),
         ([(7, PLAIN), (3, DRAGON)], "Character art."),  # flat from 7 in 10, and 3 in 10 are not named
-        # under 7 in 10 no subject is the kind of art: each is said by its share
-        ([(6, PLAIN), (4, DRAGON)], "Artwork, mostly characters and some creatures."),
-        ([(6, PLAIN), (3, DRAGON), (1, SCENERY)], "Artwork, mostly characters."),
-        ([(5, SCENERY), (4, PLAIN), (1, DRAGON)], "Artwork, including environments and characters."),
-        ([(5, PLAIN), (3, DRAGON), (2, SCENERY)], "Artwork, including characters."),  # round 4: one subject of half
-        ([(6, BOTH), (4, tags(subjects=[], genres=[], style_words=[]))], "Artwork, mostly characters and creatures."),
-        # beside a subject that leads, another is part of it or goes with most of it
-        ([(6, PLAIN), (4, BOTH)], "Character art and some creatures."),
-        ([(4, PLAIN), (6, BOTH)], "Character art, mostly with creatures."),
+        # the subjects are named together, by the works that show any of them: round 7's critic, "'Artwork' is
+        # filler", where characters were 6 of 10, or creatures 4 of 8 and props 3 of 8
+        ([(6, PLAIN), (4, DRAGON)], "Character and creature art."),
+        ([(5, SCENERY), (4, PLAIN), (1, DRAGON)], "Environment and character art."),
+        ([(6, PLAIN), (4, BOTH)], "Character and creature art."),
+        ([(4, PLAIN), (6, BOTH)], "Character and creature art."),
         ([(8, BOTH), (2, PLAIN)], "Character and creature art."),
         (
             [(6, PLAIN), (4, tags(subjects=["vehicle or mech"], genres=[], style_words=[]))],
-            "Artwork, mostly characters and some vehicles.",
+            "Character and vehicle art.",
+        ),
+        ([(6, PLAIN), (3, DRAGON), (1, SCENERY)], "Mostly character art."),
+        ([(6, BOTH), (4, tags(subjects=[], genres=[], style_words=[]))], "Mostly character and creature art."),
+        ([(5, PLAIN), (3, DRAGON), (2, SCENERY)], "Character art, among other things."),  # round 4: one of half
+        (
+            [(4, DRAGON), (3, tags(subjects=["prop or weapon"], genres=[], style_words=[])), (1, SCENERY)],
+            "Creature art, among other things.",
         ),
     ],
 )
 def test_a_subject_is_said_by_its_share_of_the_works(groups, sentence):
     assert said(*groups) == sentence
+    assert not sentence.startswith("Artwork")
 
 
 @pytest.mark.parametrize(
@@ -484,11 +485,10 @@ def test_a_subject_is_said_by_its_share_of_the_works(groups, sentence):
             [(10, tags(genres=["fantasy", "science fiction"], style_words=[]))],
             "Fantasy and science fiction character art.",
         ),
-        # a genre holds for all the works, whatever share of them each subject is
-        (
-            [(6, FANTASY), (4, tags(subjects=["creature"], style_words=[]))],
-            "Fantasy artwork, mostly characters and some creatures.",
-        ),
+        ([(6, FANTASY), (4, tags(subjects=["creature"], style_words=[]))], "Fantasy character and creature art."),
+        # a genre holds for all the works, whatever share of them the subjects are: it leads, and they follow
+        ([(6, FANTASY), (4, tags(subjects=[], style_words=[]))], "Fantasy art, mostly characters."),
+        ([(5, FANTASY), (5, tags(subjects=[], style_words=[]))], "Fantasy art, including characters."),
     ],
 )
 def test_a_genre_is_stated_flat_or_not_at_all(groups, sentence):
@@ -517,21 +517,33 @@ def test_what_stands_flat_before_the_kind_of_art_is_true_of_most_works_together(
         ([(7, tags(genres=["anime style"], style_words=[])), (3, PLAIN)], "Anime character art."),
         ([(6, tags(genres=["anime style"], style_words=[])), (4, PLAIN)], "Character art, mainly in an anime style."),
         ([(10, tags(genres=["fantasy", "realistic"], style_words=[]))], "Realistic fantasy character art."),
-        ([(4, tags(genres=["anime style"], style_words=[])), (6, PLAIN)], "Character art, partly in an anime style."),
+        # round 7's critic: "'Partly' is wrong on all four cards that use it". The hedge says "often", which
+        # holds however many more works the tags missed: 5 of 11 tagged anime where the critic saw 9
+        ([(5, tags(genres=["anime style"], style_words=[])), (6, PLAIN)], "Character art, often in an anime style."),
         (
             [(5, tags(genres=["stylized cartoon"], style_words=[])), (5, PLAIN)],
-            "Character art, partly in a cartoon style.",  # never "a stylized cartoon style"
+            "Character art, often in a cartoon style.",  # never "a stylized cartoon style"
         ),
         ([(2, tags(genres=["realistic"], style_words=[])), (8, PLAIN)], "Character art."),
+        # and the critic's own counts: 9 of 11 anime, 10 of 10 realistic, 6 of 8 cartoon are flat
+        ([(9, tags(genres=["anime style"], style_words=[])), (2, PLAIN)], "Anime character art."),
+        ([(10, tags(subjects=["environment"], genres=["realistic"], style_words=[]))], "Realistic environment art."),
+        ([(6, tags(subjects=[], genres=["stylized cartoon"], style_words=[])), (2, DRAGON)], "Cartoon art."),
+        # with nothing else to name, the manner is named, by its share: round 7's "Artwork, partly in a cartoon style"
+        (
+            [(4, tags(subjects=[], genres=["stylized cartoon"], style_words=[])), (4, tags(subjects=[], genres=[]))],
+            "Cartoon art, among other things.",
+        ),
         # "mostly" once on a card: the manner has a word of its own
         (
-            [(6, tags(genres=["anime style"], style_words=[])), (4, DRAGON)],
-            "Artwork, mostly characters and some creatures, mainly in an anime style.",
+            [(6, tags(genres=["anime style"], style_words=[])), (4, tags(subjects=[], genres=[], style_words=[]))],
+            "Mostly character art, mainly in an anime style.",
         ),
     ],
 )
 def test_the_drawing_manner_leads_when_most_works_have_it_and_is_hedged_when_part_of_them_do(groups, sentence):
     assert said(*groups) == sentence
+    assert "partly" not in sentence
 
 
 def test_a_style_word_is_counted_for_search_and_never_said():
@@ -542,40 +554,47 @@ def test_a_style_word_is_counted_for_search_and_never_said():
     assert "Style: painterly, muted." in profiles.embedded_text(profiles.template(found), found)
 
 
-# 2. The artist's own tags: the second sentence, in their words.
+# 2. The artist's own tags: shown apart from the card, as theirs, and never in it (owner decision 11).
 
 OWN = ["dinosaur", "paleoart", "creaturedesign", "digitalart"]
 
 
+def shown(*groups, **artist):
+    """The artist's own tags the site shows for such a body of work."""
+    return profiles.facts_of(body(*groups), **artist)[0]["own_words"]
+
+
 @pytest.mark.parametrize(
-    ("groups", "sentence"),
+    ("groups", "own_words"),
     [
-        ([(10, DRAGON, OWN)], 'Creature art. Tags their work "dinosaur" and "paleoart".'),
-        ([(10, PLAIN, OWN)], 'Character art. Tags their work "dinosaur", "paleoart" and "creature design".'),
-        # a tag on 4 works in 10 is quoted, and round 6's "some birds" on 3 of 10 is not
-        ([(4, DRAGON, ["dinosaur"]), (6, DRAGON)], 'Creature art. Tags their work "dinosaur".'),
-        ([(3, DRAGON, ["dinosaur"]), (7, DRAGON)], "Creature art."),
-        ([(4, DRAGON, ["dinosaur"]), (7, DRAGON)], "Creature art."),  # 4 of 11 is under 40 percent
-        ([(3, DRAGON, ["dinosaur"]), (2, DRAGON)], "Creature art."),  # and never on fewer than 4 works
-        ([(4, DRAGON, ["dinosaur"]), (1, DRAGON)], 'Creature art. Tags their work "dinosaur".'),
+        ([(10, DRAGON, OWN)], ["dinosaur", "paleoart", "creature design"]),
+        # a tag on one work is the artist's as much as one on all of them
+        ([(1, DRAGON, ["dinosaur"]), (9, DRAGON)], ["dinosaur"]),
         # the most used first; of two as often used, the one the artist writes earlier
+        ([(6, DRAGON, ["wolf", "dinosaur"]), (4, DRAGON, ["theropod", "dinosaur"])], ["dinosaur", "wolf", "theropod"]),
+        ([(10, DRAGON, ["theropod", "wolf"])], ["theropod", "wolf"]),
+        ([(10, DRAGON, ["wolf", "theropod"])], ["wolf", "theropod"]),
+        # twelve at most
         (
-            [(6, DRAGON, ["wolf", "dinosaur"]), (4, DRAGON, ["theropod", "dinosaur"])],
-            'Creature art. Tags their work "dinosaur", "wolf" and "theropod".',
+            [(10, DRAGON, [f"{letter}tag" for letter in "abcdefghijklmn"])],
+            [f"{letter}tag" for letter in "abcdefghijkl"],
         ),
-        ([(10, DRAGON, ["theropod", "wolf"])], 'Creature art. Tags their work "theropod" and "wolf".'),
-        ([(10, DRAGON, ["wolf", "theropod"])], 'Creature art. Tags their work "wolf" and "theropod".'),
-        # three at most
-        ([(10, DRAGON, ["a1", "b2", "c3", "d4", "e5"])], 'Creature art. Tags their work "a1", "b2" and "c3".'),
         # the same tag however it is written, and a work that has it twice counts once
         (
             [(2, DRAGON, ["Paleo_Art", "paleoart"]), (2, DRAGON, ["PALEOART"]), (6, DRAGON, ["paleo-art"])],
-            'Creature art. Tags their work "paleo-art".',
+            ["paleo-art"],
         ),
     ],
 )
-def test_the_second_sentence_quotes_the_tags_the_artist_put_on_the_most_works(groups, sentence):
-    assert said(*groups) == sentence
+def test_the_tags_shown_are_the_ones_the_artist_put_on_the_most_works(groups, own_words):
+    assert shown(*groups) == own_words
+
+
+def test_the_card_is_one_sentence_and_quotes_no_tag_of_the_artists():
+    found, _ = profiles.facts_of(body((10, DRAGON, OWN)))
+
+    assert profiles.template(found) == "Creature art."
+    assert found["own_words"] == ["dinosaur", "paleoart", "creature design"]
 
 
 def test_the_quoted_tags_are_kept_with_the_number_of_counted_works_that_carry_each():
@@ -623,11 +642,9 @@ def test_a_tag_is_printed_as_a_reader_expects_it_only_where_the_split_is_certain
         ["art", "digitalart", "digital_art", "artwork", "drawing", "illustration", "digitalpainting", "2dart"],
         ["artworkdigital", "digitalartwork", "conceptart", "conceptdesign", "gameart", "visualdevelopment", "design"],
         ["artist", "digitalartist", "illustrationdigital", "mydrawing", "dailyart", "style", "mood", "girl", "hot"],
-        # what the first sentence has said: the tags discovery searches by, and the artist's word for a genre
-        ["characterdesign", "characterconcept", "characterart", "character", "characters", "character_art"],
-        ["fantasy", "fantasyart", "fantasycharacter", "fantasycharacterdesign", "fantasy_illustration"],
         # selling and availability, where it is posted, what it was made with, a statement about AI
         ["commission", "commissionsopen", "adoptablesopen", "forsale", "auction", "ych", "paypal", "freelance"],
+        ["adoptable", "adopts", "characteradopt", "ocadopt"],
         ["deviantart", "dailydeviation", "artoftheday", "artstation", "instaart", "artistsondeviantart"],
         ["photoshop", "procreate", "blender3d", "clipstudiopaint", "noai", "notaigenerated", "humanmadeart"],
         # praise, a year
@@ -640,56 +657,59 @@ def test_a_tag_is_printed_as_a_reader_expects_it_only_where_the_split_is_certain
         [],
     ],
 )
-def test_a_tag_that_says_nothing_or_is_not_about_the_work_is_not_quoted(own):
+def test_a_tag_that_says_nothing_or_is_not_about_the_work_is_not_shown(own):
     found, _ = profiles.facts_of(body((10, FANTASY, own)))
 
     assert found["own_words"] == [] and found["counts"]["own_words"] == {}
     assert profiles.template(found) == "Fantasy character art."
 
 
-def test_a_tag_discovery_searches_by_is_quoted_where_it_names_what_the_first_sentence_does_not():
-    own = ["creaturedesign", "characterdesign", "conceptart", "weapondesign"]
-
-    assert said((10, FANTASY, own)) == 'Fantasy character art. Tags their work "creature design" and "weapon design".'
-    assert said((10, SCENERY, own)) == (
-        'Environment art. Tags their work "creature design", "character design" and "weapon design".'
-    )
-    # by any spelling of what the sentence says, and "landscape" has no cape in it
-    scifi = tags(subjects=["environment"], genres=["science fiction"], style_words=[])
-    assert said((10, scifi, ["scifi", "sci-fi", "sciencefiction", "scifiart", "landscape"])) == (
-        'Science fiction environment art. Tags their work "landscape".'
-    )
-    assert said((10, SCENERY, ["scifi"])) == 'Environment art. Tags their work "scifi".'
-    # nor does a word that only has a left-out one in it go with those: a soldier is not sold, nor Salem for sale
-    assert said((10, SCENERY, ["soldier", "salem", "sapphire"])) == (
-        'Environment art. Tags their work "soldier", "salem" and "sapphire".'
-    )
-    assert (
-        said((10, SCENERY, ["psychedelic", "wheels"])) == 'Environment art. Tags their work "psychedelic" and "wheels".'
-    )
+def test_a_word_with_a_left_out_one_in_it_is_shown():
+    # a soldier is not sold, nor Salem for sale, and "landscape" has no cape in it
+    assert shown((10, SCENERY, ["soldier", "salem", "sapphire", "psychedelic", "wheels", "landscape"])) == [
+        *("soldier", "salem", "sapphire", "psychedelic", "wheels", "landscape")
+    ]
 
 
-def test_no_tag_says_again_what_one_quoted_before_it_has_said():
-    assert said((10, DRAGON, ["dragon", "dragons", "dragonart", "reddragon", "wolf"])) == (
-        'Creature art. Tags their work "dragon" and "wolf".'
-    )
-    assert said((10, PLAIN, ["darkfantasy", "darkart", "fantasyart", "dark", "knight"])) == (
-        'Character art. Tags their work "dark fantasy" and "knight".'
-    )
+def test_no_tag_says_again_what_one_shown_before_it_has_said():
+    assert shown((10, DRAGON, ["dragon", "dragons", "dragonart", "reddragon", "wolf"])) == ["dragon", "wolf"]
+    assert shown((10, PLAIN, ["darkfantasy", "darkart", "fantasyart", "dark", "knight"])) == ["dark fantasy", "knight"]
     # nor in the plural, nor by its initials
-    assert said((10, PLAIN, ["elf", "elves", "elfart", "originalcharacter", "oc", "ocs"])) == (
-        'Character art. Tags their work "elf" and "original character".'
-    )
+    assert shown((10, PLAIN, ["elf", "elves", "elfart", "originalcharacter", "oc", "ocs"])) == [
+        *("elf", "original character")
+    ]
+    assert shown((10, PLAIN, ["characterdesign", "characterart", "character", "characters"])) == ["character design"]
 
 
-def test_the_artists_own_handle_or_name_is_not_quoted():
+@pytest.mark.parametrize(
+    "own",
+    [
+        ["dnd", "dungeonsanddragons", "ttrpg"],  # round 7's critic: "three synonyms in a row"
+        ["dungeonsanddragons", "dnd", "dungeons_and_dragons", "dnd_character"],
+        ["DnD", "DungeonsAndDragons"],
+    ],
+)
+def test_one_name_written_two_ways_is_shown_once(own):
+    found = [re.sub(r"[\s_-]", "", tag.lower()) for tag in shown((10, FANTASY, own))]
+
+    assert not {"dnd", "dungeonsanddragons"} <= set(found)
+    assert found[0] == re.sub(r"[_-]", "", own[0].lower())  # as the artist wrote it first, never another word
+
+
+def test_a_genre_or_a_word_written_two_ways_is_shown_once():
+    assert shown((10, FANTASY, ["scifi", "sci-fi", "sciencefiction", "science_fiction"])) == ["scifi"]
+    assert shown((10, FANTASY, ["science_fiction", "scifi"])) == ["science fiction"]
+    assert shown((10, FANTASY, ["colourful", "colorful"])) == ["colourful"]
+
+
+def test_the_artists_own_handle_or_name_is_not_shown():
     own = ["zzfakealpha", "zzfake", "alpha", "artofzzfakealpha", "zz_fake_alpha", "paleoart"]
 
-    assert said((10, DRAGON, own), handle=ALPHA) == 'Creature art. Tags their work "paleoart".'
-    assert said((10, DRAGON, own)) == 'Creature art. Tags their work "zzfakealpha" and "paleoart".'
+    assert shown((10, DRAGON, own), handle=ALPHA) == ["paleoart"]
+    assert shown((10, DRAGON, own)) == ["zzfakealpha", "paleoart"]
 
 
-def test_a_tag_that_few_artists_in_the_store_use_is_not_quoted():
+def test_a_tag_that_few_artists_in_the_store_use_is_not_shown():
     """A name is seldom anyone else's tag: the artist's own, a friend's, a director's."""
     for n, handle in enumerate((ALPHA, BRAVO, CHARLIE)):
         own = ["paleoart", "fakefirstname", *(["fakesurname"] if n else []), f"fakename{n}"]
@@ -698,22 +718,15 @@ def test_a_tag_that_few_artists_in_the_store_use_is_not_quoted():
     assert run(Fake()) == {"profiled": 3, "with_own_tags": 3}
     assert profiles.SHARED == 3
     # "fakesurname" is on every work of two of them, and that is not enough
-    assert {profile["template"] for profile in profiles.profiles()} == {
-        'Creature art. Tags their work "paleoart" and "fakefirstname".'
-    }
+    for profile in profiles.profiles():
+        assert (profile["template"], profile["own_words"]) == ("Creature art.", ["paleoart", "fakefirstname"])
 
 
-def test_a_tag_the_plain_contact_rule_refuses_is_not_quoted_alone_or_with_the_others():
-    assert said((10, DRAGON, ["call555x019x942", "paleoart"])) == 'Creature art. Tags their work "paleoart".'
-    # three tags that pass one by one and hold nine digits between them: the push stage would refuse the card
-    assert library.holds_contact('"mk123", "mk456" and "mk789"')
-    assert said((10, DRAGON, ["mk123", "mk456", "mk789", "paleoart"])) == (
-        'Creature art. Tags their work "mk123", "mk456" and "paleoart".'
-    )
-    # and eight are one too many, beside the digit of "in 3D"
-    in_3d = tags("3d render", ["creature"], [], [])
-    assert library.holds_contact('Creature art in 3D. Tags their work "mk123", "mk456" and "ab78".')
-    assert said((10, in_3d, ["mk123", "mk456", "ab78"])) == 'Creature art in 3D. Tags their work "mk123" and "mk456".'
+def test_a_tag_the_plain_contact_rule_refuses_is_not_shown_alone_or_with_the_others():
+    assert shown((10, DRAGON, ["call555x019x942", "paleoart"])) == ["paleoart"]
+    # three tags that pass one by one and hold nine digits between them, side by side on the page
+    assert library.holds_contact("mk123 mk456 mk789")
+    assert shown((10, DRAGON, ["mk123", "mk456", "mk789", "paleoart"])) == ["mk123", "mk456", "paleoart"]
 
 
 def test_tags_alone_make_no_profile():
@@ -780,7 +793,7 @@ def test_the_facts_lead_with_what_most_works_have_and_keep_only_so_many_of_a_kin
 
     assert found["specialties"] == ["environment", "character", "creature"]  # 10 works, then the first of those with 6
     assert found["genres"] == ["cyberpunk", "realistic"]  # not the wider science fiction, and one manner; fantasy has 6
-    assert (found["mostly"], found["hedged"]) == (["character", "creature"], [])  # 6 in 10
+    assert (found["mostly"], found["hedged"]) == ([], [])  # 6 in 10 each, and named together: 10 show one of them
     assert found["style_words"] == ["painterly", "monochrome"]  # all have 10: the order of the list, and two
     assert all(len(found[name]) <= most for name, most in profiles.AT_MOST.items() if name in found)
 
@@ -985,13 +998,16 @@ def test_open_for_work_is_never_inferred_and_never_false(monkeypatch):
     artist(ALPHA, [tags()] * 6, tagline="Freelance Illustrator", own_tags=dict.fromkeys(range(6), [*hints, "knight"]))
     artist(BRAVO, [tags()] * 6, tagline="Commissions closed", own_tags={0: ["commissionsopen"]})
     artist(CHARLIE, [tags()] * 6, own_tags={0: ["commissionsopen"]}, published={0: OLD})
-    monkeypatch.setattr(profiles, "SHARED", 1)  # nor does the second sentence say it in their tags, whoever uses those
+    monkeypatch.setattr(profiles, "SHARED", 1)  # nor do the tags shown as theirs say it, whoever uses those
 
     assert run(Fake()) == {"profiled": 3, "with_own_tags": 1}
     for profile in profiles.profiles():
         assert profile["open_for_work"] is None and profile["open_evidence"] == []
-        assert not re.search("open|commission|hire|available|freelance|sale", profile["template"].lower())
-    assert profiles.profiles()[0]["template"] == 'Fantasy character art. Tags their work "knight".'
+        shown_words = " ".join([profile["template"], *profile["own_words"]]).lower()
+        assert not re.search("open|commission|hire|available|freelance|sale", shown_words)
+    assert (profiles.profiles()[0]["template"], profiles.profiles()[0]["own_words"]) == (
+        *("Fantasy character art.", ["knight"]),
+    )
 
 
 def test_a_tagline_is_quoted_as_evidence_only_when_it_was_read_and_holds_no_private_contact():
@@ -1026,15 +1042,7 @@ def test_a_tagline_is_quoted_as_evidence_only_when_it_was_read_and_holds_no_priv
 )
 def test_a_card_that_is_not_fit_to_print_is_refused(text, why):
     assert why in profiles.unfit(text)
-    assert why in profiles.unfit(f'{text} Tags their work "paleoart". Open for commissions.')
-
-
-def test_a_quoted_tag_may_say_a_word_of_the_first_sentence_again():
-    """It is the artist's word, and adds one of its own: one that adds nothing was left out before this."""
-    card = said((10, FANTASY, ["fantasycreature", "characterportrait", "fantasycharacter"]))
-
-    assert card == 'Fantasy character art. Tags their work "fantasy creature" and "characterportrait".'
-    assert profiles.unfit('Character art in digital line work. Tags their work "paleoart".') is None  # "work" twice
+    assert why in profiles.unfit(f"{text} Open for commissions.")
 
 
 def test_a_card_the_print_check_refuses_is_not_printed(monkeypatch):
@@ -1079,6 +1087,8 @@ def test_every_card_the_template_writes_passes_the_print_check_and_names_nothing
         assert profiles.unfit(text) is None, text
         first, pieces = text.split(". ")[0].rstrip(".").lower(), found["eligible"]
         assert first.count("mostly") <= 1 and first.count("mainly") <= 1, text
+        # round 7's critic: no "Artwork" for an opening, no "partly", and none of the artist's tags in it
+        assert not re.match("art(work)?\\b", first) and "partly" not in first and '"' not in text, text
         for term, places in found["tagged"].items():
             named = any(re.search(rf"\b{re.escape(form.lower())}\b", first) for form in profiles.FORMS[term][:2])
             if len(places) < 4 or 100 * len(places) < 40 * pieces or term == profiles.COMMON_MEDIUM:
@@ -1086,11 +1096,9 @@ def test_every_card_the_template_writes_passes_the_print_check_and_names_nothing
             elif term in (*profiles.WORLD_FORMS, *profiles.MEDIUM_FORMS) and 100 * len(places) < 70 * pieces:
                 assert not named, (term, text)  # a genre and a medium behind no hedge
             elif term in profiles.SUBJECT_FORMS and 100 * len(places) >= 70 * pieces:
-                # what most works show stands flat, in the kind of art itself: never behind "mostly" or "some"
-                assert re.search(rf"\b{profiles.FORMS[term][0]}\b", first.split(",")[0].split(" some ")[0]), (
-                    term,
-                    text,
-                )
+                # what most works show stands flat, in the kind of art itself: never behind "mostly"
+                assert re.search(rf"\b{profiles.FORMS[term][0]}\b", first.split(",")[0]), (term, text)
+                assert not first.startswith("mostly"), text
     assert len(cards) > 200
 
 
@@ -1107,7 +1115,7 @@ def test_the_vector_is_1024_numbers_of_unit_length_made_from_the_card_and_every_
 
     (profile,) = profiles.profiles()
     text = (
-        'Anime fantasy character art. Tags their work "warrior" and "creature design". Open for commissions.\n'
+        "Anime fantasy character art. Open for commissions.\n"
         "Specialties: character.\nIn the artist's words: warrior, creature design.\n"
         "Mediums: digital painting.\nGenres: fantasy, anime style.\nStyle: painterly."
     )
@@ -1517,13 +1525,9 @@ def test_the_sample_prints_one_json_object_a_line_for_the_critic(capsys, monkeyp
         *("artist", "template", "written", "written_by_model", "facts", "open_for_work", "open_evidence"),
         *("images", "images_left_out", "own_tags"),
     }
-    assert (
-        alpha["template"]
-        == alpha["written"]
-        == ('Fantasy character art. Tags their work "warrior" and "knight". Open for commissions.')
-    )
-    # exactly the tags the second sentence quotes, each with the number of the works that count which carry it
-    assert alpha["own_tags"] == {"warrior": 4, "knight": 4}
+    assert alpha["template"] == alpha["written"] == "Fantasy character art. Open for commissions."
+    # exactly the tags the site shows as theirs, each with the number of the works that count which carry it
+    assert alpha["own_tags"] == {"warrior": 4, "knight": 4, "elf": 1}
     assert alpha["open_for_work"] is True
     assert alpha["open_evidence"] == [{"source": "tagline", "says": "Commissions open", "kind": "commissions"}]
     assert alpha["facts"]["counts"]["subjects"] == {"character": 6}

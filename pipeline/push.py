@@ -93,7 +93,6 @@ DELETE_PERCENT = 10
 DELETE_FLOOR = 5
 TEST_SLUG = "zz-"  # how the other builders' test rows begin. Never sent, and a database that has one is left alone
 STYLE_MODEL, STYLE_RULE = "csd", "local"  # round 7's blind test chose them
-TOP_TAGS = 12  # of the artist's own tags, the most used
 MAX_SEARCH_TEXT = 4000  # sql/001_schema.sql: artists_own_words_sizes
 
 # Besides these, one reason for each mark the collect stage has left: "marked_<its reason>" (see _marked).
@@ -386,8 +385,14 @@ def build(
         profile = written[key]
         used = Counter(tag for _, _, _, own, *_ in ready for tag in set(own))
         most_used = plain([tag for tag, _ in sorted(used.items(), key=lambda item: (-item[1], item[0]))])
-        # An older row may lack a kind.
-        facts = plain([value for field in profiles.STATED for value in profile.get(field, [])])
+        # The artist's own tags the site shows as theirs: those the profile stage's one rule picked
+        # (profiles._own_tags), of those on a work that goes, as it prints them. A printed tag may have spaces
+        # put in it, and sql/001_schema.sql takes 60 characters a tag.
+        on_sent = {re.sub(r"[\s_-]", "", tag.lower()) for tag in used}
+        shown = plain([tag for tag in profile["own_words"] if re.sub(r"[\s_-]", "", tag) in on_sent and len(tag) <= 60])
+        # An older row may lack a kind. Its own_words are of works that may not go: of those that do, every tag is
+        # in most_used, and the ones shown are in top_tags, which keyword search reads too.
+        facts = plain([value for field in profiles.STATED if field != "own_words" for value in profile.get(field, [])])
         # ponytail: the specialty the artist picked on DeviantArt is not in it: nothing has read that field
         # for a private contact. Add it when the tagging stage does.
         # ponytail: every part of it has passed the plain rule as a text of its own, and the text they make is
@@ -406,7 +411,7 @@ def build(
                 "site_url": site_url,
                 "site_domain": site_domain,
                 "tagline": next(iter(plain([tagline])), None) if tagline and contacts.get(key) == "no" else None,
-                "top_tags": most_used[:TOP_TAGS],
+                "top_tags": shown,
                 "search_text": search_text or None,
                 "profile": next(iter(plain([profile["written"]])), None),
                 "specialties": plain(profile["specialties"]),
