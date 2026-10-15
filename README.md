@@ -107,8 +107,8 @@ The removal check reads the removal requests that a proof code was given out for
 ```bash
 uv run python -m pipeline.removals --dry-run
 uv run python -m pipeline.removals
-uv run python -m pipeline.removals --pending              # the open requests, by public handle
-uv run python -m pipeline.removals --grant SLUG --reject SLUG
+uv run python -m pipeline.removals --pending              # the open requests: slug, id, public handle
+uv run python -m pipeline.removals --grant ID --reject ID
 ```
 
 The analysis stages take days on one GPU at full scale, so a small worker runs them in turns and can be paused. A pause loses nothing: each stage saves every work as it finishes it and holds before its next request to a model.

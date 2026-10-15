@@ -3,14 +3,17 @@
     uv run python -m pipeline.removals --dry-run     what a run would remove, and nothing changed anywhere
     uv run python -m pipeline.removals
     uv run python -m pipeline.removals --pending     the open requests, for the owner to answer
-    uv run python -m pipeline.removals --grant SLUG [SLUG ...]     the owner's yes: removed for good
-    uv run python -m pipeline.removals --reject SLUG [SLUG ...]    the owner's no: closed, nothing else changes
+    uv run python -m pipeline.removals --grant ID [ID ...]     the owner's yes: removed for good
+    uv run python -m pipeline.removals --reject ID [ID ...]    the owner's no: closed, nothing else changes
 
 Hard rule 7 and owner decision 6. On the site an artist asks for their code (start_removal_proof, through the
 site's server function), which files their request as one a code was given out for. A request without a code
 (request_removal) is the owner's alone: a run only counts it. A request is a lasting record (sql/001_schema.sql:
-removal_requests): it keeps the handle and site the artist was listed with when they asked, and no push, hold-back,
-rename or deletion of their public row touches it. Only a proven removal or the owner's answer closes it.
+removal_requests), bound when it is filed to the artist listed under the slug then: their handle, their site and
+the account the library keeps for them (artists.da_account, which the push stage sends). Nothing afterwards changes
+that, and no push, hold-back, rename or deletion of their public row touches it: a slug that passes to another
+handle, or a site to another artist, takes nobody else into the request. Only a proven removal or the owner's
+answer closes it, and either removes and bars what it was bound to and nothing else.
 
 The queue (removal_requests.code_at and due_at). A run reads, with the service key, at most MAX_REQUESTS of the
 open requests with a code that are due, the one due longest first, and moves each one it looks at on: an hour
@@ -22,32 +25,40 @@ two weeks to ask for it again.
 It looks for the request's code in two places, and nowhere else:
   1. The DeviantArt profile of the handle the request was made for, through the official API: its bio (the About
      text the site points to) and its tagline, which only the account holder writes. Only when the answer is the
-     account the local library keeps for the artist (under either spelling of its hash), renamed or not: when the
-     handle answers for somebody else, or not at all, the account's other handles kept here are asked, so a
-     rename leaves no request behind. For an artist the library keeps no account for, this place is not read:
-     whoever holds the handle now could be somebody else.
-  2. Their own site on the request, while the profile as just read (the artist's account, or for an artist with no
-     account kept, the handle's own) still names it: a <meta name="artist-search-removal"> in the front page's
+     account the request is bound to (under either spelling of its hash), renamed or not: when the handle answers
+     for somebody else, or not at all, the account's other handles kept here are asked, so a rename leaves no
+     request behind. For a request bound to no account (the library kept none for the artist), this place is not
+     read: whoever holds the handle now could be somebody else. The site's page says so to such an artist.
+  2. Their own site on the request, while the profile as just read (the account's, or for a request bound to no
+     account, the handle's own) still names it: a <meta name="artist-search-removal"> in the front page's
      head, or the file /.well-known/artist-search-removal.txt holding the code and nothing else, read through
      the polite fetcher (crawl.PoliteFetcher.read_proof). A comment, a guestbook entry or anything else a
      visitor can write is in neither. A site their profile no longer names, such as a domain they let lapse and
      moved on from, or the site of a deleted account, is not read.
 Case, the space around the code and HTML entities do not matter, nor do characters that show as nothing. The code
-is the slug's own, so one pasted onto another artist's page proves nothing for them. Codes do not expire. One
-made before the owner replaced the secret is not the slug's code any more, and proves nothing.
+is the slug's own, so one pasted onto another artist's page proves nothing for them; and it is read only in the
+places of the artist the request is bound to, so a slug that has passed to another handle proves nothing for that
+handle either. Codes do not expire. One made before the owner replaced the secret is not the slug's code any
+more, and proves nothing.
 
 A code found where it must be goes to confirm_removal, which checks it again and removes the artist at once and
-for good, listed at that moment or not, and closes the request. The two key hashes the request was made under then
-go on the local store's list (store.import_removed), so no stage here collects the artist again. The next push or
-collect purges what is kept about them, under every handle of their account, as it does for every removal on the
-database's list. The owner's --grant does the same for an open request without proof. A request whose artist is
-removed another way (under another handle of their account, say) is closed by the database as that happens.
+for good, listed at that moment or not, and closes the request. What it bars is what the proof covered: the handle
+and the account the request is bound to, and its site only while the profile just read still names it (and no
+other handle is listed with it: grant_request). Those key hashes, as the database answers them, go on the local
+store's list (store.import_removed), so no stage here collects the artist again. The next push or collect purges
+what is kept about them, under every handle of their account, as it does for every removal on the database's
+list. The owner's --grant does the same for an open request without proof (its site included, on the same
+condition). A request whose artist is removed another way (under another handle of their account, say) is closed
+by the database as that happens.
 
 Anything less leaves the request open, for the owner and for its next look.
 
 Every request to DeviantArt waits its turn in discover.Pace, and holds the API's lock for that request alone: a
 collect run can start between two of them, and this run then stops at its next one. Every request to a site goes
-through the fetcher. A run with nothing due asks neither.
+through the fetcher, and is over within crawl.PROOF_SECONDS_PER_RESPONSE whatever the site does: one that runs
+out of time closes the site for the run, and its request is moved on to its next look like any other. So a run
+takes at most about MAX_REQUESTS such deadlines, and a slow site holds no run, lock or queue. A run with nothing
+due asks neither.
 
 `--dry-run` makes the same reads and requests, and changes nothing: no call to confirm_removal, nothing written to
 the local store, no request moved on. (The API's pace file is kept as for any request to it: discover.Pace.) Stdout
@@ -89,16 +100,25 @@ COUNTS = (
     "proven_on_deviantart",
     "proven_on_own_site",
     "artists_removed",  # with --dry-run: would be
-    "proofs_refused_by_database",  # the code changed between the read and the removal
+    # The code changed between the read and the removal, or the request was closed meanwhile: its account was
+    # barred earlier in the run, by the proof of a request for another of its handles.
+    "proofs_refused_by_database",
     "left_for_owner_no_code_found",
     "left_for_owner_not_checked",  # a place could not be read, or there is none we may read: looked at again later
 )
-REQUEST_COLUMNS = "artist_slug,code_at,da_username,site_url,site_domain,da_key,site_key"
+REQUEST_COLUMNS = "id,artist_slug,code_at,da_username,site_url,site_domain,da_account"
 
 
 def _rows(table: str, **params: str) -> list[dict[str, Any]]:
-    """Rows of a table of the public database, read through the Data API with the service key."""
-    return db._checked(db.data_api("GET", table, "secret", params=params))
+    """Rows of a table of the public database, read through the Data API with the service key: every row, a page at
+    a time, since the Data API answers at most its max-rows (1,000 by default) and says nothing of the rest. With a
+    limit, the one page. `order` must make the order total, or a page can repeat a row and miss another."""
+    rows: list[dict[str, Any]] = []
+    while True:
+        page = db._checked(db.data_api("GET", table, "secret", params=params | {"offset": str(len(rows))}))
+        rows += page
+        if not page or "limit" in params:
+            return rows
 
 
 def _plain(text: str) -> str:
@@ -124,7 +144,7 @@ def _move_on(request: dict[str, Any], now: datetime, dry_run: bool) -> None:
     """Set when the request is looked at next. Not in a dry run, which changes nothing."""
     if not dry_run:
         due = _next_look(request["code_at"], now).isoformat()
-        where = {"artist_slug": f"eq.{request['artist_slug']}"}
+        where = {"id": f"eq.{request['id']}", "outcome": "is.null"}  # not one a proof just closed
         db._checked(db.data_api("PATCH", "removal_requests", "secret", params=where, json={"due_at": due}))
 
 
@@ -140,17 +160,17 @@ def _profile(api: discover._Api, handle: str) -> dict[str, Any] | None:
 
 
 def _look(
-    api: discover._Api, fetcher: crawl.PoliteFetcher, artist: dict[str, Any], code: str, local: store.Snapshot
-) -> str:
-    """Where the artist's code is: "deviantart" or "own_site". Or why it was not found: "no_code_found" when every
-    place it may be in was read, "not_checked" when one could not be, or there is none we may read."""
-    handle = artist["da_username"]
+    api: discover._Api, fetcher: crawl.PoliteFetcher, request: dict[str, Any], code: str, local: store.Snapshot
+) -> tuple[str, bool]:
+    """Where the request's code is: "deviantart" or "own_site", and whether the profile just read still names the
+    request's site, so that the proof covers it. Or why it was not found: "no_code_found" when every place it may be
+    in was read, "not_checked" when one could not be, or there is none we may read."""
+    handle, kept = request["da_username"], request["da_account"]
     if not isinstance(handle, str) or not store.HANDLE.fullmatch(handle):
-        return "not_checked"
-    # The artist's own profile: the account the library keeps for the handle, under whatever handle it answers now.
-    # Not a profile the handle has passed to another account, and not one answer given for every lookup, which the
-    # API did once. Where the library keeps no account, the handle's own profile may only vouch for the site.
-    kept = library.account_hash(store.artist_key(handle), local)
+        return "not_checked", False
+    # The profile of the account the request is bound to, under whatever handle it answers now. Not a profile the
+    # handle has passed to another account, and not one answer given for every lookup, which the API did once. A
+    # request bound to no account has only the handle's own profile, which may only vouch for the site.
     others = library.same_account(store.artist_key(handle), local) if kept else []
     for asked in [handle, *(key.removeprefix("da:") for key in others)]:  # a renamed account may answer only anew
         profile = _profile(api, asked)
@@ -159,21 +179,22 @@ def _look(
         if not kept or kept in (library.account(user_id), library.account(user_id, "da-user")):
             break
     if profile is None:
-        return "not_checked"
+        return "not_checked", False
+    named = {store.registrable_domain(host) for host in store.hosts_in(profile.get("website"))}
+    covered = bool(request["site_url"]) and request["site_domain"] in named
     if kept:
         if kept not in (library.account(user_id), library.account(user_id, "da-user")):
-            return "not_checked"
+            return "not_checked", False
         if any(_holds(profile.get(field), code) for field in PROFILE_FIELDS):
-            return "deviantart"
+            return "deviantart", covered
     elif not (isinstance(name, str) and name.lower() == handle.lower()):
-        return "not_checked"
-    named = {store.registrable_domain(host) for host in store.hosts_in(profile.get("website"))}
-    if not artist["site_url"] or artist["site_domain"] not in named:
-        return "no_code_found" if kept else "not_checked"
-    found = fetcher.read_proof(artist["site_url"], PROOF_NAME, lambda said: _plain(said).strip() == code)
-    if isinstance(found, str):  # robots.txt shuts us out, no answer, a redirect off the site
-        return "not_checked"
-    return "own_site" if found else "no_code_found"
+        return "not_checked", False
+    if not covered:
+        return "no_code_found" if kept else "not_checked", False
+    found = fetcher.read_proof(request["site_url"], PROOF_NAME, lambda said: _plain(said).strip() == code)
+    if isinstance(found, str):  # robots.txt shuts us out, no answer in time, a redirect off the site
+        return "not_checked", False
+    return "own_site" if found else "no_code_found", True
 
 
 def run(
@@ -199,7 +220,7 @@ def run(
         outcome="is.null",
         code_at="not.is.null",  # a request no code was given out for is the owner's alone
         due_at=f"lte.{now.isoformat()}",
-        order="due_at.asc,code_at.asc",  # the one due longest first
+        order="due_at.asc,code_at.asc,id.asc",  # the one due longest first
         limit=str(MAX_REQUESTS),
     )
     counts["requests_due"] = len(due)
@@ -216,19 +237,20 @@ def run(
     ):
         api = discover._Api(http, client_id, client_secret)
         for request in due:
-            slug = request["artist_slug"]
-            code = db.rpc("removal_code", {"p_slug": slug}, "secret")
-            where = _look(api, fetcher, request, code, kept) if CODE.fullmatch(str(code)) else "not_checked"
+            code = db.rpc("removal_code", {"p_slug": request["artist_slug"]}, "secret")
+            found = _look(api, fetcher, request, code, kept) if CODE.fullmatch(str(code)) else ("not_checked", False)
+            where, site = found
             if where not in ("deviantart", "own_site"):
                 counts[f"left_for_owner_{where}"] += 1
             else:
                 counts[f"proven_on_{where}"] += 1
+                args = {"p_id": request["id"], "p_code": code, "p_site": site}
                 if dry_run:
                     counts["artists_removed"] += 1
                 # The database first: it is the judge of the code. Here only once it has removed them, and only
                 # what it put on its own list, which every later push takes as the database's own removal.
-                elif db.rpc("confirm_removal", {"p_slug": slug, "p_code": code}, "secret") is True:
-                    store.import_removed([key for key in (request["da_key"], request["site_key"]) if key], local)
+                elif barred := db.rpc("confirm_removal", args, "secret"):
+                    store.import_removed(barred, local)
                     counts["artists_removed"] += 1
                 else:
                     counts["proofs_refused_by_database"] += 1
@@ -236,34 +258,36 @@ def run(
 
 
 def pending() -> list[str]:
-    """One line for each open request, the oldest first: the slug and the public handle it was made for, when it was
-    first and last asked for and how often, and whether a code was given out and a note left. For the owner, who
-    reads a note in the database's removal_requests table and answers with --grant or --reject."""
+    """One line for each open request, the oldest first, every one of them: the slug, the request's id, the public
+    handle it was made for, when it was first and last asked for and how often, and whether a code was given out and
+    a note left. For the owner, who reads a note in the database's removal_requests table and answers by id with
+    --grant or --reject. A slug can have more than one: the artist listed under it changed, or their site did."""
     rows = _rows(
         "removal_requests",
-        select="artist_slug,da_username,first_at,last_at,requests,code_at,note",
+        select="id,artist_slug,da_username,first_at,last_at,requests,code_at,note",
         outcome="is.null",
-        order="first_at.asc",
+        order="first_at.asc,id.asc",
     )
     return [
-        f"{row['artist_slug']}  handle {row['da_username'] or '?'}  first asked {row['first_at'][:10]}, "
+        f"{row['artist_slug']}  id {row['id']}  handle {row['da_username'] or '?'}  "
+        f"first asked {row['first_at'][:10]}, "
         f"last {row['last_at'][:10]}, {row['requests']} times  code given out: {'yes' if row['code_at'] else 'no'}  "
         f"note: {'yes' if row['note'] else 'no'}"
         for row in rows
     ]
 
 
-def answer(grant: list[str], reject: list[str], local: pathlib.Path | str | None = None) -> dict[str, int]:
-    """The owner's answer to open requests, by slug. A granted one is removed for good as a proven one is, here at once
-    too; a rejected one is closed and nothing else changes. A slug with no open request is left alone."""
+def answer(grant: list[int], reject: list[int], local: pathlib.Path | str | None = None) -> dict[str, int]:
+    """The owner's answer to open requests, by id. A granted one is removed for good as a proven one is, its site
+    with it (grant_request), here at once too; a rejected one is closed and nothing else changes. An id with no
+    open request is left alone."""
     counts = {"granted": 0, "rejected": 0}
-    for slug in grant:
-        keys = _rows("removal_requests", select="da_key,site_key", artist_slug=f"eq.{slug}", outcome="is.null")
-        if keys and db.rpc("purge_removed", {"p_slugs": [slug]}, "secret") == 1:
-            store.import_removed([key for key in keys[0].values() if key], local)
+    for request in grant:
+        if barred := db.rpc("grant_request", {"p_id": request, "p_outcome": "granted", "p_site": True}, "secret"):
+            store.import_removed(barred, local)
             counts["granted"] += 1
-    for slug in reject:
-        counts["rejected"] += db.rpc("reject_removal", {"p_slug": slug}, "secret") is True
+    for request in reject:
+        counts["rejected"] += db.rpc("reject_removal", {"p_id": request}, "secret") is True
     return counts
 
 
@@ -278,8 +302,8 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=(__doc__ or "").splitlines()[0])
     parser.add_argument("--dry-run", action="store_true", help="make the same checks, and change nothing")
     parser.add_argument("--pending", action="store_true", help="list the open requests, and change nothing")
-    parser.add_argument("--grant", nargs="+", default=[], metavar="SLUG", help="remove them for good")
-    parser.add_argument("--reject", nargs="+", default=[], metavar="SLUG", help="close their requests, and no more")
+    parser.add_argument("--grant", nargs="+", type=int, default=[], metavar="ID", help="remove them for good")
+    parser.add_argument("--reject", nargs="+", type=int, default=[], metavar="ID", help="close them, and no more")
     args = parser.parse_args(argv)
     try:
         if args.pending:

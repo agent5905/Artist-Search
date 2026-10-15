@@ -16,6 +16,7 @@ One narrower door, for hard rule 7 only: read_proof reads the two places where a
 on their own site, and nothing else (see its docstring).
 """
 
+import concurrent.futures
 import fnmatch
 import ipaddress
 import json
@@ -31,9 +32,10 @@ from dataclasses import dataclass
 from html import unescape
 from html.parser import HTMLParser
 from http.cookiejar import DefaultCookiePolicy
-from typing import Literal
+from typing import Any, Literal
 from urllib.parse import unquote
 
+import httpcore
 import httpx
 import tldextract
 
@@ -45,7 +47,10 @@ PAGE_MAX_BYTES = 2_000_000
 IMAGE_MAX_BYTES = 15_000_000
 POLICY_MAX_BYTES = 512_000  # robots.txt and tdmrep.json. RFC 9309 asks crawlers to read at least 500 KiB
 TIMEOUT = httpx.Timeout(15.0)  # connect, read, write and pool, each
-MAX_SECONDS_PER_RESPONSE = 120.0  # the read timeout is per chunk, so a slow drip needs a limit of its own
+# One deadline a request, from connecting to the last byte: the timeouts above are per read, so a slow drip of the
+# handshake, the head or the body needs a limit of its own (see _send). A site that reaches it is closed for the run.
+MAX_SECONDS_PER_RESPONSE = 120.0
+PROOF_SECONDS_PER_RESPONSE = 20.0  # the same for a removal proof: a small file and a page, and a run looks at 30 sites
 MAX_CRAWL_DELAY = 60.0  # a host that asks for more patience than this is treated as closed to us
 MAX_REDIRECTS = 5
 SITE_REQUEST_BUDGET = 60  # requests of one site per process, everything counted. A mistaken site stays a small one
@@ -614,6 +619,25 @@ def _opted_out(headers: httpx.Headers, body: bytes) -> bool:
     return any(_meta_reserves(text) for text in _decodings(body, "<meta"))
 
 
+def _reads_until(deadline: float, clock: Callable[[], float]) -> Callable[[str, dict[str, Any]], None]:
+    """httpcore's trace extension, which hands over each stream a request opens (the connection, then TLS over it).
+    Each is read only until the deadline, by `clock`: so a head that drips is cut off as a body that drips is."""
+
+    def opened(event: str, info: dict[str, Any]) -> None:
+        stream = info.get("return_value")
+        if event in ("connection.connect_tcp.complete", "connection.start_tls.complete") and stream is not None:
+            read = stream.read
+
+            def timed(max_bytes: int, timeout: float | None = None) -> bytes:
+                if clock() > deadline:
+                    raise httpcore.ReadTimeout("the response took too long")
+                return read(max_bytes, timeout)
+
+            stream.read = timed
+
+    return opened
+
+
 def _shown(url: object) -> str:
     """The URL as it was given, for a result. Anything that is not a string is shown as nothing: str() can raise."""
     return url if isinstance(url, str) else ""
@@ -773,12 +797,15 @@ class PoliteFetcher:
                     reason = "budget"
                 if reason:
                     return FetchResult(str(url), skip=reason)
-                response, body = self._send(url, address, cap)
+                seconds = PROOF_SECONDS_PER_RESPONSE if proof else MAX_SECONDS_PER_RESPONSE
+                response, body = self._send(url, address, cap, seconds)
                 status = response.status_code
                 if response.has_redirect_location:
                     url = url.join(response.headers["location"])
                     continue
-            except (httpx.HTTPError, httpx.InvalidURL, OSError):
+            except (httpx.HTTPError, httpx.InvalidURL, OSError) as error:
+                if proof and isinstance(error, httpx.TimeoutException):  # a slow site costs a proof one deadline a run
+                    _SPENT[site] = SITE_REQUEST_BUDGET
                 return FetchResult(str(url), skip="error")
             if status in (401, 403):
                 reason = "auth"
@@ -810,9 +837,18 @@ class PoliteFetcher:
         address = next((address for address in addresses if ":" not in address), addresses[0])
         return (None if policy_path else self._origin_refusal(url, proof)), address
 
-    def _send(self, url: httpx.URL, address: str, cap: int) -> tuple[httpx.Response, bytes | None]:
-        """One rate-limited GET. The body is None when the response failed, redirected or is larger than `cap`."""
-        site, host = _site(url), _host(url)
+    def _send(self, url: httpx.URL, address: str, cap: int, seconds: float) -> tuple[httpx.Response, bytes | None]:
+        """One rate-limited GET, over within `seconds` of being sent: connecting, a TLS handshake, the head and the
+        body. The body is None when the response failed, redirected or is larger than `cap`.
+
+        Past the deadline it is a timeout (for a removal proof, the site is then closed for the run: see _get).
+        Every read of the connection checks the deadline by this fetcher's clock
+        (_reads_until), and the GET runs in a thread of its own, which is waited for no longer than that: a TLS
+        handshake blocks where no read of ours runs, so a dripped one is left to the site.
+        ponytail: a thread a request, and one left behind for each site that holds a handshake open until the
+        process ends. Cancel the socket itself if that ever adds up.
+        """
+        site = _site(url)
         delay = _DELAY.get(site, config.MIN_SECONDS_PER_HOST)
         now = self._clock()
         # A last reading later than now came from another clock: a full interval from now is then the safe wait.
@@ -827,30 +863,48 @@ class PoliteFetcher:
                 stalled = time.monotonic()
             elif time.monotonic() - stalled > STALLED_CLOCK_SECONDS:
                 raise TimeoutError("the clock has stopped, so the wait cannot be shown to be over")
-        deadline = now + MAX_SECONDS_PER_RESPONSE
+        deadline = now + seconds
         _SPENT[site] = _SPENT.get(site, 0) + 1
+        answer: concurrent.futures.Future[tuple[httpx.Response, bytes | None]] = concurrent.futures.Future()
+
+        def exchange() -> None:
+            try:
+                answer.set_result(self._exchange(url, address, cap, deadline))
+            except Exception as error:  # handed over as it is
+                answer.set_exception(error)
+
+        threading.Thread(target=exchange, daemon=True).start()
         try:
-            # The connection goes to the address that was checked, not to whatever the name resolves to by now.
-            # The name still travels in the Host header, and it is the name the TLS certificate is verified for.
-            pinned = url.copy_with(host=address)
-            extensions = {"sni_hostname": host}
-            with self._client.stream("GET", pinned, headers={"Host": host}, extensions=extensions) as response:
-                if response.status_code in (429, 503):  # told to back off: the site is closed for the rest of the run
-                    _SPENT[site] = SITE_REQUEST_BUDGET
-                declared = response.headers.get("content-length", "")
-                if not response.is_success or (declared.isdigit() and int(declared) > cap):
-                    return response, None
-                assert isinstance(response.stream, httpx.SyncByteStream)
-                raw = bytearray()
-                for chunk in response.stream:  # bytes as they arrive, so a stream that decodes to nothing still ends
-                    raw += chunk
-                    if len(raw) > cap:
-                        return response, None
-                    if self._clock() > deadline:
-                        raise httpx.ReadTimeout("the response took too long")
-                return response, _decoded(bytes(raw), response.headers.get("content-encoding", ""), cap)
+            return answer.result(timeout=max(deadline - self._clock(), 0.0))
+        except TimeoutError:
+            raise httpx.ReadTimeout("the response took too long") from None
         finally:
             _LAST[site] = self._clock()  # the wait runs from the end of a request, and a failed one still counts
+
+    def _exchange(self, url: httpx.URL, address: str, cap: int, deadline: float) -> tuple[httpx.Response, bytes | None]:
+        """The GET itself, for _send."""
+        site, host = _site(url), _host(url)
+        # The connection goes to the address that was checked, not to whatever the name resolves to by now.
+        # The name still travels in the Host header, and it is the name the TLS certificate is verified for.
+        pinned = url.copy_with(host=address)
+        extensions = {"sni_hostname": host, "trace": _reads_until(deadline, self._clock)}
+        with self._client.stream("GET", pinned, headers={"Host": host}, extensions=extensions) as response:
+            if self._clock() > deadline:  # however the head came (a transport may have no reads to check)
+                raise httpx.ReadTimeout("the response took too long")
+            if response.status_code in (429, 503):  # told to back off: the site is closed for the rest of the run
+                _SPENT[site] = SITE_REQUEST_BUDGET
+            declared = response.headers.get("content-length", "")
+            if not response.is_success or (declared.isdigit() and int(declared) > cap):
+                return response, None
+            assert isinstance(response.stream, httpx.SyncByteStream)
+            raw = bytearray()
+            for chunk in response.stream:  # bytes as they arrive, so a stream that decodes to nothing still ends
+                raw += chunk
+                if len(raw) > cap:
+                    return response, None
+                if self._clock() > deadline:
+                    raise httpx.ReadTimeout("the response took too long")
+            return response, _decoded(bytes(raw), response.headers.get("content-encoding", ""), cap)
 
     def _origin_refusal(self, url: httpx.URL, proof: bool = False) -> Skip | None:
         """What the origin's robots.txt and tdmrep.json say about this URL. Each is fetched once per origin.

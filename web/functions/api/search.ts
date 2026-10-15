@@ -5,7 +5,7 @@
 // limit, their network's or the day's for everyone, the answer is a 429 that says how long to wait.
 // Every function here calls the database the same way: as its public role, with the publishable key, and with the
 // site's token (SITE_TOKEN), a secret of the Cloudflare Pages project that never reaches the browser. The public
-// role may run the site's six functions and nothing else, and those only with the token. The browser holds no key.
+// role may run the site's seven functions and nothing else, and those only with the token. The browser holds no key.
 import { call, rpc } from '../../src/rpc'
 
 export type Env = {
@@ -57,7 +57,7 @@ export const site = <T>(env: Env, name: string, args: object, fetcher: typeof fe
 export async function wait(
   request: Request,
   env: Env,
-  kind: 'search' | 'similar' | 'profile' | 'removal',
+  kind: 'search' | 'similar' | 'profile' | 'removal' | 'claim',
   fetcher: typeof fetch,
 ): Promise<number> {
   const args = { p_token: env.SITE_TOKEN, p_kind: kind, p_client: client(request), p_network: network(request) }
