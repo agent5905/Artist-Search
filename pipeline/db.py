@@ -134,7 +134,7 @@ def load(artists: list[dict[str, Any]], works: list[dict[str, Any]], neighbors: 
 
     An artist is a row of the artists table: "slug", "name" and "da_username" are required;
     "site_url" with "site_domain" (both or neither), "tagline", "top_tags", "search_text", "profile",
-    "specialties", "mediums", "open_for_work", "profile_embedding" and "hidden" are optional.
+    "specialties", "mediums", "open_for_work", "profile_embedding", "da_account" and "hidden" are optional.
     A work names its artist by "artist_slug" and needs "source" ('deviantart' or 'site'), "page_url"
     and "image_url"; "title", "description", "tags", "position" and the image's size in pixels,
     "width" with "height" (both or neither), are optional.

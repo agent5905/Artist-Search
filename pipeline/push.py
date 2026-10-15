@@ -493,6 +493,9 @@ def _build(local: store.Snapshot, removed: Collection[str]) -> tuple[Rows, Rows,
                 "slug": slug,
                 "name": listed[key],
                 "da_username": listed[key],
+                # The account the library keeps for them: a removal request is bound to it when it is filed, and
+                # the verifier reads the bio of that account only (sql/001_schema.sql, artists.da_account).
+                "da_account": library.account_hash(key, local),
                 "site_url": None if website_emptied else site_url,
                 "site_domain": None if website_emptied else site_domain,
                 "tagline": next(iter(plain([tagline])), None)

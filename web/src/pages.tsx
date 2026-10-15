@@ -325,7 +325,7 @@ export function ProfilePage() {
               <ul>
                 {artist.top_tags.map((tag) => (
                   <li key={tag}>
-                    <Link to={`/?q=${encodeURIComponent(tag)}`}>#{tag}</Link>
+                    <Link to={`/?q=${encodeURIComponent(tag)}`}>{tag}</Link>
                   </li>
                 ))}
               </ul>

@@ -41,7 +41,7 @@ FACTS = {
     "hedged": [],
 }
 ARTIST_FIELDS = {
-    *("slug", "name", "da_username", "site_url", "site_domain", "tagline", "top_tags", "search_text"),
+    *("slug", "name", "da_username", "da_account", "site_url", "site_domain", "tagline", "top_tags", "search_text"),
     *("profile", "specialties", "mediums", "open_for_work", "profile_embedding"),
 }
 WORK_FIELDS = {
@@ -768,6 +768,7 @@ def test_the_rows_are_exactly_these(fake):
         "slug": ALPHA,
         "name": ALPHA,
         "da_username": ALPHA,
+        "da_account": library.account_hash(f"da:{ALPHA}"),  # the account a removal request is bound to
         "site_url": f"https://www.{ALPHA}.art/",
         "site_domain": f"{ALPHA}.art",
         "tagline": f"FAKE-TAGLINE {ALPHA}",
