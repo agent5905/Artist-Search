@@ -456,7 +456,9 @@ def _build(local: store.Snapshot, removed: Collection[str]) -> tuple[Rows, Rows,
         )
         # ponytail: the specialty the artist picked on DeviantArt is not in it: nothing has read that field
         # for a private contact. Add it when the tagging stage does.
-        words = [*facts, *(title for _, _, title, *_ in ready if title), *most_used]
+        # Of the artist's tags, only those on the reviewed list are searched by, as only those are shown: a tag
+        # left off the list is left off for what it says, and a search for it should find nobody.
+        words = [*facts, *(title for _, _, title, *_ in ready if title), *filter(profiles.approved, most_used)]
         search_text = next(iter(plain([_search_text(words)])), None)  # and read whole, as every text that goes
         artists.append(
             {

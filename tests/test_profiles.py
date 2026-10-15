@@ -1714,7 +1714,11 @@ def collected_again(handle, n, *, title=None, thumb=THUMB, image=None):
     )
 
 
-def test_an_artist_whose_work_was_read_from_an_image_they_replaced_waits_and_the_row_is_made_again():
+def test_an_artist_whose_work_was_read_from_an_image_they_replaced_waits_and_the_row_is_made_again(monkeypatch):
+    # One moment for every row these collections write. collected_again answers with one work, not the artist's
+    # whole gallery, so a second between the two would leave the others "missing from the latest answer" (_FALLEN)
+    # and fail the test at random, as it did one run in five.
+    monkeypatch.setattr(store, "_now", lambda: "2026-10-14T12:00:00+00:00")
     ids = artist(ALPHA, [tags()] * 6)
     assert run(Fake())["profiled"] == 1
     kept, key = table(), f"da:{ALPHA}"
@@ -1771,7 +1775,11 @@ def test_a_row_is_not_current_while_the_verified_tags_it_counted_are_not_the_one
     assert run(Fake())["profiled"] == 1 and profiles.current() == {key}
 
 
-def test_a_work_collected_after_the_row_was_made_leaves_the_row_current():
+def test_a_work_collected_after_the_row_was_made_leaves_the_row_current(monkeypatch):
+    # One moment for every row these collections write. collected_again answers with one work, not the artist's
+    # whole gallery, so a second between the two would leave the others "missing from the latest answer" (_FALLEN)
+    # and fail the test at random, as it did one run in five.
+    monkeypatch.setattr(store, "_now", lambda: "2026-10-14T12:00:00+00:00")
     """The row rests on the works it counted. One it never counted cannot make it out of date."""
     ids = artist(ALPHA, [tags()] * 6)
     assert run(Fake())["profiled"] == 1

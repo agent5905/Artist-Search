@@ -2138,10 +2138,10 @@ def test_a_work_whose_title_or_tags_changed_after_they_were_read_is_held_until_t
 
     read_again(made[1], made[2])  # read, and found to hold no contact: now they are words that were read
     assert push.run(False)["works_sent"] == 11
-    # the tag is searched by; it is shown as the artist's once the profile stage has picked it (profiles._own_tags).
-    # Beside "whatsapp" in the title its digits would make seven with the others: it goes without them.
+    # The tag was read and holds no contact, but it is not on the reviewed list (profiles.approved), so it is
+    # neither shown nor searched by. The title, read the same way, is searched by, and the whole still passes.
     text = sent_artists(fake)[ALPHA]["search_text"]
-    assert title in text and "discord_fakepainter " in text and not library.holds_contact(text)
+    assert title in text and "discord_fakepainter" not in text and not library.holds_contact(text)
 
 
 def test_a_work_whose_image_the_artist_replaced_is_held_until_the_new_image_is_fetched_and_read(fake):
