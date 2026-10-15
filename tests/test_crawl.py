@@ -1259,8 +1259,29 @@ def test_only_plain_public_http_urls_are_requested(url):
 
 
 def test_there_is_no_public_way_to_fetch_without_opening_a_site():
-    assert [name for name in vars(PoliteFetcher) if not name.startswith("_")] == ["open_site"]
+    # read_proof is the one other door, and it opens only two fixed addresses: the next test.
+    assert [name for name in vars(PoliteFetcher) if not name.startswith("_")] == ["open_site", "read_proof"]
     assert [name for name in vars(Site) if not name.startswith("_")] == ["fetch"]
+
+
+@pytest.mark.parametrize(
+    ("root", "skip"),
+    [
+        ("https://janedoe.art/gallery", "not_own_site"),
+        ("https://janedoe.some-unlisted-platform.com/", "not_own_site"),
+        ("https://janedoe.github.io/", "platform"),
+        ("http://localhost/", "bad_url"),
+        ("https://janedoe.art/", None),
+    ],
+)
+def test_a_removal_proof_is_read_from_two_addresses_of_an_own_site_and_nothing_else(root, skip):
+    web = Web({"https://janedoe.art/": reply(200, '<html><head><meta name="x" content="yes"></head><body>')})
+    found = web.fetcher.read_proof(root, "x", lambda said: said == "yes")
+    if skip:
+        assert found == skip and web.urls == []
+    else:
+        assert found is True
+        assert web.urls == [f"{root}robots.txt", f"{root}.well-known/x.txt", root]
 
 
 @pytest.mark.parametrize(

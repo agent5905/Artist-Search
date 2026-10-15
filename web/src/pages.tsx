@@ -3,7 +3,7 @@ import { useRef, useState, type FormEvent, type ReactNode } from 'react'
 import { Link, useNavigate, useParams, useSearchParams } from 'react-router'
 import { Busy, getArtist, PAGE, removalCode, requestRemoval, search, similarArtists } from './api'
 import facets from './facets.json'
-import { availability, Cards, Failed, host, Icon, label, Notice, Skeletons, Slow, sourceName, Tags, Thumb, useLoad, web } from './ui'
+import { about, availability, Cards, Failed, host, Icon, label, Notice, Skeletons, Slow, sourceName, Tags, Thumb, useLoad, web } from './ui'
 
 const TITLE = 'Artist Search'
 
@@ -339,7 +339,7 @@ export function ProfilePage() {
 
 // ------------------------------------------------------------------------------------- claim or remove
 
-const PLACES = ['DeviantArt profile', 'own site'] // where an artist can post the proof code
+const PROOF = 'artist-search-removal' // the <meta> name and the file the verifier reads (pipeline/removals.py)
 
 export function Remove() {
   const { slug } = useParams()
@@ -377,8 +377,8 @@ function RemoveStart() {
         <h2>Then pick one of two ways</h2>
         <ul className="ways">
           <li>
-            <strong>With proof.</strong> You get a short code to post on your DeviantArt profile or your own site. Once the code is seen
-            there, the profile is removed for good.
+            <strong>With proof.</strong> You get a short code to put in your DeviantArt profile’s About text or tagline, or on your own
+            site. Once the code is found there, the profile is removed for good.
           </li>
           <li>
             <strong>Without proof.</strong> You send a request, with a note if you like. The site owner reads it and decides.
@@ -392,41 +392,52 @@ function RemoveStart() {
 
 function RemoveProfile({ slug }: { slug: string }) {
   const artist = useLoad(`artist ${slug}`, () => getArtist(slug))
-  const code = useLoad(`code ${slug}`, () => removalCode(slug))
-  const [copied, setCopied] = useState(false)
-  const [place, setPlace] = useState(PLACES[0])
-  const [sent, setSent] = useState<{ proof?: boolean; request?: boolean }>({})
+  const [code, setCode] = useState('')
+  const [copied, setCopied] = useState('')
+  const [sent, setSent] = useState(false)
   const [busy, setBusy] = useState('')
-  const [problem, setProblem] = useState('')
+  const [problem, setProblem] = useState<{ kind: string; error: unknown }>()
 
   if (artist.failed) return <Page narrow><Failed retry={artist.retry} /></Page>
   if (artist.stale) return <Page narrow><p className="fine" role="status">Loading…</p></Page>
   if (!artist.data) return <Gone />
-  const { name, site_url } = artist.data
+  const { name, site_url, deviantart_url } = artist.data
   const site = web(site_url)
+  const tag = `<meta name="${PROOF}" content="${code}">`
+  const file = site ? new URL(`/.well-known/${PROOF}.txt`, site).href : ''
 
-  const send = async (kind: 'proof' | 'request', note: string) => {
+  const ask = async (kind: 'code' | 'request', run: () => Promise<void>) => {
     setBusy(kind)
-    setProblem('')
+    setProblem(undefined)
     try {
-      await requestRemoval(slug, note)
-      setSent((was) => ({ ...was, [kind]: true }))
-    } catch {
-      setProblem(kind)
+      await run()
+    } catch (error) {
+      setProblem({ kind, error })
     } finally {
       setBusy('')
     }
   }
-  const copy = () =>
-    navigator.clipboard.writeText(code.data ?? '').then(
-      () => setCopied(true),
+  const copy = (text: string) =>
+    navigator.clipboard.writeText(text).then(
+      () => setCopied(text),
       () => {},
     )
-  const failure = (
-    <p className="problem" role="alert">
-      That did not go through. Nothing was sent; please try again in a minute.
-    </p>
+  const copyRow = (text: string) => (
+    <span className="code-row">
+      <code>{text}</code>
+      <button className="btn quiet" type="button" onClick={() => copy(text)}>
+        {copied === text ? 'Copied' : 'Copy'}
+      </button>
+    </span>
   )
+  const failure = (kind: string) =>
+    problem?.kind === kind && (
+      <p className="problem" role="alert">
+        {problem.error instanceof Busy
+          ? `That is a lot of requests from your connection today. Please try again in ${about(problem.error.seconds)}.`
+          : 'That did not go through. Nothing was sent; please try again in a minute.'}
+      </p>
+    )
 
   return (
     <Page narrow>
@@ -444,79 +455,60 @@ function RemoveProfile({ slug }: { slug: string }) {
         <h2>
           <span className="num">1</span> Remove it with proof
         </h2>
-        <p>Show the profile is yours by posting a short code where only you can post.</p>
-        {sent.proof ? (
-          <p className="thanks" role="status">
-            <Icon name="check" size={20} />
-            <span>
-              <strong>Thank you.</strong> We look for the code on your {place} automatically, usually within the hour, and keep looking while
-              your request is open. As soon as it is seen, this profile is deleted and you will not be added again.
-            </span>
-          </p>
+        <p>Show the profile is yours by putting a short code where only you can write.</p>
+        {code ? (
+          <ol className="steps">
+            <li>
+              <span>Your code:</span>
+              {copyRow(code)}
+            </li>
+            <li>
+              <span>Put it in one of these places. Capitals and spaces around it do not matter; anywhere else does not count.</span>
+              <ul className="ways">
+                <li>
+                  <strong>On DeviantArt:</strong> paste it into the About text or the tagline of{' '}
+                  <a href={deviantart_url}>the DeviantArt profile this one was made from</a>.
+                </li>
+                {site && (
+                  <li>
+                    <strong>Or on {host(site)}:</strong> add this line to the head of your front page, between &lt;head&gt; and
+                    &lt;/head&gt;:
+                    {copyRow(tag)}
+                    or put a plain text file that holds only the code at this address:
+                    {copyRow(file)}
+                    This counts while your DeviantArt profile gives {host(site)} as your website, and unless your robots.txt keeps out our
+                    crawler, ArtistSearchBot. A comment or a guestbook entry on your page never counts, so no visitor can remove you.
+                  </li>
+                )}
+              </ul>
+            </li>
+            <li>
+              <span>
+                That is all. We look for the code regularly, and as soon as it is found this profile is deleted and you will not be added
+                again. You can take the code down after that.
+              </span>
+            </li>
+          </ol>
         ) : (
           <>
-            <ol className="steps">
-              <li>
-                <span>Copy your code.</span>
-                <span className="code-row">
-                  <code aria-live="polite">{code.failed ? 'The code did not load.' : (code.data ?? 'Loading…')}</code>
-                  {code.failed ? (
-                    <button className="btn quiet" type="button" onClick={code.retry}>
-                      Try again
-                    </button>
-                  ) : (
-                    <button className="btn quiet" type="button" onClick={copy} disabled={!code.data}>
-                      {copied ? 'Copied' : 'Copy'}
-                    </button>
-                  )}
-                </span>
-              </li>
-              <li>
-                <span>
-                  Paste it into the About text or the tagline of your DeviantArt profile
-                  {site ? `, or onto the front page of ${host(site)} if that page links to your DeviantArt profile` : ''}. It is looked for
-                  there and nowhere else.
-                </span>
-              </li>
-              <li>
-                <span>Come back here and say where it is.</span>
-                <form
-                  className="inline-form"
-                  onSubmit={(event) => {
-                    event.preventDefault()
-                    send('proof', `Proof code posted on the artist’s ${place}.`)
-                  }}
-                >
-                  {site && ( // without a site on record, the profile is the one place the code is looked for
-                    <span className="radios" role="radiogroup" aria-label="Where the code is">
-                      {PLACES.map((value) => (
-                        <label className="chip" key={value}>
-                          <input type="radio" name="place" checked={place === value} onChange={() => setPlace(value)} />
-                          On my {value}
-                        </label>
-                      ))}
-                    </span>
-                  )}
-                  <button className="btn" disabled={busy === 'proof' || !code.data}>
-                    {busy === 'proof' ? 'Sending…' : 'I’ve posted the code'}
-                  </button>
-                </form>
-              </li>
-            </ol>
-            {problem === 'proof' && failure}
-            <p className="fine">
-              The code is checked automatically, usually within the hour. You can take it down once this profile is gone.
-            </p>
+            <button className="btn" type="button" disabled={busy === 'code'} onClick={() => ask('code', async () => setCode(await removalCode(slug)))}>
+              {busy === 'code' ? 'Getting your code…' : 'Get my code'}
+            </button>
+            {failure('code')}
           </>
         )}
+        <p className="fine">
+          If this profile is still here a day after you put the code up, check that it is exactly where step 2 says. If it is, or you cannot
+          put it there, send a request below and the site owner will look at it.
+        </p>
       </section>
 
       <section className="option">
         <h2>
           <span className="num">2</span> Ask without proof
         </h2>
-        <p>Can’t post the code? Send a request. The site owner reads every one and decides; nothing changes until then.</p>
-        {sent.request ? (
+        <p>Can’t put the code up? Send a request. The site owner reads every one and decides; nothing changes until then.</p>
+        {sent ? (
           <p className="thanks" role="status">
             <Icon name="check" size={20} />
             <span>
@@ -528,12 +520,13 @@ function RemoveProfile({ slug }: { slug: string }) {
             className="stack-form"
             onSubmit={(event) => {
               event.preventDefault()
-              send('request', String(new FormData(event.currentTarget).get('note') ?? ''))
+              const note = String(new FormData(event.currentTarget).get('note') ?? '')
+              ask('request', async () => (await requestRemoval(slug, note), setSent(true)))
             }}
           >
             <label htmlFor="note">Anything the owner should know (optional)</label>
             <textarea id="note" name="note" rows={3} maxLength={300} placeholder="For example: this is my work and I’d like it taken down." />
-            {problem === 'request' && failure}
+            {failure('request')}
             <button className="btn" disabled={busy === 'request'}>
               {busy === 'request' ? 'Sending…' : 'Send removal request'}
             </button>

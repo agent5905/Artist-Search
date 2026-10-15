@@ -11,6 +11,9 @@ FetchResult saying why not otherwise. Proving it costs at most VERIFY_REQUEST_BU
 tdmrep.json, the front page). A site that fails is closed for the rest of the run, for every fetcher. Neither step
 raises, nothing is requested that is not on a proven site, and no site is asked for more than SITE_REQUEST_BUDGET
 requests in one process.
+
+One narrower door, for hard rule 7 only: read_proof reads the two places where an artist puts a removal proof code
+on their own site, and nothing else (see its docstring).
 """
 
 import fnmatch
@@ -46,6 +49,10 @@ MAX_CRAWL_DELAY = 60.0  # a host that asks for more patience than this is treate
 MAX_REDIRECTS = 5
 SITE_REQUEST_BUDGET = 60  # requests of one site per process, everything counted. A mistaken site stays a small one
 VERIFY_REQUEST_BUDGET = 3  # all a site is asked until its front page proves whose it is: robots.txt, tdmrep.json, it
+# All a site is asked for a removal proof: robots.txt, the proof file and the front page, each perhaps once more on
+# the other side of an http-to-https or www redirect, which brings a robots.txt of its own.
+PROOF_REQUEST_BUDGET = 8
+PROOF_REDIRECTS = 3
 STALLED_CLOCK_SECONDS = 0.1  # real time. A clock that reads the same for this long has stopped, not just ticked late
 META_TAG_MAX = 100_000  # characters. A <meta> tag that does not end within this is treated as an opt-out
 GZIP_MEMBERS_MAX = 64  # no real page has more than one; each further one costs a copy of what is left
@@ -191,6 +198,7 @@ _DEFAULT_PORT = {"http": 80, "https": 443}
 _NAT64 = ipaddress.ip_network("64:ff9b::/96")
 
 _META_OPEN = re.compile(r"<meta(?=[\s/>])", re.IGNORECASE)
+_HEAD_END = re.compile(r"</head(?=[\s/>])|<body(?=[\s/>])", re.IGNORECASE)
 _TAG = re.compile(r"<!--|<([a-zA-Z][^\s/>]*)")  # a comment, or the opening of a tag with its name
 # Elements whose content is text, not markup: nothing inside them is a link.
 _RAW_TEXT = {
@@ -493,6 +501,20 @@ def _meta_reserves(text: str) -> bool:
     return False
 
 
+def _head_meta(text: str, name: str) -> list[str]:
+    """The content of every <meta name="<name>"> in the page's head: before the first <body> or </head>. Nothing
+    after that counts, since a visitor's comment or guestbook entry lands in the body, never the head. A page that
+    marks no end to its head has none. A commented-out tag in the head still counts: only the owner writes there."""
+    end = _HEAD_END.search(text)
+    head = text[: end.start()] if end else ""
+    values = []
+    for opening in _META_OPEN.finditer(head):
+        attributes, _ = _attributes(head, opening.end())
+        if attributes and attributes.get("name", "").strip().lower() == name:
+            values.append(attributes.get("content", ""))
+    return values
+
+
 def _hrefs(text: str) -> Iterator[str]:
     """The href of every <a>, <area> and <link> that is markup: none from a comment, a script or an attribute."""
     position = 0
@@ -642,6 +664,36 @@ class PoliteFetcher:
                 return FetchResult(str(root), skip="not_own_site")
             return Site(self, root_url, profile_url, front_page)
 
+    def read_proof(self, root_url: str, name: str, holds: Callable[[str], bool]) -> bool | Skip:
+        """Whether the site says, where only its owner can write, something that `holds` accepts: in the whole
+        text of /.well-known/<name>.txt, or in the content of a <meta name="<name>"> in the front page's head
+        (_head_meta). Nowhere else on any page. False when both were read and neither holds it; the reason when
+        one of them could not be read and the other did not hold it. Never raises.
+
+        Hard rule 7, as the owner's lead decided: reading this one file or tag, which the artist put there for us at
+        their own request, is not AI use, so no AI opt-out stops it (noai, an AI crawler shut out, a TDM
+        reservation). robots.txt for our own user agent still does: what it disallows us is not fetched. No link
+        back to a profile is asked for, and a redirect is followed only within the site, PROOF_REDIRECTS at most.
+        """
+        with _LOCK:
+            reason = _own_site_refusal(root_url)
+            if reason:
+                return reason
+            root, skipped = _request_url(root_url), None
+            try:
+                for path in (f"/.well-known/{name}.txt", "/"):
+                    page = self._get(root.copy_with(raw_path=path.encode()), PAGE_MAX_BYTES, "", PROOF_REDIRECTS, True)
+                    if page.ok:
+                        text = page.content.decode("utf-8", "replace")
+                        if any(map(holds, _head_meta(text, name) if path == "/" else [text])):
+                            return True
+                    elif page.status not in (404, 410):  # no such file is an answer; anything else is not
+                        skipped = skipped or page.skip
+            except Exception:  # a skip never raises, so an unexpected failure is logged and skipped
+                log.exception("could not read the proof on %s", root)
+                return "error"
+            return skipped or False
+
     def _fetch(self, root: str, profile: str, url: str, image: bool) -> FetchResult:
         """What Site.fetch runs. The claim is judged again here, so a handle made by hand opens nothing more."""
         with _LOCK:
@@ -665,17 +717,21 @@ class PoliteFetcher:
                 log.exception("could not fetch %s", parsed)
                 return FetchResult(str(parsed), skip="error")
 
-    def _get(self, url: httpx.URL, cap: int, policy_path: str = "", redirects: int = MAX_REDIRECTS) -> FetchResult:
+    def _get(
+        self, url: httpx.URL, cap: int, policy_path: str = "", redirects: int = MAX_REDIRECTS, proof: bool = False
+    ) -> FetchResult:
         """Follow one URL through at most `redirects` redirects.
 
         `policy_path` is set when the URL is robots.txt or tdmrep.json itself. No rule can forbid reading those,
         their own headers do not close the host, and they may only redirect to the same path on the same site.
+        `proof` is set for read_proof: its own budget, and robots.txt for us is the only rule that applies.
         """
         site, status = _site(url), 0
         for _ in range(redirects + 1):
             try:
-                reason, address = self._admit(url, site, policy_path)
-                budget = SITE_REQUEST_BUDGET if _OWNERS.get(site) else VERIFY_REQUEST_BUDGET
+                reason, address = self._admit(url, site, policy_path, proof)
+                unproven = PROOF_REQUEST_BUDGET if proof else VERIFY_REQUEST_BUDGET
+                budget = SITE_REQUEST_BUDGET if _OWNERS.get(site) else unproven
                 if not reason and _SPENT.get(site, 0) >= budget:
                     reason = "budget"
                 if reason:
@@ -693,14 +749,14 @@ class PoliteFetcher:
                 reason = "error"
             elif body is None:
                 reason = "too_large"
-            elif not policy_path and _opted_out(response.headers, body):
+            elif not policy_path and not proof and _opted_out(response.headers, body):
                 reason = "ai_opt_out"
             else:
                 return FetchResult(str(url), body, response.headers.get("content-type", ""), status)
             return FetchResult(str(url), status=status, skip=reason)
         return FetchResult(str(url), status=status, skip="error")  # one redirect too many: `url` is where it pointed
 
-    def _admit(self, url: httpx.URL, site: str, policy_path: str) -> tuple[Skip | None, str]:
+    def _admit(self, url: httpx.URL, site: str, policy_path: str, proof: bool = False) -> tuple[Skip | None, str]:
         """Every check a URL must pass before it is requested, run again for each redirect hop.
 
         Returns the reason to refuse it, or the one address the request may connect to.
@@ -715,7 +771,7 @@ class PoliteFetcher:
             return "bad_url", ""
         # ponytail: one address is tried, an IPv4 one if there is one. No falling back to the others.
         address = next((address for address in addresses if ":" not in address), addresses[0])
-        return (None if policy_path else self._origin_refusal(url)), address
+        return (None if policy_path else self._origin_refusal(url, proof)), address
 
     def _send(self, url: httpx.URL, address: str, cap: int) -> tuple[httpx.Response, bytes | None]:
         """One rate-limited GET. The body is None when the response failed, redirected or is larger than `cap`."""
@@ -759,19 +815,22 @@ class PoliteFetcher:
         finally:
             _LAST[site] = self._clock()  # the wait runs from the end of a request, and a failed one still counts
 
-    def _origin_refusal(self, url: httpx.URL) -> Skip | None:
-        """What the origin's robots.txt and tdmrep.json say about this URL. Each is fetched once per origin."""
+    def _origin_refusal(self, url: httpx.URL, proof: bool = False) -> Skip | None:
+        """What the origin's robots.txt and tdmrep.json say about this URL. Each is fetched once per origin.
+        For a removal proof (`proof`), only what robots.txt says to us: see read_proof."""
         origin = f"{url.scheme}://{_host(url)}"
         if origin not in self._origins:
-            self._origins[origin] = self._load_robots(url)
+            self._origins[origin] = self._load_robots(url, proof)
         robots = self._origins[origin]
         if isinstance(robots, str):
             return robots
         path = unquote(url.raw_path.decode("ascii"))  # decoded, so /%70rivate cannot slip past Disallow: /private
-        if robots.ai_opt_out(path):
+        if not proof and robots.ai_opt_out(path):
             return "ai_opt_out"
         if not robots.allows(path):
             return "robots"
+        if proof:
+            return None
         if robots.tdm is None:  # asked for only once robots.txt has let a URL through
             tdm = self._load_tdm(url, robots)
             if isinstance(tdm, str):
@@ -780,9 +839,10 @@ class PoliteFetcher:
             robots.tdm = tdm
         return "ai_opt_out" if any(_matches(location, path) for location in robots.tdm) else None
 
-    def _load_robots(self, url: httpx.URL) -> _Robots | Skip:
+    def _load_robots(self, url: httpx.URL, proof: bool = False) -> _Robots | Skip:
         """Fetch one origin's robots.txt. Only a 404 or 410 means "no rules"; any other failure closes the origin."""
-        result = self._get(url.copy_with(raw_path=ROBOTS_PATH.encode(), fragment=None), POLICY_MAX_BYTES, ROBOTS_PATH)
+        robots_url = url.copy_with(raw_path=ROBOTS_PATH.encode(), fragment=None)
+        result = self._get(robots_url, POLICY_MAX_BYTES, ROBOTS_PATH, proof=proof)
         if result.skip == "budget":
             return "budget"
         if result.skip and result.status not in (404, 410):

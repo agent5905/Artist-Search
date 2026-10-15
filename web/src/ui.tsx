@@ -246,14 +246,19 @@ export function Failed({ retry }: { retry: () => void }) {
   )
 }
 
+/** A wait in words: "about a minute", "about 12 minutes", "about 3 hours". */
+export function about(seconds: number) {
+  const minutes = Math.max(1, Math.ceil(seconds / 60))
+  return minutes === 1 ? 'about a minute' : minutes < 90 ? `about ${minutes} minutes` : `about ${Math.round(minutes / 60)} hours`
+}
+
 /** The search asked to be left alone for a while (Busy): nothing is broken, and it says when to try again. */
 export function Slow({ seconds, retry }: { seconds: number; retry: () => void }) {
-  const minutes = Math.max(1, Math.ceil(seconds / 60))
   return (
-    <Notice title="That’s a lot of searches in a few minutes">
+    <Notice title="That’s a lot of searches for now">
       <p>
-        To keep the search free for everyone, each visitor gets a number of searches every ten minutes. Yours come back in about{' '}
-        {minutes === 1 ? 'a minute' : `${minutes} minutes`}.
+        To keep the search free for everyone, each visitor gets a number of searches every ten minutes, and everyone together a number
+        each day. Searching opens again in {about(seconds)}.
       </p>
       <button className="btn" onClick={retry}>
         Try again

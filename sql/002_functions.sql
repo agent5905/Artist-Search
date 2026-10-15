@@ -468,16 +468,19 @@ as $$
     and not exists (select 1 from public.removed gone where gone.key_hash in (a.da_key, a.site_key))
 $$;
 
--- Removal (hard rule 7, owner decision 6). Nothing the public can call changes what is shown, and
--- nothing the public can call undoes what an artist did:
+-- Removal (hard rule 7, owner decision 6). Nothing a visitor can reach changes what is shown, and
+-- nothing a visitor can reach undoes what an artist did:
 --   * request_removal logs a request for the owner;
---   * start_removal_proof tells the artist the code to put on their own site or DeviantArt profile;
---   * confirm_removal (service role: the verifier, once it has seen the code there) removes the
---     artist at once and for good;
---   * purge_removed and reject_removal (service role) are the owner's answer to an unproven request.
+--   * start_removal_proof (sql/003_limits.sql) tells the artist the code to put on their own site or
+--     DeviantArt profile, and from then on the verifier looks for it;
+--   * confirm_removal (the verifier, once it has seen the code there) removes the artist at once and
+--     for good;
+--   * purge_removed and reject_removal are the owner's answer to an unproven request.
+-- All of them are the service role's: visitors reach the first two through the site's server
+-- function (web/functions/api/removal.ts), which client_wait limits.
 
--- Logs a request: one row per artist, with the first request's note. Asking again only counts.
--- Always returns true, whatever the slug, so it gives nothing away.
+-- Logs a request: one row per artist, with the first request's note. Asking again only counts, and
+-- moves nothing in the verifier's queue. Always returns true, whatever the slug, so it gives nothing away.
 create or replace function public.request_removal(p_slug text, p_note text default null) returns boolean
 language sql security definer set search_path = ''
 as $$
@@ -497,14 +500,6 @@ as $$
   select 'artist-search-removal-'
       || left(encode(extensions.hmac(coalesce(p_slug, ''), secret, 'sha256'), 'hex'), 32)
   from public.removal_secret
-$$;
-
--- Tells the artist their code. It never changes and nothing is written, so no other caller can
--- spoil it, and the answer has the same shape whether the slug is unknown, hidden or visible.
-create or replace function public.start_removal_proof(p_slug text) returns text
-language sql stable security definer set search_path = ''
-as $$
-  select public.removal_code(p_slug)
 $$;
 
 -- Service role only. Removes artists outright: their keys go on the removal list, which deletes
@@ -590,19 +585,18 @@ revoke all on function
   public.get_artist(text),
   public.request_removal(text, text),
   public.removal_code(text),
-  public.start_removal_proof(text),
   public.remove_artists(text[]),
   public.confirm_removal(text, text),
   public.reject_removal(text),
   public.purge_removed(text[])
 from public, anon, authenticated, service_role;
 
+-- The browser's two, with the publishable key: a profile and its similar artists. Searching and asking
+-- for removal go through the site's server functions, which count each visitor (client_wait in
+-- sql/003_limits.sql) and call the database with a secret key of their own.
 grant execute on function
-  public.search_artists(text, real[], text[], text[], boolean, int, int),
   public.similar_artists(text, int),
-  public.get_artist(text),
-  public.request_removal(text, text),
-  public.start_removal_proof(text)
+  public.get_artist(text)
 to anon;
 
 grant execute on function
@@ -623,7 +617,6 @@ grant execute on function
   public.similar_artists(text, int),
   public.get_artist(text),
   public.request_removal(text, text),
-  public.start_removal_proof(text),
   public.remove_artists(text[]),
   public.confirm_removal(text, text),
   public.reject_removal(text),

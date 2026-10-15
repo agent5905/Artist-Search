@@ -2,6 +2,7 @@
 // The search page builds its filters from that file, so they only ever offer values the data has.
 // ponytail: a snapshot, taken by reading every public card (100 a call). Rerun after a load; a facets
 // function in the database is the upgrade when that gets slow or stale.
+// It runs on the owner's machine with the pipeline's secret key: the publishable key cannot search.
 import { readFileSync, writeFileSync } from 'node:fs'
 import { parseEnv } from 'node:util'
 
@@ -11,7 +12,7 @@ let artists = 0
 for (let offset = 0; offset <= 1000; offset += 100) {
   const response = await fetch(`${env.VITE_SUPABASE_URL}/rest/v1/rpc/search_artists`, {
     method: 'POST',
-    headers: { apikey: env.VITE_SUPABASE_PUBLISHABLE_KEY, 'content-type': 'application/json' },
+    headers: { apikey: env.SUPABASE_SECRET_KEY, 'content-type': 'application/json' },
     body: JSON.stringify({ q: '', p_limit: 100, p_offset: offset }),
   })
   if (!response.ok) throw new Error(`search_artists answered ${response.status}`)
