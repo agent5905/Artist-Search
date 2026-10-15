@@ -71,7 +71,8 @@ Examples from the log:
 | Blind test against DeviantArt's "More Like This" | Lost on the 442-artist pool, 8 to 21 and then 11 to 17. To be rerun on the full pool |
 | Blind test against DeviantArt's own search | Not yet run. The reference results for 36 frozen queries are captured |
 | Profile claims | About one unsupported claim in 20 cards under a strict critic; the owner accepted that in place of the spec's "every claim" |
-| Removal proof | The request and code steps exist. The check that finds the code and carries out the removal is being built |
+| Removal proof | Built: `pipeline.removals` looks for the code on the artist's DeviantArt profile or own site and removes them at once. It runs from the owner's machine, is not scheduled yet, and has not been judged by a critic |
+| Search rate limit | Built: 60 searches per visitor in ten minutes, counted in Cloudflare's cache. Needs no Cloudflare setting. Not yet judged |
 | Public deployment | Not done. It waits on the owner's approval |
 | Crawling artists' own portfolio sites | The polite crawler is built and tested but not used at scale |
 
@@ -99,6 +100,13 @@ uv run python -m pipeline.tagging --max-works 500 --formats
 uv run python -m pipeline.profiles --max-artists 500
 uv run python -m pipeline.push --dry-run
 uv run python -m pipeline.push
+```
+
+The removal check reads the pending removal requests and removes every artist whose proof code is on their DeviantArt profile or on the front page of their own site. Run it on a schedule, every 15 minutes, with Windows Task Scheduler. With nothing pending it asks DeviantArt nothing.
+
+```bash
+uv run python -m pipeline.removals --dry-run
+uv run python -m pipeline.removals
 ```
 
 The analysis stages take days on one GPU at full scale, so a small worker runs them in turns and can be paused. A pause loses nothing: each stage saves every work as it finishes it and holds before its next request to a model.
