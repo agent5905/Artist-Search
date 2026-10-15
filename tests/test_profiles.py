@@ -59,6 +59,14 @@ def cache(tmp_path, monkeypatch):
 
     monkeypatch.setattr(socket.socket, "connect", no_network)
     monkeypatch.setattr(socket, "create_connection", no_network)
+    # The invented tags below are on the reviewed list as far as these tests go, so that every other rule is seen
+    # to hold them back. The list's own tests give it none.
+    monkeypatch.setattr(profiles, "APPROVED", profiles.APPROVED | INVENTED)
+
+
+INVENTED = {f"{letter}tag" for letter in "abcdefghijklmn"} | {"colorful", "fakefirstname", "fakesurname"}
+INVENTED |= {"zzfakealpha", "zzfake", "alpha", "artofzzfakealpha", "yydarkraven", "darkraven"}
+INVENTED |= {"fakename0", "fakename1", "fakename2", "call555x019x942", "mk123", "mk456", "mk789"}
 
 
 def tags(medium="digital painting", subjects=("character",), genres=("fantasy",), style_words=("painterly",), **flags):
@@ -624,7 +632,7 @@ def test_the_quoted_tags_are_kept_with_the_number_of_counted_works_that_carry_ea
         # as the artist wrote it wherever that is not certain: no word is made up
         (["paleoart"], "paleoart"),
         (["dragonage"], "dragonage"),
-        (["catgirl"], "catgirl"),
+        (["speedpaint"], "speedpaint"),
         (["fantasyartwork"], "fantasyartwork"),  # "art work" or "artwork"
         (["warhammer40k"], "warhammer40k"),
     ],
@@ -664,11 +672,16 @@ def test_a_tag_that_says_nothing_or_is_not_about_the_work_is_not_shown(own):
     assert profiles.template(found) == "Fantasy character art."
 
 
-def test_a_word_with_a_left_out_one_in_it_is_shown():
-    # a soldier is not sold, nor Salem for sale, and "landscape" has no cape in it
-    assert shown((10, SCENERY, ["soldier", "salem", "sapphire", "psychedelic", "wheels", "landscape"])) == [
-        *("soldier", "salem", "sapphire", "psychedelic", "wheels", "landscape")
-    ]
+def test_only_a_tag_on_the_reviewed_list_is_shown():
+    """The third critic of the push stage: a list of banned words let "lolita", "yuri" and many more through.
+    Every tag on the reviewed list is shown, however it is written, and no other, whatever it is."""
+    own = ["soldier", "Landscape", "spaceship", "character_design", "lolita", "yuri", "midriff", "salem"]
+    own += ["sapphire", "wheels", "spaceships", "bunnysuit", "croptop", "zzinventedtag"]
+    assert shown((10, SCENERY, own)) == ["soldier", "landscape", "spaceship", "character design"]
+    assert all(
+        profiles.approved(tag) for tag in ("Soldier", "character_design", "character design", "dungeons_and_dragons")
+    )
+    assert not any(map(profiles.approved, ("lolita", "yuri", "midriff", "zzinventedtag", "")))
 
 
 def test_no_tag_says_again_what_one_shown_before_it_has_said():
@@ -712,7 +725,7 @@ def test_the_artists_own_handle_or_name_is_not_shown():
     assert shown((10, DRAGON, ["yy_dark_raven", "paleoart"]), handle="YY_Dark-Raven") == ["paleoart"]
 
 
-# What the second critic of the push stage found shown, and what the list made from the store's real tags catches.
+# What the second critic of the push stage found shown: none of it is on the reviewed list.
 @pytest.mark.parametrize(
     "own",
     [
@@ -723,13 +736,6 @@ def test_the_artists_own_handle_or_name_is_not_shown():
 )
 def test_a_dress_body_or_sex_word_anywhere_in_a_tag_is_not_shown(own):
     assert shown((10, FANTASY, own)) == []
-
-
-def test_a_word_that_only_looks_like_one_of_dress_or_body_is_shown():
-    own = ["butterfly", "spaceships", "thorns", "armchair", "fairytail", "blackink", "sportscar", "tombraider"]
-    own += ["stealthaircraft", "longneck"]
-
-    assert [tag.replace(" ", "") for tag in shown((10, SCENERY, own))] == own
 
 
 @pytest.mark.parametrize("how", ["marked", "taken_down"])
@@ -1747,6 +1753,22 @@ def test_a_row_is_not_current_while_a_work_it_counted_has_words_nobody_read_or_w
     assert profiles.current() == set()  # the row counted a work that does not count any more
     assert run(Fake())["profiled"] == 1 and profiles.current() == {key}
     assert profiles.profiles()[0]["facts"]["counted"] == sorted(set(ids) - {ids[2]})
+
+
+def test_a_row_is_not_current_while_the_verified_tags_it_counted_are_not_the_ones_that_stand():
+    """The third critic of the push stage: a card from the tags of an older prompt version went as current."""
+    ids = artist(ALPHA, [tags()] * 6)
+    assert run(Fake())["profiled"] == 1
+    kept, key = table(), f"da:{ALPHA}"
+    with closing(sqlite3.connect(config.LOCAL_DB)) as conn, conn:  # a new prompt version: none read under it yet
+        conn.execute("UPDATE work_tags SET prompt_version = prompt_version - 1")
+    assert profiles.current() == set()
+    for work_id in ids:  # read again under it, from the same images, and found to say the same
+        tag(work_id, tags())
+    assert profiles.current() == {key} and run(Fake()) == {"unchanged": 1} and table() == kept
+    tag(ids[0], tags(subjects=["creature"]))  # one of them read again, and otherwise
+    assert profiles.current() == set()
+    assert run(Fake())["profiled"] == 1 and profiles.current() == {key}
 
 
 def test_a_work_collected_after_the_row_was_made_leaves_the_row_current():

@@ -26,11 +26,13 @@ In this order, and the order is the point:
 Four things stop a run, each with a message and a status that is not zero:
   - the database holds a slug that begins "zz-". Those are another builder's test rows, and this stage would
     delete them. It is the first thing looked at, before anything is done here or there;
-  - the removals made here would bar more than DELETE_FLOOR people that the database's list does not bar
-    already: each artist kept here whom they bar, and each of their hashes that is no handle or account of one
-    of those artists (a site, a handle nobody here has). Removals come one at a time, a person each, so many at
-    once is a broken local store and nobody's wish. What the database's own list asks is done all the same,
-    here and there: it is the list of record, and it puts nobody new on itself. Nothing else is done, and
+  - the removals would bar more than DELETE_FLOOR people beyond those the database's list names itself: each
+    artist a removal made here bars, each artist a removal on either list reaches only through what is kept
+    here (a handle the account was kept under before, a profile with the account's hash), and each hash added
+    that is no handle or account of one of them (a site, a handle nobody here has). Removals come one at a
+    time, a person under a handle or two, so many at once is a broken local store and nobody's wish: a corrupt
+    table of rename links once turned one removal through the site into twelve. Whom the database's own list
+    names is removed all the same, here and there: it is the list of record. Nothing else is done, and
     `--allow-delete N` lets N of them through;
   - the local library has no artists. An empty or a new file is no reason to empty the database;
   - more would be deleted than a run is believed about: more than DELETE_PERCENT of the artists the database
@@ -54,8 +56,9 @@ them and found no private contact. A work's page address is made from its title,
 contact, or were not read, is not sent at all. And every text that is sent, whoever wrote it, is held to the
 collect stage's plain rule as it goes (library.holds_contact): a description is a model's words about an image,
 and an image can show an address. A text that fails is left out, and a work whose title or description fails is
-not sent. What a model wrote (a description, verified tags, the profile and its facts) is also left out when it
-names a messaging, social or payment service (library.names_service): no model reads it for contacts, and "Discord
+not sent. An artist's search_text, made of many such texts, is held to it as a whole too (_search_text). What a
+model wrote (a description, verified tags, the profile and its facts) is also left out when it names a
+messaging, social or payment service (library.names_service): no model reads it for contacts, and "Discord
 fakepainter#1234" passes the plain rule. A work whose description names one goes without it. The handle is the
 one text that is not asked: it is the name the artist is listed under.
 A reading is tied to what was read: every reader this stage builds from gives a reading only while it is of the
@@ -98,7 +101,7 @@ PICKS = 4
 # not believed.
 DELETE_PERCENT = 10
 # Deletions of each kind that a run may always make, however little the database holds. And the people the
-# removals made here may always bar (see run).
+# removals may always bar beyond those the database's list names (see run).
 DELETE_FLOOR = 5
 TEST_SLUG = "zz-"  # how the other builders' test rows begin. Never sent, and a database that has one is left alone
 STYLE_MODEL, STYLE_RULE = "csd", "local"  # round 7's blind test chose them
@@ -238,6 +241,34 @@ def _size(size: object) -> tuple[int | None, int | None]:
 def _too_many(part: int, whole: int) -> bool:
     """True when `part` is ADULT_PERCENT or more of a `whole` that is not nothing."""
     return whole > 0 and 100 * part >= ADULT_PERCENT * whole
+
+
+def _search_text(parts: list[str]) -> str:
+    """Texts of an artist's that each passed the plain rule alone, joined and cut to MAX_SEARCH_TEXT characters.
+
+    Side by side their digits add up: two titles, "Call or WhatsApp" and "5550199", are a number to call, and
+    ten titles with a year each are forty digits. While the plain rule refuses the whole (library.holds_contact),
+    the digits go but for the first eight of them, part by part in order, and then but for the first six: the
+    rule reads nine as a number, and seven beside a word for calling. A search of artwork has little use for
+    them, and every word stays. What is made is still read whole by the caller, as every text it sends is:
+    something other than digits can add up too, such as a tag "dot" between two others.
+    ponytail: in the order the parts come, so a title's year can take the place of a tag's "40k". Prefer digits
+    joined to letters if that is ever missed.
+    """
+    text = " ".join(parts)
+    for most in (8, 6):
+        if not library.holds_contact(text):
+            break
+        kept, left = [], most
+        for part in parts:
+            digits = sum(map(str.isdigit, part))
+            if digits <= left:
+                left -= digits
+            else:
+                part = "".join(" " if char.isdigit() else char for char in part)
+            kept.append(part)
+        text = " ".join(" ".join(kept).split())
+    return text if len(text) <= MAX_SEARCH_TEXT else text[:MAX_SEARCH_TEXT].rsplit(" ", 1)[0]
 
 
 def _removed_here(local: pathlib.Path | str | None) -> set[str]:
@@ -407,10 +438,17 @@ def _build(local: store.Snapshot, removed: Collection[str]) -> tuple[Rows, Rows,
         used = Counter(tag for _, _, _, own, *_ in ready for tag in set(own))
         most_used = plain([tag for tag, _ in sorted(used.items(), key=lambda item: (-item[1], item[0]))])
         # The artist's own tags the site shows as theirs: those the profile stage's one rule picked
-        # (profiles._own_tags), of those on a work that goes, as it prints them. A printed tag may have spaces
-        # put in it, and sql/001_schema.sql takes 60 characters a tag.
+        # (profiles._own_tags), of those on a work that goes, as it prints them, and on the reviewed list as it is
+        # now (profiles.approved): a row made before a tag was taken off it, or before there was one, says nothing
+        # here. A printed tag may have spaces put in it, and sql/001_schema.sql takes 60 characters a tag.
         on_sent = {re.sub(r"[\s_-]", "", tag.lower()) for tag in used}
-        shown = plain([tag for tag in profile["own_words"] if re.sub(r"[\s_-]", "", tag) in on_sent and len(tag) <= 60])
+        shown = plain(
+            [
+                tag
+                for tag in profile["own_words"]
+                if re.sub(r"[\s_-]", "", tag) in on_sent and profiles.approved(tag) and len(tag) <= 60
+            ]
+        )
         # An older row may lack a kind. Its own_words are of works that may not go: of those that do, every tag is
         # in most_used, and the ones shown are in top_tags, which keyword search reads too.
         facts = plain(
@@ -418,14 +456,8 @@ def _build(local: store.Snapshot, removed: Collection[str]) -> tuple[Rows, Rows,
         )
         # ponytail: the specialty the artist picked on DeviantArt is not in it: nothing has read that field
         # for a private contact. Add it when the tagging stage does.
-        # ponytail: every part of it has passed the plain rule as a text of its own, and the text they make is
-        # not read again as one. Digits only add up there: on 2026-10-13, 72 of 271 real artists failed that
-        # way, 70 on nine digits from ten titles and 2 on seven beside "pastel". Ceiling: a number spread over
-        # several titles on purpose, which is as public on the works' own rows. Read it as one when the rule
-        # can tell a year from a number to call.
-        search_text = " ".join([*facts, *(title for _, _, title, *_ in ready if title), *most_used])
-        if len(search_text) > MAX_SEARCH_TEXT:
-            search_text = search_text[:MAX_SEARCH_TEXT].rsplit(" ", 1)[0]
+        words = [*facts, *(title for _, _, title, *_ in ready if title), *most_used]
+        search_text = next(iter(plain([_search_text(words)])), None)  # and read whole, as every text that goes
         artists.append(
             {
                 "slug": slug,
@@ -516,7 +548,7 @@ def _removed_sql(key_hashes: set[str]) -> str:
 
 
 def _removal(
-    listed: set[str], there: Rows, kept: set[str], local: pathlib.Path | str | None
+    listed: set[str], there: Rows, kept: set[str], local: pathlib.Path | str | None, follow: bool = True
 ) -> tuple[set[str], set[str], int]:
     """What hard rule 7 asks of this run for these key hashes, worked out with nothing changed: every key hash
     the two removal lists must hold for them, the keys of the artists those bar that are stored or kept here,
@@ -528,10 +560,12 @@ def _removal(
 
     A hash bars the stored artists it names, by their handle or by the site of their stored link
     (store.named_by), and the artists kept here (`kept`, the library's keys) under a handle it names. A removal
-    covers the account, so it reaches every other handle the same account is kept under, as the collect stage
-    linked them (library.same_account), and theirs in turn: no further, and never another artist. Each of those
-    handles goes on the list, and each account's hash with it, so that the account is known for what it is
-    under a handle it takes later, when the purge has deleted the profile that names it.
+    covers the account, so it reaches every other handle the same account is kept under: as the collect stage
+    linked them (library.same_account), and any kept here whose profile has the account's hash on the list,
+    and theirs in turn: no further, and never another artist. Each of those handles goes on the list, and each
+    account's hash with it, so that the account is known for what it is under a handle it takes later, when the
+    purge has deleted the profile that names it. With `follow` False a hash bars only whom it names itself:
+    the account's hash still goes on the list, and nobody it reaches here is barred (see run).
 
     An artist the database (`there`, its listing) shows with a removed site is removed under their handle as
     well, which is what the store does for the artists it lists: they stay out when their profile names
@@ -543,7 +577,9 @@ def _removal(
     while True:  # until a pass finds nobody new: each pass but the last bars somebody
         stored = store.named_by(hashes, local)
         more = {*stored, *(key for key in kept if store.covers(hashes, key))}
-        more |= {other for key in more for other in library.same_account(key, local)}
+        if follow:
+            more |= {other for key in more for other in library.same_account(key, local)}
+            more |= {key for key in kept if library.account_hash(key, local) in hashes}
         if more <= barred:
             return hashes, barred, len(stored)
         barred |= more
@@ -568,9 +604,9 @@ def run(dry_run: bool, allow_delete: int | None = None, local: pathlib.Path | st
 
     Stop, and nothing more is done, in the four cases the module's docstring names; when too much would be
     deleted it carries the counts. `allow_delete` is how many artists, how many works and how many neighbour
-    rows this one run may delete instead, and how many people the removals made here may bar (see the module's
-    docstring) when that is more than DELETE_FLOOR. RuntimeError when the database fails, ValueError when a
-    removal list cannot be read: whichever comes, nothing after it is done.
+    rows this one run may delete instead, and how many people the removals may bar beyond those the database's
+    list names (see the module's docstring) when that is more than DELETE_FLOOR. RuntimeError when the database
+    fails, ValueError when a removal list cannot be read: whichever comes, nothing after it is done.
     """
     there = db.sql(LISTING_SQL)
     if any(str(row["slug"]).startswith(TEST_SLUG) for row in there):
@@ -585,16 +621,17 @@ def run(dry_run: bool, allow_delete: int | None = None, local: pathlib.Path | st
         raise Stop(NO_ARTISTS)  # a run would make the file and find nothing in it: a dry run makes no file
     with store.snapshot(local) as now:
         kept = set(library.artist_keys(now))
-        # What the database's own list asks, and what it asks with the removals made here.
-        theirs, whole = _removal(remote, there, kept, now), _removal(remote | _removed_here(now), there, kept, now)
-        # The people the removals made here bar that the database's list does not: each artist, and each hash
-        # that is no handle or account of one of them.
-        new = whole[1] - theirs[1]
+        named = _removal(remote, there, kept, now, False)  # whom the database's own list names itself
+        whole = _removal(remote | _removed_here(now), there, kept, now)  # and all that the two lists come to here
+        # The people that is beyond whom the database's list names: each artist a removal made here bars or a
+        # removal reaches through what is kept here (a renamed handle, an account), and each hash that is no
+        # handle or account of one of them.
+        new = whole[1] - named[1]
         own = {store._hash(key) for key in new} | {hash_ for key in new if (hash_ := library.account_hash(key, now))}
-        people = len(new) + len(whole[0] - theirs[0] - own)
+        people = len(new) + len(whole[0] - named[0] - own)
     may_add = max(DELETE_FLOOR, allow_delete or 0)  # a handful always goes through, whatever a run is told
-    flood = people > may_add  # then only the database's own list is honoured, and the run stops after it
-    hashes, removed, applied = theirs if flood else whole
+    flood = people > may_add  # then only whom the database's own list names is removed, and the run stops after it
+    hashes, removed, applied = named if flood else whole
     purge = sorted(removed & kept)
     # What the database's list lacks is added, so that another machine, or this file made again, hears of it.
     # The artists the list bars go with it, whatever happens further down: the database deletes them itself when
@@ -615,11 +652,12 @@ def run(dry_run: bool, allow_delete: int | None = None, local: pathlib.Path | st
     if flood:
         done = "would be" if dry_run else "was"
         raise Stop(
-            f"the removals made here would bar {people} people (it may bar {may_add}): add "
-            f"{len(whole[0] - theirs[0])} key hashes to the database's removal list, where they stay for good, and "
-            f"purge {len(whole[1] & kept) - len(purge)} artists here. Removals come one at a time, so this many at "
-            f"once looks like a broken local store. What the database's own list asks {done} done, here and there, "
-            f"and nothing else. If they are real removals, run it again with --allow-delete {people}."
+            f"the removals would bar {people} people beyond those the database's list names (it may bar {may_add}): "
+            f"add {len(whole[0] - named[0])} key hashes to the database's removal list, where they stay for good, "
+            f"and purge {len(whole[1] & kept) - len(purge)} artists here. Removals come one at a time, a person "
+            f"under a handle or two, so this many at once looks like a broken local store. Whom the database's own "
+            f"list names {done} removed, here and there, and nothing else. If they are real removals, run it again "
+            f"with --allow-delete {people}."
         )
     if not kept - removed:
         raise Stop(NO_ARTISTS)
@@ -703,7 +741,8 @@ def main(argv: list[str] | None = None) -> None:
         metavar="N",
         help="let this one run delete up to N artists who no longer qualify, and up to N works and N neighbour rows "
         f"of artists who stay (without it: {DELETE_PERCENT} percent of what the database has, and never fewer than "
-        f"{DELETE_FLOOR}); and let the removals made here bar up to N people (without it: {DELETE_FLOOR})",
+        f"{DELETE_FLOOR}); and let the removals bar up to N people beyond those the database's list names "
+        f"(without it: {DELETE_FLOOR})",
     )
     args = parser.parse_args(argv)
     try:

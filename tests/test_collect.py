@@ -2188,6 +2188,23 @@ def test_an_account_removed_under_one_handle_is_not_collected_under_the_next(cap
     assert counts_of(world, capsys)[collect.PROCESSED] == 0 and world.since(seen) == []  # and never asked about again
 
 
+def test_an_account_that_goes_on_the_list_while_its_images_are_fetched_is_not_stored_under_any_handle(capsys, tmp_path):
+    """The third critic of the push stage: an account removed under another handle, as the push stage brings it
+    from the list of record, while this turn fetches images. The list is asked once more before anything is
+    written, of the account as well as of the handle: nothing is stored, and the handle is barred too."""
+    world = solo(4)
+
+    def removal_arrives(request):
+        if request.url.path == preview_path(4) and not library.account_removed(f"FAKE-USERID-{ALPHA}"):
+            store.import_removed([library.account(f"FAKE-USERID-{ALPHA}")])
+
+    world.detours.append(removal_arrives)
+    counts = counts_of(world, capsys)
+    assert counts[collect.REMOVED] == 1 and counts[collect.PROFILES] == counts[collect.WORKS] == 0
+    assert library.artist_keys() == [] and files(tmp_path) == ["cache/pipeline.sqlite"]
+    assert store.is_removed(ALPHA) and store.all_artists() == []
+
+
 def trio():
     """ALPHA with four good works, and BRAVO and DELTA with one each: two the API goes on answering for."""
     world = solo(4)

@@ -673,9 +673,10 @@ def store_artist(
     `works` are keyword arguments for checked_work(). Each is added, or brought up to date with the time, and
     its row names the work's cached image when there is one. For a work that is kept, a title or a tag list
     that is empty or not given, a publish time or a thumbnail that is not given, and a size that is not given
-    all stay as they are kept. So does a title, or every tag of a list, that the rules here refuse, and then
-    the work is marked REFUSED. A work that is kept and is not among `works` is left as it is: its fetched_at is
-    when it was last seen and still qualified. A work kept under another artist's key is not taken from them.
+    all stay as they are kept: but for the size of a thumbnail that now shows another file, which goes. So does
+    a title, or every tag of a list, that the rules here refuse, and then the work is marked REFUSED. A work
+    that is kept and is not among `works` is left as it is: its fetched_at is when it was last seen and still
+    qualified. A work kept under another artist's key is not taken from them.
 
     A work's cached image is written down with its fingerprint as the image of the file its thumbnail shows
     (see own_file) when the work is first stored with one. From then on only the caller's word, `fetched` set
@@ -777,6 +778,8 @@ def store_artist(
                         "INSERT OR REPLACE INTO work_sizes (deviation_id, width, height) VALUES (?, ?, ?)",
                         (work_id, *size),
                     )
+                elif kept and own_file(thumb) != own_file(kept[2]):  # the size kept is of the picture shown before
+                    conn.execute("DELETE FROM work_sizes WHERE deviation_id = ?", (work_id,))
                 stored.add(work_id)
                 if title_refused or tags_refused:
                     held[work_id] = REFUSED

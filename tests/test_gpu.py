@@ -63,10 +63,13 @@ def test_status_counts_a_reading_as_done_only_while_it_is_of_the_image_the_work_
     tagging.results(), profiles.profiles()  # so that their tables exist
     read, rests = library.fingerprint(jpeg), tagging.read_as([work_id], {work_id: library.fingerprint(jpeg)}, {})
     verified = tagging.result_set(profiles.TAGGER, profiles.TAGGER)
+    result = {"medium": "digital painting", "subjects": ["character"], "genres": [], "style_words": []}
+    result |= {"description": "FAKE-DESCRIPTION.", "explicit": False, "not_artwork": False}
+    facts, _ = profiles.facts_of([{"id": work_id, "result": result, "declared": None}])  # as the profile stage keeps
     rows = {
-        "work_tags": (work_id, verified, tagging.PROMPT_VERSION, "{}", at, read),
+        "work_tags": (work_id, verified, tagging.PROMPT_VERSION, json.dumps(result), at, read),
         "work_format": (work_id, profiles.TAGGER, tagging.FORMAT_VERSION, "{}", at, read),
-        "artist_profiles": (key, "FAKE-BASIS" + rests, "nothing_clear", json.dumps({"counted": [work_id]}), "[]"),
+        "artist_profiles": (key, "FAKE-BASIS" + rests, "nothing_clear", json.dumps(facts), "[]"),
     }
     with sqlite3.connect(config.LOCAL_DB) as conn:
         conn.execute("CREATE TABLE style_vectors (deviation_id TEXT, model TEXT, vector BLOB, fingerprint TEXT)")
