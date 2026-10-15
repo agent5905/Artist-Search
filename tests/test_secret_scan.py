@@ -1,5 +1,8 @@
+import hashlib
 import sys
 from pathlib import Path
+
+import httpx
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 
@@ -25,6 +28,23 @@ def test_images_and_env_file_are_blocked():
     assert problems(".env", "", [])
     assert problems(".env.cloudflare_info", "", [])
     assert problems(".env.example", "GH_TOKEN=", []) == []
+
+
+def test_the_sites_token_reaches_the_database_only_as_its_hash(monkeypatch):
+    """pipeline.db.migrate, with the database a stand-in: the token's sha256 goes with the schema, in one call."""
+    from pipeline import db
+
+    token = "FAKE-SITE-TOKEN-" + "x" * 32
+    sent = []
+    monkeypatch.setattr(db, "load_env", lambda: {"SITE_TOKEN": token})
+    monkeypatch.setattr(db, "sql", lambda query: sent.append(query) or [])
+    monkeypatch.setattr(db, "data_api", lambda *args, **kwargs: httpx.Response(200, json={"paths": []}))
+    db.migrate()
+
+    assert token not in "".join(sent)
+    hashed = hashlib.sha256(token.encode()).hexdigest()
+    assert sent[0].endswith(f"('{hashed}') on conflict (only_row) do update set token_hash = excluded.token_hash;")
+    assert "create table if not exists public.site_secret" in sent[0]  # the schema and the hash: one transaction
 
 
 def test_short_env_values_are_ignored(tmp_path):

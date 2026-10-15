@@ -6,7 +6,7 @@
 -- Hard rule 7: an artist is known by a DeviantArt handle and, if they have a site, its registrable
 -- domain. Each has exactly one spelling here, so a removed artist cannot come back under a variant.
 -- Row level security is on for every table with no policies: the public role reads only through
--- the functions in 002_functions.sql.
+-- the functions in 003_limits.sql, which the site's server calls with a token of its own.
 
 create extension if not exists vector with schema extensions;
 create extension if not exists pg_trgm with schema extensions; -- for misspelled search words
@@ -153,16 +153,39 @@ create index if not exists search_words_trgm_idx on public.search_words using gi
 -- tests/test_db.py. Ceiling: it still reads one row per artist. Past about 30,000 artists add HNSW
 -- on artists.profile_embedding.
 
--- Removal requests waiting for the owner: logged, never acted on by themselves (owner decision 6).
--- One row per artist: when it was first and last asked for, how often, and what the first request
--- said. A later request only counts; nothing a visitor sends can erase what an artist wrote.
+-- Removal requests (owner decision 6): a lasting record, which nothing but a proven removal or the owner's
+-- answer closes. No load, hold-back, rename or deletion of the artist's row touches it. One open row per
+-- slug: when it was first and last asked for, how often, what the first request said, and the handle and
+-- site it was made for, so the verifier finds the artist while they are not listed. A later request only
+-- counts; nothing a visitor sends can erase what an artist wrote.
 create table if not exists public.removal_requests (
-  artist_slug text primary key,
+  artist_slug text primary key, -- the slug asked about; its proof code is that slug's. 'closed:<uuid>' once closed
   note text, -- the first request's note
   first_at timestamptz not null default now(),
   last_at timestamptz not null default now(),
   requests bigint not null default 1
 );
+alter table public.removal_requests
+  add column if not exists da_username text, -- the public handle and site the artist was listed with when asked
+  add column if not exists site_url text,
+  add column if not exists site_domain text,
+  -- The removal list's two keys for them, as artists.da_key and site_key are made.
+  add column if not exists da_key text generated always as (public.key_hash('da:' || lower(da_username))) stored,
+  add column if not exists site_key text generated always as (public.key_hash('site:' || site_domain)) stored,
+  -- The verifier's queue (pipeline/removals.py). code_at: when a proof code was last asked for; null for a
+  -- request without one, which only the owner answers. due_at: when the verifier looks for the code next.
+  add column if not exists code_at timestamptz,
+  add column if not exists due_at timestamptz,
+  -- Null while open. 'proven' (the verifier saw the code), 'granted' or 'rejected' (the owner's answer), or
+  -- 'removed' (the artist was removed another way). A closed row keeps nothing of the artist: its slug gives
+  -- way to a random key and the handle, site and note go.
+  add column if not exists outcome text;
+-- An open request filed before those columns gets the handle and site its artist is listed with now, so
+-- that it can be granted while they are not listed. It fills only what is empty: rerun, it changes nothing.
+update public.removal_requests r
+set da_username = a.da_username, site_url = a.site_url, site_domain = a.site_domain
+from public.artists a
+where a.slug = r.artist_slug and r.da_username is null and r.outcome is null;
 
 -- The one secret a removal proof code is derived from. Readable by the table owner only, which the
 -- two functions that need it run as. Made once, with a random value.
@@ -239,6 +262,8 @@ begin
       ('artist_neighbors', 'artist_neighbors_few_picks', 'check (cardinality(picks) <= 4)'),
       ('removal_requests', 'removal_requests_pkey', 'primary key (artist_slug)'),
       ('removal_requests', 'removal_requests_short', 'check (length(artist_slug) <= 80 and length(note) <= 300)'),
+      ('removal_requests', 'removal_requests_outcome',
+       $$check (outcome in ('proven', 'granted', 'rejected', 'removed'))$$),
       ('removed', 'removed_key_is_a_hash', $$check (key_hash ~ '^[0-9a-f]{64}$')$$)
     ) as listed (table_name, name, definition)
   loop

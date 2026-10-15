@@ -29,6 +29,7 @@ import zlib
 from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass
 from html import unescape
+from html.parser import HTMLParser
 from http.cookiejar import DefaultCookiePolicy
 from typing import Literal
 from urllib.parse import unquote
@@ -198,7 +199,6 @@ _DEFAULT_PORT = {"http": 80, "https": 443}
 _NAT64 = ipaddress.ip_network("64:ff9b::/96")
 
 _META_OPEN = re.compile(r"<meta(?=[\s/>])", re.IGNORECASE)
-_HEAD_END = re.compile(r"</head(?=[\s/>])|<body(?=[\s/>])", re.IGNORECASE)
 _TAG = re.compile(r"<!--|<([a-zA-Z][^\s/>]*)")  # a comment, or the opening of a tag with its name
 # Elements whose content is text, not markup: nothing inside them is a link.
 _RAW_TEXT = {
@@ -501,18 +501,55 @@ def _meta_reserves(text: str) -> bool:
     return False
 
 
+class _HeadEnds(Exception):
+    """Raised by _Head where a browser would end the page's head."""
+
+
+class _Head(HTMLParser):
+    """The <meta> elements of a page's head, read with the standard library's HTML parser as a browser builds the
+    head: it ends at </head>, at <body>, at the first element that has no place in a head (a <p>, an <h1>), or at
+    the first text that is not white space, whether or not the page writes <head> and </head> at all. A <meta> in a
+    comment, in a script, style, title or other element whose content is text, or inside another element's
+    attribute value, is not an element. Parsing stops where the head ends, so a malformed body costs nothing."""
+
+    IN_HEAD = {"html", "head", "base", "basefont", "bgsound", "link", "meta", "template"}
+    TEXT = {"script", "style", "title", "noscript", "noframes"}  # in a head too, and their content is text
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.metas: list[dict[str, str]] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag not in self.IN_HEAD | self.TEXT:
+            raise _HeadEnds
+        if tag == "meta":
+            attributes: dict[str, str] = {}
+            for key, value in attrs:
+                attributes.setdefault(key, value or "")  # the first of a repeated attribute wins, as in a browser
+            self.metas.append(attributes)
+        elif tag in self.TEXT:
+            self.set_cdata_mode(tag)  # the parser itself does this for script and style only
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag in ("head", "body", "html", "br"):
+            raise _HeadEnds
+
+    def handle_data(self, data: str) -> None:
+        if not self.cdata_elem and data.strip(" \t\n\f\r"):  # type: ignore[attr-defined]
+            raise _HeadEnds
+
+
 def _head_meta(text: str, name: str) -> list[str]:
-    """The content of every <meta name="<name>"> in the page's head: before the first <body> or </head>. Nothing
-    after that counts, since a visitor's comment or guestbook entry lands in the body, never the head. A page that
-    marks no end to its head has none. A commented-out tag in the head still counts: only the owner writes there."""
-    end = _HEAD_END.search(text)
-    head = text[: end.start()] if end else ""
-    values = []
-    for opening in _META_OPEN.finditer(head):
-        attributes, _ = _attributes(head, opening.end())
-        if attributes and attributes.get("name", "").strip().lower() == name:
-            values.append(attributes.get("content", ""))
-    return values
+    """The content of every <meta name="<name>"> element in the page's head (_Head). Nothing after the head counts,
+    since a visitor's comment or guestbook entry lands in the body, never the head, and nothing in the head that is
+    not a <meta> element counts either: a review the head carries as JSON-LD, a comment quoted in og:description."""
+    head = _Head()
+    try:
+        head.feed(text.removeprefix(chr(0xFEFF)))  # a byte order mark is not text before the head
+        head.close()
+    except (_HeadEnds, AssertionError):  # the parser asserts on a "<![" it cannot read: the head is read up to it
+        pass
+    return [meta.get("content", "") for meta in head.metas if meta.get("name", "").strip().lower() == name]
 
 
 def _hrefs(text: str) -> Iterator[str]:

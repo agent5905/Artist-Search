@@ -80,10 +80,10 @@ end
 $$;
 
 -- Service role only. Deletes the artists that keys on the removal list bar (works cascade), found by
--- index, with what was pending for them. p_keys null means every key on the list: db.after_load()
--- runs that as a sweep. A row another transaction holds is skipped rather than waited for, so a
--- removal never queues behind a load; the public functions leave such a row out until it is swept.
--- Returns how many artists were deleted.
+-- index. p_keys null means every key on the list: db.after_load() runs that as a sweep. A row another
+-- transaction holds is skipped rather than waited for, so a removal never queues behind a load; the
+-- public functions leave such a row out until it is swept. Removal requests are not touched: only a
+-- proven removal or the owner's answer closes one. Returns how many artists were deleted.
 create or replace function public.delete_removed(p_keys text[] default null) returns int
 language plpgsql set search_path = ''
 as $$
@@ -100,19 +100,22 @@ begin
     returning 1
   )
   select count(*) into gone from deleted;
-  delete from public.removal_requests r
-  where not exists (select 1 from public.artists a where a.slug = r.artist_slug);
   return gone;
 end
 $$;
 
 -- When keys join the removal list, by a removal or by hand, the artists they bar go at once, and
--- the word list is rebuilt so that none of their words is left to steer a search.
+-- the word list is rebuilt so that none of their words is left to steer a search. An open removal
+-- request they bar has nothing left to ask, and is closed as 'removed', so it keeps their handle no
+-- longer (close_request is in the removal functions below).
 create or replace function public.removed_after_insert() returns trigger
 language plpgsql set search_path = ''
 as $$
 begin
   perform public.delete_removed(array(select key_hash from added));
+  perform public.close_request(r.artist_slug, 'removed')
+  from public.removal_requests r
+  where r.outcome is null and (r.da_key in (select key_hash from added) or r.site_key in (select key_hash from added));
   perform public.refresh_search_words();
   return null;
 end
@@ -471,35 +474,59 @@ $$;
 -- Removal (hard rule 7, owner decision 6). Nothing a visitor can reach changes what is shown, and
 -- nothing a visitor can reach undoes what an artist did:
 --   * request_removal logs a request for the owner;
---   * start_removal_proof (sql/003_limits.sql) tells the artist the code to put on their own site or
---     DeviantArt profile, and from then on the verifier looks for it;
+--   * start_removal_proof tells the artist the code to put on their own site or DeviantArt profile, and
+--     from then on the verifier looks for it;
 --   * confirm_removal (the verifier, once it has seen the code there) removes the artist at once and
 --     for good;
 --   * purge_removed and reject_removal are the owner's answer to an unproven request.
--- All of them are the service role's: visitors reach the first two through the site's server
--- function (web/functions/api/removal.ts), which client_wait limits.
+-- A request stays open until one of the last three closes it, whatever happens to the artist's row
+-- meanwhile. All of them are the service role's: visitors reach the first two through the site's
+-- server functions (site_removal_code and site_request_removal in sql/003_limits.sql), which count them.
 
--- Logs a request: one row per artist, with the first request's note. Asking again only counts, and
--- moves nothing in the verifier's queue. Always returns true, whatever the slug, so it gives nothing away.
+-- Logs a request: one open row per artist, with the first request's note, and the handle and site the
+-- artist is listed with now. Asking again only counts, and moves nothing in the verifier's queue. Always
+-- returns true, whatever the slug, so it gives nothing away.
 create or replace function public.request_removal(p_slug text, p_note text default null) returns boolean
 language sql security definer set search_path = ''
 as $$
   with logged as (
-    insert into public.removal_requests as r (artist_slug, note)
-    select a.slug, left(p_note, 300) from public.artists a where a.slug = p_slug
-    on conflict (artist_slug) do update set last_at = now(), requests = r.requests + 1
+    insert into public.removal_requests as r (artist_slug, note, da_username, site_url, site_domain)
+    select a.slug, left(p_note, 300), a.da_username, a.site_url, a.site_domain
+    from public.artists a where a.slug = p_slug
+    on conflict (artist_slug) do update set
+      last_at = now(), requests = r.requests + 1,
+      da_username = excluded.da_username, site_url = excluded.site_url, site_domain = excluded.site_domain
   )
   select true
 $$;
 
 -- The proof code for a slug: derived from the slug and a secret, so it is the same every time, it is
--- stored nowhere, and nobody without the secret can work it out. Not callable directly by any role.
+-- stored nowhere, and nobody without the secret can work it out. Service role only: the verifier asks
+-- it for the code to look for. Null when the secret is missing.
 create or replace function public.removal_code(p_slug text) returns text
 language sql stable security definer set search_path = ''
 as $$
   select 'artist-search-removal-'
       || left(encode(extensions.hmac(coalesce(p_slug, ''), secret, 'sha256'), 'hex'), 32)
   from public.removal_secret
+$$;
+
+-- Tells the artist their code, and from then on the verifier looks for it: the slug's request is filed
+-- if it was not, and its checks start over (hourly for a day, then daily for two weeks, then weekly:
+-- pipeline/removals.py), due at once unless it already was. The code never changes. The answer has the
+-- same shape whether the slug is unknown, hidden or visible; only an artist's slug is filed.
+create or replace function public.start_removal_proof(p_slug text) returns text
+language sql security definer set search_path = ''
+as $$
+  with filed as (
+    insert into public.removal_requests as r (artist_slug, da_username, site_url, site_domain, code_at, due_at)
+    select a.slug, a.da_username, a.site_url, a.site_domain, now(), now()
+    from public.artists a where a.slug = p_slug
+    on conflict (artist_slug) do update set
+      code_at = now(), due_at = least(r.due_at, now()),
+      da_username = excluded.da_username, site_url = excluded.site_url, site_domain = excluded.site_domain
+  )
+  select public.removal_code(p_slug)
 $$;
 
 -- Service role only. Removes artists outright: their keys go on the removal list, which deletes
@@ -522,42 +549,88 @@ begin
 end
 $$;
 
--- Service role only: the verifier calls it once it has seen the code on the artist's own page.
--- True when the slug is an artist's and the code is theirs: the artist is then removed at once and
--- can never be re-added. False, and nothing changes, for anything else.
-create or replace function public.confirm_removal(p_slug text, p_code text) returns boolean
-language plpgsql security definer set search_path = ''
+-- Service role only. Closes an open request with the verifier's or the owner's answer, and keeps nothing
+-- of the artist in it: its slug gives way to a random key (so the artist can ask again) and the handle,
+-- site and note go. Returns whether there was one open.
+create or replace function public.close_request(p_slug text, p_outcome text) returns boolean
+language sql set search_path = ''
 as $$
+  with closed as (
+    update public.removal_requests
+    set artist_slug = 'closed:' || gen_random_uuid(), outcome = p_outcome, note = null, da_username = null,
+        site_url = null, site_domain = null, due_at = null
+    where artist_slug = p_slug and outcome is null
+    returning 1
+  )
+  select exists (select 1 from closed)
+$$;
+
+-- Service role only. Grants an open request: the keys of the handle and site it was made for, and of the
+-- artist listed under its slug now if there is one, go on the removal list in one statement (which
+-- deletes whoever they bar), and the request is closed. Whether the artist is listed at this moment does
+-- not matter: the next push bars and purges them everywhere. False, and nothing changes, without one
+-- open, or without a key to bar (a request older than its handle column, for an artist not listed now).
+create or replace function public.grant_request(p_slug text, p_outcome text) returns boolean
+language plpgsql set search_path = ''
+as $$
+declare
+  keys text[];
 begin
-  if p_code is distinct from public.removal_code(p_slug)
-     or not exists (select 1 from public.artists where slug = p_slug)
-  then
+  select array_remove(array[r.da_key, r.site_key], null) || coalesce(
+           (select public.artist_keys(a.da_username, a.site_domain) from public.artists a where a.slug = p_slug), '{}')
+  into keys
+  from public.removal_requests r where r.artist_slug = p_slug and r.outcome is null
+  for update of r;
+  if coalesce(cardinality(keys), 0) = 0 then
     return false;
   end if;
-  perform public.remove_artists(array[p_slug]);
+  perform public.close_request(p_slug, p_outcome); -- first, so the removal below does not close it as 'removed'
+  insert into public.removed (key_hash) select distinct unnest(keys) on conflict (key_hash) do nothing;
   return true;
 end
 $$;
 
--- Service role only. The owner turns down an artist's unproven request: it is deleted, and nothing
--- else changes. Returns whether there was one.
-create or replace function public.reject_removal(p_slug text) returns boolean
-language sql set search_path = ''
+-- Service role only: the verifier calls it once it has seen the code where only the artist can write.
+-- True when the slug has an open request and the code is that slug's: the artist is then removed at once
+-- and for good, listed at this moment or not, and the request is closed. False, and nothing changes, for
+-- anything else, and when the secret is missing (no code is then anyone's).
+create or replace function public.confirm_removal(p_slug text, p_code text) returns boolean
+language plpgsql security definer set search_path = ''
 as $$
-  with gone as (
-    delete from public.removal_requests where artist_slug = p_slug returning 1
-  )
-  select exists (select 1 from gone)
+begin
+  if not coalesce(p_code = public.removal_code(p_slug), false) then
+    return false;
+  end if;
+  return public.grant_request(p_slug, 'proven');
+end
 $$;
 
--- Service role only. The owner grants unproven requests after reviewing them: each slug in p_slugs
--- that has a pending request is removed as confirm_removal would. Returns how many artists were deleted.
+-- Service role only. The owner turns down an artist's unproven request: it is closed, and nothing else
+-- changes. Returns whether there was one open.
+create or replace function public.reject_removal(p_slug text) returns boolean
+language sql set search_path = ''
+as $$ select public.close_request(p_slug, 'rejected') $$;
+
+-- Service role only. The owner grants unproven requests after reviewing them: each slug in p_slugs that
+-- has an open request is removed as confirm_removal would. Returns how many requests were granted.
 create or replace function public.purge_removed(p_slugs text[]) returns int
 language sql set search_path = ''
 as $$
-  select public.remove_artists(array(
-    select r.artist_slug from public.removal_requests r where r.artist_slug = any (p_slugs)
-  ))
+  select (count(*) filter (where public.grant_request(asked.slug, 'granted')))::int
+  from (select distinct unnest(p_slugs) as slug) asked
+$$;
+
+-- Service role only. How many requests there are in each state, for the verifier's report: open with a
+-- code and without one, proven, and closed otherwise (granted, rejected, or removed another way).
+create or replace function public.removal_tally() returns jsonb
+language sql stable set search_path = ''
+as $$
+  select jsonb_build_object(
+    'requests_open_with_code', count(*) filter (where outcome is null and code_at is not null),
+    'requests_open_without_code', count(*) filter (where outcome is null and code_at is null),
+    'requests_proven', count(*) filter (where outcome = 'proven'),
+    'requests_closed', count(*) filter (where outcome <> 'proven'))
+  from public.removal_requests
 $$;
 
 -- Functions are not executable by the public unless granted (see the default privileges in
@@ -585,19 +658,18 @@ revoke all on function
   public.get_artist(text),
   public.request_removal(text, text),
   public.removal_code(text),
+  public.start_removal_proof(text),
   public.remove_artists(text[]),
+  public.close_request(text, text),
+  public.grant_request(text, text),
   public.confirm_removal(text, text),
   public.reject_removal(text),
-  public.purge_removed(text[])
+  public.purge_removed(text[]),
+  public.removal_tally()
 from public, anon, authenticated, service_role;
 
--- The browser's two, with the publishable key: a profile and its similar artists. Searching and asking
--- for removal go through the site's server functions, which count each visitor (client_wait in
--- sql/003_limits.sql) and call the database with a secret key of their own.
-grant execute on function
-  public.similar_artists(text, int),
-  public.get_artist(text)
-to anon;
+-- None of these is the public's. The site's server functions reach the five a visitor needs through
+-- sql/003_limits.sql, with a token of their own, once the visitor is counted.
 
 grant execute on function
   public.clean_url(text),
@@ -617,8 +689,13 @@ grant execute on function
   public.similar_artists(text, int),
   public.get_artist(text),
   public.request_removal(text, text),
+  public.removal_code(text),
+  public.start_removal_proof(text),
   public.remove_artists(text[]),
+  public.close_request(text, text),
+  public.grant_request(text, text),
   public.confirm_removal(text, text),
   public.reject_removal(text),
-  public.purge_removed(text[])
+  public.purge_removed(text[]),
+  public.removal_tally()
 to service_role;
