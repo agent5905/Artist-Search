@@ -923,3 +923,13 @@ What failed:
 **Push round 7 (in progress):** the tags shown become an approved list, reviewed tag by tag, instead of a banned list; anything not on it stays hidden. Any removal's expansion counts toward the flood guard. Cards go stale when their tag readings are redone. A removed account stays barred under any handle. Search text is checked whole. Tests for the eight uncaught breaks.
 
 Nothing has been pushed; none of these reached the public.
+
+**Claim-or-remove and the rate limit, judged: not fit for the public yet.**
+- **Anyone could remove an artist:** the site hands out an artist's code to anyone, and the checker accepted it anywhere in the artist's front page, visitor comments included. Nothing is public, so nobody was exposed.
+- **Real proofs failed too often:** a case-sensitive match, no redirect followed, AI opt-out sites never read, and nothing scheduled while the page promised "within the hour".
+- **The queue could be starved:** free, unlimited requests, newest first. Forty fake ones kept a real proven one from ever being checked.
+- **The rate limit was beaten 100 times over** with simultaneous requests, because the counter is not atomic, and skipped entirely by calling the database's search with the public key.
+- 10 of 49 deliberate breaks went uncaught.
+- **What held:** a confirmed removal is permanent; a request without proof changes nothing; no secret leaks; a refused searcher is never stuck.
+
+**Round 2 (in progress):** proof only in a place the artist alone controls (a tag in the page head, a fixed file on the site, or the DeviantArt bio or tagline of the right account), matched without regard to case. Redirects within the same site are followed. The lead's call, to be stated in the code: reading that one file, which the artist put there for us at their own request, is not AI use, so an AI opt-out does not stop it, while robots.txt still does. A fair queue: oldest first, only requests with an issued code, each checked less often over time. Search only through the site's server, with a limit the database counts atomically and a daily cap over all visitors.
