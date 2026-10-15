@@ -893,3 +893,33 @@ Every work's rating (safe, suggestive or explicit) decides what is held back fro
 - **Over-strict the other way:** 7 of our 30 held-back works the critic calls safe (a casual tank top, cleavage-only portraits, a shirtless fighter, gunslingers). That costs coverage, not safety.
 - **Gaps in the scale's wording,** none of which changed what was held in the sample: frontal nudity with nothing drawn in fits neither step; "nipples" does not say female; there is no rule for young-looking characters; cartoon gore is ambiguous.
 - **A policy question for the owner:** "moderate blood and wounds" counts as suggestive, so it is held back. It is common in game art, and it is behind two of the four borderline cases. Changing it means re-rating every work, about two days of GPU, so it waits for the current run to finish.
+
+### Round 23: claim-or-remove proof checking; push's third critic (2026-10-14)
+
+**Claim-or-remove is built (not yet judged).**
+- `uv run python -m pipeline.removals` reads pending removal requests and looks for the artist's code: first in their DeviantArt bio or tagline, through the paced API, then on the front page of their own site, through the polite crawler. The site must be the one on record, still named on their profile, and link back to it.
+- On finding the code it confirms the removal and records it locally at once.
+- It refuses when the code is on someone else's page, the profile belongs to another account, the site is not theirs, robots.txt or an AI opt-out closes the site, or the request names nobody.
+- It makes no request when nothing is pending. Scheduling it (Windows Task Scheduler every 15 minutes is the recommendation) is a standing change to the owner's machine and waits for the owner.
+- **Search rate limit:** 60 searches per visitor in ten minutes, refused before Workers AI or the database is asked, with a polite notice. Nothing needs configuring in Cloudflare. Each Cloudflare location counts separately; closing that needs a small Worker, the owner's call.
+- Both are with a critic.
+
+**Push's third critic: no, for now.**
+
+What held:
+- **Concurrency:** 480 loads with a real writer committing during each one (3,069 writes landed mid-build); every load was exactly one moment of the store.
+- Dry runs byte-identical; reruns change nothing; 51 corrupted or missing table states all stopped safely.
+- **Scale:** about two minutes and under 2 GB for 4,000 artists and 40,000 works.
+- None of the earlier critics' counterexamples still stands.
+
+What failed:
+- **The artist's own tags shown on the site.** The hand-written list of banned body and dress words misses common ones. On today's real data, "lolita" and "yuri" would be shown, with "midriff", "bunnysuit" and "croptop" close behind. The critic called this the thing most likely to put something unsuitable in public.
+- **One removal can cascade:** with a corrupted local table, a single removal through the site deleted 12 public artists and put 23 entries on the permanent list, unguarded.
+- **Cards resting on tag readings since redone** still counted as current.
+- **A removed account could return under a new handle** if the local store were rebuilt.
+- **Search text joined from separately checked pieces** can add up to a phone number; 172 of 617 trip the rule today, all harmless digits.
+- 8 of 25 deliberate breaks went uncaught by the tests.
+
+**Push round 7 (in progress):** the tags shown become an approved list, reviewed tag by tag, instead of a banned list; anything not on it stays hidden. Any removal's expansion counts toward the flood guard. Cards go stale when their tag readings are redone. A removed account stays barred under any handle. Search text is checked whole. Tests for the eight uncaught breaks.
+
+Nothing has been pushed; none of these reached the public.
