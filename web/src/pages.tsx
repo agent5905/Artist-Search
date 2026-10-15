@@ -1,7 +1,7 @@
 // The pages: search, similar style, profile, and claim or remove.
 import { useRef, useState, type FormEvent, type ReactNode } from 'react'
 import { Link, useNavigate, useParams, useSearchParams } from 'react-router'
-import { Busy, getArtist, PAGE, removalCode, requestRemoval, search, similarArtists } from './api'
+import { Busy, type Claim, claim, getArtist, PAGE, removalCode, requestRemoval, search, similarArtists } from './api'
 import facets from './facets.json'
 import { about, availability, Cards, Failed, host, Icon, label, Notice, Skeletons, sourceName, Tags, Thumb, useLoad, web } from './ui'
 
@@ -343,16 +343,17 @@ const PROOF = 'artist-search-removal' // the <meta> name and the file the verifi
 
 export function Remove() {
   const { slug } = useParams()
-  return slug ? <RemoveProfile slug={slug} key={slug} /> : <RemoveStart />
+  return slug ? <RemoveProfile asked={slug} key={slug} /> : <RemoveStart />
 }
 
 /** Reached from the footer, where no profile is in view: explain, and help the artist find theirs. */
 function RemoveStart() {
   const navigate = useNavigate()
+  // Straight to the profile's own page by DeviantArt username: no search, which is a read and can be used up for the day.
   const find = (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault()
     const name = String(new FormData(event.currentTarget).get('name') ?? '').trim()
-    if (name) navigate(`/?q=${encodeURIComponent(name)}`)
+    if (name) navigate(`/remove/${encodeURIComponent(name)}`)
   }
   return (
     <Page narrow>
@@ -364,21 +365,24 @@ function RemoveStart() {
       </p>
       <section className="option">
         <h2>First, find your profile</h2>
-        <p>Search for your name or DeviantArt username, open your profile, and follow “Is this you?” on it.</p>
+        <p>Enter your DeviantArt username to go straight to your profile’s page for this.</p>
         <form className="inline-form" onSubmit={find}>
           <label className="sr-only" htmlFor="find-name">
-            Your name or DeviantArt username
+            Your DeviantArt username
           </label>
-          <input id="find-name" name="name" placeholder="Your name or DeviantArt username" autoComplete="off" maxLength={80} />
+          <input id="find-name" name="name" placeholder="Your DeviantArt username" autoComplete="off" maxLength={80} />
           <button className="btn">Find my profile</button>
         </form>
+        <p className="fine">
+          Or <Link to="/">search</Link> for your name, open your profile, and follow “Is this you?” on it.
+        </p>
       </section>
       <section className="option">
         <h2>Then pick one of two ways</h2>
         <ul className="ways">
           <li>
             <strong>With proof.</strong> You get a short code to put in your DeviantArt profile’s About text or tagline, or on your own
-            site. Once the code is found there, the profile is removed for good.
+            site: your profile’s page says which of these works for it. Once the code is found there, the profile is removed for good.
           </li>
           <li>
             <strong>Without proof.</strong> You send a request, with a note if you like. The site owner reads it and decides.
@@ -390,8 +394,70 @@ function RemoveStart() {
   )
 }
 
-function RemoveProfile({ slug }: { slug: string }) {
-  const artist = useLoad(`artist ${slug}`, () => getArtist(slug))
+/**
+ * Where a code can show the profile is theirs, and only there (pipeline/removals.py): on DeviantArt only when the account
+ * the profile was made from was kept (site_claim's deviantart_proof), and on their site when it has one. Without either,
+ * it says so, and points to the request without proof. The places themselves once the artist has their code.
+ */
+export function ProofPlaces({ claim, code, copyRow }: { claim: Claim; code: string; copyRow: (text: string) => ReactNode }) {
+  const { deviantart_url, deviantart_proof } = claim
+  const site = web(claim.site_url)
+  return (
+    <>
+      {!deviantart_proof && (
+        <p className="fine">
+          {site ? 'Not on DeviantArt for this profile, only on your site: ' : 'There is no place we can check a code for this profile: '}
+          we did not keep which DeviantArt account it was made from, so a code there could be put up by whoever has that name now.
+          {site ? '' : ' Please send a request below instead, and the site owner will look at it.'}
+        </p>
+      )}
+      {(deviantart_proof || site) && <p>Show the profile is yours by putting a short code where only you can write.</p>}
+      {code && (deviantart_proof || site) && (
+        <ol className="steps">
+          <li>
+            <span>Your code:</span>
+            {copyRow(code)}
+          </li>
+          <li>
+            <span>
+              Put it {deviantart_proof && site ? 'in one of these places' : 'here'}. Capitals and spaces around it do not matter; anywhere
+              else does not count.
+            </span>
+            <ul className="ways">
+              {deviantart_proof && (
+                <li>
+                  <strong>On DeviantArt:</strong> paste it into the About text or the tagline of{' '}
+                  <a href={deviantart_url}>the DeviantArt profile this one was made from</a>.
+                </li>
+              )}
+              {site && (
+                <li>
+                  <strong>{deviantart_proof ? 'Or on' : 'On'} {host(site)}:</strong> add this line to the head of your front page, between
+                  &lt;head&gt; and &lt;/head&gt;:
+                  {copyRow(`<meta name="${PROOF}" content="${code}">`)}
+                  or put a plain text file that holds only the code at this address:
+                  {copyRow(new URL(`/.well-known/${PROOF}.txt`, site).href)}
+                  This counts while your DeviantArt profile gives {host(site)} as your website, and unless your robots.txt keeps out our
+                  crawler, ArtistSearchBot. A comment or a guestbook entry on your page never counts, so no visitor can remove you.
+                </li>
+              )}
+            </ul>
+          </li>
+          <li>
+            <span>
+              That is all. We look for the code every hour for a day after you get it, then once a day for two weeks, then once a week. As
+              soon as it is found this profile is deleted and you will not be added again. You can take the code down after that.
+            </span>
+          </li>
+        </ol>
+      )}
+    </>
+  )
+}
+
+/** `asked` is the slug in the address, or a DeviantArt username typed on RemoveStart: site_claim takes either. */
+function RemoveProfile({ asked }: { asked: string }) {
+  const artist = useLoad(`claim ${asked}`, () => claim(asked)) // counted apart from the reads: it always loads
   const [code, setCode] = useState('')
   const [copied, setCopied] = useState('')
   const [sent, setSent] = useState(false)
@@ -401,10 +467,8 @@ function RemoveProfile({ slug }: { slug: string }) {
   if (artist.failed) return <Page narrow><Failed error={artist.error} retry={artist.retry} /></Page>
   if (artist.stale) return <Page narrow><p className="fine" role="status">Loading…</p></Page>
   if (!artist.data) return <Gone />
-  const { name, site_url, deviantart_url } = artist.data
+  const { slug, name, site_url, deviantart_proof } = artist.data
   const site = web(site_url)
-  const tag = `<meta name="${PROOF}" content="${code}">`
-  const file = site ? new URL(`/.well-known/${PROOF}.txt`, site).href : ''
 
   const ask = async (kind: 'code' | 'request', run: () => Promise<void>) => {
     setBusy(kind)
@@ -455,53 +519,26 @@ function RemoveProfile({ slug }: { slug: string }) {
         <h2>
           <span className="num">1</span> Remove it with proof
         </h2>
-        <p>Show the profile is yours by putting a short code where only you can write.</p>
-        {code ? (
-          <ol className="steps">
-            <li>
-              <span>Your code:</span>
-              {copyRow(code)}
-            </li>
-            <li>
-              <span>Put it in one of these places. Capitals and spaces around it do not matter; anywhere else does not count.</span>
-              <ul className="ways">
-                <li>
-                  <strong>On DeviantArt:</strong> paste it into the About text or the tagline of{' '}
-                  <a href={deviantart_url}>the DeviantArt profile this one was made from</a>.
-                </li>
-                {site && (
-                  <li>
-                    <strong>Or on {host(site)}:</strong> add this line to the head of your front page, between &lt;head&gt; and
-                    &lt;/head&gt;:
-                    {copyRow(tag)}
-                    or put a plain text file that holds only the code at this address:
-                    {copyRow(file)}
-                    This counts while your DeviantArt profile gives {host(site)} as your website, and unless your robots.txt keeps out our
-                    crawler, ArtistSearchBot. A comment or a guestbook entry on your page never counts, so no visitor can remove you.
-                  </li>
-                )}
-              </ul>
-            </li>
-            <li>
-              <span>
-                That is all. We look for the code every hour for a day after you get it, then once a day for two weeks, then once a week.
-                As soon as it is found this profile is deleted and you will not be added again. You can take the code down after that.
-              </span>
-            </li>
-          </ol>
-        ) : (
+        <ProofPlaces claim={artist.data} code={code} copyRow={copyRow} />
+        {(deviantart_proof || site) && (
           <>
-            <button className="btn" type="button" disabled={busy === 'code'} onClick={() => ask('code', async () => setCode(await removalCode(slug)))}>
-              {busy === 'code' ? 'Getting your code…' : 'Get my code'}
+            {/* Every press is sent: asking again starts the checks over, as the note below says. */}
+            <button
+              className={code ? 'btn quiet' : 'btn'}
+              type="button"
+              disabled={busy === 'code'}
+              onClick={() => ask('code', async () => setCode(await removalCode(slug)))}
+            >
+              {busy === 'code' ? 'Getting your code…' : code ? 'Get my code again' : 'Get my code'}
             </button>
             {failure('code')}
+            <p className="fine">
+              Putting the code up more than two weeks after you got it? Come back to this page and press “Get my code” again first: the code
+              is the same, and the hourly checks start over. If this profile is still here a day after the code went up, check that it is
+              exactly where step 2 says. If it is, or you cannot put it there, send a request below and the site owner will look at it.
+            </p>
           </>
         )}
-        <p className="fine">
-          Putting the code up more than two weeks after you got it? Come back to this page and press “Get my code” again first: the code is
-          the same, and the hourly checks start over. If this profile is still here a day after the code went up, check that it is exactly
-          where step 2 says. If it is, or you cannot put it there, send a request below and the site owner will look at it.
-        </p>
       </section>
 
       <section className="option">

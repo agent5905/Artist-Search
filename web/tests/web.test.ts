@@ -11,9 +11,11 @@ import { renderToStaticMarkup } from 'react-dom/server'
 import { MemoryRouter } from 'react-router'
 import { describe, expect, it, vi } from 'vitest'
 import { handle as artistPage } from '../functions/api/artist'
-import { handle as removal } from '../functions/api/removal'
+import { claim as claimPage, handle as removal } from '../functions/api/removal'
 import { client, handle, MAX_QUERY, network, onRequestGet, TOO_MANY, type Env } from '../functions/api/search'
-import { Busy, getArtist, removalCode, requestRemoval, search, similarArtists } from '../src/api'
+import { Busy, claim, getArtist, removalCode, requestRemoval, search, similarArtists } from '../src/api'
+import { ProofPlaces } from '../src/pages'
+import { call } from '../src/rpc'
 import { Cards } from '../src/ui'
 
 const VECTOR = Array.from({ length: 1024 }, (_, i) => i / 1024)
@@ -247,11 +249,12 @@ describe('the limits, which the database keeps', () => {
     await handle(from('2001:db8:77:1200::5'), site, db.fetcher)
     await artistPage(from('2001:db8:77:1200::5', '/api/artist?slug=someone'), site, db.fetcher)
     await artistPage(from('2001:db8:77:1200::5', '/api/artist?slug=someone&similar=1'), site, db.fetcher)
+    await claimPage(from('2001:db8:77:1200::5', '/api/removal?slug=someone'), site, db.fetcher)
     for (const body of [{ slug: 'someone', proof: true }, { slug: 'someone' }]) await removal(post(body, '2001:db8:77:1200::5'), site, db.fetcher)
 
     const asked = { p_token: TOKEN, p_client: '2001:db8:77:1200::/56', p_network: '2001:db8:77::/48' }
     expect(db.called('client_wait').map((call) => call.args)).toEqual(
-      ['search', 'profile', 'similar', 'removal', 'removal'].map((kind) => ({ ...asked, p_kind: kind })),
+      ['search', 'profile', 'similar', 'claim', 'removal', 'removal'].map((kind) => ({ ...asked, p_kind: kind })),
     )
   })
 
@@ -274,7 +277,7 @@ describe('the limits, which the database keeps', () => {
     const asked = vi.fn(async (_url: string) => Response.json({ error: TOO_MANY }, { status: 429, headers: { 'retry-after': '150' } }))
     vi.stubGlobal('fetch', asked)
     try {
-      for (const load of [() => search('q=limited'), () => getArtist('limited'), () => similarArtists('limited')]) {
+      for (const load of [() => search('q=limited'), () => getArtist('limited'), () => similarArtists('limited'), () => claim('limited')]) {
         const error = await load().catch((reason: unknown) => reason)
         expect(error).toBeInstanceOf(Busy)
         expect((error as Busy).seconds).toBe(150)
@@ -283,6 +286,7 @@ describe('the limits, which the database keeps', () => {
         '/api/search?q=limited&offset=0',
         '/api/artist?slug=limited',
         '/api/artist?slug=limited&similar=1',
+        '/api/removal?slug=limited',
       ])
     } finally {
       vi.unstubAllGlobals()
@@ -422,6 +426,94 @@ describe('POST /api/removal', () => {
       vi.unstubAllGlobals()
     }
   })
+
+  it('files the request again at every press of “Get my code”, which starts its checks over', async () => {
+    const asked = vi.fn(async () => Response.json({ code: 'artist-search-removal-0123456789abcdef0123456789abcdef' }))
+    vi.stubGlobal('fetch', asked)
+    try {
+      await removalCode('pressed-twice')
+      await removalCode('pressed-twice') // the artist comes back to the page, in the same tab, and presses again
+      expect(asked).toHaveBeenCalledTimes(2)
+    } finally {
+      vi.unstubAllGlobals()
+    }
+  })
+})
+
+describe('GET /api/removal: the claim-or-remove page', () => {
+  it('counts the visitor as asking about a removal, then asks site_claim with the token: the artist, or null', async () => {
+    const shown = { slug: 'someone', name: 'Someone', site_url: null, deviantart_url: 'https://www.deviantart.com/someone', deviantart_proof: true }
+    const db = database(Response.json([shown]), Response.json([]))
+    const answers = [
+      await claimPage(from('203.0.113.7', '/api/removal?slug=someone'), env(), db.fetcher),
+      await claimPage(from('203.0.113.7', `/api/removal?slug=${'s'.repeat(500)}`), env(), db.fetcher),
+    ]
+    expect([await answers[0].json(), await answers[1].json()]).toEqual([shown, null])
+    expect(answers[0].headers.get('cache-control')).toBe('no-store')
+    expect(db.calls.map((call) => [call.name, call.args])).toEqual([
+      ['client_wait', { p_token: TOKEN, p_kind: 'claim', p_client: '203.0.113.7', p_network: '203.0.113.0/24' }],
+      ['site_claim', { p_token: TOKEN, p_slug: 'someone' }],
+      ['client_wait', { p_token: TOKEN, p_kind: 'claim', p_client: '203.0.113.7', p_network: '203.0.113.0/24' }],
+      ['site_claim', { p_token: TOKEN, p_slug: 's'.repeat(80) }],
+    ])
+
+    const blank = database()
+    expect((await claimPage(from('203.0.113.7', '/api/removal?slug='), env(), blank.fetcher)).status).toBe(400)
+    expect(blank.calls).toEqual([])
+    const over = Object.assign(database(), { limit: 0 })
+    const refused = await claimPage(from('203.0.113.7', '/api/removal?slug=someone'), env(), over.fetcher)
+    expect([refused.status, refused.headers.get('retry-after'), over.called('site_claim')]).toEqual([429, '120', []])
+  })
+
+  it('loads, and gives the code, while the day’s reads are used up for everyone', async () => {
+    // The critic's case: one person spends the shared read total. The page loads the artist through its own count.
+    const counted: string[] = []
+    const fetcher = (async (url: string, init: RequestInit) => {
+      const name = url.replace('https://db.test/rest/v1/rpc/', '')
+      const args = JSON.parse(String(init.body))
+      if (name === 'client_wait') return (counted.push(args.p_kind), Response.json(['claim', 'removal'].includes(args.p_kind) ? 0 : 87))
+      if (name === 'site_claim') return Response.json([{ name: 'Spent', site_url: null, deviantart_url: 'x', deviantart_proof: true }])
+      return Response.json(name === 'site_removal_code' ? 'artist-search-removal-0123456789abcdef0123456789abcdef' : [])
+    }) as unknown as typeof fetch
+    vi.stubGlobal('fetch', async (path: string, init?: RequestInit) =>
+      path.startsWith('/api/artist')
+        ? artistPage(from('203.0.113.7', path), env(), fetcher)
+        : init?.method === 'POST'
+          ? removal(post(JSON.parse(String(init.body))), env(), fetcher)
+          : claimPage(from('203.0.113.7', path), env(), fetcher),
+    )
+    try {
+      expect(await getArtist('spent-reads').catch((reason: unknown) => reason)).toBeInstanceOf(Busy)
+      expect(await claim('spent-reads')).toMatchObject({ name: 'Spent' })
+      expect(await removalCode('spent-reads')).toMatch(/^artist-search-removal-/)
+      expect(counted).toEqual(['profile', 'claim', 'removal'])
+    } finally {
+      vi.unstubAllGlobals()
+    }
+  })
+})
+
+describe('the pages’ loader and the database call', () => {
+  it('keeps no failure, so “Try again” asks again', async () => {
+    let calls = 0
+    vi.stubGlobal('fetch', async () => (++calls <= 2 ? new Response('down', { status: 500 }) : Response.json({ slug: 'flaky' })))
+    try {
+      await expect(getArtist('flaky')).rejects.toThrow() // asked twice, failed twice
+      expect(await getArtist('flaky')).toEqual({ slug: 'flaky' })
+      expect(calls).toBe(3)
+    } finally {
+      vi.unstubAllGlobals()
+    }
+  })
+
+  it('gives up on the database after a while, rather than wait for ever', async () => {
+    const seen: (AbortSignal | null | undefined)[] = []
+    const fetcher = (async (_url: string, init: RequestInit) => (seen.push(init.signal), Response.json(0))) as unknown as typeof fetch
+    await call('https://db.test', KEY, 'client_wait', {}, fetcher)
+    expect(seen).toHaveLength(1)
+    expect(seen[0]).toBeInstanceOf(AbortSignal)
+    expect(seen[0]?.aborted).toBe(false)
+  })
 })
 
 describe('an artist card', () => {
@@ -439,6 +531,28 @@ describe('an artist card', () => {
     const html = renderToStaticMarkup(createElement(MemoryRouter, null, createElement(Cards, { artists: [artist] })))
 
     expect([...html.matchAll(/class="thumb" href="[^"]*work-(\d+)"/g)].map((found) => Number(found[1]))).toEqual([7, 0, 10, 3])
+  })
+})
+
+describe('the claim-or-remove page', () => {
+  const places = (deviantart_proof: boolean, site_url: string | null) => {
+    const claim = { slug: 'someone', name: 'Someone', site_url, deviantart_url: 'https://www.deviantart.com/someone', deviantart_proof }
+    return renderToStaticMarkup(createElement(ProofPlaces, { claim, code: 'CODE', copyRow: (text: string) => text }))
+  }
+
+  it('offers DeviantArt only for a profile whose account was kept, the site when there is one, and says which', () => {
+    expect([places(true, 'https://someone.art/'), places(true, null)].map((page) => page.includes('About text or the tagline'))).toEqual([true, true])
+    expect(places(true, 'https://someone.art/')).toContain('Or on someone.art')
+
+    const siteOnly = places(false, 'https://someone.art/')
+    expect(siteOnly).not.toContain('About text')
+    expect(siteOnly).toContain('Not on DeviantArt for this profile, only on your site')
+    expect(siteOnly).toContain('On someone.art')
+
+    const neither = places(false, null)
+    expect(neither).toContain('There is no place we can check a code for this profile')
+    expect(neither).toContain('send a request below')
+    expect(neither).not.toContain('Your code')
   })
 })
 

@@ -3,8 +3,8 @@
 -- Hard rule 1: no column holds image bytes. There is no bytea anywhere, every URL must pass
 -- clean_url (which nothing carrying "data:" can) and sit on the host its source says it is on, and
 -- every text column and list entry is too short to carry an image as text (the *_sizes constraints).
--- Hard rule 7: an artist is known by a DeviantArt handle and, if they have a site, its registrable
--- domain. Each has exactly one spelling here, so a removed artist cannot come back under a variant.
+-- Hard rule 7: an artist is known by a DeviantArt handle, their account's hash, and, if they have a site, its
+-- registrable domain. Each has exactly one spelling here, so a removed artist cannot come back under a variant.
 -- Row level security is on for every table with no policies: the public role reads only through
 -- the functions in 003_limits.sql, which the site's server calls with a token of its own.
 
@@ -154,21 +154,27 @@ create index if not exists search_words_trgm_idx on public.search_words using gi
 -- on artists.profile_embedding.
 
 -- Removal requests (owner decision 6): a lasting record, which nothing but a proven removal or the owner's
--- answer closes. No load, hold-back, rename or deletion of the artist's row touches it. One open row per
--- slug: when it was first and last asked for, how often, what the first request said, and the handle and
--- site it was made for, so the verifier finds the artist while they are not listed. A later request only
--- counts; nothing a visitor sends can erase what an artist wrote.
+-- answer closes. No load, hold-back, rename or deletion of the artist's row touches it. A request is bound,
+-- when it is filed, to the artist listed under the slug then: their handle, their site and the account the
+-- local library keeps for them (artists.da_account). Nothing afterwards changes what it is bound to, so the
+-- verifier finds that artist while they are not listed, and only that artist: a slug can pass to another
+-- handle, and a site to another artist. A later request for the same handle and site is the same request and
+-- only counts (and fills in an account that was not known yet); one for anything else is a request of its
+-- own (removal_requests_open_idx below). Nothing a visitor sends can erase what an artist wrote.
 create table if not exists public.removal_requests (
-  artist_slug text primary key, -- the slug asked about; its proof code is that slug's. 'closed:<uuid>' once closed
+  id bigint generated always as identity primary key, -- how the verifier and the owner name a request
+  artist_slug text not null, -- the slug asked about; its proof code is that slug's. 'closed:<uuid>' once closed
   note text, -- the first request's note
   first_at timestamptz not null default now(),
   last_at timestamptz not null default now(),
   requests bigint not null default 1
 );
 alter table public.removal_requests
+  add column if not exists id bigint generated always as identity,
   add column if not exists da_username text, -- the public handle and site the artist was listed with when asked
   add column if not exists site_url text,
   add column if not exists site_domain text,
+  add column if not exists da_account text, -- and the account the library keeps for them; null when it keeps none
   -- The removal list's two keys for them, as artists.da_key and site_key are made.
   add column if not exists da_key text generated always as (public.key_hash('da:' || lower(da_username))) stored,
   add column if not exists site_key text generated always as (public.key_hash('site:' || site_domain)) stored,
@@ -178,7 +184,7 @@ alter table public.removal_requests
   add column if not exists due_at timestamptz,
   -- Null while open. 'proven' (the verifier saw the code), 'granted' or 'rejected' (the owner's answer), or
   -- 'removed' (the artist was removed another way). A closed row keeps nothing of the artist: its slug gives
-  -- way to a random key and the handle, site and note go.
+  -- way to a random key and the handle, site, account and note go.
   add column if not exists outcome text;
 -- An open request filed before those columns gets the handle and site its artist is listed with now, so
 -- that it can be granted while they are not listed. It fills only what is empty: rerun, it changes nothing.
@@ -186,6 +192,21 @@ update public.removal_requests r
 set da_username = a.da_username, site_url = a.site_url, site_domain = a.site_domain
 from public.artists a
 where a.slug = r.artist_slug and r.da_username is null and r.outcome is null;
+-- A table made before requests had an id was keyed by the slug, one request a slug. The id is the key now.
+do $$
+begin
+  if exists (
+    select 1 from pg_constraint
+    where conrelid = 'public.removal_requests'::regclass and conname = 'removal_requests_pkey'
+      and pg_get_constraintdef(oid) = 'PRIMARY KEY (artist_slug)'
+  ) then
+    alter table public.removal_requests drop constraint removal_requests_pkey, add primary key (id);
+  end if;
+end
+$$;
+alter table public.removal_requests alter column artist_slug set not null;
+create unique index if not exists removal_requests_open_idx
+on public.removal_requests (artist_slug, da_key, site_key) nulls not distinct where outcome is null;
 
 -- The one secret a removal proof code is derived from. Readable by the table owner only, which the
 -- two functions that need it run as. Made once, with a random value.
@@ -195,7 +216,8 @@ create table if not exists public.removal_secret (
 );
 insert into public.removal_secret default values on conflict do nothing;
 
--- sha256 hex of 'da:<handle>' and 'site:<domain>' for every removed artist, so they are never re-added.
+-- sha256 hex of 'da:<handle>' and 'site:<domain>' for every removed artist, and of their account as the
+-- library hashes it (artists.da_account), so they are never re-added.
 create table if not exists public.removed (
   key_hash text primary key,
   removed_at timestamptz not null default now()
@@ -208,6 +230,10 @@ alter table public.works
   add column if not exists width int,
   add column if not exists height int;
 alter table public.artist_neighbors add column if not exists picks smallint[];
+-- The hash the local library knows the artist's DeviantArt account by (library.account_hash), sent by the push
+-- stage; null when it keeps none. A removal request is bound to it, a proof on DeviantArt is read only on that
+-- account's profile, and a removal bars it, so the account is not listed again under any handle.
+alter table public.artists add column if not exists da_account text;
 
 -- Search reads every artist's row, and after a big write each page of them has to come back into
 -- memory before the public's 3 s run out. So the row keeps only what search reads (the keyword
@@ -244,6 +270,7 @@ begin
        ' and public.short_list(specialties, 20, 60) and public.short_list(mediums, 20, 60))'),
       ('artists', 'artists_own_words_sizes',
        'check (length(tagline) <= 300 and length(search_text) <= 4000 and public.short_list(top_tags, 40, 60))'),
+      ('artists', 'artists_da_account_hash', $$check (da_account ~ '^[0-9a-f]{64}$')$$),
       ('works', 'works_urls_clean', 'check (public.clean_url(page_url) and public.clean_url(image_url))'),
       -- A DeviantArt work is a deviation page and a thumbnail on DeviantArt's image host. (A work on
       -- the artist's own site is checked against that site by the trigger works_before_write.)
@@ -260,7 +287,6 @@ begin
       ('works', 'works_one_per_key', 'unique (artist_id, key)'),
       -- As many as a card shows, so the list is too short to carry anything else (hard rule 1).
       ('artist_neighbors', 'artist_neighbors_few_picks', 'check (cardinality(picks) <= 4)'),
-      ('removal_requests', 'removal_requests_pkey', 'primary key (artist_slug)'),
       ('removal_requests', 'removal_requests_short', 'check (length(artist_slug) <= 80 and length(note) <= 300)'),
       ('removal_requests', 'removal_requests_outcome',
        $$check (outcome in ('proven', 'granted', 'rejected', 'removed'))$$),
@@ -284,6 +310,7 @@ alter index public.artists_fts_idx set (fastupdate = off);
 -- an artist leaves no second copy behind, and removing one artist never blocks another.
 create unique index if not exists artists_da_key_idx on public.artists (da_key);
 create unique index if not exists artists_site_key_idx on public.artists (site_key);
+create index if not exists artists_da_account_idx on public.artists (da_account); -- for a removal, too
 -- A card shows an artist's first four works: with this, it reads four rows instead of all of them.
 create index if not exists works_artist_position_idx on public.works (artist_id, position, id);
 
@@ -303,4 +330,5 @@ revoke all on table public.removal_secret from service_role;
 grant all on table
   public.artists, public.works, public.artist_neighbors, public.search_words, public.removal_requests, public.removed
 to service_role;
-revoke all on sequence public.artists_id_seq, public.works_id_seq from public, anon, authenticated;
+revoke all on sequence public.artists_id_seq, public.works_id_seq, public.removal_requests_id_seq
+from public, anon, authenticated;

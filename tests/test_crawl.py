@@ -11,10 +11,12 @@ import re
 import socket
 import sys
 import threading
+import time
 import zlib
 from collections import defaultdict
 from pathlib import Path
 
+import httpcore
 import httpx
 import pytest
 import tldextract
@@ -2038,6 +2040,83 @@ def test_a_slow_drip_is_cut_off(headers, first, drop):
     web.get("/a")
     assert web.times[2] == 1000.0 + 2 * MIN
     assert web.times[3] - web.times[2] >= MAX_SECONDS_PER_RESPONSE + MIN  # the wait runs from the end of the drip
+
+
+class Wire(httpcore.MockStream):
+    """httpcore's in-memory connection, which MockTransport does not have: the answer is read a byte at a time, each
+    read moving the clock `per_read` seconds (inside the read timeout), and a TLS handshake waits, in real time, for
+    `handshake` to be set (one that never ends, as far as the fetcher can tell)."""
+
+    def __init__(self, answer, clock, per_read, handshake):
+        super().__init__([answer[i : i + 1] for i in range(len(answer))])
+        self.clock, self.per_read, self.handshake = clock, per_read, handshake
+
+    def read(self, max_bytes, timeout=None):
+        self.clock.now += self.per_read
+        return super().read(max_bytes, timeout)
+
+    def start_tls(self, ssl_context, server_hostname=None, timeout=None):
+        self.handshake.wait(5)
+        return self
+
+
+def over_the_wire(answer, clock, per_read=0.0, handshake=None):
+    """A fetcher whose every request goes through httpx's own transport and httpcore to a Wire sending `answer`, and
+    the list of the Wires it opened."""
+    opened = []
+    if handshake is None:
+        handshake = threading.Event()
+        handshake.set()
+
+    class Network(httpcore.MockBackend):
+        def connect_tcp(self, *args, **kwargs):
+            opened.append(Wire(answer, clock, per_read, handshake))
+            return opened[-1]
+
+    transport = httpx.HTTPTransport()
+    transport._pool = httpcore.ConnectionPool(network_backend=Network([]))
+    fetcher = PoliteFetcher(
+        transport=transport, clock=clock, sleep=clock.sleep, resolver=lambda host: ["93.184.216.34"]
+    )
+    return fetcher, opened
+
+
+DRIPPED_HEAD = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nX-Pad: " + b"a" * 100_000 + b"\r\n\r\n"
+
+
+def test_a_head_that_drips_is_cut_off_at_the_deadline():
+    """The critic's tarpit: the head a byte every 14 s, each inside the 15 s read timeout, and 100 kB of it."""
+    clock = Clock()
+    fetcher, opened = over_the_wire(DRIPPED_HEAD, clock, per_read=14.0)
+    crawl._OWNERS["janedoe.art"] = "janedoe"
+    began = clock.now
+    assert Site(fetcher, SITE, PROFILE).fetch(f"{SITE}/a").skip == "robots"  # robots.txt took too long: closed
+    assert len(opened) == 1 and clock.now - began <= MIN + MAX_SECONDS_PER_RESPONSE + 14.0
+
+
+def test_a_site_that_drips_costs_a_proof_one_short_deadline_and_nothing_more_this_run():
+    clock = Clock()
+    fetcher, opened = over_the_wire(DRIPPED_HEAD, clock, per_read=14.0)
+    began = clock.now
+    assert fetcher.read_proof(f"{SITE}/", "artist-search-removal", lambda said: True) == "robots"
+    assert len(opened) == 1 and clock.now - began <= MIN + crawl.PROOF_SECONDS_PER_RESPONSE + 14.0
+    # Closed for the run: the next look, by any fetcher, asks the site nothing.
+    again, _ = over_the_wire(DRIPPED_HEAD, clock, per_read=14.0)
+    assert again.read_proof(f"{SITE}/", "artist-search-removal", lambda said: True) == "budget"
+    assert len(opened) == 1
+
+
+def test_a_tls_handshake_that_never_ends_is_left_to_the_site_at_the_deadline(monkeypatch):
+    """No read of ours runs inside a handshake, so only the deadline itself, in real time, can end the wait."""
+    monkeypatch.setattr(crawl, "PROOF_SECONDS_PER_RESPONSE", 0.2)
+    handshake = threading.Event()
+    fetcher, opened = over_the_wire(b"", Clock(), handshake=handshake)
+    began = time.monotonic()
+    try:
+        assert fetcher.read_proof(f"{SITE}/", "artist-search-removal", lambda said: True) == "robots"
+        assert time.monotonic() - began < 2 and len(opened) == 1
+    finally:
+        handshake.set()
 
 
 # --- 7. A skip never raises ----------------------------------------------------------------------------------------

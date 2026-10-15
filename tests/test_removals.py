@@ -1,7 +1,7 @@
 """Tests for pipeline.removals.
 
 The public database is the push tests' FakeDb, with what this stage reads and calls besides: the removal requests
-with their queue (code_at, due_at), removal_tally, removal_code, confirm_removal, purge_removed and reject_removal,
+with their queue (code_at, due_at), removal_tally, removal_code, confirm_removal, grant_request and reject_removal,
 as sql/002_functions.sql has them. (tests/test_db.py runs the real ones against the owner's database.) It is put
 in the place of pipeline.db for both stages, so a run of this one and a push that follows it meet the same
 database. DeviantArt's API and the artists' sites are httpx.MockTransports: no network, no real sleeping. The time
@@ -36,7 +36,7 @@ from test_push import (
     unsynced,
 )
 
-from pipeline import config, crawl, discover, library, push, removals, store
+from pipeline import config, crawl, db, discover, library, push, removals, store
 
 SECRET = "FAKE-REMOVAL-SECRET"
 START = datetime(2026, 10, 14, 12, tzinfo=UTC).timestamp()
@@ -60,16 +60,21 @@ def when(text):
 class RemovalsDb(FakeDb):
     """FakeDb, with the removal requests and the functions this stage calls, as sql/002_functions.sql has them.
 
-    A request is filed by request_removal (no code) or start_removal_proof (a code given out: its checks start over,
-    due at once unless it already was), with the handle and site the artist is listed with then. Nothing a push or a
-    load does touches it. confirm_removal and purge_removed grant an open one: it is closed, and the keys it was made
-    under, with those of the artist listed under its slug, join the list, which deletes whoever they bar. An open
-    request those keys bar is closed as "removed". A row with a removed handle or site is not loaded again
-    (artists_before_write). A closed request keeps nothing of the artist."""
+    An artist's row carries da_account, the library's hash of their account, as the push stage sends it (a row sent
+    without one gets it here, from the library, which is where the push takes it). A request is filed by
+    request_removal (no code) or start_removal_proof (a code given out: its checks start over, due at once unless it
+    already was), bound to the artist listed under the slug then: their handle, site and account. The same handle
+    and site asked about again is the same request, which only counts (and takes an account it lacked); anything
+    else is a request of its own. Nothing a push or a load does touches one. confirm_removal and grant_request close
+    an open one, and put on the list the handle and the account it is bound to, and its site when the caller says
+    the proof covered it and no other handle is listed with it now: never whoever the slug lists now. That deletes
+    whoever they bar, and an open request whose handle or account they bar is closed as "removed". A row with a
+    removed handle, site or account is not loaded again (artists_before_write). A closed request keeps nothing of
+    the artist. `queue` names an open request by its handle (by its handle and id when the handle has two)."""
 
     def __init__(self):
         super().__init__()
-        self.queue = {}  # artist_slug -> the request's row; a closed one is under "closed:<n>"
+        self.queue = {}  # the request's handle -> its row; a closed one is under "closed:<n>"
         self.now = lambda: datetime.fromtimestamp(START, UTC).isoformat()  # the database's clock: World sets it
         self.secret = SECRET
         self.proofs = {}  # slug -> what removal_code answers instead of the slug's code
@@ -80,11 +85,14 @@ class RemovalsDb(FakeDb):
 
     @property
     def requests(self):
-        return [slug for slug, row in self.queue.items() if row["outcome"] is None]  # open, in the order filed
+        return [name for name, row in self.queue.items() if row["outcome"] is None]  # open, in the order filed
 
     def made_for(self, row):
         """The removal list's two keys for the handle and site a request was made for, as its generated columns."""
         return dict(zip(("da_key", "site_key"), self.keys(row) if row["da_username"] else (None, None), strict=True))
+
+    def _open(self, request_id):
+        return next((name for name in self.requests if self.queue[name]["id"] == request_id), None)
 
     def file(self, slug, with_code, note=None):
         """request_removal (without a code) or start_removal_proof (with one), as the database does it."""
@@ -92,41 +100,54 @@ class RemovalsDb(FakeDb):
         if listed is None:
             return
         now = self.now()
-        row = self.queue.setdefault(
-            slug, {"note": note, "first_at": now, "requests": 0, "code_at": None, "due_at": None}
-        )
-        row |= {name: listed.get(name) for name in ("da_username", "site_url", "site_domain")}
-        row |= {"last_at": now, "requests": row["requests"] + 1, "outcome": None}
+        bound = {name: listed.get(name) for name in ("da_username", "site_url", "site_domain", "da_account")}
+        same = [name for name in self.requests if self.queue[name]["artist_slug"] == slug]
+        same = [name for name in same if self.made_for(self.queue[name]) == self.made_for(bound)]
+        if same:
+            row = self.queue[same[0]]
+            row["da_account"] = row["da_account"] or bound["da_account"]
+            if not with_code:
+                row |= {"last_at": now, "requests": row["requests"] + 1}
+        else:
+            row = {"id": next(self._ids), "artist_slug": slug, "note": note, "first_at": now, "last_at": now}
+            row |= bound | {"requests": 1, "code_at": None, "due_at": None, "outcome": None}
+            handle = bound["da_username"]
+            self.queue[handle if handle not in self.queue else f"{handle}#{row['id']}"] = row
         if with_code:
             row["code_at"], row["due_at"] = now, min(row["due_at"] or now, now, key=when)
 
-    def close(self, slug, outcome):
-        row = self.queue.pop(slug)
-        gone = dict.fromkeys(("note", "da_username", "site_url", "site_domain", "due_at"))
-        self.queue[f"closed:{next(self._ids)}"] = row | gone | {"outcome": outcome}
+    def close(self, name, outcome):
+        row = self.queue.pop(name)
+        gone = dict.fromkeys(("note", "da_username", "site_url", "site_domain", "da_account", "due_at"))
+        closed = f"closed:{next(self._ids)}"
+        self.queue[closed] = row | gone | {"artist_slug": closed, "outcome": outcome}
 
-    def grant(self, slug, outcome):
-        keys = {*self.made_for(self.queue[slug]).values()} if slug in self.requests else set()
-        keys |= {key for row in self.artists.values() if row["slug"] == slug for key in self.keys(row)}
-        if slug not in self.requests or not keys - {None}:
-            return False
-        self.close(slug, outcome)  # first, so the removal does not close it as "removed"
-        self.sql(push._removed_sql(keys - {None}))
-        return True
+    def grant(self, request_id, outcome, site):
+        name = self._open(request_id)
+        if name is None:
+            return None
+        row = self.queue[name]
+        da_key, site_key = self.made_for(row).values()
+        listed = [self.keys(other) for other in self.artists.values()]
+        taken = any(other_site == site_key and other_da != da_key for other_da, other_site in listed)
+        keys = [key for key in (da_key, row["da_account"], site_key if site and not taken else None) if key]
+        if not keys:
+            return None
+        self.close(name, outcome)  # first, so the removal does not close it as "removed"
+        self.sql(push._removed_sql(set(keys)))
+        return keys
 
     def data_api(self, method, path, key, params, json=None):
         assert key == "secret" and path == "removal_requests"  # the service key, and nothing else
         if method == "PATCH":
-            assert set(params) == {"artist_slug"} and set(json) == {"due_at"}
-            slug = params["artist_slug"].removeprefix("eq.")
-            self.moved.append((slug, json["due_at"]))
-            if slug in self.queue:
-                self.queue[slug]["due_at"] = json["due_at"]
+            assert set(params) == {"id", "outcome"} and params["outcome"] == "is.null" and set(json) == {"due_at"}
+            name = self._open(int(params["id"].removeprefix("eq.")))
+            self.moved.append((self.queue[name]["artist_slug"] if name else None, json["due_at"]))
+            if name:
+                self.queue[name]["due_at"] = json["due_at"]
             return httpx.Response(204)
         assert method == "GET" and params["outcome"] == "is.null"  # only open requests are ever read
-        rows = [{"artist_slug": slug, **self.queue[slug], **self.made_for(self.queue[slug])} for slug in self.requests]
-        if "artist_slug" in params:  # the owner's answer, one slug
-            rows = [row for row in rows if f"eq.{row['artist_slug']}" == params["artist_slug"]]
+        rows = [self.queue[name] | self.made_for(self.queue[name]) for name in self.requests]
         if "due_at" in params:  # a run's queue
             now = params["due_at"].removeprefix("lte.")
             assert params == {
@@ -134,11 +155,16 @@ class RemovalsDb(FakeDb):
                 "outcome": "is.null",
                 "code_at": "not.is.null",
                 "due_at": f"lte.{now}",
-                "order": "due_at.asc,code_at.asc",
+                "order": "due_at.asc,code_at.asc,id.asc",
                 "limit": str(removals.MAX_REQUESTS),
+                "offset": "0",
             }
             due = [row for row in rows if row["code_at"] and when(row["due_at"]) <= when(now)]
-            rows = sorted(due, key=lambda row: (when(row["due_at"]), when(row["code_at"])))[: int(params["limit"])]
+            rows = sorted(due, key=lambda row: (when(row["due_at"]), when(row["code_at"]), row["id"]))
+        else:  # the owner's list, a page at a time
+            assert params["order"] == "first_at.asc,id.asc"
+            rows = sorted(rows, key=lambda row: (when(row["first_at"]), row["id"]))
+        rows = rows[int(params["offset"]) :][: int(params.get("limit", len(rows)))]
         columns = params["select"].split(",")
         return httpx.Response(200, json=[{name: row.get(name) for name in columns} for row in rows])
 
@@ -152,27 +178,44 @@ class RemovalsDb(FakeDb):
                 "requests_proven": sum(row["outcome"] == "proven" for row in rows),
                 "requests_closed": sum(row["outcome"] not in (None, "proven") for row in rows),
             }
-        if name == "purge_removed":
-            return sum(self.grant(slug, "granted") for slug in dict.fromkeys(args["p_slugs"]))
-        slug = args["p_slug"]
         if name == "removal_code":
-            return self.proofs.get(slug, code(slug, self.secret))
+            return self.proofs.get(args["p_slug"], code(args["p_slug"], self.secret))
+        if name == "grant_request":
+            return self.grant(args["p_id"], args["p_outcome"], args["p_site"])
         if name == "reject_removal":
-            return slug in self.requests and not self.close(slug, "rejected")
+            request = self._open(args["p_id"])
+            return request is not None and not self.close(request, "rejected")
         assert name == "confirm_removal"
+        request = self._open(args["p_id"])
+        slug = self.queue[request]["artist_slug"] if request else None
         self.confirmed.append((slug, args["p_code"]))
-        return args["p_code"] == code(slug, self.secret) and self.grant(slug, "proven")
+        if slug is None or args["p_code"] != code(slug, self.secret):
+            return None
+        return self.grant(args["p_id"], "proven", args["p_site"])
 
     def sql(self, query):
         answer = super().sql(query)
-        for slug in self.requests:  # removed_after_insert
-            if set(self.made_for(self.queue[slug]).values()) & set(self.removed):
-                self.close(slug, "removed")
+        for artist_id in [key for key, row in self.artists.items() if row.get("da_account") in self.removed]:
+            self._delete_artist(artist_id)  # delete_removed, by account
+        for name in self.requests:  # removed_after_insert: by the handle or the account, never the site alone
+            if {self.made_for(self.queue[name])["da_key"], self.queue[name]["da_account"]} & set(self.removed):
+                self.close(name, "removed")
         return answer
 
     def load(self, artists, works, neighbors):
-        self.skips |= {row["slug"] for row in artists if set(self.keys(row)) & set(self.removed)}
-        return super().load(artists, works, neighbors)
+        def account(row):
+            return (
+                row["da_account"] if "da_account" in row else library.account_hash(store.artist_key(row["da_username"]))
+            )
+
+        artists = [row | {"da_account": account(row)} for row in artists]
+        refused = {row["slug"] for row in artists if {*self.keys(row), row["da_account"]} & set(self.removed)}
+        refused -= self.skips
+        self.skips |= refused  # for this load: a slug is refused for the row it holds, not for good
+        try:
+            return super().load(artists, works, neighbors)
+        finally:
+            self.skips -= refused
 
 
 def profile(handle, *, user=None, name=None, **fields):
@@ -232,18 +275,21 @@ class Sites:
     def __init__(self):
         self.pages = {}
         self.raw = {}
+        self.slow = set()  # URLs whose answer takes an hour to come
         self.urls = []
 
     def fetcher(self):
-        clock = Clock()
+        self.clock = Clock()
         transport = httpx.MockTransport(self._serve)
         return crawl.PoliteFetcher(
-            transport=transport, clock=clock, sleep=clock.sleep, resolver=lambda _: ["93.184.216.34"]
+            transport=transport, clock=self.clock, sleep=self.clock.sleep, resolver=lambda _: ["93.184.216.34"]
         )
 
     def _serve(self, request):
         url = str(request.url.copy_with(host=request.headers["host"]))
         self.urls.append(url)
+        if url in self.slow:
+            self.clock.now += 3600
         if url in self.raw:
             status, headers, *body = self.raw[url]
             return httpx.Response(status, headers=headers, text=body[0] if body else "")
@@ -327,16 +373,20 @@ def test_the_code_in_the_profiles_own_text_removes_the_artist_there_at_once_and_
     world.da.profiles[ALPHA] = profile(ALPHA, bio="Concept artist.")
     # Long words get split by markup, and the code is in a sentence of the artist's own.
     split = code(BRAVO)[:30] + "<wbr>" + code(BRAVO)[30:]
-    world.da.profiles[BRAVO] = profile(BRAVO, **{field: f"<p>Please take me off Artist Search: {split}</p>"})
+    said = {field: f"<p>Please take me off Artist Search: {split}</p>"}
+    world.da.profiles[BRAVO] = profile(BRAVO, website=f"https://{BRAVO}.art/", **said)
 
     assert world.check() == expected(
         requests_due=2, proven_on_deviantart=1, artists_removed=1, left_for_owner_no_code_found=1
     )
-    # There: gone, both hashes on the list, the request answered. The other artist's request waits for the owner.
+    # There: gone, the hashes of their handle, account and site on the list, the request answered. The other
+    # artist's request waits for the owner.
     assert [row["slug"] for row in world.db.artists.values()] == [ALPHA] and world.db.requests == [ALPHA]
-    assert set(world.db.removed) == {digest(f"da:{BRAVO}"), digest(f"site:{BRAVO}.art")}
-    # Here at once, the same two hashes: no stage collects the handle or the site again.
+    account = library.account(f"FAKE-USER-{BRAVO}")
+    assert set(world.db.removed) == {digest(f"da:{BRAVO}"), account, digest(f"site:{BRAVO}.art")}
+    # Here at once, the same three: no stage collects the handle, the account or the site again.
     assert store.is_removed(BRAVO) and store.is_removed(f"https://www.{BRAVO}.art/") and not store.is_removed(ALPHA)
+    assert library.account_removed(f"FAKE-USER-{BRAVO}")
     assert world.sites.urls == []  # proven on DeviantArt: the site is not asked
     assert world.da.log_levels == {logging.CRITICAL + 1}  # no request URL, which holds a handle, was logged
 
@@ -420,10 +470,12 @@ def test_an_answer_from_the_same_account_under_its_new_handle_is_the_artists(wor
 
 @pytest.mark.parametrize("spelling", ["uid", "da-user"])
 def test_the_account_is_known_under_either_spelling_of_its_hash(world, spelling):
-    world.list(ALPHA)
+    artist(ALPHA)
     with sqlite3.connect(config.LOCAL_DB) as conn:  # how a profile written before the 'uid' spelling holds it
         held = library.account(f"FAKE-USER-{ALPHA}", spelling)
         conn.execute("UPDATE profiles SET user_hash = ? WHERE artist_key = ?", (held, f"da:{ALPHA}"))
+    world.list(ALPHA)  # the push sends the hash as the library holds it, and the request is bound to it
+    assert world.db.queue[ALPHA]["da_account"] == held
     world.da.profiles[ALPHA] = profile(ALPHA, bio=code(ALPHA))
 
     assert world.check() == expected(requests_due=1, proven_on_deviantart=1, artists_removed=1)
@@ -570,6 +622,11 @@ def test_only_the_head_and_the_file_count_never_what_a_visitor_can_write(world, 
             lambda c: page(f'<noscript><img src="https://x.example/p.gif"></noscript>{meta(c)}'),
         ),
         ("before_a_declaration_the_parser_cannot_read", lambda c: page(f"{meta(c)}<![ broken")),
+        # A browser keeps the first of an attribute written twice, and so does the reader.
+        (
+            "an_attribute_written_twice",
+            lambda c: page(f'<meta name="{removals.PROOF_NAME}" content="{c}" content="x">'),
+        ),
     ],
 )
 def test_the_code_however_written_in_the_head_is_found(world, spelling, placed):
@@ -596,6 +653,8 @@ NO_HEAD_END = {
         False,
     ),
     "after_the_first_words": (lambda c: f"<html><title>Jane</title>Latest comment: {meta(c)}", False),
+    # Where the page says its head ends, it ends: the page tells the artist to put the tag between the two.
+    "after_the_head_end": (lambda c: f"<html><head><title>Jane</title></head>{meta(c)}<body><p>Jane</p></body>", False),
     "after_the_first_element_of_the_body": (
         lambda c: f'<html><title>Jane</title><img src="/jane.png"><div class="comments">{meta(c)}</div>',
         False,
@@ -804,7 +863,7 @@ def test_every_run_counts_the_requests_in_every_state_and_names_nobody(world, ca
     for handle in (ALPHA, BRAVO, CHARLIE, DELTA):
         world.list(handle, code=handle in (ALPHA, BRAVO))
         world.da.profiles[handle] = profile(handle, bio="Concept artist.")
-    world.db.rpc("reject_removal", {"p_slug": DELTA}, "secret")
+    world.db.rpc("reject_removal", {"p_id": world.db.queue[DELTA]["id"]}, "secret")
     world.da.profiles[BRAVO]["bio"] = code(BRAVO)
     world.check()
     monkeypatch.setattr(config, "load_env", lambda: {"DEVIANT_ART_ID": "FAKE-ID", "DEVIANT_ART_SECRET": "FAKE-KEY"})
@@ -1030,15 +1089,18 @@ def test_the_owner_lists_the_open_requests_by_handle_and_answers_them(world, cap
 
     assert removals.main(["--pending"]) == 0
     lines = capsys.readouterr().out.splitlines()
-    assert [line.split()[0] for line in lines] == [ALPHA, BRAVO, CHARLIE]
+    ids = {handle: world.db.queue[handle]["id"] for handle in (ALPHA, BRAVO, CHARLIE)}
+    assert [line.split()[:3] for line in lines] == [[handle, "id", str(ids[handle])] for handle in ids]
     assert "2 times  code given out: no  note: yes" in lines[0] and "code given out: yes  note: no" in lines[1]
     assert "me@example.com" not in "".join(lines)  # a note is read in the database, never printed
     assert json.dumps([world.db.queue, world.db.artists, world.db.removed]) == before
 
-    assert removals.main(["--grant", BRAVO, "yy-fake-nobody", "--reject", CHARLIE, ALPHA]) == 0
+    answers = ["--grant", str(ids[BRAVO]), "999999", "--reject", str(ids[CHARLIE]), str(ids[ALPHA])]
+    assert removals.main(answers) == 0
     assert json.loads(capsys.readouterr().out) == {"granted": 1, "rejected": 2}
     assert world.db.requests == [] and not gone(world, ALPHA) and not gone(world, CHARLIE)
-    assert set(world.db.removed) == {digest(f"da:{BRAVO}"), digest(f"site:{BRAVO}.art")}
+    account = library.account(f"FAKE-USER-{BRAVO}")
+    assert set(world.db.removed) == {digest(f"da:{BRAVO}"), account, digest(f"site:{BRAVO}.art")}
     assert store.is_removed(BRAVO) and store.is_removed(f"{BRAVO}.art") and not store.is_removed(ALPHA)
     assert world.check() == expected() and world.tally == TALLY | {"requests_closed": 3}
     assert not any(handle in json.dumps(world.db.queue) for handle in (ALPHA, BRAVO, CHARLIE))
@@ -1138,15 +1200,200 @@ def test_two_requests_for_one_account_under_two_handles(world, posted):
     world.da.profiles[BRAVO] = world.da.profiles[CHARLIE] = profile(CHARLIE, user=BRAVO, bio=" ".join(codes))
 
     counts = world.check()
-    proven = 2 if posted == "both_codes" else 1
+    # The first proof bars the account, which deletes both rows and closes the other request: its proof, seen in
+    # the same run, finds nothing left to remove.
+    found = {"proven_on_deviantart": 2, "proofs_refused_by_database": 1} if posted == "both_codes" else {}
     assert counts == expected(
-        requests_due=2, proven_on_deviantart=proven, artists_removed=proven, left_for_owner_no_code_found=2 - proven
+        requests_due=2, artists_removed=1, **(found or {"proven_on_deviantart": 1, "left_for_owner_no_code_found": 1})
     )
-    # The verifier removes only the slugs whose code it saw. The push that follows takes the account under both.
+    assert world.db.artists == {} and world.db.requests == []
+    # The push that follows takes the account under both handles here too.
     counts = push.run(False)
     assert counts["artists_purged_here"] == 2 and sorted(sent_artists(world.db)) == [ALPHA]
     assert not any(word in world.db.held() for word in of_artist(BRAVO) + of_artist(CHARLIE))
     assert world.db.requests == [] and library.artist_keys() == [f"da:{ALPHA}"]
+
+
+# A request is bound to the artist it was filed for, and a proof removes them and nobody else (the third critic).
+
+# Two DeviantArt accounts whose handles push._slug makes into one slug. The first sorts first, so a push lists it
+# and holds the second back (slug_unusable) while both are kept.
+TWIN, TWIN_SECOND = "yy-fake-echo", "yy-Fake_Echo"
+TWIN_SLUG = push._slug(TWIN_SECOND)
+
+
+def listed_as(world, handle, slug, site=None):
+    """What a push leaves in the database for the artist: listed under `slug`, which may not be their handle's."""
+    domain = urlsplit(site).hostname.removeprefix("www.") if site else None
+    world.db.load(
+        [{"slug": slug, "name": handle, "da_username": handle, "site_url": site, "site_domain": domain}], [], []
+    )
+
+
+def barred(world, handle):
+    return (
+        digest(f"da:{handle.lower()}") in world.db.removed or library.account(f"FAKE-USER-{handle}") in world.db.removed
+    )
+
+
+def test_a_slug_that_passes_to_another_handle_takes_nobody_else_into_the_request(world):
+    """The slug's first artist asks for its code, then holds himself back, and the next push lists the second under
+    the slug. His code in his own bio removes him alone. A visitor's later request for the slug is the second
+    artist's own; it re-points nothing, and her code in her own bio removes her alone."""
+    assert push._slug(TWIN) == TWIN_SLUG
+    artist(TWIN)
+    artist(TWIN_SECOND)
+    listed_as(world, TWIN, TWIN_SLUG)
+    world.db.file(TWIN_SLUG, with_code=True)
+    listed_as(world, TWIN_SECOND, TWIN_SLUG)
+    world.db.file(TWIN_SLUG, with_code=False)  # anyone asks about the slug now: a request for whoever it lists
+    assert [world.db.queue[name]["da_username"] for name in world.db.requests] == [TWIN, TWIN_SECOND]
+    world.da.profiles[TWIN] = profile(TWIN, bio=f"bye {code(TWIN_SLUG)}")
+    world.da.profiles[TWIN_SECOND] = profile(TWIN_SECOND, bio="Concept artist. Not leaving.")
+
+    assert world.check() == expected(requests_due=1, proven_on_deviantart=1, artists_removed=1)
+    assert barred(world, TWIN) and not barred(world, TWIN_SECOND)
+    assert [row["da_username"] for row in world.db.artists.values()] == [TWIN_SECOND]
+    assert [world.db.queue[name]["da_username"] for name in world.db.requests] == [TWIN_SECOND]
+
+    world.db.file(TWIN_SLUG, with_code=True)  # she asks for the code: her request, its checks start
+    world.da.profiles[TWIN_SECOND]["bio"] = f"Please remove me. {code(TWIN_SLUG)}"
+    world.later(hours=1)
+    assert world.check() == expected(requests_due=1, proven_on_deviantart=1, artists_removed=1)
+    assert barred(world, TWIN_SECOND) and world.db.artists == {}
+
+
+def test_a_slug_twin_through_the_real_push_is_not_purged_for_the_other_s_proof(world):
+    artist(TWIN, angle=0.0)
+    artist(TWIN_SECOND, angle=0.4)
+    artist(ALPHA, angle=0.8)  # somebody else, so the library is never empty
+    assert push.run(False)["artists_held_slug_unusable"] == 1
+    world.db.file(TWIN_SLUG, with_code=True)
+    library.mark_artist(store.artist_key(TWIN), "account gone")  # the first holds himself back
+    push.run(False)
+    world.da.profiles[TWIN] = profile(TWIN, bio=code(TWIN_SLUG))
+    world.da.profiles[TWIN_SECOND] = profile(TWIN_SECOND, bio="Concept artist.")
+
+    assert world.check() == expected(requests_due=1, proven_on_deviantart=1, artists_removed=1)
+    push.run(False)
+    assert sorted(row["da_username"] for row in world.db.artists.values()) == sorted([ALPHA, TWIN_SECOND])
+    assert not library.account_removed(f"FAKE-USER-{TWIN_SECOND}") and library.account_removed(f"FAKE-USER-{TWIN}")
+
+
+@pytest.mark.parametrize("proof", ["in_the_bio", "on_the_new_site"])
+def test_a_site_the_artist_has_left_is_not_barred_and_whoever_holds_it_now_stays(world, proof):
+    """The critic's stale site: ALPHA asked while listed with old.art, then moved to new.art; BRAVO lists old.art now.
+    ALPHA's proof bars ALPHA's handle and account, and not old.art, which ALPHA's profile no longer names."""
+    old, new = f"https://{ALPHA}-old.art/", f"https://{ALPHA}-new.art/"
+    world.list(ALPHA, site=old)
+    listed_as(world, ALPHA, ALPHA, site=new)
+    listed_as(world, BRAVO, BRAVO, site=old)
+    world.da.profiles[ALPHA] = profile(ALPHA, bio=code(ALPHA) if proof == "in_the_bio" else "", website=new)
+    world.sites.pages[new] = world.sites.pages[old] = page(meta(code(ALPHA)))
+
+    if proof == "in_the_bio":
+        assert world.check() == expected(requests_due=1, proven_on_deviantart=1, artists_removed=1)
+    else:
+        # The request is bound to old.art, which ALPHA's profile no longer names: no site is read for it.
+        assert world.check() == expected(requests_due=1, left_for_owner_no_code_found=1) and world.sites.urls == []
+        world.db.file(ALPHA, with_code=True)  # ALPHA asks again as listed now: a request of its own, for new.art
+        world.later(hours=1)
+        assert world.check() == expected(
+            requests_due=2, left_for_owner_no_code_found=1, proven_on_own_site=1, artists_removed=1
+        )
+        assert digest(f"site:{ALPHA}-new.art") in world.db.removed
+    assert gone(world, ALPHA) and not gone(world, BRAVO) and world.db.requests == []
+    assert digest(f"site:{ALPHA}-old.art") not in world.db.removed and f"{old}robots.txt" not in world.sites.urls
+
+
+def test_a_proof_on_deviantart_bars_the_site_only_while_the_profile_names_it(world):
+    site = f"https://{ALPHA}.art/"
+    world.list(ALPHA, site=site)
+    world.da.profiles[ALPHA] = profile(ALPHA, bio=code(ALPHA), website=None)  # a site it no longer names
+
+    assert world.check() == expected(requests_due=1, proven_on_deviantart=1, artists_removed=1)
+    assert set(world.db.removed) == {digest(f"da:{ALPHA}"), library.account(f"FAKE-USER-{ALPHA}")}
+    assert not store.is_removed(site)
+
+
+def test_a_request_stays_bound_to_the_account_it_was_filed_for(world):
+    """The library comes to hold another account for the handle after the request was filed (the handle passed on and
+    was collected again). The request is the first account's: the new holder's code proves nothing for it."""
+    world.list(ALPHA)
+    with sqlite3.connect(config.LOCAL_DB) as conn:
+        conn.execute(
+            "UPDATE profiles SET user_hash = ? WHERE artist_key = ?",
+            (library.account("FAKE-USER-yy-fake-newcomer"), f"da:{ALPHA}"),
+        )
+    world.da.profiles[ALPHA] = profile(ALPHA, user="yy-fake-newcomer", bio=code(ALPHA))
+
+    assert world.check() == expected(requests_due=1, left_for_owner_not_checked=1)
+    assert not gone(world, ALPHA) and world.db.removed == []
+
+
+def test_another_artists_removal_by_a_site_leaves_this_artists_request_open(world):
+    """The critic's case: ALPHA's request was made with old.art, ALPHA moved on, BRAVO lists old.art now and proves
+    his own removal. old.art is barred with BRAVO; ALPHA, still listed, keeps the request for the owner."""
+    old, new = f"https://{ALPHA}-old.art/", f"https://{ALPHA}-new.art/"
+    world.list(ALPHA, site=old, code=False)
+    listed_as(world, ALPHA, ALPHA, site=new)
+    world.list(BRAVO, site=old)
+    world.da.profiles[BRAVO] = profile(BRAVO, bio=code(BRAVO), website=old)
+
+    assert world.check() == expected(requests_due=1, proven_on_deviantart=1, artists_removed=1)
+    assert gone(world, BRAVO) and digest(f"site:{ALPHA}-old.art") in world.db.removed
+    assert not gone(world, ALPHA) and world.db.requests == [ALPHA]
+
+
+def test_the_owner_sees_every_open_request_however_many_the_data_api_answers_at_once(world, monkeypatch):
+    """The critic's case: the Data API answers 1,000 rows at most and says nothing of the rest."""
+    for n in range(1000):
+        world.list(f"yy-fake-f{n:04d}", account=False, code=False)
+    world.later(minutes=1)
+    world.list(ALPHA, code=False)
+    served = world.db.data_api
+
+    def at_most_a_thousand(method, path, key, params, json=None):
+        answer = served(method, path, key, params, json)
+        return httpx.Response(200, json=answer.json()[:1000]) if method == "GET" else answer
+
+    monkeypatch.setattr(world.db, "data_api", at_most_a_thousand)
+    lines = removals.pending()
+    assert len(lines) == 1001 and lines[-1].startswith(f"{ALPHA}  id ")
+    assert len({line.split()[2] for line in lines}) == 1001  # every request once
+
+
+def test_a_site_that_takes_too_long_costs_one_look_and_the_queue_moves_on(world):
+    """The critic's tarpit, as a run meets it: a site that answers in an hour. Its look is one request, cut off at the
+    deadline; the site is asked nothing more this run; the request is moved on, and the next one is looked at."""
+    site = f"https://{ALPHA}.art/"
+    world.list(ALPHA, site=site)
+    world.da.profiles[ALPHA] = profile(ALPHA, website=site)
+    world.sites.slow.add(f"{site}robots.txt")
+    world.later(seconds=1)
+    world.list(BRAVO)
+    world.da.profiles[BRAVO] = profile(BRAVO, bio=code(BRAVO))
+
+    assert world.check() == expected(
+        requests_due=2, left_for_owner_not_checked=1, proven_on_deviantart=1, artists_removed=1
+    )
+    assert world.sites.urls == [f"{site}robots.txt"] and [slug for slug, _ in world.db.moved] == [ALPHA, None]
+    world.later(minutes=15)
+    assert world.check() == expected()  # not due again for an hour: the next run meets other requests first
+
+
+def test_migrate_gives_the_database_the_site_tokens_hash_and_never_the_token(monkeypatch):
+    """Without the owner's database: what db.migrate sends. The critic's two breaks were no token, and the token."""
+    sent = []
+    monkeypatch.setattr(db, "load_env", lambda: {"SITE_TOKEN": "FAKE-SITE-TOKEN-0123456789"})
+    monkeypatch.setattr(db, "sql", lambda query: sent.append(query) or [])
+    monkeypatch.setattr(db, "data_api", lambda *args, **kwargs: httpx.Response(200, json={"paths": {}}))
+    db.migrate()
+    hashed = hashlib.sha256(b"FAKE-SITE-TOKEN-0123456789").hexdigest()
+    assert sent[0].endswith(
+        f"values ('{hashed}') on conflict (only_row) do update set token_hash = excluded.token_hash;"
+    )
+    assert not any("FAKE-SITE-TOKEN" in query for query in sent)
 
 
 def test_stdout_is_counts_only_and_a_failure_is_named_by_its_kind(world, monkeypatch, capsys):

@@ -25,6 +25,8 @@ export type Artist = {
   works: Work[]
 }
 export type Profile = Artist & { top_tags: string[] | null; site_url: string | null; deviantart_url: string }
+/** What the claim-or-remove page shows (site_claim): deviantart_proof is whether a code on DeviantArt can prove anything. */
+export type Claim = { slug: string; name: string; site_url: string | null; deviantart_url: string; deviantart_proof: boolean }
 export type Results = { artists: Artist[]; ranked_by: 'meaning' | 'keywords' | 'name' }
 
 export const PAGE = 24 // what /api/search returns at most (functions/api/search.ts)
@@ -75,8 +77,12 @@ async function removal<T>(body: object): Promise<T> {
   return (await response.json()) as T
 }
 
-/** The artist's code. Asking for it files their request, and from then on the code is looked for. */
-export const removalCode = (slug: string) =>
-  once(`code ${slug}`, async () => (await removal<{ code: string }>({ slug, proof: true })).code)
+/** The claim-or-remove page's artist, by slug or DeviantArt username, counted as a removal (functions/api/removal.ts),
+ * never as a read. */
+export const claim = (slug: string) => once(`claim ${slug}`, () => get<Claim | null>(`/api/removal?slug=${encodeURIComponent(slug)}`))
+
+/** The artist's code. Asking for it files their request, and from then on the code is looked for. Every press is
+ * sent: asking again starts the checks over, as the page says. */
+export const removalCode = async (slug: string) => (await removal<{ code: string }>({ slug, proof: true })).code
 
 export const requestRemoval = (slug: string, note: string) => removal<{ ok: boolean }>({ slug, note: note.trim() || null })

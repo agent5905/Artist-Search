@@ -1,9 +1,10 @@
 -- What the site's server may ask the database for, and how much. Safe to rerun, and it only adds: two
--- tables and the functions below. db.migrate() runs the files in name order in one transaction, so this
--- one runs after 002_functions.sql, and then sets the site's token from .env (SITE_TOKEN), by its hash.
+-- tables and the functions below (a counts table of an earlier shape is brought to this one). db.migrate()
+-- runs the files in name order in one transaction, so this one runs after 002_functions.sql, and then sets
+-- the site's token from .env (SITE_TOKEN), by its hash.
 --
 -- The site's server functions (web/functions/api/) call the database as the anon role, with the publishable
--- key, and send the site's token, a secret of the Cloudflare project. The anon role may run the six
+-- key, and send the site's token, a secret of the Cloudflare project. The anon role may run the seven
 -- functions below and nothing else, and each of them refuses a call without the token. So the publishable
 -- key alone opens nothing, and nothing the site can reach deletes or hides an artist.
 
@@ -36,6 +37,14 @@ create table if not exists public.client_counts (
   client_key text primary key,
   busy_until float8 not null
 );
+-- A table of an earlier shape (windows of hits, never applied anywhere but possible): it takes this one, and its
+-- counts start again from nothing, which is all they are.
+alter table public.client_counts
+  drop column if exists slot,
+  drop column if exists hits,
+  drop column if exists hits_before,
+  drop column if exists seen_at,
+  add column if not exists busy_until float8 not null default 0;
 create index if not exists client_counts_busy_until_idx on public.client_counts (busy_until);
 alter table public.client_counts enable row level security;
 revoke all on table public.client_counts from public, anon, authenticated, service_role;
@@ -46,8 +55,9 @@ revoke all on table public.client_counts from public, anon, authenticated, servi
 -- told to wait costs nothing.
 --   read: a page of search results or of similar artists counts 1, a profile 0.1 (its size). 50 a day
 --         per visitor, 100 per network, 1,000 for everyone.
---   removal: asking for a code, or asking without one. 10 a day per visitor, 20 per network. No total:
---         many networks together must not be able to keep an artist from asking.
+--   removal: asking for a code, or asking without one, counts 1; the claim-or-remove page itself (site_claim)
+--         0.1. 10 a day per visitor, 20 per network. No total, and apart from the reads: many networks
+--         together must not be able to keep an artist from asking, and a day's reads used up must not either.
 -- "n a day" means n at once, then one every 1/n of a day; so in any 24 hours one visitor gets at most
 -- 2n, as does one network, and day after day n. One visitor is 5% of the day's reads, one network 10%.
 -- The total is a backstop for the free tier's 5 GB of egress a month. A page of 24 cards is 117 kB as
@@ -67,8 +77,8 @@ language plpgsql security definer set search_path = ''
 as $$
 declare
   budget constant text := case when p_kind in ('search', 'similar', 'profile') then 'read'
-                               when p_kind = 'removal' then 'removal' end;
-  cost constant float8 := case p_kind when 'profile' then 0.1 else 1 end;
+                               when p_kind in ('removal', 'claim') then 'removal' end;
+  cost constant float8 := case when p_kind in ('profile', 'claim') then 0.1 else 1 end;
   per_day constant float8[] := case budget when 'read' then '{50, 100, 1000}'::float8[] else '{10, 20, null}'::float8[] end;
   secret text;
   keys text[];
@@ -140,6 +150,25 @@ as $$
   select public.similar_artists(p_slug, 24);
 $$;
 
+-- What the claim-or-remove page shows of a listed artist, and no more (it is counted as a removal, not a read):
+-- the slug, the name, the two places a code can go, and whether the DeviantArt one can prove anything. It can
+-- only for an artist whose account the library keeps (artists.da_account): without it, whoever holds the handle
+-- now could be somebody else (pipeline/removals.py). p_slug may be the artist's DeviantArt username instead, so an
+-- artist can reach the page with no search, which is a read. Nothing when the artist is not listed.
+create or replace function public.site_claim(p_token text, p_slug text) returns setof jsonb
+language sql stable security definer set search_path = ''
+as $$
+  select public.site_check(p_token);
+  select jsonb_build_object(
+    'slug', a.slug, 'name', a.name, 'site_url', a.site_url,
+    'deviantart_url', 'https://www.deviantart.com/' || a.da_username, 'deviantart_proof', a.da_account is not null)
+  from public.artists a
+  where (a.slug = p_slug or a.da_key = public.key_hash('da:' || lower(p_slug))) and not a.hidden
+    and not exists (select 1 from public.removed gone where gone.key_hash in (a.da_key, a.site_key, a.da_account))
+  order by a.slug = p_slug desc
+  limit 1
+$$;
+
 create or replace function public.site_removal_code(p_token text, p_slug text) returns text
 language sql security definer set search_path = ''
 as $$
@@ -160,6 +189,7 @@ revoke all on function
   public.site_search(text, text, real[], text[], text[], boolean, int),
   public.site_artist(text, text),
   public.site_similar(text, text),
+  public.site_claim(text, text),
   public.site_removal_code(text, text),
   public.site_request_removal(text, text, text)
 from public, anon, authenticated, service_role;
@@ -169,6 +199,7 @@ grant execute on function
   public.site_search(text, text, real[], text[], text[], boolean, int),
   public.site_artist(text, text),
   public.site_similar(text, text),
+  public.site_claim(text, text),
   public.site_removal_code(text, text),
   public.site_request_removal(text, text, text)
 to anon;

@@ -60,6 +60,7 @@ TABLES = (
 PUBLIC_FUNCTIONS = [
     "client_wait",
     "site_artist",
+    "site_claim",
     "site_removal_code",
     "site_request_removal",
     "site_search",
@@ -74,7 +75,6 @@ SERVICE_FUNCTIONS = [
     "confirm_removal",
     "delete_removed",
     "grant_request",
-    "purge_removed",
     "refresh_search_words",
     "reject_removal",
     "removal_code",
@@ -224,10 +224,23 @@ def key_hashes(row: dict[str, Any]) -> list[str]:
     return [digest(key) for key in keys]
 
 
+def account(row: dict[str, Any]) -> str:
+    """The hash the library keeps for the stand-in account behind a row's handle (library.account), as push sends it."""
+    return digest(f"uid:FAKE-USER-{row['da_username']}")
+
+
+# Two handles push._slug makes into one slug, of two accounts: the slug passes from the first to the second.
+TWINS = [
+    {**artist("twin", da_username=handle), "da_account": account({"da_username": handle})}
+    for handle in ("zz-test-twin", "ZZ-Test_Twin")
+]
+
 # Every key a removal in these tests could leave behind, so cleaning up never depends on a test having passed.
 FORGET = "delete from public.removed where key_hash in ({})".format(
     ", ".join(
-        f"'{key_hash}'" for row in (*ARTISTS, GONE, STAY, KEEP, RACE, HELD, *CROWD) for key_hash in key_hashes(row)
+        f"'{key_hash}'"
+        for row in (*ARTISTS, GONE, STAY, KEEP, RACE, HELD, *CROWD, *TWINS)
+        for key_hash in [*key_hashes(row), account(row)]
     )
 )
 
@@ -871,6 +884,23 @@ def test_publishable_key_runs_the_sites_functions_only_and_only_with_the_token()
     assert slugs(as_the_site("site_search", q=WORD)) == ["zz-test-alpha", "zz-test-beta"]
     assert as_the_site("site_request_removal", p_slug="zz-test-nobody", p_note=None) is True
     assert CODE.fullmatch(as_the_site("site_removal_code", p_slug="zz-test-nobody"))
+    # The claim-or-remove page's artist, by slug or by DeviantArt username in any case (no search needed).
+    assert (
+        as_the_site("site_claim", p_slug="ZZ-Test-Alpha")
+        == as_the_site("site_claim", p_slug="zz-test-alpha")
+        == [
+            {
+                "slug": "zz-test-alpha",
+                "name": BY_SLUG["zz-test-alpha"]["name"],
+                "site_url": BY_SLUG["zz-test-alpha"]["site_url"],
+                "deviantart_url": "https://www.deviantart.com/zz-test-alpha",
+                "deviantart_proof": False,  # no account sent for it: a code on DeviantArt could be anybody's
+            }
+        ]
+    )
+    assert (
+        as_the_site("site_claim", p_slug="zz-test-hidden") == as_the_site("site_claim", p_slug="zz-test-nobody") == []
+    )
     # A page of search results is 24 cards, whatever is asked.
     assert (
         db.data_api(
@@ -886,6 +916,7 @@ def test_publishable_key_runs_the_sites_functions_only_and_only_with_the_token()
         ("site_search", {"q": WORD}),
         ("site_request_removal", {"p_slug": "zz-test-alpha", "p_note": None}),
         ("site_removal_code", {"p_slug": "zz-test-alpha"}),
+        ("site_claim", {"p_slug": "zz-test-alpha"}),
         ("client_wait", {"p_kind": "search", "p_client": "zz-test-intruder", "p_network": "zz-test-intruder"}),
     )
     for name, args in site_calls:
@@ -901,11 +932,10 @@ def test_publishable_key_runs_the_sites_functions_only_and_only_with_the_token()
         ("similar_artists", {"p_slug": "zz-test-alpha"}),
         ("request_removal", {"p_slug": "zz-test-alpha"}),
         ("start_removal_proof", {"p_slug": "zz-test-alpha"}),
-        ("confirm_removal", {"p_slug": "zz-test-alpha", "p_code": "x"}),
-        ("purge_removed", {"p_slugs": ["zz-test-alpha"]}),
-        ("reject_removal", {"p_slug": "zz-test-alpha"}),
-        ("close_request", {"p_slug": "zz-test-alpha", "p_outcome": "rejected"}),
-        ("grant_request", {"p_slug": "zz-test-alpha", "p_outcome": "granted"}),
+        ("confirm_removal", {"p_id": 1, "p_code": "x", "p_site": True}),
+        ("reject_removal", {"p_id": 1}),
+        ("close_request", {"p_id": 1, "p_outcome": "rejected"}),
+        ("grant_request", {"p_id": 1, "p_outcome": "granted", "p_site": True}),
         ("removal_tally", {}),
         ("remove_artists", {"p_slugs": ["zz-test-alpha"]}),
         ("delete_removed", {}),
@@ -958,11 +988,11 @@ def test_tables_are_locked_and_functions_are_pinned():
         "tables_without_rls": 0,
         "policies": 0,
         "tables_open_to_the_public": 0,
-        "sequences": 2,
+        "sequences": 3,
         "sequences_open_to_the_public": 0,
         "anon_functions": PUBLIC_FUNCTIONS,
         "authenticated_functions": 0,
-        # The site's six, what they run, and the two that read the proof secret (neither is the public's).
+        # The site's seven, what they run, and the two that read the proof secret (neither is the public's).
         "definer_functions": sorted([*PUBLIC_FUNCTIONS, *SITE_FUNCTIONS, "confirm_removal", "removal_code"]),
         "functions_without_fixed_path": None,
         "purge_everything_is_gone": True,
@@ -1019,8 +1049,24 @@ def proof_code(row_or_slug: dict[str, Any] | str) -> str:
     return code
 
 
-def confirm(row: dict[str, Any], code: str) -> bool:
-    return db.rpc("confirm_removal", {"p_slug": row["slug"], "p_code": code}, "secret")
+def request_id(row_or_slug: dict[str, Any] | str, handle: str | None = None) -> int:
+    """The id of the slug's open request (the one made for `handle`, when the slug has more than one); 0 for none."""
+    slug = row_or_slug if isinstance(row_or_slug, str) else row_or_slug["slug"]
+    rows = db.sql(
+        "select id, da_username from public.removal_requests "
+        f"where artist_slug = '{slug}' and outcome is null order by id"
+    )
+    return next((row["id"] for row in rows if handle in (None, row["da_username"])), 0)
+
+
+def confirm(row: dict[str, Any], code: str, site: bool = True, handle: str | None = None) -> list[str] | None:
+    """confirm_removal for the row's open request: the keys it barred, or None."""
+    return db.rpc("confirm_removal", {"p_id": request_id(row, handle), "p_code": code, "p_site": site}, "secret")
+
+
+def grant(request: int) -> list[str] | None:
+    """The owner's yes to a request (removals.answer): the keys it barred, or None."""
+    return db.rpc("grant_request", {"p_id": request, "p_outcome": "granted", "p_site": True}, "secret")
 
 
 def test_an_artists_request_survives_whatever_is_asked_after_it(seeded):
@@ -1067,12 +1113,12 @@ def test_no_public_call_changes_what_is_shown_or_spoils_a_code(seeded):
 
     # Guessing gets nowhere: the functions that act are not the public's to call, with a real code or without.
     for slug in targets[:5]:
-        guess = {"p_slug": slug, "p_code": before[slug]}
+        guess = {"p_id": request_id(slug), "p_code": before[slug], "p_site": True}
         assert denied(db.data_api("POST", "rpc/confirm_removal", "publishable", json=guess))
     for name, args in (
-        ("purge_removed", {"p_slugs": targets}),
+        ("grant_request", {"p_id": request_id(targets[0]), "p_outcome": "granted", "p_site": True}),
         ("remove_artists", {"p_slugs": targets}),
-        ("reject_removal", {"p_slug": targets[0]}),
+        ("reject_removal", {"p_id": request_id(targets[0])}),
     ):
         assert denied(db.data_api("POST", f"rpc/{name}", "publishable", json=args)), name
 
@@ -1113,24 +1159,24 @@ def test_proof_of_control_removes_at_once_and_for_good(seeded):
     code = proof_code(GONE)
     assert {proof_code(GONE) for _ in range(5)} == {code}
     # A code that is wrong, or somebody else's, does nothing, and says so. Nor can the public confirm.
-    assert confirm(GONE, "artist-search-removal-" + "0" * 32) is False
-    assert confirm(GONE, proof_code(STAY)) is False
-    assert confirm(artist("nobody"), proof_code("zz-test-nobody")) is False  # a code for nobody removes nobody
-    guess = {"p_slug": GONE["slug"], "p_code": code}
+    assert confirm(GONE, "artist-search-removal-" + "0" * 32) is None
+    assert confirm(GONE, proof_code(STAY)) is None
+    assert confirm(artist("nobody"), proof_code("zz-test-nobody")) is None  # a code for nobody removes nobody
+    guess = {"p_id": request_id(GONE), "p_code": code, "p_site": True}
     assert denied(db.data_api("POST", "rpc/confirm_removal", "publishable", json=guess))
     assert db.sql(there) == untouched and db.sql(remembered) == [] and visible(GONE)
 
     # The verifier confirms the artist's code: the artist and their works are gone at once, with what was
     # pending for them, the words only they used, and every neighbour row they were in. Only the hashed
     # keys remain.
-    assert confirm(GONE, code) is True
+    assert sorted(confirm(GONE, code) or []) == GONE_HASHES  # its handle and its site: no account was sent for it
     assert db.sql(there) == nothing_left
     assert similar("stay") == []  # the artist who had them as a neighbour is still served, without them
     assert [row["key_hash"] for row in db.sql(remembered)] == GONE_HASHES
     assert slugs(db.sql(REQUESTS)) == [STAY["slug"]]  # GONE's is closed; STAY's code was asked for above
     assert visible(STAY)
     # The code opens nothing a second time, and the artist cannot be loaded again.
-    assert confirm(GONE, code) is False
+    assert confirm(GONE, code) is None
     assert db.upsert("artists", [GONE], "slug", "slug") == []
     # Nor by a load, which skips their works and every neighbour row that names them.
     assert db.load([GONE], works_of("gone", 1, artist_slug=GONE["slug"]), pair) == 2
@@ -1162,28 +1208,29 @@ def test_the_owner_answers_unproven_requests(seeded):
     hashes = ", ".join(f"'{key_hash}'" for key_hash in GONE_HASHES)
     remembered = f"select key_hash from public.removed where key_hash in ({hashes}) order by key_hash"
 
-    # "Purge everything pending" does not exist, for anyone, and the public cannot purge or reject at all.
+    # "Purge everything pending" does not exist, for anyone, and the public cannot grant or reject at all.
     everything = db.data_api("POST", "rpc/purge_removed", "secret", json={})
     assert everything.status_code == 404 and everything.json()["code"] == "PGRST202"
-    assert denied(db.data_api("POST", "rpc/purge_removed", "publishable", json={"p_slugs": [GONE["slug"]]}))
-    assert denied(db.data_api("POST", "rpc/reject_removal", "publishable", json={"p_slug": STAY["slug"]}))
-    # Slugs without a request are left alone, so a typo cannot delete an artist who never asked.
-    assert db.rpc("purge_removed", {"p_slugs": []}, "secret") == 0
-    assert db.rpc("purge_removed", {"p_slugs": ["zz-test-alpha", "zz-test-nobody"]}, "secret") == 0
+    gone, stay = request_id(GONE), request_id(STAY)
+    yes = {"p_id": gone, "p_outcome": "granted", "p_site": True}
+    assert denied(db.data_api("POST", "rpc/grant_request", "publishable", json=yes))
+    assert denied(db.data_api("POST", "rpc/reject_removal", "publishable", json={"p_id": stay}))
+    # An id without an open request is left alone, so a typo cannot delete an artist who never asked.
+    assert grant(0) is None and grant(request_id("zz-test-alpha")) is None
     assert visible(BY_SLUG["zz-test-alpha"]) and visible(GONE) and db.sql(remembered) == []
 
     # Turned down: the request is closed, and nothing else changes.
-    assert db.rpc("reject_removal", {"p_slug": STAY["slug"]}, "secret") is True
-    assert db.rpc("reject_removal", {"p_slug": STAY["slug"]}, "secret") is False  # nothing left to reject
+    assert db.rpc("reject_removal", {"p_id": stay}, "secret") is True
+    assert db.rpc("reject_removal", {"p_id": stay}, "secret") is False  # nothing left to reject
     assert slugs(db.sql(REQUESTS)) == [GONE["slug"]]
     assert visible(STAY)
 
     # Granted: that artist is removed for good, and only that one.
-    assert db.rpc("purge_removed", {"p_slugs": [GONE["slug"]]}, "secret") == 1
+    assert sorted(grant(gone) or []) == GONE_HASHES
     assert not visible(GONE) and visible(STAY)
     assert [row["key_hash"] for row in db.sql(remembered)] == GONE_HASHES
     assert db.sql(REQUESTS) == []
-    assert db.rpc("purge_removed", {"p_slugs": [GONE["slug"]]}, "secret") == 0
+    assert grant(gone) is None
 
 
 OPEN = """
@@ -1194,7 +1241,8 @@ from public.removal_requests where artist_slug like 'zz-test-%' and outcome is n
 NAMED_WHEN_CLOSED = """
 select count(*)::int as n from public.removal_requests
 where outcome is not null and (artist_slug not like 'closed:%' or note is not null or da_username is not null
-                               or site_url is not null or site_domain is not null or due_at is not null)
+                               or site_url is not null or site_domain is not null or da_account is not null
+                               or due_at is not null)
 """
 
 
@@ -1220,12 +1268,12 @@ def test_a_request_outlives_its_artists_row_and_only_an_answer_closes_it(seeded)
     assert db.sql(OPEN) == made_for
 
     # Not listed, and removed all the same: for good, under the handle and site the request was made for.
-    assert confirm(GONE, code) is True
+    assert confirm(GONE, code)
     hashes = ", ".join(f"'{key_hash}'" for key_hash in GONE_HASHES)
     assert db.sql(f"select count(*)::int as n from public.removed where key_hash in ({hashes})") == [{"n": 2}]
     assert db.upsert("artists", [GONE], "slug", "slug") == []  # the next push cannot list them again
     # The owner grants the other while it is not listed either: the same.
-    assert db.rpc("purge_removed", {"p_slugs": [STAY["slug"]]}, "secret") == 1
+    assert grant(request_id(STAY))
     assert db.upsert("artists", [STAY], "slug", "slug") == []
     assert db.sql(OPEN) == [] and db.sql(NAMED_WHEN_CLOSED) == [{"n": 0}]
     after = tally()
@@ -1249,9 +1297,58 @@ def test_an_artist_removed_another_way_has_their_open_requests_closed(seeded):
 def test_a_rejected_artist_can_ask_again(seeded):
     fresh(STAY)
     ask(STAY, "first")
-    assert db.rpc("reject_removal", {"p_slug": STAY["slug"]}, "secret") is True
+    assert db.rpc("reject_removal", {"p_id": request_id(STAY)}, "secret") is True
     ask(STAY, "second")
     assert db.sql(REQUESTS) == [{"slug": STAY["slug"], "note": "second", "requests": 1, "in_order": True}]
+
+
+def test_a_proof_removes_the_artist_it_was_bound_to_and_not_whoever_the_slug_lists_now(seeded):
+    """The third critic's slug twin. The first asks for the slug's code; the next push lists the second under it; anyone
+    asks about the slug. Each request names its own artist, and the first's proof removes the first alone."""
+    first, second = TWINS
+    fresh(first)
+    code = proof_code(first)
+    db.sql("delete from public.artists where slug = 'zz-test-twin'")  # the next push holds the first back
+    db.upsert("artists", [second], "slug", "slug")  # and lists the second under the slug
+    ask(second)
+    made_for = """
+        select da_username, da_account, code_at is not null as coded from public.removal_requests
+        where artist_slug = 'zz-test-twin' and outcome is null order by id
+    """
+    assert db.sql(made_for) == [
+        {"da_username": "zz-test-twin", "da_account": account(first), "coded": True},
+        {"da_username": "ZZ-Test_Twin", "da_account": account(second), "coded": False},
+    ]
+    assert sorted(confirm(first, code, site=False, handle="zz-test-twin") or []) == sorted(
+        [digest("da:zz-test-twin"), account(first)]
+    )
+    assert visible(second) and [row["da_username"] for row in db.sql(made_for)] == ["ZZ-Test_Twin"]
+    # The code is the slug's: put up by the second in her own place, it removes her, and her alone.
+    assert sorted(confirm(second, code, site=False) or []) == sorted([digest("da:zz-test_twin"), account(second)])
+    assert not visible(second)
+
+
+def test_granting_an_artist_who_left_their_site_does_not_bar_whoever_lists_it_now(seeded):
+    """The third critic's stale site key: STAY asked while listed with their site, moved on, and KEEP lists it now."""
+    fresh(STAY, KEEP)
+    ask(STAY, "it is me")
+    db.upsert("artists", [{**STAY, **site("moved")}], "slug", "slug")
+    db.upsert("artists", [{**KEEP, **site("stay")}], "slug", "slug")
+    try:
+        assert grant(request_id(STAY)) == [digest("da:zz-test-stay")]
+        assert visible(KEEP) and not visible(STAY)
+    finally:
+        db.upsert("artists", [KEEP], "slug", "slug")  # its own site again, which the next test's STAY needs free
+
+
+def test_a_site_barred_with_its_artist_closes_no_other_artists_request(seeded):
+    fresh(STAY, KEEP)
+    ask(STAY, "it is me")
+    db.upsert("artists", [{**STAY, **site("moved")}], "slug", "slug")
+    db.upsert("artists", [{**KEEP, **site("stay")}], "slug", "slug")
+    ask(KEEP)
+    assert set(grant(request_id(KEEP)) or []) == {digest("da:zz-test-keep"), digest("site:zz-test-stay.invalid")}
+    assert slugs(db.sql(OPEN)) == [STAY["slug"]] and visible(STAY)
 
 
 def bar_gone() -> None:
@@ -1785,6 +1882,7 @@ def test_the_days_total_holds_reads_back_for_everyone_a_little_at_a_time(seeded)
         assert abs(wait("search", client) - 86400 / READS_A_DAY) <= 2
         assert abs(wait("profile", client) - 86400 / READS_A_DAY / 10) <= 2
         assert wait("removal", client) == 0  # asking for removal has no day's total
+        assert wait("claim", client) == 0  # nor has the claim-or-remove page, which is counted with removals
         # Nothing refused was counted.
         assert (
             counts_kept(counted_as("read", "visitor", client)) == 1
@@ -1888,8 +1986,8 @@ def test_the_verifier_removes_through_the_real_queue_and_the_real_confirm_remova
             table, **params, **({"artist_slug": "like.zz-test-*"} if table == "removal_requests" else {})
         ),
     )
-    fresh(GONE, STAY, KEEP)
-    for row in (GONE, STAY):  # the library keeps their accounts
+    fresh(*({**row, "da_account": account(row) if row is not KEEP else None} for row in (GONE, STAY, KEEP)))
+    for row in (GONE, STAY):  # the library keeps their accounts, and the push sent them
         handle = row["da_username"]
         assert store.upsert_artist(handle, f"https://www.deviantart.com/{handle}", [], 1)
         library.store_artist(
@@ -1918,8 +2016,10 @@ def test_the_verifier_removes_through_the_real_queue_and_the_real_confirm_remova
     assert {name: count for name, count in counts.items() if name not in removals.TALLY} == {
         name: 0 for name in removals.COUNTS if name not in removals.TALLY
     } | {"requests_due": 2, "proven_on_deviantart": 1, "artists_removed": 1, "left_for_owner_no_code_found": 1}
-    hashes = ", ".join(f"'{key_hash}'" for key_hash in GONE_HASHES)
-    assert db.sql(f"select count(*)::int as n from public.removed where key_hash in ({hashes})") == [{"n": 2}]
+    # Their handle and account. Not their site, which the profile it read does not name.
+    hashes = ", ".join(f"'{key_hash}'" for key_hash in [*GONE_HASHES, account(GONE)])
+    barred = db.sql(f"select key_hash from public.removed where key_hash in ({hashes}) order by 1")
+    assert [row["key_hash"] for row in barred] == sorted([digest("da:zz-test-gone"), account(GONE)])
     assert db.upsert("artists", [GONE], "slug", "slug") == []  # and not listed again
     assert visible(STAY) and visible(KEEP)
     assert store.is_removed(GONE["da_username"])  # here too, at once
@@ -1935,7 +2035,7 @@ def test_the_verifier_removes_through_the_real_queue_and_the_real_confirm_remova
 
 def test_errors_do_not_echo_secrets(monkeypatch):
     with pytest.raises(RuntimeError, match="42501") as refusal:
-        db.rpc("purge_removed", {"p_slugs": []}, "publishable")
+        db.rpc("reject_removal", {"p_id": 0}, "publishable")
 
     def unreachable(method: str, url: str, **kwargs: Any):
         raise httpx.ConnectError(f"cannot reach {url}")
