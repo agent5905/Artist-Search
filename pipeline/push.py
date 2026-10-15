@@ -469,10 +469,12 @@ def _build(local: store.Snapshot, removed: Collection[str]) -> tuple[Rows, Rows,
         most_used = plain([tag for tag, _ in sorted(used.items(), key=lambda item: (-item[1], item[0]))])
         # The artist's own tags the site shows as theirs: those the profile stage's one rule picked
         # (profiles._own_tags), of those on a work that goes. Each is on the reviewed list as it is now, as the
-        # list spells it and never in the artist's own spacing ("tit_an" is the listed "titan"): a row whose own
-        # words are not is not current (profiles.current). sql/001_schema.sql takes 60 characters a tag.
+        # list keys it and never in the artist's own spacing ("tit_an" is the listed "titan"): a row whose own
+        # words are not is not current (profiles.current). It is printed as the list spells it (profiles.displayed:
+        # "dark fantasy"), and that is what the rule and sql/001_schema.sql's 60 characters a tag are held to.
         on_sent = {profiles._compared(tag) for tag in used}
-        shown = plain([tag for tag in profile["own_words"] if tag in on_sent and len(tag) <= 60])
+        printed = [profiles.displayed(tag) for tag in profile["own_words"] if tag in on_sent]
+        shown = plain([text for text in printed if len(text) <= 60])
         # An older row may lack a kind. Its own_words are of works that may not go: of those that do, every tag is
         # in most_used, and the ones shown are in top_tags, which keyword search reads too.
         facts = plain(
@@ -481,9 +483,9 @@ def _build(local: store.Snapshot, removed: Collection[str]) -> tuple[Rows, Rows,
         # ponytail: the specialty the artist picked on DeviantArt is not in it: nothing has read that field
         # for a private contact. Add it when the tagging stage does.
         # Of the artist's tags, only those on the reviewed list are searched by, as only those are shown, and as
-        # the list spells them: a tag left off the list is left off for what it says, and a search for it, or for
-        # a word the artist's spacing makes of a listed one, should find nobody.
-        listed_tags = dict.fromkeys(map(profiles._compared, filter(profiles.approved, most_used)))
+        # the list spells them (profiles.displayed): a tag left off the list is left off for what it says, and a
+        # search for it, or for a word the artist's spacing makes of a listed one, should find nobody.
+        listed_tags = dict.fromkeys(profiles.displayed(tag) for tag in most_used if profiles.approved(tag))
         words = [*facts, *(title for _, _, title, *_ in ready if title), *listed_tags]
         search_text = _search_text(words)  # read whole, as every text that goes, by both rules
         artists.append(

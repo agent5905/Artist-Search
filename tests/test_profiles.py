@@ -680,6 +680,17 @@ def test_only_a_tag_on_the_reviewed_list_is_shown():
     assert not any(map(profiles.approved, ("lolita", "yuri", "midriff", "zzinventedtag", "")))
 
 
+def test_the_reviewed_list_is_read_a_line_at_a_time_and_a_display_is_only_what_is_printed():
+    keys, spelled = profiles._reviewed("darkfantasy\tdark fantasy\n\ntitan\nwarhammer40k\twarhammer 40k\n")
+    assert keys == {"darkfantasy", "titan", "warhammer40k"}  # the blank line is no tag, and the display is none
+    assert spelled == {"darkfantasy": "dark fantasy", "warhammer40k": "warhammer 40k"}
+    # The key is what is approved and compared, however the artist writes it; a display is no way in.
+    assert profiles.approved("Dark_Fantasy") and not profiles.approved("dark fantasy")
+    assert profiles.displayed("Dark_Fantasy") == profiles.displayed("darkfantasy") == "dark fantasy"
+    assert profiles.displayed("dungeons_and_dragons") == "dnd"  # compared first: _SHORT, then the list's spelling
+    assert profiles.displayed("Titan") == "titan" and profiles.displayed("zzinventedtag") == "zzinventedtag"
+
+
 def test_no_tag_says_again_what_one_shown_before_it_has_said():
     assert shown((10, DRAGON, ["dragon", "dragons", "dragonart", "reddragon", "wolf"])) == ["dragon", "wolf"]
     assert shown((10, PLAIN, ["darkfantasy", "darkart", "fantasyart", "dark", "knight"])) == ["darkfantasy", "knight"]
