@@ -996,3 +996,29 @@ Nothing has been pushed; none of these reached the public.
 - A Cloudflare edge rate-limiting rule is written for the owner to add at launch, the real answer to a flood from many addresses.
 
 **Cost, stated to the owner:** about $2,000 by the tool's count so far, most of it in the critic and builder rounds on push and claim-or-remove. Each round has found real problems in what reaches the public or in whether removals work.
+
+### Round 26: push round 8, claim-or-remove round 4, readable tags (2026-10-15)
+
+**Push round 8 merged** (the fourth critic's findings):
+- A card is current only while its search vector was made from approved tags, its "open for commissions" evidence still reads the same in the artist's current words, and it was made at the current version. Every card is being remade by the GPU worker.
+- A website or tagline the artist has emptied is no longer sent, though the local store keeps it.
+- Approved tags are printed in the list's own spelling, never the artist's.
+- Works DeviantArt flags mature now count toward an artist's adult share.
+- Removals made here go through however many there are.
+- A broken style vector is left out of the ranking.
+- Search text is checked against service names as a whole.
+- 48 more tags came off the approved list, which now holds 1,518.
+
+**Readable tags.** The approved list gained an optional display spelling, used only for printing ("dark fantasy" for `darkfantasy`). The run-together form stays the key that is matched and approved. 562 tags have one; ambiguous splits, such as "titan", were left alone. A first attempt to split the keys in place was stopped by the agent doing it: the list is read word by word, so that would have approved unreviewed fragments.
+
+**Claim-or-remove round 4 merged** (its third critic's findings):
+- A request is bound, when filed, to the account then listed under the slug, and a proof bars only that account. The slug-collision, stale-site and re-pointed-request attacks fail.
+- Each fetch has one 20-second deadline; the critic's 50-day tarpit costs 34 seconds.
+- Claim-or-remove pages have their own budget and work when the day's searches are spent.
+- "Get my code" can be pressed again to restart the schedule.
+- The owner's list pages through everything.
+- Push now sends each artist's account hash for requests to bind to.
+- A Cloudflare edge rate-limiting rule is written for the owner to add at launch.
+- **Known limit:** whoever buys a domain an artist let lapse, while the artist's profile still names it, can prove a removal.
+
+**What comes next, to keep cost down:** push and claim-or-remove each get one more critic close to the push, judging the final code on fully analysed data, not one round per change. The GPU worker's pace fell to about 300 works an hour, partly because builders' and critics' test runs compete for the CPU. About four days of analysis remain.
