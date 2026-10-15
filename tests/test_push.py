@@ -2525,9 +2525,27 @@ OFF_THE_LIST += ["squareenix", "ubisoft", "valve", "wizardsofthecoast"]
 
 def test_the_reviewed_list_is_one_plain_tag_a_line_sorted_and_holds_none_of_these():
     lines = pathlib.Path(profiles.__file__).with_name("approved_tags.txt").read_text(encoding="utf-8").split("\n")
-    assert lines[-1] == "" and lines[:-1] == sorted(set(lines[:-1])) and set(lines[:-1]) == profiles.APPROVED
+    keys = [line.partition("\t")[0] for line in lines[:-1]]  # a line is a key, or a key, a tab and its display
+    assert lines[-1] == "" and keys == sorted(set(keys)) and set(keys) == profiles.APPROVED
     assert all(tag == profiles._compared(tag) and re.fullmatch("[a-z0-9]+", tag) for tag in profiles.APPROVED)
     assert not {profiles._compared(tag) for tag in [*UNSHOWN, *OFF_THE_LIST]} & profiles.APPROVED
+
+
+def test_a_display_on_the_reviewed_list_is_its_key_spaced_and_nothing_else():
+    """The site prints the display (profiles.displayed) and nothing is approved or compared by it, so it may add
+    single spaces to its key and change no letter, digit or order. A tag left run together has no display."""
+    lines = pathlib.Path(profiles.__file__).with_name("approved_tags.txt").read_text(encoding="utf-8").split("\n")
+    pairs = [line.split("\t") for line in lines[:-1] if "\t" in line]
+    assert len(pairs) > 500 and all(len(pair) == 2 for pair in pairs)
+    for key, display in pairs:
+        assert re.fullmatch("[a-z0-9]+( [a-z0-9]+)+", display), display
+        assert display.replace(" ", "").lower() == key, (key, display)
+    assert dict(pairs) == profiles.DISPLAY and set(profiles.DISPLAY) <= profiles.APPROVED
+    # What a split could make another word of is left run together, as it is written: never "tit an", "ass assin".
+    assert not {"titan", "assassin"} & set(profiles.DISPLAY)
+    assert [profiles.displayed(key) for key in ("titan", "assassin")] == ["titan", "assassin"]
+    words = {word for display in profiles.DISPLAY.values() for word in display.split()}
+    assert not words & {"ass", "tit", "tits", "anal", "sex", "cum", "nude", "porn", "rape", "fag", "hoe", "nazi"}
 
 
 def test_only_a_tag_on_the_reviewed_list_is_shown_as_the_artists(fake):
@@ -2550,7 +2568,10 @@ def test_only_a_tag_on_the_reviewed_list_is_shown_as_the_artists(fake):
 
     push.run(False)
 
-    assert sent_artists(fake)[ALPHA]["top_tags"] == ["knight", "characterdesign"]
+    # Printed as the list spells it, though the row and every comparison keep the key "characterdesign".
+    sent = sent_artists(fake)[ALPHA]
+    assert sent["top_tags"] == ["knight", "character design"]
+    assert "character design" in sent["search_text"] and "characterdesign" not in sent["search_text"]
 
 
 def own_words(handle, words):

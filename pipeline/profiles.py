@@ -193,7 +193,24 @@ _LONG = re.compile("|".join(_SHORT))
 # a person has read it and added it. Never one about a body, dress, sex, a fetish, an age or a real person, nor
 # selling or the artist's own promotion, nor one the reader was unsure of. Made on 2026-10-14 by reading the 2,200
 # tags the rules below would then show most, out of 9,162: 90% of the places for a tag on the site.
-APPROVED = frozenset(pathlib.Path(__file__).with_name("approved_tags.txt").read_text(encoding="utf-8").split())
+# A line is the tag as it is compared (its key), and for a tag of several words may go on with a tab and the same
+# words spaced as they read: "darkfantasy", a tab, "dark fantasy". That spelling (displayed) is only what the site
+# prints; approval and every comparison are of the key. No spelling means the key is printed: a tag whose words
+# could read as others when split, or whose breaks were not plain, has none.
+
+
+def _reviewed(text: str) -> tuple[frozenset[str], dict[str, str]]:
+    """The keys of the reviewed list's text, and the spelling to print for each key that has one."""
+    keys, spelled = [], {}
+    for key, _, spelling in (line.partition("\t") for line in text.splitlines()):
+        if key:
+            keys.append(key)
+            if spelling:
+                spelled[key] = spelling
+    return frozenset(keys), spelled
+
+
+APPROVED, DISPLAY = _reviewed(pathlib.Path(__file__).with_name("approved_tags.txt").read_text(encoding="utf-8"))
 # Two claims counted on every sheet and never stated: the push stage's to weigh.
 UNSUITABLE = "sexualised or gory"
 SAME = "one repeated subject"
@@ -291,6 +308,13 @@ def approved(tag: str) -> bool:
     return _compared(tag) in APPROVED
 
 
+def displayed(tag: str) -> str:
+    """A tag as the site prints it: its spelling on the reviewed list (DISPLAY), "dark fantasy" for "darkfantasy", or
+    else the tag as _compared() has it. Only for printing: approval, matching and every count are of _compared()."""
+    key = _compared(tag)
+    return DISPLAY.get(key, key)
+
+
 def _leading(counts: Counter[str], need: int, order: Iterable[str], at_most: int) -> list[str]:
     """The `at_most` values of `order` that most works have, of those at least `need` works have."""
     return sorted((value for value in order if counts[value] >= need), key=lambda value: -counts[value])[:at_most]
@@ -314,13 +338,14 @@ def _reads(written: str) -> str:
 
 
 def _own_tags(works: list[dict[str, Any]], handle: str, shared: Collection[str] | None) -> dict[str, int]:
-    """The artist's own tags that the site shows as theirs, as the reviewed list spells them -> how many of
+    """The artist's own tags that the site shows as theirs, each as the reviewed list keys it -> how many of
     `works` carry each.
 
     The one rule for them: the push stage sends these, of those on a work it sends, and no other tag of the
     artist's as theirs. A tag is compared without its case, "_" and "-" (_plain), and in one of the two ways
-    artists write some names (_SHORT), and it is printed so: never with the artist's own spacing, which once
-    made the listed "titan" the words "tit an". The most used come first, and of two as often used the one the
+    artists write some names (_SHORT), and it is kept so: never with the artist's own spacing, which once
+    made the listed "titan" the words "tit an". The site prints it as the list spells it (displayed), the push
+    stage's to do. The most used come first, and of two as often used the one the
     artist writes earlier among a work's tags; AT_MOST["own_words"] are kept. Only a tag on the reviewed list is
     shown (approved): every other is left out. Left out as well, because it says nothing, is not about the work,
     or says again what one before it says:
