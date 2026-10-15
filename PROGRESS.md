@@ -969,3 +969,30 @@ Nothing has been pushed; none of these reached the public.
 - Two separately clean titles join into a contact handle in search text.
 - Its review of the approved list: take off 9 (selling, photos of real people, a social network) and 11 it could not call safe (fetishised fandoms, double meanings, drugs, war imagery, an age term). All 20 come off.
 - **Push round 8 follows the claim-or-remove round, since both change push.** Its main fix remakes every profile card, a few hours of GPU inside the analysis still running.
+
+### Round 25: claim-or-remove round 3, and its third critic (2026-10-15)
+
+**Round 3 merged.**
+- Removal requests are lasting records that no push, hold-back or rename closes.
+- The owner can list and answer them (`pipeline.removals --pending`, `--grant`, `--reject`), and every run prints counts.
+- The page head is read with a real HTML parser.
+- Search limits apply per visitor, per network and overall; refused tries do not count.
+- All database access goes through the site's server, which proves itself with a site token, so the browser holds no database key.
+- 4,906 tests pass.
+
+**Its third critic: still no.**
+- Held: removals are permanent under every handle; no secret reaches the browser, a log or the repository; the SQL is sound as written, with no breach of the limit in 160,000 reordered concurrent calls.
+- **Biggest gap:** requests were keyed by an artist's slug, not their account. Two handles that make the same slug let one artist's proof bar the other, permanently. A later request could also overwrite an open one.
+- A site that sends its reply one byte every 14 seconds stalled the checker for weeks.
+- About 20 addresses could drain the day's read allowance, blacking out search and every claim-or-remove page with it.
+- A second "Get my code" in the same tab filed nothing.
+- The owner's list of pending requests stopped at 1,000.
+
+**Round 4 (in progress):**
+- A request is bound to the artist's account when its code is issued, and a proof bars only that account.
+- Every fetch gets one overall deadline.
+- Claim-or-remove pages no longer depend on the read allowance.
+- A second press restarts the schedule; every list pages through.
+- A Cloudflare edge rate-limiting rule is written for the owner to add at launch, the real answer to a flood from many addresses.
+
+**Cost, stated to the owner:** about $2,000 by the tool's count so far, most of it in the critic and builder rounds on push and claim-or-remove. Each round has found real problems in what reaches the public or in whether removals work.
