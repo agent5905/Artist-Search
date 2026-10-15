@@ -877,3 +877,19 @@ The critic would not run push at scale while anything else writes to the store, 
 - The owner chose to restart the GPU work, and it is running again.
 
 **Analysis: under way.** Style vectors 19,381 of 39,744; tags and ratings about 7,900 each; profile cards 728 of 3,948. Tagging and rating run at roughly 400 works an hour each, so about four days remain.
+
+### Round 22: the content ratings' first blind check (2026-10-14)
+
+Every work's rating (safe, suggestive or explicit) decides what is held back from a studio-facing site, and no critic had judged it. A fresh critic rated 75 real works blind (45 the tagging stage called safe, 20 suggestive, 10 explicit, shuffled), with the stage's own definitions, choosing the stricter rating on anything borderline.
+
+| Ours / critic | Safe | Suggestive | Explicit |
+|---|---|---|---|
+| Safe (45) | 41 | 4 | 0 |
+| Suggestive (20) | 6 | 13 | 1 |
+| Explicit (10) | 1 | 3 | 6 |
+
+- **What reaches the public:** 41 of our 45 "safe" works the critic also called safe. The 4 it would hold were all borderline calls it made stricter on purpose (a lace nightie, stitched zombie wounds, blood from a claw, a torn loincloth). It found no clear miss.
+- **Every nude in the sample was already held back,** including the full-frontal nudes the scale's wording does not clearly cover.
+- **Over-strict the other way:** 7 of our 30 held-back works the critic calls safe (a casual tank top, cleavage-only portraits, a shirtless fighter, gunslingers). That costs coverage, not safety.
+- **Gaps in the scale's wording,** none of which changed what was held in the sample: frontal nudity with nothing drawn in fits neither step; "nipples" does not say female; there is no rule for young-looking characters; cartoon gore is ambiguous.
+- **A policy question for the owner:** "moderate blood and wounds" counts as suggestive, so it is held back. It is common in game art, and it is behind two of the four borderline cases. Changing it means re-rating every work, about two days of GPU, so it waits for the current run to finish.
