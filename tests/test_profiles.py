@@ -575,7 +575,7 @@ def shown(*groups, **artist):
 @pytest.mark.parametrize(
     ("groups", "own_words"),
     [
-        ([(10, DRAGON, OWN)], ["dinosaur", "paleoart", "creature design"]),
+        ([(10, DRAGON, OWN)], ["dinosaur", "paleoart", "creaturedesign"]),
         # a tag on one work is the artist's as much as one on all of them
         ([(1, DRAGON, ["dinosaur"]), (9, DRAGON)], ["dinosaur"]),
         # the most used first; of two as often used, the one the artist writes earlier
@@ -590,7 +590,7 @@ def shown(*groups, **artist):
         # the same tag however it is written, and a work that has it twice counts once
         (
             [(2, DRAGON, ["Paleo_Art", "paleoart"]), (2, DRAGON, ["PALEOART"]), (6, DRAGON, ["paleo-art"])],
-            ["paleo-art"],
+            ["paleoart"],
         ),
     ],
 )
@@ -602,7 +602,7 @@ def test_the_card_is_one_sentence_and_quotes_no_tag_of_the_artists():
     found, _ = profiles.facts_of(body((10, DRAGON, OWN)))
 
     assert profiles.template(found) == "Creature art."
-    assert found["own_words"] == ["dinosaur", "paleoart", "creature design"]
+    assert found["own_words"] == ["dinosaur", "paleoart", "creaturedesign"]
 
 
 def test_the_quoted_tags_are_kept_with_the_number_of_counted_works_that_carry_each():
@@ -618,26 +618,22 @@ def test_the_quoted_tags_are_kept_with_the_number_of_counted_works_that_carry_ea
 @pytest.mark.parametrize(
     ("own", "printed"),
     [
-        # with the spaces the artist put in it
-        (["character_design"], "character design"),
-        (["Dungeons_And_Dragons"], "dungeons and dragons"),
-        (["sci-fi"], "sci-fi"),
-        (["dnd_5e"], "dnd 5e"),
-        # split where it is words of the fixed lists joined, in the one way there is
-        (["creaturedesign"], "creature design"),
-        (["darkfantasy"], "dark fantasy"),
-        (["monsterdesign"], "monster design"),
-        (["originalcharacter"], "original character"),
-        (["fanart"], "fan art"),
-        # as the artist wrote it wherever that is not certain: no word is made up
+        (["character_design"], "characterdesign"),
+        (["Dungeons_And_Dragons"], "dnd"),  # a long name written short, as the list has it
+        (["sci-fi"], "scifi"),
+        (["dnd_5e"], "dnd5e"),
+        (["creaturedesign"], "creaturedesign"),
+        (["Dark-Fantasy"], "darkfantasy"),
+        # the fourth critic of the push stage: the artist's spacing made words of listed tags, that the list has not
+        (["tit_an"], "titan"),
+        (["jap_anese"], "japanese"),
+        (["rac-coon"], "raccoon"),
+        (["heroin_e"], "heroine"),
         (["paleoart"], "paleoart"),
-        (["dragonage"], "dragonage"),
-        (["speedpaint"], "speedpaint"),
-        (["fantasyartwork"], "fantasyartwork"),  # "art work" or "artwork"
         (["warhammer40k"], "warhammer40k"),
     ],
 )
-def test_a_tag_is_printed_as_a_reader_expects_it_only_where_the_split_is_certain(own, printed):
+def test_a_tag_is_printed_as_the_reviewed_list_spells_it_never_in_the_artists_spacing(own, printed):
     found, _ = profiles.facts_of(body((10, tags("unclear", ["environment"], [], []), own)))
 
     assert found["own_words"][:1] == [printed]
@@ -677,21 +673,21 @@ def test_only_a_tag_on_the_reviewed_list_is_shown():
     Every tag on the reviewed list is shown, however it is written, and no other, whatever it is."""
     own = ["soldier", "Landscape", "spaceship", "character_design", "lolita", "yuri", "midriff", "salem"]
     own += ["sapphire", "wheels", "spaceships", "bunnysuit", "croptop", "zzinventedtag"]
-    assert shown((10, SCENERY, own)) == ["soldier", "landscape", "spaceship", "character design"]
+    assert shown((10, SCENERY, own)) == ["soldier", "landscape", "spaceship", "characterdesign"]
     assert all(
-        profiles.approved(tag) for tag in ("Soldier", "character_design", "character design", "dungeons_and_dragons")
+        profiles.approved(tag) for tag in ("Soldier", "character_design", "Character-Design", "dungeons_and_dragons")
     )
     assert not any(map(profiles.approved, ("lolita", "yuri", "midriff", "zzinventedtag", "")))
 
 
 def test_no_tag_says_again_what_one_shown_before_it_has_said():
     assert shown((10, DRAGON, ["dragon", "dragons", "dragonart", "reddragon", "wolf"])) == ["dragon", "wolf"]
-    assert shown((10, PLAIN, ["darkfantasy", "darkart", "fantasyart", "dark", "knight"])) == ["dark fantasy", "knight"]
+    assert shown((10, PLAIN, ["darkfantasy", "darkart", "fantasyart", "dark", "knight"])) == ["darkfantasy", "knight"]
     # nor in the plural, nor by its initials
     assert shown((10, PLAIN, ["elf", "elves", "elfart", "originalcharacter", "oc", "ocs"])) == [
-        *("elf", "original character")
+        *("elf", "originalcharacter")
     ]
-    assert shown((10, PLAIN, ["characterdesign", "characterart", "character", "characters"])) == ["character design"]
+    assert shown((10, PLAIN, ["characterdesign", "characterart", "character", "characters"])) == ["characterdesign"]
 
 
 @pytest.mark.parametrize(
@@ -706,13 +702,13 @@ def test_one_name_written_two_ways_is_shown_once(own):
     found = [re.sub(r"[\s_-]", "", tag.lower()) for tag in shown((10, FANTASY, own))]
 
     assert not {"dnd", "dungeonsanddragons"} <= set(found)
-    assert found[0] == re.sub(r"[_-]", "", own[0].lower())  # as the artist wrote it first, never another word
+    assert found[0] == "dnd"  # as the reviewed list spells it, however the artist wrote it
 
 
 def test_a_genre_or_a_word_written_two_ways_is_shown_once():
     assert shown((10, FANTASY, ["scifi", "sci-fi", "sciencefiction", "science_fiction"])) == ["scifi"]
-    assert shown((10, FANTASY, ["science_fiction", "scifi"])) == ["science fiction"]
-    assert shown((10, FANTASY, ["colourful", "colorful"])) == ["colourful"]
+    assert shown((10, FANTASY, ["science_fiction", "scifi"])) == ["scifi"]
+    assert shown((10, FANTASY, ["colourful", "colorful"])) == ["colorful"]
 
 
 def test_the_artists_own_handle_or_name_is_not_shown():
@@ -1164,7 +1160,7 @@ def test_the_vector_is_1024_numbers_of_unit_length_made_from_the_card_and_every_
     (profile,) = profiles.profiles()
     text = (
         "Anime fantasy character art. Open for commissions.\n"
-        "Specialties: character.\nIn the artist's words: warrior, creature design.\n"
+        "Specialties: character.\nIn the artist's words: warrior, creaturedesign.\n"
         "Mediums: digital painting.\nGenres: fantasy, anime style.\nStyle: painterly."
     )
     assert profile["template"] == text.splitlines()[0]
@@ -1740,7 +1736,8 @@ def test_an_artist_whose_work_was_read_from_an_image_they_replaced_waits_and_the
     assert run(quiet) == {"unchanged": 1} and quiet.requests == []
 
 
-def test_a_row_is_not_current_while_a_work_it_counted_has_words_nobody_read_or_words_that_say_otherwise():
+def test_a_row_is_not_current_while_a_work_it_counted_has_words_nobody_read_or_words_that_say_otherwise(monkeypatch):
+    monkeypatch.setattr(store, "_now", lambda: "2026-10-14T12:00:00+00:00")  # one moment, as in the test above
     ids = artist(ALPHA, [tags()] * 6)
     assert run(Fake())["profiled"] == 1
     kept, key = table(), f"da:{ALPHA}"

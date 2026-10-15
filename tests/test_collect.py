@@ -975,6 +975,8 @@ def test_the_ten_most_recent_qualifying_works_are_kept_whatever_order_the_galler
     assert run(world) == 0
     assert kept(ALPHA) == [29, 27, 25, 23, 21, 20, 19, 17, 16, 14]
     assert len(kept(ALPHA)) == collect.MAX_WORKS == 10
+    # The two flagged mature are not kept, and are counted, as a number and nothing else, for the adult share.
+    assert library.answers()[key(ALPHA)] == (False, False, 2)
     assert len([request for request in world.requests("api") if request.url.path == GALLERY_PATH]) == 1
 
 
@@ -1282,6 +1284,7 @@ def test_a_kept_work_that_qualifies_again_loses_its_mark_though_it_is_no_longer_
     assert run(world) == 0
     world.galleries[ALPHA][0]["is_mature"] = True  # work 1, the oldest
     assert counts_of(world, capsys)[collect.MARKED] == 1 and work_marks() == {1: "mature"}
+    assert library.answers()[key(ALPHA)][2] == 0  # kept, with a mark: its rows speak for it, and it is not counted
     world.galleries[ALPHA][0]["is_mature"] = False
     world.work(ALPHA, 11)  # ten newer ones now: work 1 is seen, and is not one of the ten taken
     counts = counts_of(world, capsys)

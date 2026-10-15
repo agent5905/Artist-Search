@@ -91,7 +91,7 @@ AT_MOST = {"specialties": 3, "worlds": 2, "manners": 1, "own_words": 12, "style_
 SHARED = 3  # artists in the store who use a tag, the artist among them, before it is shown as the artist's
 CELL, PER_ROW, LABEL = 300, 5, 34  # the contact sheet: pixels a picture, pictures a row, pixels for its number
 RECENT_DAYS = 180  # a work's own tags say something about commissions for this long
-TEMPLATE_VERSION = 10  # bump when template(), or what facts_of() makes a fact, changes
+TEMPLATE_VERSION = 11  # bump when template(), what facts_of() makes a fact, or embedded_text() changes
 SHEET_VERSION = 7  # bump when the sheet or COUNT_PROMPT changes
 
 # Every value a profile may state, and its spellings. The first is the template's. "photo" and "unclear" are not
@@ -157,8 +157,8 @@ _WIDER = {"dark fantasy": "fantasy", "cyberpunk": "science fiction"}
 GENRE_FORMS = WORLD_FORMS | MANNER_FORMS
 FORMS = MEDIUM_FORMS | SUBJECT_FORMS | GENRE_FORMS | STYLE_FORMS
 # The fields of the facts that search reads, in the order the vector's text lists them. `own_words` are the
-# artist's own tags that the site shows as theirs, as it prints them. `formats` is a kind of output, which only a
-# row made before round 7 has: the push stage reads it from such a row until the row is made again.
+# artist's own tags that the site shows as theirs, as the reviewed list spells them. `formats` is a kind of output,
+# which only a row made before round 7 has: the push stage reads it from such a row until the row is made again.
 STATED = ("specialties", "own_words", "mediums", "genres", "formats", "style_words")
 
 # The artist's own tags (see _own_tags). The catch-alls every artist uses, and words that tell a studio nothing
@@ -282,12 +282,12 @@ def _plain(tag: str) -> str:
 
 
 def _compared(tag: str) -> str:
-    """A tag, or a tag as the site prints it, as one: _plain() without spaces, a long name written short (_SHORT)."""
-    return _LONG.sub(lambda name: _SHORT[name[0]], _plain(tag).replace(" ", ""))
+    """A tag as one, and as the site prints it: _plain(), with a long name written short (_SHORT)."""
+    return _LONG.sub(lambda name: _SHORT[name[0]], _plain(tag))
 
 
 def approved(tag: str) -> bool:
-    """True when a tag, or a tag as the site prints it, is on the reviewed list (APPROVED)."""
+    """True when a tag is on the reviewed list (APPROVED), however its case, "_" and "-" are written."""
     return _compared(tag) in APPROVED
 
 
@@ -314,14 +314,16 @@ def _reads(written: str) -> str:
 
 
 def _own_tags(works: list[dict[str, Any]], handle: str, shared: Collection[str] | None) -> dict[str, int]:
-    """The artist's own tags that the site shows as theirs, as it prints them -> how many of `works` carry each.
+    """The artist's own tags that the site shows as theirs, as the reviewed list spells them -> how many of
+    `works` carry each.
 
     The one rule for them: the push stage sends these, of those on a work it sends, and no other tag of the
     artist's as theirs. A tag is compared without its case, "_" and "-" (_plain), and in one of the two ways
-    artists write some names (_SHORT). The most used come first, and of two as often used the one the artist
-    writes earlier among a work's tags; AT_MOST["own_words"] are kept. Only a tag on the reviewed list is shown
-    (approved): every other is left out. Left out as well, because it says nothing, is not about the work, or
-    says again what one before it says:
+    artists write some names (_SHORT), and it is printed so: never with the artist's own spacing, which once
+    made the listed "titan" the words "tit an". The most used come first, and of two as often used the one the
+    artist writes earlier among a work's tags; AT_MOST["own_words"] are kept. Only a tag on the reviewed list is
+    shown (approved): every other is left out. Left out as well, because it says nothing, is not about the work,
+    or says again what one before it says:
       - a tag made only of catch-all words (_SAYS_NOTHING) and of the words of those taken before it, a plural
         as its singular: "digitalart", and after "dark fantasy" "dark art";
       - the artist's `handle`, a part of it, or a tag it is part of, the handle compared as a tag is (_plain);
@@ -346,7 +348,6 @@ def _own_tags(works: list[dict[str, Any]], handle: str, shared: Collection[str] 
             if tag not in spelled or re.search("[_-]", written):
                 spelled[tag] = written
     quoted: dict[str, int] = {}
-    taken: list[str] = []
     handle = _plain(handle)  # "yy-dark-raven" is the tag "yydarkraven"
     # The words that add nothing, each without its plural ending: "elf", then "elves".
     nothing = {_single(word) for word in _SAYS_NOTHING}
@@ -362,11 +363,10 @@ def _own_tags(works: list[dict[str, Any]], handle: str, shared: Collection[str] 
             )
             or (handle and (tag in handle or handle in tag))
             or (shared is not None and tag not in shared)
-            or any(tag in other or other in tag for other in taken)
-            or library.holds_contact(" ".join([*quoted, reads]))
+            or any(tag in other or other in tag for other in quoted)
+            or library.holds_contact(" ".join([*quoted, tag]))
         ):
-            taken.append(tag)
-            quoted[reads] = used[tag]
+            quoted[tag] = used[tag]
             nothing |= {_single(tag), *parts}  # nor is this one said again: "dark fantasy", then "dark art"
     return quoted
 
@@ -385,8 +385,8 @@ def facts_of(
     place among the counted works, from 1, and the module's docstring says what share of them makes a fact.
     `mostly` lists the subjects (by the works that show any of them) and the manner that most works have and
     not CLEAR_PERCENT of them, and `hedged` those that hold for part of the works only: neither may be stated
-    flat. `own_words` are the artist's own tags that the site shows as theirs, as it prints them, with their
-    counts in counts["own_words"]: see _own_tags, which `handle` and `shared` are for.
+    flat. `own_words` are the artist's own tags that the site shows as theirs, as the list spells them, with
+    their counts in counts["own_words"]: see _own_tags, which `handle` and `shared` are for.
     """
 
     def explicit(result: dict[str, Any]) -> bool:
@@ -518,6 +518,26 @@ def open_evidence(tagline: str | None, works: list[tuple[str, list[str], str | N
             if kind:
                 found.append({"source": "tag", "says": tag, "kind": kind, "work": work_id, "published_at": published})
     return found[:5]
+
+
+def _evidence(db: pathlib.Path | str | None, now: datetime) -> dict[str, list[dict]]:
+    """open_evidence() for every collected artist, of their own words as they are now: the tagline their latest
+    answer gives (one it gave empty is none, library.answers), when the tagging stage read it as it is and found no
+    private contact in it, since it is quoted; and their own tags on the works that still stand (_FALLEN)."""
+    quotable = {key for key, answer in tagging.contacts(TAGGER, db).items() if answer == "no"}
+    quotable -= {key for key, (emptied, _, _) in library.answers(db).items() if emptied}
+    query = f"SELECT artist_key, deviation_id, tags, published_at FROM works WHERE deviation_id NOT IN ({_FALLEN})"
+    works, taglines = _transact(
+        db,
+        lambda conn: (
+            conn.execute(query + " ORDER BY 1, 2").fetchall(),
+            dict(conn.execute("SELECT artist_key, tagline FROM profiles").fetchall()),
+        ),
+    )
+    own: dict[str, list[tuple[str, list[str], str | None]]] = {}
+    for key, work_id, tags, published in works:
+        own.setdefault(key, []).append((work_id, json.loads(tags), published))
+    return {key: open_evidence(taglines.get(key) if key in quotable else None, mine, now) for key, mine in own.items()}
 
 
 def _open_sentence(evidence: list[dict]) -> str:
@@ -698,7 +718,9 @@ def embedded_text(profile: str, facts: dict[str, Any]) -> str:
     """What an artist's vector is made of: the profile, then every fact by its name, as search filters on it.
 
     The second part does not depend on how the sentence happens to be worded, and has what it leaves out: the
-    artist's own tags, the medium everybody has, and the style words.
+    artist's own tags, the medium everybody has, and the style words. The own tags are facts_of's, so each is on
+    the reviewed list and spelled as the list spells it: a row whose own_words are not is not current, and its
+    vector is not sent.
     """
     names = {"specialties": "Specialties", "own_words": "In the artist's words", "mediums": "Mediums"}
     names |= {"genres": "Genres", "style_words": "Style"}
@@ -735,13 +757,12 @@ def run(
     versions = [TEMPLATE_VERSION, SHEET_VERSION, TAGGER, EMBEDDER]
     result_set = tagging.result_set(TAGGER, TAGGER)
 
-    def read(conn: sqlite3.Connection) -> tuple[list[Any], dict[str, str | None], set[str], dict[str, str]]:
+    def read(conn: sqlite3.Connection) -> tuple[list[Any], set[str], dict[str, str]]:
         return (
             conn.execute(
                 "SELECT artist_key, deviation_id, image_file, tags, published_at, "
                 f"deviation_id IN ({_FALLEN}) FROM works ORDER BY 1, 2"
             ).fetchall(),
-            dict(conn.execute("SELECT artist_key, tagline FROM profiles").fetchall()),
             {
                 work_id
                 for (work_id,) in conn.execute(  # tagged, and from the image the work shows now
@@ -771,9 +792,8 @@ def run(
         listed = _listed(db)
         results, declared = tagging.results(TAGGER, db=db, verifier=TAGGER), tagging.declared_ai(TAGGER, db)
         images = library.image_prints(db)
-        # A tagline is quoted as evidence, so only one that was read and found to hold no private contact is used.
-        quotable = {key for key, answer in tagging.contacts(TAGGER, db).items() if answer == "no"}
-        rows, taglines, tagged, stored = _transact(db, read)
+        said = _evidence(db, now)
+        rows, tagged, stored = _transact(db, read)
         collected: dict[str, list[Any]] = {}
         users: dict[str, set[str]] = {}  # an own tag, as it is compared -> the artists who use it
         for key, *work, fell in rows:
@@ -798,7 +818,7 @@ def run(
                 key.partition(":")[2],  # the handle, which the store keeps as "da:<handle>"
                 shared,
             )
-            evidence = open_evidence(taglines.get(key) if key in quotable else None, own, now)
+            evidence = said.get(key, [])
             basis = hashlib.sha256(json.dumps([versions, facts, evidence], sort_keys=True).encode()).hexdigest()
             # And what the row rests on (see current): the same tags read from another image make another row,
             # because the sheet is of the images.
@@ -868,33 +888,52 @@ def _readings(facts: dict[str, Any]) -> list[Any]:
     return [facts.get("counted", []), facts.get("tagged", {}), *(counts.get(field, {}) for field in fields)]
 
 
-def current(db: pathlib.Path | str | None = None) -> set[str]:
+def current(db: pathlib.Path | str | None = None, now: datetime | None = None) -> set[str]:
     """The artists whose row still rests on what it was made from: each work it counted still stands (_FALLEN)
     and is read as it was then, from the same image and with the same word on AI (tagging.read_as, kept at the
     end of the row's basis), and its verified tags as they stand now, at this prompt version, are the ones the
     row counted (facts_of, counted again over the same works). A work that has fallen counts as one with no
     image, and a work with no verified tags now as one that is not counted.
 
+    A profile rests as well on the version of this stage that made it, and on what the rules and the artist say
+    now: it was made at TEMPLATE_VERSION; each of its own_words is on the reviewed list as it is now, spelled as
+    the list spells it, which is what its vector was made from (embedded_text); and each word of its
+    open_evidence is still what the artist's own words say at `now` (_evidence): a card that says "Open for
+    commissions." beside a tagline that now says closed, or on a tag that has grown older than RECENT_DAYS, does
+    not. A card that claims nothing claims nothing false: when the artist comes to say they are open, it waits
+    for this stage to make it again, and is sent meanwhile.
+
     The others are waiting: for the tagging stage to read again a work whose image or words have changed, or
     every work after a new prompt version, and then, when that reading comes out otherwise, for this stage to
-    make the row again; or for this stage to make it again without the works that fell. Their row stays, so that
-    a reading that comes out the same costs nothing; but it says what nobody has read of the work as it is, and
-    the push stage holds the artist back meanwhile (see profiles).
+    make the row again; or for this stage to make it again without the works that fell, or as it makes rows
+    now. Their row stays, so that a reading that comes out the same costs nothing; but it says what nobody has
+    read of the work as it is, and the push stage holds the artist back meanwhile (see profiles).
     """
     images, declared = library.image_prints(db), tagging.declared_ai(TAGGER, db)
     results = tagging.results(TAGGER, db=db, verifier=TAGGER)
     fallen = {work_id for (work_id,) in _transact(db, lambda conn: conn.execute(_FALLEN).fetchall())}
     images = {work_id: image for work_id, image in images.items() if work_id not in fallen}
-    rows = _transact(db, lambda conn: conn.execute("SELECT artist_key, basis, facts FROM artist_profiles").fetchall())
+    said = _evidence(db, now or datetime.now(UTC))
+    query = "SELECT artist_key, basis, facts, excluded, template_version, open_evidence FROM artist_profiles"
+    rows = _transact(db, lambda conn: conn.execute(query).fetchall())
 
-    def rests(basis: str, facts: dict[str, Any]) -> bool:
+    def rests(
+        key: str, basis: str, facts: dict[str, Any], excluded: str | None, version: int | None, evidence: str
+    ) -> bool:
         counted = facts.get("counted", [])
         works = [{"id": work, "result": results.get(work), "declared": declared.get(work)} for work in counted]
-        return basis.endswith(tagging.read_as(counted, images, declared)) and (
-            _readings(facts) == _readings(facts_of(works)[0])
+        if not basis.endswith(tagging.read_as(counted, images, declared)) or (
+            _readings(facts) != _readings(facts_of(works)[0])
+        ):
+            return False
+        own = facts.get("own_words", [])
+        return excluded is not None or (
+            version == TEMPLATE_VERSION
+            and all(approved(tag) and tag == _compared(tag) for tag in own)
+            and all(item in said.get(key, []) for item in json.loads(evidence))
         )
 
-    return {key for key, basis, facts in rows if rests(basis, json.loads(facts))}
+    return {key for key, basis, facts, *row in rows if rests(key, basis, json.loads(facts), *row)}
 
 
 def profiles(db: pathlib.Path | str | None = None) -> list[dict[str, Any]]:
@@ -947,8 +986,8 @@ def sample(count: int, seed: int, db: pathlib.Path | str | None = None) -> list[
     """A random sample of the profiles for the critic, each with the paths of the artist's cached images.
 
     `images` are the works the facts were counted over; `images_left_out` are the artist's other cached works
-    (flagged or declared AI-made). `own_tags` are the artist's own tags that the site shows as theirs, as it
-    prints them, each with the number of those works that carry it.
+    (flagged or declared AI-made). `own_tags` are the artist's own tags that the site shows as theirs, as the
+    reviewed list spells them, each with the number of those works that carry it.
     The order is a hash of the seed and the artist, as in tagging.sample(). Only profiles that are current, and
     made as this version makes them: the critic holds each against the images as they are now.
     """

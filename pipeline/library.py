@@ -110,6 +110,15 @@ CREATE TABLE IF NOT EXISTS work_images (
     source TEXT NOT NULL,            -- own_file() of the thumbnail the work was stored with when it was fetched
     fingerprint TEXT NOT NULL CHECK (length(fingerprint) = 64)  -- fingerprint() of the cached file's bytes
 ) STRICT;
+-- What an artist's latest stored answer said beside the values kept above (see store_artist): whether it gave the
+-- tagline and the website as texts that show nothing, which a later stage does not publish though what an earlier
+-- answer gave stays kept, and how many works of its gallery page DeviantArt flags mature and nothing here keeps.
+CREATE TABLE IF NOT EXISTS answers (
+    artist_key TEXT PRIMARY KEY,
+    tagline_emptied INTEGER NOT NULL CHECK (tagline_emptied IN (0, 1)),
+    website_emptied INTEGER NOT NULL CHECK (website_emptied IN (0, 1)),
+    mature INTEGER NOT NULL CHECK (mature >= 0)
+) STRICT;
 """
 # The fingerprint of the image a work has now, for a query that names the work's row `w`. NULL, which equals
 # nothing, while the work has no cached image or the one it has is of a file its thumbnail no longer shows. A
@@ -657,6 +666,7 @@ def store_artist(
     works: Iterable[Mapping[str, Any]],
     marks: Mapping[str, str | None] | None = None,
     old_keys: Iterable[str] = (),
+    mature: int = 0,
     db: pathlib.Path | str | None = None,
 ) -> tuple[int, int, int]:
     """Add to what is kept about one artist and bring it up to date, in one transaction. Nothing is deleted, and
@@ -669,6 +679,13 @@ def store_artist(
     these rules themselves refuse today goes, with no mark. The account hash is written once and never
     replaced: whose account a handle is does not change, and the caller turns away an answer that says
     otherwise (see holders).
+
+    What the answer said is written down beside what is kept (see answers). A tagline or a website given as a
+    text that shows nothing is one the artist emptied: it stays kept, against an answer that blanks it by
+    mistake, and it is not published until an answer gives it again. Missing, null or not a text, the field was
+    not answered, which is a bad or partial answer, and what the last answer that said something said stands;
+    so it does for a text the rules here refuse, which marks the artist. `mature` is how many works of the
+    answer's gallery page DeviantArt flags mature and that are not kept: the caller's count.
 
     `works` are keyword arguments for checked_work(). Each is added, or brought up to date with the time, and
     its row names the work's cached image when there is one. For a work that is kept, a title or a tag list
@@ -722,6 +739,14 @@ def store_artist(
             "INSERT OR REPLACE INTO profiles (artist_key, tagline, specialty, level, website, fetched_at, user_hash) "
             "VALUES (?, ?, ?, ?, ?, ?, ?)",
             (key, *said, store._now(), old_hash or account(user_id)),
+        )
+        # Emptied, or given again, as this answer says; as it was when this answer says nothing it can be told by.
+        was = conn.execute("SELECT tagline_emptied, website_emptied FROM answers WHERE artist_key = ?", (key,))
+        answered = zip((tagline, website), (checked[0], checked[3]), was.fetchone() or (0, 0), strict=True)
+        emptied = [1 if isinstance(text, str) and _unsaid(text) else 0 if new else old for text, new, old in answered]
+        conn.execute(
+            "INSERT OR REPLACE INTO answers (artist_key, tagline_emptied, website_emptied, mature) VALUES (?, ?, ?, ?)",
+            (key, *emptied, mature),
         )
         conn.execute("DELETE FROM skipped WHERE artist_key = ?", (key,))
         conn.execute("DELETE FROM artist_marks WHERE artist_key = ? AND same_as IS NULL", (key,))
@@ -879,6 +904,16 @@ def thumb_sizes(db: pathlib.Path | str | None = None) -> dict[str, tuple[int, in
     with _open(db) as conn:
         rows = conn.execute("SELECT deviation_id, width, height FROM work_sizes")
         return {work_id: (width, height) for work_id, width, height in rows}
+
+
+def answers(db: pathlib.Path | str | None = None) -> dict[str, tuple[bool, bool, int]]:
+    """What each artist's latest stored answer said beside what is kept (see store_artist): artist key -> (it
+    emptied the tagline, it emptied the website, how many works of its gallery page DeviantArt flags mature and
+    nothing here keeps). An artist last stored before these were written down is not in it: until their next
+    turn, nothing of theirs counts as emptied and no work of theirs as mature."""
+    with _open(db) as conn:
+        rows = conn.execute("SELECT artist_key, tagline_emptied, website_emptied, mature FROM answers")
+        return {key: (bool(tagline), bool(website), mature) for key, tagline, website, mature in rows}
 
 
 def cached_image(work_id: str, db: pathlib.Path | str | None = None, thumb: object = None) -> bool:

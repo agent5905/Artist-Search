@@ -16,7 +16,9 @@ sweep of cached files that no row refers to.
   - A stored work that is missing from a later answer stays, with the time it was last seen.
   - A stored work, or an artist, that the API shows as no longer qualifying (mature, not a public image,
     account gone, a profile that names a removed site) is marked with the reason and the time. Later stages
-    read the marks (library.work_marks, library.artist_marks) and decide what is published.
+    read the marks (library.work_marks, library.artist_marks) and decide what is published. A work the API
+    flags mature is never stored; how many of the artist's gallery page are is kept as a number, and nothing
+    else of them (library.answers), for the push stage's share of adult works.
   - A removal reaches the artist it names, under every handle of their account, and nobody else. An own site
     that is kept for an artist is written into the store's row too, which is where the removal of a site looks.
     A profile that names a removed site, in a link of any shape, or whose website kept from an earlier answer
@@ -574,6 +576,8 @@ def _collect_artist(
             works=kept,
             marks=marks,
             old_keys=old_keys,
+            # The works of this page DeviantArt flags mature that are not kept: a number, for the adult share.
+            mature=len({work_id for work_id, why in marks.items() if why == _MARKS[MATURE]} - kept_before),
             db=db,
         )
     except sqlite3.IntegrityError:
