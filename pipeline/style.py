@@ -213,7 +213,8 @@ def _vectors(
     model: str, db: pathlib.Path | str | None, artist_key: str | None = None
 ) -> dict[str, dict[str, np.ndarray]]:
     """artist key -> deviation id -> vector, for every work that is still collected and has one of the image it
-    shows now."""
+    shows now. A vector that is not DIMENSIONS finite numbers with a length is none: one zero vector once made
+    every score NaN."""
     query = (
         "SELECT w.artist_key, w.deviation_id, v.vector FROM works w JOIN style_vectors v USING (deviation_id) "
         f"WHERE v.model = ? AND v.vector IS NOT NULL AND {_CURRENT} "
@@ -222,7 +223,9 @@ def _vectors(
     found: dict[str, dict[str, np.ndarray]] = {}
     with _open(db) as conn:
         for key, work_id, blob in conn.execute(query, (model, artist_key)):
-            found.setdefault(key, {})[work_id] = np.frombuffer(blob, dtype=np.float16)
+            numbers = np.frombuffer(blob, dtype=np.float16) if len(blob) == 2 * DIMENSIONS else np.zeros(0)
+            if np.isfinite(length := float(np.linalg.norm(numbers.astype(np.float32)))) and length > 0:
+                found.setdefault(key, {})[work_id] = numbers
     return found
 
 

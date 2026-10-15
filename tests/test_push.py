@@ -17,6 +17,7 @@ import socket
 import sqlite3
 from array import array
 from contextlib import closing
+from datetime import UTC, datetime, timedelta
 from urllib.parse import urlsplit
 
 import httpx
@@ -331,13 +332,18 @@ def artist(
     if profile:  # last, from the readings there are now, as the profile stage makes a row
         vector = array("f", [1.0, *[0.0] * (profiles.DIMENSIONS - 1)]).tobytes()
         texts = (
-            (None,) * 6 if profile == "excluded" else (f"FAKE-TEMPLATE {handle}.", 1, f"FAKE-PROFILE {handle}.", 1, 1)
+            (None,) * 6
+            if profile == "excluded"
+            else (f"FAKE-TEMPLATE {handle}.", profiles.TEMPLATE_VERSION, f"FAKE-PROFILE {handle}.", 1, 1)
         )
         texts = texts if profile == "excluded" else (*texts, vector)
         reason = "nothing_clear" if profile == "excluded" else None
         facts = FACTS | ({"sheet": {"pictures": sheet[0], "unsuitable": sheet[1]}} if sheet else {})
-        # The artist's own tags the site shows as theirs, as the profile stage picks them: the most used first.
-        facts |= {"own_words": [f"zzall{word}", *(work["tags"][0] for work in made)]}
+        # The artist's own tags the site shows as theirs, as the profile stage picks them: the most used first,
+        # of those on the reviewed list as it is (this file's fixture puts the invented ones on it), each as the
+        # list spells it.
+        own = [profiles._compared(tag) for tag in (f"zzall{word}", *(work["tags"][0] for work in made))]
+        facts |= {"own_words": [tag for tag in own if profiles.approved(tag)]}
         # What the profile rests on, as the profile stage keeps it: the works it counted, each as it was read.
         facts |= counted_as(sorted(work["id"] for work in made[: counted or 0]))
         said = {work["id"]: edits.get(n, {}).get("declared", "no") for n, work in enumerate(made)}
@@ -717,11 +723,11 @@ def test_a_title_and_tags_with_a_contact_or_with_no_reading_are_not_sent(fake, r
 
 def test_a_tag_shown_as_the_artists_is_one_the_profile_stage_picked_on_a_work_that_goes(fake):
     """Round 8: the site's chips go through the profile stage's one rule (profiles._own_tags), and are always a
-    tag the artist put on a work that is sent, as they wrote it or with the spaces put in where it is certain."""
+    tag the artist put on a work that is sent, as the reviewed list spells it ("Dungeons_And_Dragons" is "dnd")."""
     works, word = artist(ALPHA, 5, edits={4: {"rating": "suggestive"}}), squashed(ALPHA)
-    picked = ["dungeons and dragons", f"zzown{word}0", f"zzown{word}4", "zzinvented"]
+    picked = ["dnd", f"zzown{word}0", f"zzown{word}4", "zzinvented"]
     with closing(sqlite3.connect(config.LOCAL_DB)) as conn, conn:
-        tags = json.dumps(["Dungeons_And_Dragons", "dnd", "digitalart", f"zzall{word}"])
+        tags = json.dumps(["Dungeons_And_Dragons", "digitalart", f"zzall{word}"])
         conn.execute("UPDATE works SET tags = ? WHERE deviation_id = ?", (tags, works[1]["id"]))
         conn.execute(
             "UPDATE artist_profiles SET facts = ? WHERE artist_key = ?",
@@ -733,13 +739,12 @@ def test_a_tag_shown_as_the_artists_is_one_the_profile_stage_picked_on_a_work_th
 
     row = sent_artists(fake)[ALPHA]
     # not one on a work held back, not one on no work, and not one the rule left out however much it is used
-    assert row["top_tags"] == ["dungeons and dragons", f"zzown{word}0"]
+    assert row["top_tags"] == ["dnd", f"zzown{word}0"]
     with closing(sqlite3.connect(config.LOCAL_DB)) as conn:
         query = "SELECT tags FROM works WHERE deviation_id IN (?, ?, ?, ?)"
         stored = [json.loads(tags) for (tags,) in conn.execute(query, [work["id"] for work in works[:4]])]
-    on_sent = {re.sub(r"[_-]", "", tag.lower()) for tags in stored for tag in tags}
-    assert all(re.sub(r"\s", "", tag) in on_sent for tag in row["top_tags"])
-    assert "dnd" in row["search_text"]  # still searched by
+    assert set(row["top_tags"]) <= {profiles._compared(tag) for tags in stored for tag in tags}
+    assert "dnd" in row["search_text"].split() and "Dungeons_And_Dragons" not in row["search_text"]  # as listed
 
 
 # What a row is.
@@ -1758,40 +1763,67 @@ def test_a_few_removals_made_here_go_through_at_once_with_one_made_through_the_s
     assert sorted(row["slug"] for row in fake.artists.values()) == handles[3:5]
 
 
-def test_many_new_removals_at_once_stop_the_run_and_the_databases_own_list_is_honoured_all_the_same(fake, capsys):
+def test_the_owners_removals_here_go_through_at_once_however_many_with_one_made_through_the_site(fake):
+    """The fourth critic's case: six handles removed here between two pushes (store.mark_removed) tripped the
+    guard, and all six stayed public. A handle of somebody kept here is on the store's list because somebody
+    named it: they go, each with their account, however many."""
+    handles = [f"yy-fake-m{n}" for n in range(10)]
+    for n, handle in enumerate(handles):
+        artist(handle, 4, angle=0.1 * n)
+    push.run(False)
+    fake.sql(push._removed_sql({digest(f"da:{handles[9]}")}))  # through the site
+    for handle in handles[:6]:  # and six here, one at a time
+        store.mark_removed(handle)
+
+    counts = push.run(False)
+
+    assert counts["artists_purged_here"] == 7 and counts["removals_added_to_database"] == 6 * 2 + 1
+    accounts = {library.account(f"FAKE-USER-{handle}") for handle in (*handles[:6], handles[9])}
+    assert set(fake.removed) == {digest(f"da:{handle}") for handle in (*handles[:6], handles[9])} | accounts
+    assert sorted(row["slug"] for row in fake.artists.values()) == handles[6:9]
+    assert library.artist_keys() == [f"da:{handle}" for handle in handles[6:9]]
+
+
+def test_many_hashes_that_name_nobody_kept_here_stop_the_run_and_whom_the_two_lists_name_goes_all_the_same(
+    fake, capsys
+):
     handles = [f"yy-fake-m{n}" for n in range(10)]
     for n, handle in enumerate(handles):
         artist(handle, 4, angle=0.1 * n)
     push.run(False)
     fake.sql(push._removed_sql({digest(f"da:{handles[9]}")}))  # removed through the site
-    for handle in handles[:6]:  # six at once here: six people, and five is a handful
-        store.mark_removed(handle)
+    store.mark_removed(handles[0])  # one here, by name
+    store.import_removed([digest(f"da:yy-fake-nobody-{n}") for n in range(6)])  # and six hashes of nobody here
     capsys.readouterr()
-    there = {digest(f"da:{handles[9]}"), library.account(f"FAKE-USER-{handles[9]}")}
+    named = {digest(f"da:{handles[9]}"), library.account(f"FAKE-USER-{handles[9]}")}
+    named |= {digest(f"da:{handles[0]}"), library.account(f"FAKE-USER-{handles[0]}")}
 
     done = False
     for arguments in (["--dry-run"], [], ["--allow-delete", "5"], ["--dry-run", "--allow-delete", "5"]):
         with pytest.raises(SystemExit) as stopped:
             push.main(arguments)
         said = str(stopped.value.code)
-        assert "bar 6 people" in said and "add 12 key hashes" in said and "purge 6 artists here" in said
+        assert "bar 6 people" in said and "add 6 key hashes" in said and "purge 0 artists here" in said
         assert "--allow-delete 6" in said and "yy-fake" not in said and capsys.readouterr().out == ""
-        # What the database's list asks is done, here and there, from the first run that is not a dry one; none
-        # of the six is, and nothing is built.
+        # What the two lists name is done, here and there, from the first run that is not a dry one; none of the
+        # six hashes goes on the database's list, and nothing is built.
         done = done or "--dry-run" not in arguments
-        assert set(fake.removed) == (there if done else {digest(f"da:{handles[9]}")})
-        assert library.artist_keys() == [f"da:{handle}" for handle in handles[: 9 if done else 10]]
-        assert sorted(row["slug"] for row in fake.artists.values()) == handles[:9] and len(fake.loads) == 1
+        assert set(fake.removed) == (named if done else {digest(f"da:{handles[9]}")})
+        assert library.artist_keys() == [f"da:{handle}" for handle in handles[1 if done else 0 : 9 if done else 10]]
+        assert sorted(row["slug"] for row in fake.artists.values()) == handles[1 if done else 0 : 9]
+        assert len(fake.loads) == 1
 
     push.main(["--allow-delete", "6"])  # they are real: all of it goes through
     counts = json.loads(capsys.readouterr().out)
-    assert counts["removals_added_to_database"] == 12 and counts["artists_purged_here"] == 6
-    assert len(fake.removed) == 14 and sorted(row["slug"] for row in fake.artists.values()) == handles[6:9]
-    assert library.artist_keys() == [f"da:{handle}" for handle in handles[6:9]]
+    assert counts["removals_added_to_database"] == 6 and counts["artists_purged_here"] == 0
+    assert len(fake.removed) == 10 and sorted(row["slug"] for row in fake.artists.values()) == handles[1:9]
 
     store.mark_removed(handles[6])  # one more, as removals come: it goes through whatever a run is told
     push.main(["--allow-delete", "0"])
-    assert len(fake.removed) == 16 and sorted(row["slug"] for row in fake.artists.values()) == handles[7:9]
+    assert len(fake.removed) == 12 and sorted(row["slug"] for row in fake.artists.values()) == [
+        *handles[1:6],
+        *handles[7:9],
+    ]
 
 
 def test_many_hashes_of_nobody_here_are_as_many_people(fake):
@@ -1917,13 +1949,13 @@ def test_a_text_that_fails_the_plain_rule_is_left_out_of_a_row_that_is_sent_and_
     said = {
         "tagline": "FAKE-TAGLINE mail fake.person@example.invalid",
         "own tag": "zzcall5550199",
-        "own word": "zz 555 010 019 942",
+        "own word": "zz555010019942",  # as the reviewed list would spell it; the artist wrote "zz_555_010_019_942"
         "specialty": "zz@yy-fake",
         "style word": "tg://yyfakepainter",
     }
     own_words = [said["own word"], f"zzall{word}", *(work["tags"][0] for work in works)]
     facts = FACTS | {"own_words": own_words, "specialties": ["character", said["specialty"]]}
-    tags = json.dumps([said["own tag"], said["own word"].replace(" ", "_")])
+    tags = json.dumps([said["own tag"], "zz_555_010_019_942"])
     with closing(sqlite3.connect(config.LOCAL_DB)) as conn, conn:  # each read "no contact", or never read at all
         conn.execute("UPDATE profiles SET tagline = ? WHERE artist_key = ?", (said["tagline"], key))
         conn.execute("UPDATE works SET tags = ? WHERE deviation_id = ?", (tags, works[0]["id"]))
@@ -1942,7 +1974,7 @@ def test_a_text_that_fails_the_plain_rule_is_left_out_of_a_row_that_is_sent_and_
     for text in said.values():
         assert text.lower() not in json.dumps(fake.loads[-1]).lower() and text.lower() not in fake.held()
     # Each text once; the specialty twice, a search filter and a search word; and the own word twice, a tag as
-    # the site prints it and as the artist wrote it.
+    # the list spells it and as the artist wrote it.
     assert counts["texts_left_out_for_contact"] == len(said) + 2
 
 
@@ -2053,10 +2085,12 @@ NEW_PICTURE = JPEG + b"FAKE-ANOTHER-PICTURE"
 SIGNED_AGAIN = "?token=" + "eyJhbGciOiJIUzI1NiJ9" + ".FAKE-CLAIMS.FAKE-SIGNATURE"  # a header that names an algorithm
 
 
-def collected_again(handle, made, *, tagline=None, titles=None, tags=None, thumbs=None, images=None):
+def collected_again(handle, made, *, tagline=None, titles=None, tags=None, thumbs=None, images=None, **answer):
     """The collect stage's next turn for an artist of artist()'s: the same works, with what the artist has changed
     since, each by its place in the list. images: the bytes of the file an artist put under a work, which the
-    collector has fetched and says so. Nothing here reads anything: that is the tagging stage's to do."""
+    collector has fetched and says so. `answer`: the rest of what store_artist() is given, as the collector would
+    give it (a website, how many works were flagged mature). Nothing here reads anything: that is the tagging
+    stage's to do."""
     for n, data in (images or {}).items():
         library.save_image(made[n]["id"], "image/jpeg", data)
     assert library.store_artist(
@@ -2065,7 +2099,7 @@ def collected_again(handle, made, *, tagline=None, titles=None, tags=None, thumb
         tagline=tagline if tagline is not None else f"FAKE-TAGLINE {handle}",
         specialty="FAKE-SPECIALTY",
         level="Professional",
-        website=None,
+        **{"website": None} | answer,
         works=[
             {
                 "work_id": work["id"],
@@ -2139,9 +2173,12 @@ def test_a_work_whose_title_or_tags_changed_after_they_were_read_is_held_until_t
     read_again(made[1], made[2])  # read, and found to hold no contact: now they are words that were read
     assert push.run(False)["works_sent"] == 11
     # The tag was read and holds no contact, but it is not on the reviewed list (profiles.approved), so it is
-    # neither shown nor searched by. The title, read the same way, is searched by, and the whole still passes.
+    # neither shown nor searched by. The title, read the same way, is the work's own again; it names two services,
+    # so search_text, read whole by both rules, goes without it and keeps every other title.
     text = sent_artists(fake)[ALPHA]["search_text"]
-    assert title in text and "discord_fakepainter" not in text and not library.holds_contact(text)
+    assert title in [row["title"] for row in fake.loads[-1][1]] and title not in text and "discord" not in text
+    assert all(work["title"] in text for n, work in enumerate(made) if n != 1)
+    assert not library.holds_contact(text) and not library.names_service(text)
 
 
 def test_a_work_whose_image_the_artist_replaced_is_held_until_the_new_image_is_fetched_and_read(fake):
@@ -2474,11 +2511,23 @@ UNSHOWN += ["pregnant", "mpreg", "tickling", "damselindistress", "gagged", "tied
 UNSHOWN += ["bodystocking", "bunnysuit", "croptop", "nylons", "negligee", "yaoi", "yuri", "bara", "booba", "catgirl"]
 
 
+# Taken off the list after the fourth critic of the push stage read it: a platform, selling and merchandise,
+# photography, characters and words whose fan art cannot be told safe by the tag, drugs, a real war, a claim to be
+# official, and companies, which read as a claim to have worked for them.
+OFF_THE_LIST = ["bluesky", "sticker", "stickers", "stickerdesign", "wallart", "handmade", "photography"]
+OFF_THE_LIST += ["portraitphotography", "streetphotography", "pomni", "tadc", "amyrose", "bonniethebunny", "kitten"]
+OFF_THE_LIST += ["plush", "psychedelic", "worldwar2", "ww2", "magicalgirl", "officialart", "ww1", "alternatehistory"]
+OFF_THE_LIST += ["photomanipulation", "bokeh", "toy", "pony", "princesspeach", "sailormoon", "winxclub", "promoart"]
+OFF_THE_LIST += ["actionfigure", "actionfigures", "blizzardentertainment", "capcom", "dreamworks", "fromsoftware"]
+OFF_THE_LIST += ["gamefreak", "gamesworkshop", "hasbro", "konami", "mattel", "nasa", "paizo", "riotgames"]
+OFF_THE_LIST += ["squareenix", "ubisoft", "valve", "wizardsofthecoast"]
+
+
 def test_the_reviewed_list_is_one_plain_tag_a_line_sorted_and_holds_none_of_these():
     lines = pathlib.Path(profiles.__file__).with_name("approved_tags.txt").read_text(encoding="utf-8").split("\n")
     assert lines[-1] == "" and lines[:-1] == sorted(set(lines[:-1])) and set(lines[:-1]) == profiles.APPROVED
     assert all(tag == profiles._compared(tag) and re.fullmatch("[a-z0-9]+", tag) for tag in profiles.APPROVED)
-    assert not {profiles._compared(tag) for tag in UNSHOWN} & profiles.APPROVED
+    assert not {profiles._compared(tag) for tag in [*UNSHOWN, *OFF_THE_LIST]} & profiles.APPROVED
 
 
 def test_only_a_tag_on_the_reviewed_list_is_shown_as_the_artists(fake):
@@ -2492,13 +2541,23 @@ def test_only_a_tag_on_the_reviewed_list_is_shown_as_the_artists(fake):
     tags = {n: [*UNSHOWN, "Knight", "character_design", work["tags"][1]] for n, work in enumerate(made)}
     collected_again(ALPHA, made, tags=tags)
     read_again(*made)
-    with closing(sqlite3.connect(config.LOCAL_DB)) as conn, conn:
-        own = json.dumps(FACTS | {"own_words": [*UNSHOWN, "knight", "character design"]})
-        conn.execute("UPDATE artist_profiles SET facts = ? WHERE artist_key = ?", (own, f"da:{ALPHA}"))
+    # A row made before the list, or before a tag was taken off it, or with the artist's spacing: its vector was
+    # made from those words too (profiles.embedded_text), so the whole card waits to be made again.
+    for words in ([*UNSHOWN, "knight", "characterdesign"], ["knight", "character design"]):
+        own_words(ALPHA, words)
+        assert push.run(False)["artists_held_profile_out_of_date"] == 1 and sent_artists(fake) == {}
+    own_words(ALPHA, ["knight", "characterdesign"])
 
     push.run(False)
 
-    assert sent_artists(fake)[ALPHA]["top_tags"] == ["knight", "character design"]
+    assert sent_artists(fake)[ALPHA]["top_tags"] == ["knight", "characterdesign"]
+
+
+def own_words(handle, words):
+    """The profile stage's row for the artist says these are the tags the site shows as theirs."""
+    with closing(sqlite3.connect(config.LOCAL_DB)) as conn, conn:
+        facts = json.dumps(FACTS | {"own_words": words})
+        conn.execute("UPDATE artist_profiles SET facts = ? WHERE artist_key = ?", (facts, store.artist_key(handle)))
 
 
 def renamed_into(handles):
@@ -2515,7 +2574,7 @@ def renamed_into(handles):
 def test_one_removal_that_reaches_many_artists_through_what_is_kept_here_stops_the_run(fake, where):
     """The critic's: one removal through the site, and rename links that a corrupt table made, deleted twelve
     artists there and put 23 hashes on the list for good. What a removal reaches through what is kept here counts
-    against the guard, wherever the removal was made; whom the database's list names is removed all the same."""
+    against the guard, wherever the removal was made; whom the two lists name is removed all the same."""
     handles = [f"yy-fake-c{n:02d}" for n in range(12)]
     for n, handle in enumerate(handles):
         artist(handle, 4, angle=0.1 * n)
@@ -2525,17 +2584,15 @@ def test_one_removal_that_reaches_many_artists_through_what_is_kept_here_stops_t
         fake.sql(push._removed_sql({digest(f"da:{handles[0]}")}))
     else:
         store.mark_removed(handles[0])
-    listed = set(fake.removed)
 
-    with pytest.raises(push.Stop, match=f"bar {11 if where == 'through_the_site' else 12} people beyond"):
+    with pytest.raises(push.Stop, match="bar 11 people beyond"):
         push.run(False)
 
-    removed = 1 if where == "through_the_site" else 0
-    assert sorted(row["slug"] for row in fake.artists.values()) == handles[removed:]
-    assert library.artist_keys() == [f"da:{handle}" for handle in handles[removed:]]
-    assert set(fake.removed) - listed == ({library.account(f"FAKE-USER-{handles[0]}")} if removed else set())
-    if removed:  # the purge took the links with the artist they named, and the next run goes as runs do
-        assert push.run(False)["artists_sent"] == 11 and len(fake.removed) == 2
+    assert sorted(row["slug"] for row in fake.artists.values()) == handles[1:]
+    assert library.artist_keys() == [f"da:{handle}" for handle in handles[1:]]
+    assert set(fake.removed) == {digest(f"da:{handles[0]}"), library.account(f"FAKE-USER-{handles[0]}")}
+    # the purge took the links with the artist they named, and the next run goes as runs do
+    assert push.run(False)["artists_sent"] == 11 and len(fake.removed) == 2
 
 
 def test_one_person_under_three_handles_is_removed_at_once_however_far_apart_the_links_are(fake):
@@ -2618,7 +2675,7 @@ def test_a_card_counted_from_tag_readings_that_no_longer_stand_waits_for_one_cou
 def test_search_text_passes_the_plain_rule_as_a_whole_and_gives_up_digits_before_words(fake):
     """The critic's: two titles that each hold no contact are a number to call side by side."""
     made = artist(ALPHA, 6)
-    titles = {0: "Call or WhatsApp", 1: "5550199", 2: "FAKE-TITLE page 12", 3: "FAKE-TITLE 2024 study"}
+    titles = {0: "Call anytime", 1: "5550199", 2: "FAKE-TITLE page 12", 3: "FAKE-TITLE 2024 study"}
     collected_again(ALPHA, made, titles=titles)
     read_again(*made)
 
@@ -2647,22 +2704,19 @@ def test_search_text_is_cut_to_what_the_database_takes(fake):
     assert len(push._search_text(["x" * 30] * 200)) == 30 * 129 + 128
 
 
-def test_a_tag_that_prints_longer_than_the_database_takes_is_not_shown(fake):
-    """A tag is 60 characters at most as the artist wrote it (library._tags), and longer once the profile stage
-    has put spaces in it. The database takes 60 a tag, and a longer one fails the whole load (FakeDb does too)."""
+def test_a_tag_is_shown_as_the_list_spells_it_which_is_never_longer_than_the_database_takes(fake):
+    """A tag is 60 characters at most as the artist wrote it (library._tags). Printed with spaces put in it, it
+    was longer than the 60 the database takes a tag, and a longer one fails the whole load (FakeDb does too). As
+    the reviewed list spells it, it is never longer than the artist wrote it."""
     made = artist(ALPHA, 5)
-    written = "zzlong" + "xx" * 27
-    printed = "zzlong " + " ".join(["xx"] * 27)
-    assert len(written) == 60 < len(printed)
+    written = "zz_long_" + "x" * 52
     collected_again(ALPHA, made, tags={n: [written, work["tags"][1]] for n, work in enumerate(made)})
     read_again(*made)
-    with closing(sqlite3.connect(config.LOCAL_DB)) as conn, conn:
-        own = json.dumps(FACTS | {"own_words": [printed, made[0]["tags"][1]]})
-        conn.execute("UPDATE artist_profiles SET facts = ? WHERE artist_key = ?", (own, f"da:{ALPHA}"))
+    own_words(ALPHA, [profiles._compared(written), made[0]["tags"][1]])
 
     push.run(False)
 
-    assert sent_artists(fake)[ALPHA]["top_tags"] == [made[0]["tags"][1]]
+    assert sent_artists(fake)[ALPHA]["top_tags"] == ["zzlong" + "x" * 52, made[0]["tags"][1]] and len(written) == 60
 
 
 def test_a_neighbour_with_a_score_that_is_no_number_is_not_sent(fake, monkeypatch):
@@ -2720,3 +2774,184 @@ def test_a_replaced_pictures_size_is_not_sent_with_the_new_picture(fake):
 
     first = fake.loads[-1][1][0]
     assert (first["image_url"], first["width"], first["height"]) == (ANOTHER, None, None)
+
+
+# The fourth critic of the push stage.
+
+
+def test_a_card_made_by_an_older_version_of_the_profile_stage_is_held_back_with_its_vector(fake):
+    """Its biggest gap: 490 artists went with a vector made from "In the artist's words: ..." naming tags the
+    list refuses, and search by meaning reads the vectors. A card is current only as this version makes them, and
+    with own words the list takes as it spells them (test_only_a_tag_on_the_reviewed_list_is_shown_as_the_artists);
+    the profile stage makes every card again when TEMPLATE_VERSION changes, as it has for this."""
+    artist(ALPHA)
+    artist(BRAVO, angle=0.3)
+    with closing(sqlite3.connect(config.LOCAL_DB)) as conn, conn:
+        older = (profiles.TEMPLATE_VERSION - 1, f"da:{ALPHA}")
+        conn.execute("UPDATE artist_profiles SET template_version = ? WHERE artist_key = ?", older)
+
+    counts = push.run(False)
+
+    assert counts["artists_held_profile_out_of_date"] == 1 and list(sent_artists(fake)) == [BRAVO]
+    assert squashed(ALPHA) not in fake.sent()
+
+
+def set_evidence(handle, evidence, written=None):
+    """The profile stage's row for the artist quotes this evidence that they take work, and says so in `written`."""
+    with closing(sqlite3.connect(config.LOCAL_DB)) as conn, conn:
+        conn.execute(
+            "UPDATE artist_profiles SET open_evidence = ?, written = coalesce(?, written) WHERE artist_key = ?",
+            (json.dumps(evidence), written, store.artist_key(handle)),
+        )
+
+
+def test_a_card_says_open_for_work_only_while_the_artists_own_words_still_say_so(fake):
+    """The tagline quoted as evidence came to say "Commissions CLOSED", and the card went on with "Open for
+    commissions." and open_for_work beside it. The claim rests on the artist's words as they are now: the tagline
+    their latest answer gives, once it is read, and their own tags on works of the last RECENT_DAYS."""
+    made = artist(ALPHA)
+    artist(BRAVO, angle=0.3)
+    collected_again(ALPHA, made, tagline="Commissions open")
+    read_again(handle=ALPHA)
+    said = profiles.open_evidence("Commissions open", [], datetime.now(UTC))
+    set_evidence(ALPHA, said, f"FAKE-PROFILE {ALPHA}. Open for commissions.")
+    push.run(False)
+    assert sent_artists(fake)[ALPHA]["open_for_work"] is True
+
+    for read in (False, True):  # the new tagline not read yet, and read: either way the old one stands no more
+        collected_again(ALPHA, made, tagline="Commissions CLOSED, not taking any")
+        if read:
+            read_again(handle=ALPHA)
+        assert push.run(False)["artists_held_profile_out_of_date"] == 1 and list(sent_artists(fake)) == [BRAVO]
+    collected_again(ALPHA, made, tagline="Commissions open")  # as it was: the claim stands again
+    read_again(handle=ALPHA)
+    assert push.run(False)["artists_sent"] == 2 and sent_artists(fake)[ALPHA]["open_for_work"] is True
+    collected_again(ALPHA, made, tagline="")  # emptied: kept here, and no longer the artist's word
+    assert push.run(False)["artists_held_profile_out_of_date"] == 1
+
+    # A tag on a work says so for RECENT_DAYS after the work was published, and no longer.
+    collected_again(ALPHA, made, tags={0: ["commissionsopen", made[0]["tags"][1]]})
+    read_again(*made)
+    published = datetime.fromtimestamp(PUBLISHED, UTC)
+    work = (made[0]["id"], ["commissionsopen"], published.isoformat(timespec="seconds"))
+    set_evidence(ALPHA, profiles.open_evidence(None, [work], published))
+    assert f"da:{ALPHA}" in profiles.current(now=published + timedelta(days=profiles.RECENT_DAYS - 1))
+    assert f"da:{ALPHA}" not in profiles.current(now=published + timedelta(days=profiles.RECENT_DAYS + 1))
+
+
+def test_a_tagline_and_a_website_the_artists_latest_answer_empties_are_not_sent_though_they_stay_kept(fake):
+    """The artist emptied both on DeviantArt; the collect stage, which replaces nothing kept by nothing, kept them,
+    and this stage sent them on. What is sent is what the latest answer that said something says: a field it
+    gives as a text that shows nothing is not sent, and an answer that does not give the field changes nothing."""
+    site = "https://yy-fake-alpha.art/"
+    made = artist(ALPHA, website=site)
+    push.run(False)
+    row = sent_artists(fake)[ALPHA]
+    assert (row["site_url"], row["site_domain"], row["tagline"]) == (site, "yy-fake-alpha.art", f"FAKE-TAGLINE {ALPHA}")
+
+    for answer in ({"tagline": "", "website": ""}, {"tagline": 7}):  # emptied; then an answer without either
+        collected_again(ALPHA, made, **answer)
+        push.run(False)
+        row = sent_artists(fake)[ALPHA]
+        assert (row["site_url"], row["site_domain"], row["tagline"]) == (None, None, None)
+        assert "fake-tagline" not in fake.held() and "yy-fake-alpha.art" not in fake.held()
+        # Kept all the same: an answer that blanks a field by mistake loses nothing.
+        assert library.website(f"da:{ALPHA}") == site
+
+    collected_again(ALPHA, made, website=site)  # given again
+    push.run(False)
+    row = sent_artists(fake)[ALPHA]
+    assert (row["site_url"], row["tagline"]) == (site, f"FAKE-TAGLINE {ALPHA}")
+
+    # Emptied or not, a removed site the kept website is on holds the artist back, as the collect stage does.
+    other = artist(BRAVO, angle=0.3, website=f"https://{BRAVO}.art/", links=[])  # a site only the library knows
+    collected_again(BRAVO, other, website="")
+    store.mark_removed(f"{BRAVO}.art")
+    assert push.run(False)["artists_held_site_removed"] == 1 and list(sent_artists(fake)) == [ALPHA]
+
+
+def test_works_deviantart_flags_mature_count_towards_an_adult_portfolio_though_none_of_them_is_kept(fake):
+    """20 works flagged mature and 4 safe among the newest 24 passed the adult check: the collect stage keeps none
+    of the 20. It keeps how many there were (library.answers), and the share counts them. A store collected before
+    it kept the number counts none until the artist's next turn."""
+    made = artist(ALPHA, 4)
+    artist(BRAVO, angle=0.3)
+    for mature, sent in ((20, False), (2, False), (1, True), (0, True)):  # 2 in 6 is a third; 1 in 5 a fifth
+        collected_again(ALPHA, made, mature=mature)
+        counts = push.run(False)
+        assert (ALPHA in sent_artists(fake)) is sent and counts["artists_held_adult_portfolio"] == (not sent)
+    collected_again(ALPHA, made, mature=20)
+    with closing(sqlite3.connect(config.LOCAL_DB)) as conn, conn:
+        conn.execute("DELETE FROM answers")  # as a store collected before the count
+    assert push.run(False)["artists_held_adult_portfolio"] == 0 and ALPHA in sent_artists(fake)
+
+
+def test_a_listed_tag_in_the_artists_own_spacing_is_shown_and_searched_as_the_list_spells_it(fake):
+    """The listed "titan" written once as "tit_an" was shown as "tit an" and searched as "tit_an", which Postgres
+    reads as the word "tit"; and so for jap, coon and heroin."""
+    made = artist(ALPHA, 6)
+    written = ["tit_an", "Jap-Anese", "rac_coon", "heroin_e"]
+    tags = {n: [*written, work["tags"][1]] for n, work in enumerate(made)}
+    collected_again(ALPHA, made, tags=tags)
+    read_again(*made)
+    own_words(ALPHA, list(profiles._own_tags([{"tags": tags[n]} for n in tags], ALPHA, None)))  # as the stage picks
+
+    push.run(False)
+
+    row = sent_artists(fake)[ALPHA]
+    assert row["top_tags"] == ["titan", "japanese", "raccoon", "heroine"]
+    searched = set(re.split(r"[\W_]+", row["search_text"].lower()))
+    assert {"titan", "japanese", "raccoon", "heroine"} <= searched and not {"tit", "jap", "coon", "heroin"} & searched
+
+
+@pytest.mark.parametrize(
+    "unusable",
+    [bytes(2 * style.DIMENSIONS), np.full(style.DIMENSIONS, np.nan, np.float16).tobytes(), b"\x00\x3c" * 7],
+    ids=["zero", "nan", "short"],
+)
+def test_a_work_whose_style_vector_is_unusable_is_left_out_of_the_ranking_and_holds_up_nothing(fake, unusable):
+    """One zero vector made all 56 neighbour scores NaN, and every push stopped until it was fixed."""
+    handles = [ALPHA, BRAVO, CHARLIE, DELTA]
+    made = {handle: artist(handle, 5, angle=0.2 * n) for n, handle in enumerate(handles)}
+    push.run(False)
+    with closing(sqlite3.connect(config.LOCAL_DB)) as conn, conn:
+        conn.execute("UPDATE style_vectors SET vector = ? WHERE deviation_id = ?", (unusable, made[BRAVO][0]["id"]))
+
+    counts = push.run(False)
+
+    rows = [row for row in fake.loads[-1][2] if row["neighbor_slug"]]
+    assert counts["neighbours_sent"] == len(rows) == 12 and all(math.isfinite(row["score"]) for row in rows)
+    assert all(0 not in (row["picks"] or []) for row in rows if row["neighbor_slug"] == BRAVO)
+
+
+def test_search_text_read_whole_names_no_service_and_loses_only_what_made_it_name_one(fake):
+    """Two titles, "Telegram" and "fakepainter", each read alone as no contact, were "Telegram fakepainter" in
+    search_text: read whole by the plain rule only, and never for the name of a service."""
+    made = artist(ALPHA, 6)
+    collected_again(ALPHA, made, titles={0: "Telegram", 1: "fakepainter"})
+    read_again(*made)
+
+    push.run(False)
+
+    text = sent_artists(fake)[ALPHA]["search_text"]
+    assert not library.names_service(text) and not library.holds_contact(text)
+    assert "Telegram" not in text and "fakepainter" in text.split()
+    assert all(work["title"] in text for work in made[2:])
+    # A name set apart across two parts, and an address across three: what made it goes, and nothing else.
+    assert push._search_text(["FAKE words", "tele", "gram", "more"]) == "FAKE words tele more"
+    assert push._search_text(["dragon", "fakepainter", "dot", "com"]) == "dragon fakepainter dot"
+
+
+def test_search_text_gives_up_digits_from_nine_of_them_side_by_side(fake):
+    """The plain rule reads nine digits as a number (library.holds_contact): four in one title and five in another
+    are nine in search_text, and eight at most are kept."""
+    made = artist(ALPHA, 6)
+    titles = {n: "FAKE-TITLE sketch" for n in range(6)} | {0: "FAKE-TITLE 1234", 1: "FAKE-TITLE 56789"}
+    collected_again(ALPHA, made, titles=titles, tags={n: [work["tags"][1]] for n, work in enumerate(made)})
+    read_again(*made)
+
+    push.run(False)
+
+    text = sent_artists(fake)[ALPHA]["search_text"]
+    assert "1234" in text and "56789" not in text and sum(map(str.isdigit, text)) == 4
+    assert library.holds_contact("FAKE-TITLE 1234 FAKE-TITLE 56789")

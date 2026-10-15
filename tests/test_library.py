@@ -396,6 +396,25 @@ def test_storing_a_profile_twice_keeps_one_row_and_brings_up_to_date_what_was_sa
     assert library.website(BRAVO) is None and library.website("da:zz-fake-nobody") is None
 
 
+def test_a_field_the_artist_emptied_stays_kept_and_is_written_down_and_one_not_answered_changes_nothing():
+    """The fourth critic of the push stage: an artist who emptied their tagline and website was still shown with
+    them. What is kept stays, against an answer that blanks a field by mistake, and the answer is written down
+    beside it (library.answers): the push stage sends what the latest answer that said something says."""
+    profile(tagline="FAKE-TAGLINE-OLD", website="https://zz-fake-alpha.art")
+    kept = ("FAKE-TAGLINE-OLD", "https://zz-fake-alpha.art/")
+    assert library.answers() == {ALPHA: (False, False, 0)}
+    for empty in ("", "  \n", ZWSP, "<br>"):  # a text that shows nothing: the artist emptied the field
+        stored = profile(tagline=empty, website=empty, mature=3)
+        assert (stored["tagline"], stored["website"]) == kept and library.answers() == {ALPHA: (True, True, 3)}
+    for nothing in (None, 7, ["FAKE"], b"FAKE", "FAKE see zz-fake-alpha.art"):  # not answered, or refused
+        stored = profile(tagline=nothing, website=nothing)
+        assert (stored["tagline"], stored["website"]) == kept and library.answers() == {ALPHA: (True, True, 0)}
+    profile(tagline="FAKE-TAGLINE-NEW")  # given again: it is theirs again
+    assert library.answers() == {ALPHA: (False, True, 0)}
+    with pytest.raises(sqlite3.IntegrityError):  # a count is a number of works, and nothing else
+        profile(mature=-1)
+
+
 def test_a_kept_value_that_todays_rules_refuse_goes_and_nobody_is_marked_for_it():
     """Round 8, and counted in the real store: 62 websites and 4 taglines kept on 2026-10-12 under an earlier,
     looser rule, which today's rule refuses. Answered again as they are, each would be an answer refused over a
@@ -538,7 +557,8 @@ def test_an_artist_is_written_with_one_commit(monkeypatch):
         "BEGIN",
         "COMMIT",
     ]
-    assert len([statement for statement in statements if statement.startswith("INSERT")]) == 11
+    # the profile, what the answer said beside it (library.answers), and the ten works
+    assert len([statement for statement in statements if statement.startswith("INSERT")]) == 12
     assert len(rows("works")) == 10
 
 
@@ -734,7 +754,7 @@ def test_an_embedded_image_of_any_size_never_reaches_a_text_column():
         assert (rows("works")[0]["title"], rows("works")[0]["tags"]) == (None, '["faketag"]')
         assert b"FAKEBASE64" not in database_bytes() and b"base64" not in database_bytes()
     assert work(title=CHUNKED)["title"] is None
-    assert config.LOCAL_DB.stat().st_size < 100_000  # the empty tables and their indexes are about half of that
+    assert config.LOCAL_DB.stat().st_size < 120_000  # the empty tables and their indexes are most of that
 
 
 @pytest.mark.parametrize(

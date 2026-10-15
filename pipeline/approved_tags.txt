@@ -27,8 +27,6 @@ abstractdigital
 acrylic
 acrylicpainting
 action
-actionfigure
-actionfigures
 adventure
 adventurer
 adventures
@@ -57,12 +55,10 @@ alienworld
 alley
 alligator
 allosaurus
-alternatehistory
 alternateuniverse
 alucard
 amphibian
 amusementpark
-amyrose
 anakinskywalker
 ancient
 ancientegypt
@@ -218,20 +214,16 @@ blade
 bladerunner
 bleach
 blizzard
-blizzardentertainment
 bloodborne
-bluesky
 bnha
 boar
 boardgame
 boardgameart
 boardgames
 boat
-bokeh
 bokunoheroacademia
 bone
 bones
-bonniethebunny
 bookart
 bookcharacter
 bookcover
@@ -269,7 +261,6 @@ candy
 canine
 cannon
 canyon
-capcom
 captain
 car
 card
@@ -538,7 +529,6 @@ dragons
 dramaticlighting
 drawingsketch
 dreamscape
-dreamworks
 droid
 drone
 drow
@@ -684,7 +674,6 @@ freddyfazbear
 frieren
 frierenbeyondjourneysend
 frog
-fromsoftware
 fruit
 fullcolor
 fungi
@@ -702,11 +691,9 @@ gameasset
 gameassets
 gamecharacter
 gamefanart
-gamefreak
 gameofthrones
 gamera
 gameready
-gamesworkshop
 gandalf
 garden
 gargoyle
@@ -768,11 +755,9 @@ halloween
 halo
 hammer
 handdrawn
-handmade
 handpainted
 hardsurface
 harrypotter
-hasbro
 haunted
 headshot
 hearthstone
@@ -872,13 +857,11 @@ kingdomhearts
 kingkong
 kirby
 kitchen
-kitten
 knife
 knight
 knights
 knightwarrior
 kobold
-konami
 korean
 kraken
 krampus
@@ -929,7 +912,6 @@ mage
 magic
 magical
 magicalart
-magicalgirl
 magician
 mandalorian
 manga
@@ -955,7 +937,6 @@ mask
 masked
 masseffect
 mastersoftheuniverse
-mattel
 mattepaint
 mattepainting
 mcu
@@ -1039,7 +1020,6 @@ mythological
 mythologicalcreature
 mythology
 naruto
-nasa
 naturalhistory
 naturallight
 nature
@@ -1068,7 +1048,6 @@ ocean
 ocsoriginalcharacter
 octopus
 office
-officialart
 ogre
 oilpainting
 oni
@@ -1088,7 +1067,6 @@ owl
 owncharacter
 painterly
 paintingportrait
-paizo
 palace
 paladin
 paleoart
@@ -1113,8 +1091,6 @@ perspective
 phoenix
 photobash
 photobashing
-photography
-photomanipulation
 photorealism
 photorealistic
 photostudy
@@ -1136,14 +1112,11 @@ plant
 plants
 playstation
 pleinair
-plush
 pocketmonsters
 pokemon
 pokemonfanart
 pokemontrainer
 police
-pomni
-pony
 popart
 poppyplaytime
 portal
@@ -1151,7 +1124,6 @@ portrait
 portraitart
 portraitdrawing
 portraitpainting
-portraitphotography
 postapocalypse
 postapocalyptic
 poster
@@ -1167,15 +1139,12 @@ priest
 priestess
 prince
 princess
-princesspeach
 process
 productionart
-promoart
 prop
 propdesign
 props
 protagonist
-psychedelic
 pterosaur
 pulp
 pumpkin
@@ -1217,7 +1186,6 @@ revolver
 rifle
 rifleconcept
 rifledesign
-riotgames
 river
 road
 roblox
@@ -1237,7 +1205,6 @@ rpgcharacter
 rpggame
 ruins
 rwby
-sailormoon
 sakura
 samurai
 sand
@@ -1335,7 +1302,6 @@ spring
 sprite
 spy
 spyro
-squareenix
 staff
 star
 starcraft
@@ -1349,9 +1315,6 @@ starwars
 statue
 steampunk
 stevenuniverse
-sticker
-stickerdesign
-stickers
 stilllife
 stone
 storm
@@ -1361,7 +1324,6 @@ storyboards
 storybook
 street
 streetfighter
-streetphotography
 studies
 studioghibli
 study
@@ -1399,7 +1361,6 @@ tabletop
 tabletopgame
 tabletopgaming
 tactical
-tadc
 tank
 targaryen
 tarot
@@ -1433,7 +1394,6 @@ tokusatsu
 topdown
 tower
 town
-toy
 tradingcard
 traditional
 traditionalart
@@ -1453,7 +1413,6 @@ turnaround
 turtle
 tutorial
 tyrannosaurusrex
-ubisoft
 ufo
 ui
 undead
@@ -1465,7 +1424,6 @@ unsc
 urban
 urbanfantasy
 valorant
-valve
 vampire
 vector
 vectorart
@@ -1488,7 +1446,6 @@ visualstorytelling
 vocaloid
 volcano
 vr
-wallart
 wallpaper
 war
 warcraft
@@ -1526,12 +1483,10 @@ wildwest
 wingsoffire
 winter
 winterlandscape
-winxclub
 witch
 witcher
 witchy
 wizard
-wizardsofthecoast
 wof
 wolf
 wolfart
@@ -1544,12 +1499,9 @@ woodsforest
 workshop
 worldbuilding
 worldofwarcraft
-worldwar2
 wowcharacter
 wraith
 wutheringwaves
-ww1
-ww2
 wyvern
 xbox
 xenobiology
