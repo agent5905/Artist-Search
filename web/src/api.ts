@@ -1,5 +1,6 @@
-// Everything the pages ask for. Search goes through the Pages Function (it needs an embedding);
-// the rest are public database functions, called with the publishable key.
+// Everything the pages ask for. Search and removal go through the Pages Functions (functions/api/), which count
+// each visitor and call the database with a key of their own; a profile and its similar artists are public
+// database functions, called with the publishable key.
 import { rpc, twice } from './rpc'
 
 /**
@@ -39,10 +40,10 @@ function once<T>(key: string, load: () => Promise<T>): Promise<T> {
   return kept.get(key) as Promise<T>
 }
 
-/** The search's limit per visitor was reached (functions/api/search.ts): it lifts by itself after `seconds`. */
+/** A limit per visitor, or the day's, was reached (functions/api/): it lifts by itself after `seconds`. */
 export class Busy extends Error {
   constructor(readonly seconds: number) {
-    super('too many searches')
+    super('asked to wait')
   }
 }
 
@@ -62,7 +63,21 @@ export const getArtist = (slug: string) =>
 
 export const similarArtists = (slug: string) => once(`similar ${slug}`, () => call<Artist[]>('similar_artists', { p_slug: slug }))
 
-export const removalCode = (slug: string) => once(`code ${slug}`, () => call<string>('start_removal_proof', { p_slug: slug }))
+/** One POST to /api/removal (functions/api/removal.ts). Not asked again by itself: each one counts. */
+async function removal<T>(body: object): Promise<T> {
+  const response = await fetch('/api/removal', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(body),
+    signal: AbortSignal.timeout(20_000),
+  })
+  if (response.status === 429) throw new Busy(Number(response.headers.get('retry-after')) || 60)
+  if (!response.ok) throw new Error(`removal answered ${response.status}`)
+  return (await response.json()) as T
+}
 
-export const requestRemoval = (slug: string, note: string) =>
-  call<boolean>('request_removal', { p_slug: slug, p_note: note.trim() || null })
+/** The artist's code. Asking for it files their request, and from then on the code is looked for. */
+export const removalCode = (slug: string) =>
+  once(`code ${slug}`, async () => (await removal<{ code: string }>({ slug, proof: true })).code)
+
+export const requestRemoval = (slug: string, note: string) => removal<{ ok: boolean }>({ slug, note: note.trim() || null })

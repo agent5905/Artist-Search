@@ -4,7 +4,8 @@
 //   node scripts/dev.mjs --built   wrangler alone serves ./dist and the function on :8788, as Pages would
 //
 // Reads the repo's .env in memory and hands each process only what it needs:
-//   * web/.dev.vars (git-ignored) gets the two browser-safe values, for the function;
+//   * web/.dev.vars (git-ignored) gets what the functions read: the database's address and the site's own
+//     server key (SUPABASE_SERVER_KEY), which never reaches the pages;
 //   * wrangler gets the Cloudflare account id and token in its environment, for the real Workers AI binding;
 //   * Vite reads .env itself (envDir) and puts only VITE_ names in the bundle.
 import { spawn } from 'node:child_process'
@@ -14,7 +15,7 @@ import { parseEnv } from 'node:util'
 const web = new URL('../', import.meta.url)
 const env = parseEnv(readFileSync(new URL('../.env', web), 'utf8'))
 
-const forFunction = ['VITE_SUPABASE_URL', 'VITE_SUPABASE_PUBLISHABLE_KEY']
+const forFunction = ['VITE_SUPABASE_URL', 'SUPABASE_SERVER_KEY']
 writeFileSync(new URL('.dev.vars', web), forFunction.map((name) => `${name}=${JSON.stringify(env[name] ?? '')}\n`).join(''))
 mkdirSync(new URL('dist', web), { recursive: true }) // wrangler wants the directory even when Vite serves the pages
 

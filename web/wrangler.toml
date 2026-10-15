@@ -8,8 +8,9 @@ compatibility_date = "2026-10-01"
 binding = "AI"
 remote = true # there is no local Workers AI: local runs call the real one too
 
-# The search's limit per visitor counts in the Cache API (functions/api/search.ts), which needs no binding and no
-# setting. A Pages project cannot hold a rate limiting binding: wrangler refuses `ratelimits` here.
+# The limits per visitor are counted in the database (client_wait in sql/003_limits.sql), so nothing is set here.
 
-# The function also reads VITE_SUPABASE_URL and VITE_SUPABASE_PUBLISHABLE_KEY, the two browser-safe
-# values: from .dev.vars locally (scripts/dev.mjs writes it), from the Pages project's settings when hosted.
+# The functions also read VITE_SUPABASE_URL, and SUPABASE_SERVER_KEY: a Supabase secret key made for the site
+# alone. Locally both come from .dev.vars (scripts/dev.mjs writes it). Hosted, the address is a variable of the
+# Pages project and the key one of its secrets, which the owner sets and nothing here holds:
+#   npx wrangler pages secret put SUPABASE_SERVER_KEY --project-name artist-search

@@ -1147,31 +1147,6 @@ code {
   user-select: all;
 }
 
-.radios {
-  display: flex;
-  flex: 1 1 100%;
-  flex-wrap: wrap;
-  gap: 6px;
-}
-
-/* A choice, not a button: a ring that fills, so it cannot be mistaken for the send button beside it. */
-.radios .chip::before {
-  content: '';
-  width: 14px;
-  height: 14px;
-  border: 1.5px solid var(--ink-3);
-  border-radius: 50%;
-}
-
-.radios .chip:has(input:checked) {
-  background: var(--chip);
-  color: var(--ink);
-}
-
-.radios .chip:has(input:checked)::before {
-  border: 4.5px solid var(--ink);
-}
-
 .inline-form > input,
 .stack-form textarea {
   flex: 1 1 220px;

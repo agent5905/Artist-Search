@@ -1,5 +1,6 @@
-// The search function's request, its fallback and its retry; a card's works; and what the built site may contain.
-// No network: Workers AI and the database are stand-ins.
+// The search and removal functions' requests, their limits, fallback and retry; a card's works; and what the built
+// site may contain. No network: Workers AI and the database are stand-ins. The database's own count (client_wait in
+// sql/003_limits.sql) is run for real by tests/test_db.py; here a stand-in counts the same way, one call at a time.
 import { existsSync, readdirSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -8,44 +9,61 @@ import { createElement } from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
 import { MemoryRouter } from 'react-router'
 import { describe, expect, it, vi } from 'vitest'
-import { client, handle, LIMIT, MAX_QUERY, PAGE, TOO_MANY, wait, WINDOW, type Env } from '../functions/api/search'
-import { Busy, search } from '../src/api'
+import { handle as removal } from '../functions/api/removal'
+import { client, handle, MAX_QUERY, onRequestGet, PAGE, TOO_MANY, type Env } from '../functions/api/search'
+import { Busy, removalCode, requestRemoval, search } from '../src/api'
 import { Cards } from '../src/ui'
 
 const VECTOR = Array.from({ length: 1024 }, (_, i) => i / 1024)
+const KEY = 'FAKE-SERVER-KEY'
 const embeds = () => vi.fn(async () => ({ shape: [1, 1024], data: [VECTOR] }))
-const env = (run: Env['AI']['run']): Env => ({
-  AI: { run },
-  VITE_SUPABASE_URL: 'https://db.test',
-  VITE_SUPABASE_PUBLISHABLE_KEY: 'publishable',
-})
+const env = (run: Env['AI']['run'] = embeds()): Env => ({ AI: { run }, VITE_SUPABASE_URL: 'https://db.test', SUPABASE_SERVER_KEY: KEY })
 const CARDS = [{ slug: 'someone', name: 'Someone' }]
 
-/** A database that gives these answers in turn; an Error stands for a dropped connection. */
+/**
+ * A database. client_wait counts each call by kind and client, as the real one does, and says "wait 120 seconds"
+ * past `limit`. Every other function gives these answers in turn, then CARDS; an Error stands for a dropped connection.
+ */
 function database(...answers: (Response | Error)[]) {
-  const calls: { url: string; init: RequestInit }[] = []
-  const fetcher = (async (url: string, init: RequestInit) => {
-    calls.push({ url, init })
-    const answer = answers.shift() ?? Response.json(CARDS)
-    if (answer instanceof Error) throw answer
-    return answer
-  }) as typeof fetch
-  return { fetcher, calls, sent: (call = 0) => JSON.parse(String(calls[call].init.body)) }
+  const calls: { name: string; init: RequestInit; args: Record<string, unknown> }[] = []
+  const db = {
+    limit: Infinity,
+    counts: new Map<string, number>(),
+    calls,
+    called: (name: string) => calls.filter((call) => call.name === name),
+    sent: (n = 0) => db.called('search_artists')[n].args,
+    fetcher: (async (url: string, init: RequestInit) => {
+      const name = url.replace('https://db.test/rest/v1/rpc/', '')
+      const args = JSON.parse(String(init.body))
+      calls.push({ name, init, args })
+      if (name === 'client_wait') {
+        const key = `${args.p_kind} ${args.p_client}`
+        db.counts.set(key, (db.counts.get(key) ?? 0) + 1)
+        return Response.json(db.counts.get(key)! > db.limit ? 120 : 0)
+      }
+      const answer = answers.shift() ?? Response.json(CARDS)
+      if (answer instanceof Error) throw answer
+      return answer
+    }) as typeof fetch,
+  }
+  return db
 }
 const ask = (query: string, run: Env['AI']['run'], db = database()) =>
   handle(new Request(`https://artist-search.test/api/search?${query}`), env(run), db.fetcher)
 
 describe('GET /api/search', () => {
-  it('asks search_artists for the query, its embedding and the filters', async () => {
+  it('counts the visitor, then asks search_artists for the query, its embedding and the filters, with the server key', async () => {
     const run = embeds()
     const db = database()
     const response = await ask('q=dark+fantasy+creature+designer&specialty=creature&specialty=character&medium=digital+painting&open=1&offset=24', run, db)
 
     expect(run).toHaveBeenCalledExactlyOnceWith('@cf/baai/bge-m3', { text: ['dark fantasy creature designer'] })
-    expect(db.calls).toHaveLength(1)
-    expect(db.calls[0].url).toBe('https://db.test/rest/v1/rpc/search_artists')
-    expect(db.calls[0].init.method).toBe('POST')
-    expect(db.calls[0].init.headers).toEqual({ apikey: 'publishable', 'content-type': 'application/json' })
+    expect(db.calls.map((call) => call.name)).toEqual(['client_wait', 'search_artists'])
+    expect(db.calls[0].args).toEqual({ p_kind: 'search', p_client: '' })
+    for (const call of db.calls) {
+      expect(call.init.method).toBe('POST')
+      expect(call.init.headers).toEqual({ apikey: KEY, 'content-type': 'application/json' })
+    }
     expect(db.sent()).toEqual({
       q: 'dark fantasy creature designer',
       q_embedding: VECTOR,
@@ -106,75 +124,106 @@ describe('GET /api/search', () => {
 
     const recovers = database(stalled(), Response.json(CARDS))
     expect((await ask('q=mechs', embeds(), recovers)).status).toBe(200)
-    expect(recovers.calls).toHaveLength(2)
+    expect(recovers.called('search_artists')).toHaveLength(2)
     expect(recovers.sent(1)).toEqual(recovers.sent(0))
 
     const dropped = database(new TypeError('fetch failed'), Response.json(CARDS))
     expect(await (await ask('q=mechs', embeds(), dropped)).json()).toMatchObject({ artists: CARDS })
-    expect(dropped.calls).toHaveLength(2)
+    expect(dropped.called('search_artists')).toHaveLength(2)
 
     const down = database(stalled(), stalled(), Response.json(CARDS))
     const response = await ask('q=mechs', embeds(), down)
     expect(response.status).toBe(502)
     expect(await response.json()).toEqual({ error: 'The search is not answering right now.' })
-    expect(down.calls).toHaveLength(2)
+    expect(down.called('search_artists')).toHaveLength(2)
   })
 })
 
-/** One Cloudflare location's cache, as the limit uses it: what was put, by key. */
-function memoryCache() {
-  const kept = new Map<string, string>()
-  const cache = {
-    match: async (key: string) => (kept.has(key) ? new Response(kept.get(key)) : undefined),
-    put: async (key: string, response: Response) => void kept.set(key, await response.text()),
-  }
-  return cache as unknown as Cache
-}
-const from = (address: string) =>
-  new Request('https://artist-search.test/api/search?q=mechs', { headers: { 'cf-connecting-ip': address } })
+const from = (address: string, origin = 'https://artist-search.test') =>
+  new Request(`${origin}/api/search?q=mechs`, { headers: { 'cf-connecting-ip': address } })
 
-describe('the limit per client', () => {
-  it('answers 429 past the limit, before Workers AI or the database is asked, and holds up nobody else', async () => {
-    const cache = memoryCache()
+describe('the limits, which the database keeps', () => {
+  it('answers 429 when the database says wait, before Workers AI or the search is asked, and holds up nobody else', async () => {
     const run = embeds()
     const db = database()
-    for (let n = 0; n < LIMIT; n++) expect((await handle(from('203.0.113.7'), env(run), db.fetcher, cache)).status).toBe(200)
+    db.limit = 3
+    for (let n = 0; n < 3; n++) expect((await handle(from('203.0.113.7'), env(run), db.fetcher)).status).toBe(200)
 
-    const over = await handle(from('203.0.113.7'), env(run), db.fetcher, cache)
+    const over = await handle(from('203.0.113.7'), env(run), db.fetcher)
     expect(over.status).toBe(429)
-    expect(Number(over.headers.get('retry-after'))).toBeGreaterThan(0)
-    expect(Number(over.headers.get('retry-after'))).toBeLessThanOrEqual(WINDOW)
+    expect(over.headers.get('retry-after')).toBe('120')
     expect(over.headers.get('cache-control')).toBe('no-store')
     expect(await over.json()).toEqual({ error: TOO_MANY })
-    expect(run).toHaveBeenCalledTimes(LIMIT)
-    expect(db.calls).toHaveLength(LIMIT)
+    expect(run).toHaveBeenCalledTimes(3)
+    expect(db.called('search_artists')).toHaveLength(3)
 
-    expect((await handle(from('198.51.100.1'), env(run), db.fetcher, cache)).status).toBe(200)
+    expect((await handle(from('198.51.100.1'), env(run), db.fetcher)).status).toBe(200)
   })
 
-  it('lifts when the window ends, and says how long that is', async () => {
-    const cache = memoryCache()
-    const start = 1_800_000_000_000 - (1_800_000_000 % WINDOW) * 1000 // the first second of a window
-    for (let n = 0; n < LIMIT; n++) expect(await wait(cache, 'https://x.test', 'someone', start)).toBe(0)
-    expect(await wait(cache, 'https://x.test', 'someone', start + 1000)).toBe(WINDOW - 1)
-    expect(await wait(cache, 'https://x.test', 'someone', start + (WINDOW - 1) * 1000)).toBe(1)
-    expect(await wait(cache, 'https://x.test', 'someone', start + WINDOW * 1000)).toBe(0)
+  it('lets through only what the database lets through: 600 searches at once from one address', async () => {
+    const run = embeds()
+    const db = database()
+    db.limit = 60
+    const answers = await Promise.all(Array.from({ length: 600 }, () => handle(from('203.0.113.7'), env(run), db.fetcher)))
+
+    expect(answers.filter((answer) => answer.status === 200)).toHaveLength(60)
+    expect(answers.filter((answer) => answer.status === 429)).toHaveLength(540)
+    expect(db.called('client_wait')).toHaveLength(600) // every one counted
+    expect(run).toHaveBeenCalledTimes(60)
+    expect(db.called('search_artists')).toHaveLength(60)
   })
 
-  it('counts an IPv6 address by its /64, however it is written', () => {
+  it('lets nothing through when the count fails or is not a number', async () => {
+    // The count answers badly; search_artists would answer well.
+    const counting = (wait: () => Response) =>
+      (async (url: string) => (url.endsWith('client_wait') ? wait() : Response.json(CARDS))) as unknown as typeof fetch
+    const run = embeds()
+    expect((await handle(from('203.0.113.7'), env(run), counting(() => new Response('{}', { status: 500 })))).status).toBe(502)
+
+    const answer = await handle(from('203.0.113.7'), env(run), counting(() => Response.json('soon')))
+    expect(answer.status).toBe(429)
+    expect(answer.headers.get('retry-after')).toBe('60')
+    expect(run).not.toHaveBeenCalled()
+  })
+
+  it('counts the live entry point too', async () => {
+    const db = database()
+    db.limit = 0
+    vi.stubGlobal('fetch', db.fetcher)
+    try {
+      const response = await onRequestGet({ request: from('203.0.113.7'), env: env() })
+      expect(response.status).toBe(429)
+      expect(db.calls.map((call) => call.name)).toEqual(['client_wait'])
+    } finally {
+      vi.unstubAllGlobals()
+    }
+  })
+
+  it('counts an IPv6 address by its /56, however it is written', () => {
     const key = (address: string) => client(from(address))
-    expect(key('2001:db8:aa:bb::1')).toBe('2001:db8:aa:bb::/64')
-    expect(key('2001:db8:aa:bb:ffff:1:2:3')).toBe('2001:db8:aa:bb::/64')
-    expect(key('2001:0db8:00aa:00bb::9')).toBe('2001:db8:aa:bb::/64')
-    expect(key('2001:db8::1')).toBe('2001:db8:0:0::/64')
-    expect(key('1::2:3:4:5:6:7')).toBe('1:0:2:3::/64')
-    expect(key('2001:db8:aa:bc::1')).not.toBe(key('2001:db8:aa:bb::1'))
+    expect(key('2001:db8:aa:bb::1')).toBe('2001:db8:aa:0::/56')
+    expect(key('2001:db8:aa:bbcc:ffff:1:2:3')).toBe('2001:db8:aa:bb00::/56')
+    expect(key('2001:0db8:00aa:bbff::9')).toBe('2001:db8:aa:bb00::/56')
+    expect(key('2001:db8::1')).toBe('2001:db8:0:0::/56')
+    expect(key('1::2:3:4:5:6:7')).toBe('1:0:2:0::/56')
+    expect(key('1:2:3:4567::')).toBe('1:2:3:4500::/56')
+    // A home's /56 is 256 /64s: one client. The next /56 is another.
+    expect(new Set(Array.from({ length: 256 }, (_, n) => key(`2001:db8:aa:${(0x1200 + n).toString(16)}::1`))).size).toBe(1)
+    expect(key('2001:db8:aa:1300::1')).not.toBe(key('2001:db8:aa:12ff::1'))
     expect(key('203.0.113.7')).toBe('203.0.113.7')
+    // Only the address Cloudflare saw: headers a client can set change nothing.
+    const spoofed = { 'cf-connecting-ip': '203.0.113.7', 'x-forwarded-for': '1.2.3.4', 'x-real-ip': '5.6.7.8' }
+    expect(client(new Request('https://x.test/api/search', { headers: spoofed }))).toBe('203.0.113.7')
   })
 
-  it('lets the search through when the cache fails', async () => {
-    const broken = { match: async () => Promise.reject(new Error('cache down')), put: async () => {} } as unknown as Cache
-    expect((await handle(from('203.0.113.7'), env(embeds()), database().fetcher, broken)).status).toBe(200)
+  it('never puts the server key in an answer', async () => {
+    const answers = [
+      await ask('q=mechs', embeds()),
+      await ask('q=mechs', embeds(), database(new Error(KEY), new Error(KEY))),
+      await handle(from('203.0.113.7'), env(), Object.assign(database(), { limit: 0 }).fetcher),
+      await removal(post({ slug: 'someone', proof: true }), env(), database(new Response(KEY, { status: 500 }), new Error(KEY)).fetcher),
+    ]
+    for (const answer of answers) expect(await answer.text()).not.toContain(KEY)
   })
 
   it('is not asked again by the page, which is told how long to wait', async () => {
@@ -185,6 +234,74 @@ describe('the limit per client', () => {
       expect(error).toBeInstanceOf(Busy)
       expect((error as Busy).seconds).toBe(150)
       expect(asked).toHaveBeenCalledTimes(1)
+    } finally {
+      vi.unstubAllGlobals()
+    }
+  })
+})
+
+const post = (body: unknown, type = 'application/json') =>
+  new Request('https://artist-search.test/api/removal', {
+    method: 'POST',
+    headers: { 'content-type': type, 'cf-connecting-ip': '203.0.113.7' },
+    body: JSON.stringify(body),
+  })
+
+describe('POST /api/removal', () => {
+  it('counts the visitor, then gives the artist their code, which files their request', async () => {
+    const db = database(Response.json('artist-search-removal-0123456789abcdef0123456789abcdef'))
+    const response = await removal(post({ slug: 'someone', proof: true }), env(), db.fetcher)
+
+    expect(await response.json()).toEqual({ code: 'artist-search-removal-0123456789abcdef0123456789abcdef' })
+    expect(db.calls.map((call) => [call.name, call.args])).toEqual([
+      ['client_wait', { p_kind: 'removal', p_client: '203.0.113.7' }],
+      ['start_removal_proof', { p_slug: 'someone' }],
+    ])
+    expect(db.calls.every((call) => (call.init.headers as Record<string, string>).apikey === KEY)).toBe(true)
+  })
+
+  it('files a request without proof, with its note trimmed and cut to 300 characters', async () => {
+    const db = database(Response.json(true))
+    const response = await removal(post({ slug: 'someone', note: `  ${'n'.repeat(400)} ` }), env(), db.fetcher)
+
+    expect(await response.json()).toEqual({ ok: true })
+    expect(db.called('request_removal')[0].args).toEqual({ p_slug: 'someone', p_note: 'n'.repeat(300) })
+  })
+
+  it('past the visitor’s limit: a 429 that says how long, and nothing filed', async () => {
+    const db = database()
+    db.limit = 2
+    const statuses = []
+    for (let n = 0; n < 4; n++) statuses.push((await removal(post({ slug: `someone-${n}`, proof: true }), env(), db.fetcher)).status)
+
+    expect(statuses).toEqual([200, 200, 429, 429])
+    expect(db.called('start_removal_proof')).toHaveLength(2)
+  })
+
+  it('reads only a JSON body that names a profile, so another site’s form cannot post here', async () => {
+    for (const request of [post({ slug: 'someone', proof: true }, 'text/plain'), post({ proof: true }), post([1, 2])]) {
+      const db = database()
+      expect((await removal(request, env(), db.fetcher)).status).toBe(400)
+      expect(db.calls).toEqual([])
+    }
+  })
+
+  it('is what the page calls, once each time, and a 429 tells the page how long to wait', async () => {
+    const asked = vi.fn(async (_url: string, init: RequestInit) =>
+      JSON.parse(String(init.body)).proof
+        ? Response.json({ error: 'wait' }, { status: 429, headers: { 'retry-after': '7200' } })
+        : Response.json({ ok: true }),
+    )
+    vi.stubGlobal('fetch', asked)
+    try {
+      const error = await removalCode('someone').catch((reason: unknown) => reason)
+      expect(error).toBeInstanceOf(Busy)
+      expect((error as Busy).seconds).toBe(7200)
+      expect(await requestRemoval('someone', '  it is me  ')).toEqual({ ok: true })
+      expect(asked.mock.calls.map(([url, init]) => [url, init.method, JSON.parse(String(init.body))])).toEqual([
+        ['/api/removal', 'POST', { slug: 'someone', proof: true }],
+        ['/api/removal', 'POST', { slug: 'someone', note: 'it is me' }],
+      ])
     } finally {
       vi.unstubAllGlobals()
     }
@@ -233,6 +350,6 @@ describe('the built site', () => {
     // The check above means something only if these are the files the values would be in.
     expect(files.length).toBeGreaterThan(2)
     expect(PUBLIC.filter((name) => built.includes(values[name] ?? '\0'))).toEqual(PUBLIC)
-    expect(built).not.toMatch(/SUPABASE_SECRET|CLOUDFLARE_API_TOKEN|GH_TOKEN|DEVIANT_ART_SECRET/)
+    expect(built).not.toMatch(/SUPABASE_SECRET|SUPABASE_SERVER_KEY|CLOUDFLARE_API_TOKEN|GH_TOKEN|DEVIANT_ART_SECRET/)
   })
 })

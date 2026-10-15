@@ -71,8 +71,8 @@ Examples from the log:
 | Blind test against DeviantArt's "More Like This" | Lost on the 442-artist pool, 8 to 21 and then 11 to 17. To be rerun on the full pool |
 | Blind test against DeviantArt's own search | Not yet run. The reference results for 36 frozen queries are captured |
 | Profile claims | About one unsupported claim in 20 cards under a strict critic; the owner accepted that in place of the spec's "every claim" |
-| Removal proof | Built: `pipeline.removals` looks for the code on the artist's DeviantArt profile or own site and removes them at once. It runs from the owner's machine, is not scheduled yet, and has not been judged by a critic |
-| Search rate limit | Built: 60 searches per visitor in ten minutes, counted in Cloudflare's cache. Needs no Cloudflare setting. Not yet judged |
+| Removal proof | Built, and rebuilt after its critic: `pipeline.removals` looks for the code only where the artist alone can write (their DeviantArt bio or tagline, a tag in their site's head, or a file on it) and removes them at once. It checks requests a code was given out for, oldest due first, less often as they age, 30 a run. Run from the owner's machine on a schedule |
+| Limits | Built, and rebuilt after its critic: counted in the database. Per visitor (an IPv6 /56 counts as one): 60 searches in any ten minutes and 10 removal requests a day; 1,000 searches a day for everyone. Searching and removal requests go only through the site's functions, with a key of their own. Not yet run against the database |
 | Public deployment | Not done. It waits on the owner's approval |
 | Crawling artists' own portfolio sites | The polite crawler is built and tested but not used at scale |
 
@@ -102,7 +102,7 @@ uv run python -m pipeline.push --dry-run
 uv run python -m pipeline.push
 ```
 
-The removal check reads the pending removal requests and removes every artist whose proof code is on their DeviantArt profile or on the front page of their own site. Run it on a schedule, every 15 minutes, with Windows Task Scheduler. With nothing pending it asks DeviantArt nothing.
+The removal check reads the removal requests that a proof code was given out for and are due, and removes every artist whose code is in their DeviantArt bio or tagline, in a `<meta name="artist-search-removal">` in their own site's head, or in `/.well-known/artist-search-removal.txt` on it. Run it on a schedule, every 15 minutes, with Windows Task Scheduler: the site tells artists the code is checked regularly. With nothing due it asks DeviantArt nothing.
 
 ```bash
 uv run python -m pipeline.removals --dry-run
@@ -125,6 +125,8 @@ cd web
 npm install
 npm run dev
 ```
+
+The site's functions call the database with `SUPABASE_SERVER_KEY`, a Supabase secret key made for the site alone (Project Settings, API Keys, new secret key). Locally it comes from `.env`; on Cloudflare it is a secret of the Pages project, set with `npx wrangler pages secret put SUPABASE_SERVER_KEY --project-name artist-search`. Apply `sql/003_limits.sql` (`uv run python -m pipeline.db migrate`) before the site that needs it.
 
 The checks:
 
