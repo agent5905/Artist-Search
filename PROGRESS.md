@@ -933,3 +933,39 @@ Nothing has been pushed; none of these reached the public.
 - **What held:** a confirmed removal is permanent; a request without proof changes nothing; no secret leaks; a refused searcher is never stuck.
 
 **Round 2 (in progress):** proof only in a place the artist alone controls (a tag in the page head, a fixed file on the site, or the DeviantArt bio or tagline of the right account), matched without regard to case. Redirects within the same site are followed. The lead's call, to be stated in the code: reading that one file, which the artist put there for us at their own request, is not AI use, so an AI opt-out does not stop it, while robots.txt still does. A fair queue: oldest first, only requests with an issued code, each checked less often over time. Search only through the site's server, with a limit the database counts atomically and a daily cap over all visitors.
+
+### Round 24: push round 7; claim-or-remove round 2; push's fourth critic (2026-10-14)
+
+**Push round 7 merged:**
+- An approved list of 1,566 tags, read by hand from the 2,200 most used, decides which of an artist's own tags are shown or searched by. Anything not on it stays hidden; the old list of banned words is gone.
+- Any removal's reach through local records counts toward the flood guard.
+- Cards go stale when their tag readings are redone.
+- A removed account stays barred under any new handle.
+- Search text is checked whole.
+- All 148 of the third critic's probes pass, and its break runner is caught 25 of 25.
+- Two flaky profile tests were found to depend on two collections landing in the same second; they now hold the clock still.
+
+**Claim-or-remove round 2 merged.** Proof only in a place the artist alone controls; a fair queue; search only through the site's server with a database-kept limit. The SQL migration and the server key wait for the owner.
+
+**Its second critic: not yet.**
+- Fixed: visitor comments, squatters and off-site redirects no longer remove anyone; real proofs work; a flood no longer starves a real request.
+- Still open:
+  - Removal requests are deleted whenever a push stops sending the artist, so an artist who followed the instructions can be silently dropped and listed again.
+  - `<meta` text inside scripts or other tags' attributes in the page head is read as a real tag.
+  - One person can use up the day's search allowance for everyone.
+  - Artist pages and similar artists are open and unmetered with the public key.
+  - Requests without proof show up nowhere.
+- **Round 3 is under way.**
+
+**Push's fourth critic: no.**
+- Held: removal, held-back works, the snapshot, the wipe guards (about 560 runs). No tag off the approved list gets through by case, Unicode, invisible characters or homoglyphs.
+- **Biggest gap:** 490 of the 679 artists a push would send today carry a search vector built from text naming their own tags, "lolita" and "gore" among them, because their cards predate the approved list and nothing marks them stale.
+- A card still says "open for commissions" after the artist's tagline says closed.
+- A website or tagline the artist has cleared is still sent, because collection never replaces a stored value with nothing.
+- An approved tag written with an underscore is printed with the artist's spacing, which can spell an offensive word ("tit an").
+- Works DeviantArt flags as mature are skipped at collection and never counted toward an artist's adult share.
+- Six removals made here at once trip the flood guard.
+- One all-zero style vector blocks every push.
+- Two separately clean titles join into a contact handle in search text.
+- Its review of the approved list: take off 9 (selling, photos of real people, a social network) and 11 it could not call safe (fetishised fandoms, double meanings, drugs, war imagery, an age term). All 20 come off.
+- **Push round 8 follows the claim-or-remove round, since both change push.** Its main fix remakes every profile card, a few hours of GPU inside the analysis still running.
