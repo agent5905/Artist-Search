@@ -549,7 +549,10 @@ def _collect_artist(
             counts[DOWNLOADED] += 1
             work["fetched"] = True  # the library's word that the image in the cache is this answer's
         kept.append(work)
-    if store.is_removed(key, db):  # and once more before anything is written. What was downloaded is swept up.
+    # And once more before anything is written, of the handle and of the account: a removal may have come under
+    # either while the images were fetched. What was downloaded is swept up.
+    if store.is_removed(key, db) or library.account_removed(user_id, db):
+        store.mark_removed(username, db)
         _remove(key, counts, db, user_id)
         counts[REMOVED] += 1
         return

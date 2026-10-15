@@ -12,9 +12,10 @@ that an artist is not gone from the site each time collection brings a new work 
 A reading counts only while it is of the image and the words as they are now (pipeline/tagging.py): one made
 before an artist replaced the image or changed the title is as if it had never been made, and the artist waits
 for it like any other. A row is tied to the readings it was made from: the end of its basis is one fingerprint
-of the works it counted, each by its image and by what its words declare about AI. While that is not what those
-works are read as now, the row is not current (see current): it is kept, it is not published, and it is made
-again when the readings come out otherwise. When they come out the same, it is current again as it stands.
+of the works it counted, each by its image and by what its words declare about AI, and its facts say what their
+verified tags were. While either is not what those works are read as now (a new prompt version, too), the row is
+not current (see current): it is kept, it is not published, and it is made again when the readings come out
+otherwise. When they come out the same, it is current again as it stands.
 
 The facts are counts over the artist's eligible works: analyzed, not flagged or rated explicit, not flagged
 not_artwork, not declared AI-made. Only the verified tags are counted, never the descriptions, and which works
@@ -186,48 +187,13 @@ _SHORT = {
     "colour": "color",
 }
 _LONG = re.compile("|".join(_SHORT))
-# Tags that are not about the work: selling and availability (open_evidence reads those, by stricter rules),
-# where it is posted, what it was made with, whether a machine made it, praise, and a year or a serial number.
-# Matched anywhere in a tag, so each is spelled to leave "soldier", "salem", "sapphire" and "psychedelic" alone.
-# And the name of a real person, which is no fact about an artist's work.
-# ponytail: for names, only the authors that several artists in the store tag their fan art with. Another name
-# that SHARED artists use is shown: see _own_tags.
-_NOT_THE_WORK = re.compile(
-    r"comm?iss?ion|open|closed|sale$|auction|paypal|price|^ych|adopt|forhire|freelanc|deviant|artstation|insta|oftheday|"
-    r"photoshop|procreate|blender|clipstudio|krita|zbrush|corelpainter|paintstorm|ipad|wacom|noai|notai|humanmade|"
-    r"humanart|challenge|epic|beaut|amazing|awesome|badass|detail|\d{4}|lovecraft|tolkien|frankherbert|giger"
-)
-# Dress or body, and sex. The site never describes any of them, however many works are tagged so: a tag with one of
-# these in it is not shown ("musclegirl", "bikiniarmor"). Made by reading every tag that SHARED artists in the
-# store used on 2026-10-13 (2,299 of them), and each pattern held against all 13,685: "cape" is no part of
-# "landscape", "hips" of "spaceships", "wings" of "drawings", "horn" of "thorn", "robe" of "probe", "hair" of
-# "chair", nor "butt" of "butterfly".
-# ponytail: a hand list, matched anywhere in a tag. A crude tag that is not on it is shown as the artist wrote it;
-# pictures like that are still counted as UNSUITABLE, and the push stage holds back an artist who has many. The
-# upgrade is to ask the language model which of the tags the site may not print.
-_BODY = re.compile(
-    # sex, nudity and fetish
-    r"revealing|skimpy|scantily|(?<!me)nud(?:e|ity|ist|ism)|naked|topless|^bare|(?<!u)sex|seduc|sensual|erotic|"
-    r"pinup|nsfw|hentai|ecchi|lewd|porn|smut|(?<!c)kink|bdsm|fetish|bondage|shibari|spank|dominatrix|femdom|latex|"
-    r"spandex|ahegao|^futa|giantess|inflation|^vore|(?<!e)milf|waifu|husbando|succub|femboy|bunnygirl|mature|r18|"
-    r"rule34|stripp|striptease|temptress|harem|handsome|"
-    # the body and its shape
-    r"busty|boob|tits|booty|breast|cleavage|nipple|curvy|curves|thicc(?!h)|chubby|plussize|bbw|voluptuous|"
-    r"butt(?!er|on|ress)|thigh|(?<![sc])hips|legs$|waist|navel|belly|bellies|crotch|groin|genital|penis|vagina|"
-    r"pussy|armpit|(?<!long)neck|muscle|muscular|^abs$|sixpack|^body$|bodysuit|bodypaint|bodybuild|"
-    r"feet|foot(?!age)|mouth|jaw|maw|tongue|drool|saliva|teeth|(?<!tu)lips$|lipstick|eye(?!nd)|^ears$|kemonomimi|"
-    r"(?:cat|fox|elf|bunny|wolf|dog|pointy)ears|^faces?$|^hands?$|(?<!c)hair(?!craft)|blond|brunette|redhead|"
-    r"braid(?!er)|beard|^scars?$|scarred|tattoo|piercing|makeup|"
-    r"(?<!dra)wings$|^winged|(?<!t)horns?$|^horned|claws?$|fangs$|^fang$|paws?$|pawprint|antler|scales$|scalie|"
-    r"feathers$|^fur$|(?<!fairy)tail|"
-    # dress
-    r"lingerie|bikini|swimsuit|swimwear|underwear|pant(?:y|ies|ie|su)|^pants$|^bras?$|sportsbra|bralette|"
-    r"(?<!ara)thong|garter|stockings|tights|leggings|socks?$|leotard|catsuit|corset|outfit|dress|skirt|gown|"
-    r"kimono|yukata|qipao|cheongsam|hanfu|kilt|^togas?$|shirt|(?<!p)robes?$|wardrobe|^hoods?$|hoodie|jacket|"
-    r"(?<!3d)coats?$|sweater|^vests?$|^suits?$|uniform|(?<!s)cape|cloak|scarf|collar|choker|gloves?$|boots$|"
-    r"(?<!horse)shoes?$|sneaker|sandal|(?<!w)heels|jeans|shorts$|^hats?$|tophat|witchhat|jewel|earring|tiara|"
-    r"cloth|costume|cosplay|fashion"
-)
+# The artist's own tags the site may show at all: a reviewed list of plain words for what the work depicts or how
+# it is made (a subject, a genre, a setting, a medium, a technique, a kind of output, a game or a franchise), one a
+# line as a tag is compared (_compared), sorted. A tag that is not on it is not shown, whatever else it passes, until
+# a person has read it and added it. Never one about a body, dress, sex, a fetish, an age or a real person, nor
+# selling or the artist's own promotion, nor one the reader was unsure of. Made on 2026-10-14 by reading the 2,200
+# tags the rules below would then show most, out of 9,162: 90% of the places for a tag on the site.
+APPROVED = frozenset(pathlib.Path(__file__).with_name("approved_tags.txt").read_text(encoding="utf-8").split())
 # Two claims counted on every sheet and never stated: the push stage's to weigh.
 UNSUITABLE = "sexualised or gory"
 SAME = "one repeated subject"
@@ -315,6 +281,16 @@ def _plain(tag: str) -> str:
     return re.sub(r"[_-]", "", tag.lower())
 
 
+def _compared(tag: str) -> str:
+    """A tag, or a tag as the site prints it, as one: _plain() without spaces, a long name written short (_SHORT)."""
+    return _LONG.sub(lambda name: _SHORT[name[0]], _plain(tag).replace(" ", ""))
+
+
+def approved(tag: str) -> bool:
+    """True when a tag, or a tag as the site prints it, is on the reviewed list (APPROVED)."""
+    return _compared(tag) in APPROVED
+
+
 def _leading(counts: Counter[str], need: int, order: Iterable[str], at_most: int) -> list[str]:
     """The `at_most` values of `order` that most works have, of those at least `need` works have."""
     return sorted((value for value in order if counts[value] >= need), key=lambda value: -counts[value])[:at_most]
@@ -343,21 +319,19 @@ def _own_tags(works: list[dict[str, Any]], handle: str, shared: Collection[str] 
     The one rule for them: the push stage sends these, of those on a work it sends, and no other tag of the
     artist's as theirs. A tag is compared without its case, "_" and "-" (_plain), and in one of the two ways
     artists write some names (_SHORT). The most used come first, and of two as often used the one the artist
-    writes earlier among a work's tags; AT_MOST["own_words"] are kept. Left out, because it says nothing, is
-    not about the work, or says again what one before it says:
+    writes earlier among a work's tags; AT_MOST["own_words"] are kept. Only a tag on the reviewed list is shown
+    (approved): every other is left out. Left out as well, because it says nothing, is not about the work, or
+    says again what one before it says:
       - a tag made only of catch-all words (_SAYS_NOTHING) and of the words of those taken before it, a plural
         as its singular: "digitalart", and after "dark fantasy" "dark art";
-      - selling, the site, the software, a statement about AI, praise, a year (_NOT_THE_WORK), and dress or body
-        (_BODY);
       - the artist's `handle`, a part of it, or a tag it is part of, the handle compared as a tag is (_plain);
       - a tag that fewer than SHARED artists in the store use (`shared` has those that enough of them do; None
         is no store to ask): a name, the artist's or somebody else's, is seldom anyone else's tag;
       - one the plain contact rule refuses (library.holds_contact), alone or with those taken before it;
       - one that has a tag already taken in it, or is in one: "dragon", and then "dragonart"; "dnd", and then
         "dungeonsanddragons".
-    ponytail: a tag that names a real person passes when SHARED artists use it, and a word for what the artist
-    draws is lost when their handle has it ("dragon" under a handle with "dragon" in it). The upgrade for both
-    is the language model's word on each tag.
+    ponytail: a word for what the artist draws is lost when their handle has it ("dragon" under a handle with
+    "dragon" in it). The upgrade is the language model's word on each tag.
     """
     used: Counter[str] = Counter()
     late: Counter[str] = Counter()  # the places a tag has among its works' tags, added up
@@ -365,7 +339,7 @@ def _own_tags(works: list[dict[str, Any]], handle: str, shared: Collection[str] 
     for work in works:
         own: dict[str, str] = {}
         for written in work.get("tags", ()):
-            own.setdefault(_LONG.sub(lambda name: _SHORT[name[0]], _plain(written)), written)
+            own.setdefault(_compared(written), written)
         for place, (tag, written) in enumerate(own.items()):
             used[tag] += 1
             late[tag] += place
@@ -382,9 +356,10 @@ def _own_tags(works: list[dict[str, Any]], handle: str, shared: Collection[str] 
         reads = _reads(spelled[tag])
         parts = [_single(part) for part in reads.replace("-", " ").split()]
         if not (
-            all(part in nothing or any(nothing.issuperset(map(_single, way)) for way in _ways(part)) for part in parts)
-            or _NOT_THE_WORK.search(tag)
-            or _BODY.search(tag)
+            not approved(tag)
+            or all(
+                part in nothing or any(nothing.issuperset(map(_single, way)) for way in _ways(part)) for part in parts
+            )
             or (handle and (tag in handle or handle in tag))
             or (shared is not None and tag not in shared)
             or any(tag in other or other in tag for other in taken)
@@ -885,26 +860,41 @@ def _rows(db: pathlib.Path | str | None, where: str) -> list[Any]:
     return [row for row in _transact(db, lambda conn: conn.execute(query).fetchall()) if row[0] in listed]
 
 
+def _readings(facts: dict[str, Any]) -> list[Any]:
+    """What a row's facts say the verified tags of the works it counted were: which works count, which work has
+    each value a card can state, and every count facts_of makes of them."""
+    counts = facts.get("counts", {})
+    fields = ("medium", "subjects", "genres", "style_words")
+    return [facts.get("counted", []), facts.get("tagged", {}), *(counts.get(field, {}) for field in fields)]
+
+
 def current(db: pathlib.Path | str | None = None) -> set[str]:
     """The artists whose row still rests on what it was made from: each work it counted still stands (_FALLEN)
     and is read as it was then, from the same image and with the same word on AI (tagging.read_as, kept at the
-    end of the row's basis). A work that has fallen counts as one with no image.
+    end of the row's basis), and its verified tags as they stand now, at this prompt version, are the ones the
+    row counted (facts_of, counted again over the same works). A work that has fallen counts as one with no
+    image, and a work with no verified tags now as one that is not counted.
 
-    The others are waiting: for the tagging stage to read again a work whose image or words have changed, and
-    then, when that reading comes out otherwise, for this stage to make the row again; or for this stage to make
-    it again without the works that fell. Their row stays, so that a reading that comes out the same costs
-    nothing; but it says what nobody has read of the work as it is, and the push stage holds the artist back
-    meanwhile (see profiles).
+    The others are waiting: for the tagging stage to read again a work whose image or words have changed, or
+    every work after a new prompt version, and then, when that reading comes out otherwise, for this stage to
+    make the row again; or for this stage to make it again without the works that fell. Their row stays, so that
+    a reading that comes out the same costs nothing; but it says what nobody has read of the work as it is, and
+    the push stage holds the artist back meanwhile (see profiles).
     """
     images, declared = library.image_prints(db), tagging.declared_ai(TAGGER, db)
+    results = tagging.results(TAGGER, db=db, verifier=TAGGER)
     fallen = {work_id for (work_id,) in _transact(db, lambda conn: conn.execute(_FALLEN).fetchall())}
     images = {work_id: image for work_id, image in images.items() if work_id not in fallen}
     rows = _transact(db, lambda conn: conn.execute("SELECT artist_key, basis, facts FROM artist_profiles").fetchall())
-    return {
-        key
-        for key, basis, facts in rows
-        if basis.endswith(tagging.read_as(json.loads(facts).get("counted", []), images, declared))
-    }
+
+    def rests(basis: str, facts: dict[str, Any]) -> bool:
+        counted = facts.get("counted", [])
+        works = [{"id": work, "result": results.get(work), "declared": declared.get(work)} for work in counted]
+        return basis.endswith(tagging.read_as(counted, images, declared)) and (
+            _readings(facts) == _readings(facts_of(works)[0])
+        )
+
+    return {key for key, basis, facts in rows if rests(basis, json.loads(facts))}
 
 
 def profiles(db: pathlib.Path | str | None = None) -> list[dict[str, Any]]:
