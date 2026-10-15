@@ -8,9 +8,12 @@ a slug starting with zz-test-, the module fixture deletes those before and after
 statement here writes to, or deletes, any other artist's rows. The full-scale test refuses to run
 while the project holds real artists.
 
-Section 8 (the limits and the verifier's queue, sql/003_limits.sql) was written without a database to run
-it on: the owner runs it. It counts zz-test- visitors, takes back what they added to the day's total of
-searches, and for a moment sets that total to its cap, so run it before the site is public or when it is quiet.
+Sections 5, 6 and 8 (what the site may call, the removal requests, the limits and the verifier's queue:
+sql/002_functions.sql and 003_limits.sql) were written without a database to run them on: the owner runs
+them, with SITE_TOKEN in .env. They count zz-test- visitors and take back what they added to the day's total
+of reads, they close removal requests (which then keep no name, so they are found again by the time they
+were made, and deleted), and for a moment they set the day's total to its cap: run them before the site is
+public or when it is quiet.
 """
 
 import hashlib
@@ -36,9 +39,10 @@ NEEDED = (
     "VITE_SUPABASE_URL",
     "VITE_SUPABASE_PUBLISHABLE_KEY",
     "SUPABASE_SECRET_KEY",
+    "SITE_TOKEN",
 )
 if not (ROOT / ".env").exists() or not all(load_env().get(name) for name in NEEDED):
-    pytest.skip(".env lacks the Supabase keys", allow_module_level=True)
+    pytest.skip(".env lacks the Supabase keys or the site's token", allow_module_level=True)
 
 TABLES = (
     "artists",
@@ -49,23 +53,37 @@ TABLES = (
     "removal_secret",
     "removed",
     "client_counts",
+    "site_secret",
 )
-PUBLIC_FUNCTIONS = ["get_artist", "similar_artists"]  # what the browser calls with the publishable key
-# The site's server functions call these with a secret key of their own, once client_wait has let the visitor in.
-SITE_FUNCTIONS = ["client_wait", "request_removal", "search_artists", "start_removal_proof"]
+# What the site's server functions call, as the public role with the publishable key and the site's token
+# (sql/003_limits.sql). The public role may run these and nothing else.
+PUBLIC_FUNCTIONS = [
+    "client_wait",
+    "site_artist",
+    "site_removal_code",
+    "site_request_removal",
+    "site_search",
+    "site_similar",
+]
+# What those run once the token is checked, and the rest of the service role's.
+SITE_FUNCTIONS = ["get_artist", "request_removal", "search_artists", "similar_artists", "start_removal_proof"]
 SERVICE_FUNCTIONS = [
     *SITE_FUNCTIONS,
     "artist_ids",
+    "close_request",
     "confirm_removal",
     "delete_removed",
+    "grant_request",
     "purge_removed",
     "refresh_search_words",
     "reject_removal",
+    "removal_code",
+    "removal_tally",
     "remove_artists",
     "replace_neighbors",
 ]
-SEARCHES_PER_VISITOR, SEARCH_WINDOW, SEARCHES_A_DAY = 60, 600, 1000  # client_wait in sql/003_limits.sql
-REMOVALS_PER_VISITOR = 10  # a day
+READS_PER_VISITOR, READS_PER_NETWORK, READS_A_DAY = 50, 100, 1000  # client_wait in sql/003_limits.sql, a day
+REMOVALS_PER_VISITOR, REMOVALS_PER_NETWORK = 10, 20  # a day
 HELPER_FUNCTIONS = [
     "artist_card",
     "artist_fts",
@@ -76,12 +94,13 @@ HELPER_FUNCTIONS = [
     "host_under",
     "key_hash",
     "query_embedding",
-    "removal_code",
     "removed_after_insert",
     "short_list",
+    "site_check",
     "url_host",
     "works_before_write",
 ]
+TOKEN = load_env()["SITE_TOKEN"]
 FILTER_CAP = 20  # search_artists reads this many values of a filter list
 OFFSET_CAP = 1000  # and starts a page no deeper than this
 SIMILAR_CAP = 24  # similar_artists returns at most this many
@@ -297,10 +316,13 @@ def seed() -> dict[str, int]:
     return db.rpc("artist_ids", {"p_slugs": list(BY_SLUG)}, "secret")
 
 
-def clean() -> None:
+def clean(since: str = "infinity") -> None:
+    """Delete the synthetic rows, and the removal requests closed since the module began: a closed request keeps
+    no name to know it by."""
     db.sql(f"""
         delete from public.artists where slug like 'zz-test-%';
-        delete from public.removal_requests where artist_slug like 'zz-test-%';
+        delete from public.removal_requests
+        where artist_slug like 'zz-test-%' or (outcome is not null and first_at >= '{since}');
         {FORGET};
         select public.refresh_search_words();  -- so the synthetic artists' words go with them
     """)
@@ -310,28 +332,34 @@ def clean() -> None:
 def seeded():
     db.migrate()
     clean()  # in case an earlier run was killed
+    began = db.sql("select now()::text as now")[0]["now"]
     try:
         yield seed()
     finally:
-        clean()
+        clean(began)
 
 
 def slugs(rows: list[dict[str, Any]]) -> list[str]:
     return [row["slug"] for row in rows]
 
 
+def as_the_site(name: str, **args: Any) -> Any:
+    """One of the site's functions, called as its server functions call it: the publishable key and the token."""
+    return db.rpc(name, {"p_token": TOKEN, **args}, "publishable")
+
+
 def search(**args: Any) -> list[str]:
-    found = slugs(db.rpc("search_artists", {"q": "", **args}, "secret"))  # as the site's server function asks
+    found = slugs(db.rpc("search_artists", {"q": "", **args}, "secret"))
     assert "zz-test-hidden" not in found
     return found
 
 
 def similar(name: str, **args: Any) -> list[str]:
-    return slugs(db.rpc("similar_artists", {"p_slug": f"zz-test-{name}", **args}))
+    return slugs(db.rpc("similar_artists", {"p_slug": f"zz-test-{name}", **args}, "secret"))
 
 
 def visible(row: dict[str, Any]) -> bool:
-    return slugs(db.rpc("get_artist", {"p_slug": row["slug"]})) == [row["slug"]]
+    return slugs(db.rpc("get_artist", {"p_slug": row["slug"]}, "secret")) == [row["slug"]]
 
 
 def denied(response: httpx.Response) -> bool:
@@ -500,7 +528,7 @@ def test_deviantart_work_is_the_same_work_under_a_new_thumbnail(seeded):
     longer = (thumbnail("dana", 0, token="B") + "&pad=").ljust(2040, "x")  # near the 2,048 limit, and accepted
     assert db.upsert("works", [{**work, "image_url": longer}], "artist_id,key", "image_url") == [{"image_url": longer}]
     assert db.sql(f"select count(*)::int as n from public.works where artist_id = {dana}") == [{"n": 2}]
-    [profile] = db.rpc("get_artist", {"p_slug": "zz-test-dana"})
+    [profile] = db.rpc("get_artist", {"p_slug": "zz-test-dana"}, "secret")
     assert [(shown["source"], shown["image_url"] == longer) for shown in profile["works"]] == [
         ("deviantart", True),
         ("deviantart", False),
@@ -639,7 +667,7 @@ def test_search_filter_lists_are_capped():
 
 
 def test_cards_and_the_profile_page():
-    [card] = db.rpc("search_artists", {"q": WORD, "p_open_only": True})
+    [card] = db.rpc("search_artists", {"q": WORD, "p_open_only": True}, "secret")
     assert set(card) == {"slug", "name", "tagline", "profile", "specialties", "mediums", "open_for_work", "works"}
     assert (card["slug"], card["tagline"]) == ("zz-test-alpha", "Armor and creatures")
     assert [work["title"] for work in card["works"]] == ["alpha 0", "alpha 1", "alpha 2", "alpha 3"]
@@ -651,12 +679,12 @@ def test_cards_and_the_profile_page():
         "width": 300,  # and how large the image is, so the site can lay it out without cropping
         "height": 200,
     }
-    [similar, *_] = db.rpc("similar_artists", {"p_slug": "zz-test-alpha"})
+    [similar, *_] = db.rpc("similar_artists", {"p_slug": "zz-test-alpha"}, "secret")
     assert set(similar) == set(card)  # the same card from every function
     assert {work["source"] for work in similar["works"]} == {"deviantart"}
     assert all(set(work) == WORK_FIELDS for shown in (card, similar) for work in shown["works"])
 
-    [profile] = db.rpc("get_artist", {"p_slug": "zz-test-alpha"})
+    [profile] = db.rpc("get_artist", {"p_slug": "zz-test-alpha"}, "secret")
     assert set(profile) == set(card) | {"top_tags", "site_url", "deviantart_url"}
     assert profile["top_tags"] == ["zz-armor", "zz-knight"]
     assert profile["site_url"] == "https://www.zz-test-alpha.invalid/"
@@ -664,15 +692,15 @@ def test_cards_and_the_profile_page():
     assert [work["title"] for work in profile["works"]] == [f"alpha {n}" for n in range(11)]
     assert all(set(work) == WORK_FIELDS for work in profile["works"])
     assert [(work["width"], work["height"]) for work in profile["works"]] == [(300 + n, 200) for n in range(11)]
-    [unmeasured] = db.rpc("get_artist", {"p_slug": "zz-test-dana"})
+    [unmeasured] = db.rpc("get_artist", {"p_slug": "zz-test-dana"}, "secret")
     assert {(work["width"], work["height"]) for work in unmeasured["works"]} == {(None, None)}  # not known: null
-    assert db.rpc("get_artist", {"p_slug": "zz-test-hidden"}) == []
-    assert db.rpc("get_artist", {"p_slug": "zz-test-nobody"}) == []
+    assert db.rpc("get_artist", {"p_slug": "zz-test-hidden"}, "secret") == []
+    assert db.rpc("get_artist", {"p_slug": "zz-test-nobody"}, "secret") == []
 
 
 def test_a_card_leads_with_the_works_that_match_the_words():
     def cards(**args: Any) -> dict[str, list[str]]:
-        found = db.rpc("search_artists", {"q": "", "p_mediums": [MEDIUM], **args})
+        found = db.rpc("search_artists", {"q": "", "p_mediums": [MEDIUM], **args}, "secret")
         return {card["slug"]: [work["title"] for work in card["works"]] for card in found}
 
     in_order = ["alpha 0", "alpha 1", "alpha 2", "alpha 3"]
@@ -691,7 +719,7 @@ def test_a_card_leads_with_the_works_that_match_the_words():
     for args in ({"q": WORD}, {}, {"q": "the"}, {"q_embedding": QUERY}, {"q": WORD, "q_embedding": QUERY}):
         assert cards(**args)["zz-test-alpha"] == in_order, args
     # Similar artists and the profile page are not searches: the artist's own order, always.
-    [as_neighbour] = db.rpc("similar_artists", {"p_slug": "zz-test-beta"})
+    [as_neighbour] = db.rpc("similar_artists", {"p_slug": "zz-test-beta"}, "secret")
     assert [work["title"] for work in as_neighbour["works"]] == in_order
 
 
@@ -770,7 +798,7 @@ def test_a_load_that_changes_neighbours_leaves_no_stale_row(seeded):
 
 def test_a_similar_artist_leads_with_the_works_picked_for_the_seed(seeded):
     def shown(of: str) -> dict[str, list[str]]:
-        cards = db.rpc("similar_artists", {"p_slug": f"zz-test-{of}"})
+        cards = db.rpc("similar_artists", {"p_slug": f"zz-test-{of}"}, "secret")
         return {card["slug"]: [work["title"] for work in card["works"]] for card in cards}
 
     def replace(*rows: dict[str, Any]) -> httpx.Response:
@@ -824,8 +852,9 @@ def test_publishable_key_cannot_touch_tables(seeded):
     # The same read with the secret key finds the row, so the check above is not empty.
     params = {"slug": "eq.zz-test-alpha", "select": "slug"}
     assert db.data_api("GET", "artists", "secret", params=params).json() == [{"slug": "zz-test-alpha"}]
-    # The secret the proof codes are made from is not even the service role's to read.
+    # The secrets the proof codes and the site's token are checked with are not even the service role's to read.
     assert denied(db.data_api("GET", "removal_secret", "secret"))
+    assert denied(db.data_api("GET", "site_secret", "secret"))
 
     assert denied(db.data_api("POST", "artists", "publishable", json=artist("intruder")))
     hidden = {"slug": "eq.zz-test-hidden"}
@@ -835,26 +864,49 @@ def test_publishable_key_cannot_touch_tables(seeded):
     assert db.sql("select hidden from public.artists where slug = 'zz-test-hidden'") == [{"hidden": True}]
 
 
-def test_publishable_key_runs_the_public_functions_only():
-    assert slugs(db.rpc("similar_artists", {"p_slug": "zz-test-alpha", "p_limit": 1}, "publishable")) == [
-        "zz-test-gamma"
-    ]
-    assert slugs(db.rpc("get_artist", {"p_slug": "zz-test-alpha"}, "publishable")) == ["zz-test-alpha"]
-    # Searching and asking for removal are the site's server functions' alone, which count every visitor first:
-    # a direct call with the key from the site's own code skips no limit, because it gets nowhere.
-    assert slugs(db.rpc("search_artists", {"q": WORD}, "secret")) == ["zz-test-alpha", "zz-test-beta"]
-    assert db.rpc("request_removal", {"p_slug": "zz-test-nobody"}, "secret") is True
-    assert CODE.fullmatch(db.rpc("start_removal_proof", {"p_slug": "zz-test-nobody"}, "secret"))
+def test_publishable_key_runs_the_sites_functions_only_and_only_with_the_token():
+    # With the token: what the site's server functions ask for.
+    assert slugs(as_the_site("site_similar", p_slug="zz-test-alpha"))[0] == "zz-test-gamma"
+    assert slugs(as_the_site("site_artist", p_slug="zz-test-alpha")) == ["zz-test-alpha"]
+    assert slugs(as_the_site("site_search", q=WORD)) == ["zz-test-alpha", "zz-test-beta"]
+    assert as_the_site("site_request_removal", p_slug="zz-test-nobody", p_note=None) is True
+    assert CODE.fullmatch(as_the_site("site_removal_code", p_slug="zz-test-nobody"))
+    # A page of search results is 24 cards, whatever is asked.
+    assert (
+        db.data_api(
+            "POST", "rpc/site_search", "publishable", json={"p_token": TOKEN, "q": "", "p_limit": 100}
+        ).status_code
+        == 404
+    )
 
-    # Each of these exists and works for the service role or the owner; the public is refused.
+    # Without it, or with another, each of the site's functions refuses: the publishable key alone opens nothing.
+    site_calls = (
+        ("site_similar", {"p_slug": "zz-test-alpha"}),
+        ("site_artist", {"p_slug": "zz-test-alpha"}),
+        ("site_search", {"q": WORD}),
+        ("site_request_removal", {"p_slug": "zz-test-alpha", "p_note": None}),
+        ("site_removal_code", {"p_slug": "zz-test-alpha"}),
+        ("client_wait", {"p_kind": "search", "p_client": "zz-test-intruder", "p_network": "zz-test-intruder"}),
+    )
+    for name, args in site_calls:
+        unknown = db.data_api("POST", f"rpc/{name}", "publishable", json=args)  # no token: no such function
+        assert unknown.status_code == 404 and unknown.json()["code"] == "PGRST202", name
+        for token in (None, "", TOKEN + "x", TOKEN.upper(), TOKEN[:-1]):
+            assert denied(db.data_api("POST", f"rpc/{name}", "publishable", json={**args, "p_token": token})), name
+
+    # Each of these exists and works for the service role or the owner; the public is refused, token or not.
     for name, args in (
         ("search_artists", {"q": WORD}),
+        ("get_artist", {"p_slug": "zz-test-alpha"}),
+        ("similar_artists", {"p_slug": "zz-test-alpha"}),
         ("request_removal", {"p_slug": "zz-test-alpha"}),
         ("start_removal_proof", {"p_slug": "zz-test-alpha"}),
-        ("client_wait", {"p_kind": "search", "p_client": "zz-test-intruder"}),
         ("confirm_removal", {"p_slug": "zz-test-alpha", "p_code": "x"}),
         ("purge_removed", {"p_slugs": ["zz-test-alpha"]}),
         ("reject_removal", {"p_slug": "zz-test-alpha"}),
+        ("close_request", {"p_slug": "zz-test-alpha", "p_outcome": "rejected"}),
+        ("grant_request", {"p_slug": "zz-test-alpha", "p_outcome": "granted"}),
+        ("removal_tally", {}),
         ("remove_artists", {"p_slugs": ["zz-test-alpha"]}),
         ("delete_removed", {}),
         ("removal_code", {"p_slug": "zz-test-alpha"}),
@@ -863,11 +915,10 @@ def test_publishable_key_runs_the_public_functions_only():
         ("refresh_search_words", {}),
         ("artist_card", {"p_artist_id": 1}),
         ("artist_keys", {"p_da_username": "zz-test-alpha", "p_site_domain": None}),
+        ("site_check", {"p_token": TOKEN}),
     ):
         assert denied(db.data_api("POST", f"rpc/{name}", "publishable", json=args)), name
-    # Nor can the service role read a proof code's making, or the visitors' counts: only the functions that need
-    # them can.
-    assert denied(db.data_api("POST", "rpc/removal_code", "secret", json={"p_slug": "zz-test-alpha"}))
+    # Nor can the service role read the visitors' counts: only the function that keeps them can.
     assert denied(db.data_api("GET", "client_counts", "secret"))
     assert visible(BY_SLUG["zz-test-alpha"])
 
@@ -911,7 +962,7 @@ def test_tables_are_locked_and_functions_are_pinned():
         "sequences_open_to_the_public": 0,
         "anon_functions": PUBLIC_FUNCTIONS,
         "authenticated_functions": 0,
-        # The public's two, the site's four, and the two that read the proof secret (neither is the public's).
+        # The site's six, what they run, and the two that read the proof secret (neither is the public's).
         "definer_functions": sorted([*PUBLIC_FUNCTIONS, *SITE_FUNCTIONS, "confirm_removal", "removal_code"]),
         "functions_without_fixed_path": None,
         "purge_everything_is_gone": True,
@@ -1076,7 +1127,7 @@ def test_proof_of_control_removes_at_once_and_for_good(seeded):
     assert db.sql(there) == nothing_left
     assert similar("stay") == []  # the artist who had them as a neighbour is still served, without them
     assert [row["key_hash"] for row in db.sql(remembered)] == GONE_HASHES
-    assert slugs(db.sql(REQUESTS)) == [STAY["slug"]]  # GONE's went with them; STAY's code was asked for above
+    assert slugs(db.sql(REQUESTS)) == [STAY["slug"]]  # GONE's is closed; STAY's code was asked for above
     assert visible(STAY)
     # The code opens nothing a second time, and the artist cannot be loaded again.
     assert confirm(GONE, code) is False
@@ -1121,7 +1172,7 @@ def test_the_owner_answers_unproven_requests(seeded):
     assert db.rpc("purge_removed", {"p_slugs": ["zz-test-alpha", "zz-test-nobody"]}, "secret") == 0
     assert visible(BY_SLUG["zz-test-alpha"]) and visible(GONE) and db.sql(remembered) == []
 
-    # Turned down: the request goes, and nothing else changes.
+    # Turned down: the request is closed, and nothing else changes.
     assert db.rpc("reject_removal", {"p_slug": STAY["slug"]}, "secret") is True
     assert db.rpc("reject_removal", {"p_slug": STAY["slug"]}, "secret") is False  # nothing left to reject
     assert slugs(db.sql(REQUESTS)) == [GONE["slug"]]
@@ -1133,6 +1184,74 @@ def test_the_owner_answers_unproven_requests(seeded):
     assert [row["key_hash"] for row in db.sql(remembered)] == GONE_HASHES
     assert db.sql(REQUESTS) == []
     assert db.rpc("purge_removed", {"p_slugs": [GONE["slug"]]}, "secret") == 0
+
+
+OPEN = """
+select artist_slug as slug, da_username, site_domain, da_key, site_key
+from public.removal_requests where artist_slug like 'zz-test-%' and outcome is null order by artist_slug
+"""
+# Closed requests that still hold anything of an artist: there must be none.
+NAMED_WHEN_CLOSED = """
+select count(*)::int as n from public.removal_requests
+where outcome is not null and (artist_slug not like 'closed:%' or note is not null or da_username is not null
+                               or site_url is not null or site_domain is not null or due_at is not null)
+"""
+
+
+def tally() -> dict[str, int]:
+    return db.rpc("removal_tally", {}, "secret")
+
+
+def test_a_request_outlives_its_artists_row_and_only_an_answer_closes_it(seeded):
+    """The critic's case: a push holds the artist back, so their row goes and every load ends with the sweep. Their
+    request stays, with the handle and site it was made for: the code still removes them, and the owner can still
+    answer. Closed, it keeps nothing of them."""
+    fresh(GONE, STAY)
+    before = tally()
+    code = proof_code(GONE)
+    ask(STAY, "it is me")
+    db.sql("delete from public.artists where slug in ('zz-test-gone', 'zz-test-stay')")  # held back by a push
+    db.after_load()  # what every load ends with: the sweep, the word list, a vacuum
+    made_for = [
+        {"slug": row["slug"], "da_username": row["da_username"], "site_domain": row["site_domain"]}
+        | dict(zip(("da_key", "site_key"), key_hashes(row), strict=True))
+        for row in (GONE, STAY)
+    ]
+    assert db.sql(OPEN) == made_for
+
+    # Not listed, and removed all the same: for good, under the handle and site the request was made for.
+    assert confirm(GONE, code) is True
+    hashes = ", ".join(f"'{key_hash}'" for key_hash in GONE_HASHES)
+    assert db.sql(f"select count(*)::int as n from public.removed where key_hash in ({hashes})") == [{"n": 2}]
+    assert db.upsert("artists", [GONE], "slug", "slug") == []  # the next push cannot list them again
+    # The owner grants the other while it is not listed either: the same.
+    assert db.rpc("purge_removed", {"p_slugs": [STAY["slug"]]}, "secret") == 1
+    assert db.upsert("artists", [STAY], "slug", "slug") == []
+    assert db.sql(OPEN) == [] and db.sql(NAMED_WHEN_CLOSED) == [{"n": 0}]
+    after = tally()
+    assert (after["requests_proven"], after["requests_closed"]) == (
+        before["requests_proven"] + 1,
+        before["requests_closed"] + 1,
+    )
+
+
+def test_an_artist_removed_another_way_has_their_open_requests_closed(seeded):
+    fresh(GONE)
+    before = tally()
+    ask(GONE, "it is me")
+    proof_code(GONE)
+    assert tally()["requests_open_with_code"] == before["requests_open_with_code"] + 1
+    bar_gone()  # their keys on the list by hand, as a removal under another handle of theirs puts them
+    assert db.sql(OPEN) == [] and db.sql(NAMED_WHEN_CLOSED) == [{"n": 0}]
+    assert tally() == before | {"requests_closed": before["requests_closed"] + 1}
+
+
+def test_a_rejected_artist_can_ask_again(seeded):
+    fresh(STAY)
+    ask(STAY, "first")
+    assert db.rpc("reject_removal", {"p_slug": STAY["slug"]}, "secret") is True
+    ask(STAY, "second")
+    assert db.sql(REQUESTS) == [{"slug": STAY["slug"], "note": "second", "requests": 1, "in_order": True}]
 
 
 def bar_gone() -> None:
@@ -1161,7 +1280,8 @@ def test_key_on_the_removal_list_deletes_the_artist_it_bars(seeded):
     # The owner removes a site by hand (what pipeline/store.py's mark_removed does) while its artist is here.
     site_key = key_hashes(KEEP)[1]
     assert db.upsert("removed", [{"key_hash": site_key}], "key_hash", "key_hash") == [{"key_hash": site_key}]
-    # Nothing of that artist stays: not the row, not the works, not the request, not the words only they used.
+    # Nothing of that artist stays: not the row, not the works, not the words only they used, and their request
+    # is closed, with nothing of them in it.
     assert db.sql(left) == [{"artists": 0, "works": 0, "requests": 0, "words": 0}]
     assert visible(BY_SLUG["zz-test-alpha"])  # and nobody else went with them
 
@@ -1303,7 +1423,7 @@ def test_a_removal_does_not_wait_for_a_load(seeded):
         count = f"select count(*)::int as n from public.artists where slug = '{HELD['slug']}'"
         assert db.sql(count) == [{"n": 1}]
         assert not visible(HELD)
-        assert HELD["slug"] not in slugs(db.rpc("search_artists", {"q": "held"}))
+        assert HELD["slug"] not in slugs(db.rpc("search_artists", {"q": "held"}, "secret"))
         assert similar("stay") == []  # nor as anybody's neighbour, though that row is still there too
     finally:
         holder.join()
@@ -1555,116 +1675,158 @@ def visitor() -> str:
     return f"zz-test-{secrets.token_hex(4)}"
 
 
-def counted_as(kind: str, client: str) -> str:
-    """SQL for the key client_wait counts a visitor under: an HMAC, so the table holds no address."""
-    return f"encode(extensions.hmac('{kind}:{client}', (select secret from public.removal_secret), 'sha256'), 'hex')"
+def counted_as(budget: str, level: str, who: str) -> str:
+    """SQL for the key client_wait counts a visitor or a network under: an HMAC, so the table holds no address."""
+    secret = "(select secret from public.removal_secret)"
+    return f"encode(extensions.hmac('{budget} {level} {who}', {secret}, 'sha256'), 'hex')"
 
 
-def wait(kind: str, client: str) -> int:
-    return db.rpc("client_wait", {"p_kind": kind, "p_client": client}, "secret")
+def wait(kind: str, client: str, network: str | None = None) -> int:
+    return as_the_site("client_wait", p_kind=kind, p_client=client, p_network=network or client)
 
 
-def forget(client: str, searches_let_through: int = 0) -> None:
-    """Delete a test visitor's counts, and take what they added off the day's total of searches."""
-    keys = f"{counted_as('search', client)}, {counted_as('removal', client)}"
+def forget(*who: str, pages_let_through: float = 0) -> None:
+    """Delete test visitors' and networks' counts, and take what they added off the day's total of reads."""
+    keys = ", ".join(
+        counted_as(budget, level, name)
+        for name in who
+        for budget in ("read", "removal")
+        for level in ("visitor", "network")
+    )
     db.sql(f"""
         delete from public.client_counts where client_key in ({keys});
-        update public.client_counts set hits = greatest(hits - {searches_let_through}, 0)
-        where client_key = 'search:all';
+        update public.client_counts set busy_until = busy_until - {pages_let_through * 86400 / READS_A_DAY}
+        where client_key = 'read everyone';
     """)
 
 
-def due_later_than(row: dict[str, Any], interval: str) -> bool:
-    later = f"select due_at > now() + interval '{interval}' as later from public.removal_requests"
-    return db.sql(f"{later} where artist_slug = '{row['slug']}'") == [{"later": True}]
+def ahead(key: str) -> float:
+    """How far ahead of now a count is, in seconds: a day when it is full."""
+    now = "extract(epoch from clock_timestamp())"
+    [row] = db.sql(f"select busy_until - {now} as ahead from public.client_counts where client_key = {key}")
+    return row["ahead"]
 
 
-def test_600_searches_at_once_from_one_visitor_let_the_limit_through_and_no_more(seeded):
+def counts_kept(key: str) -> int:
+    return db.sql(f"select count(*)::int as n from public.client_counts where client_key = {key}")[0]["n"]
+
+
+def test_600_reads_at_once_from_one_visitor_let_their_share_through_and_the_rest_cost_nothing(seeded):
     client = visitor()
     try:
         with ThreadPoolExecutor(30) as pool:
             waits = list(pool.map(lambda _: wait("search", client), range(600)))
-        assert waits.count(0) == SEARCHES_PER_VISITOR
-        assert all(0 < seconds <= 2 * SEARCH_WINDOW for seconds in waits if seconds)
+        assert waits.count(0) == READS_PER_VISITOR
+        # The next is let in once a 50th of a day has passed, and the 550 refused moved that on by nothing.
+        assert all(0 < seconds <= 86400 / READS_PER_VISITOR + 1 for seconds in waits if seconds)
+        assert 86400 - 60 < ahead(counted_as("read", "visitor", client)) <= 86400
+        assert 0 < wait("search", client) <= 86400 / READS_PER_VISITOR + 1
         # The table holds a hash for the visitor, never what they were called.
         [row] = db.sql(
-            f"select client_key, hits from public.client_counts where client_key = {counted_as('search', client)}"
+            f"select client_key from public.client_counts where client_key = {counted_as('read', 'visitor', client)}"
         )
-        assert re.fullmatch(r"[0-9a-f]{64}", row["client_key"]) and row["hits"] == 600
+        assert re.fullmatch(r"[0-9a-f]{64}", row["client_key"])
         assert db.sql("select count(*)::int as n from public.client_counts where client_key like '%zz-test%'") == [
             {"n": 0}
         ]
     finally:
-        forget(client, SEARCHES_PER_VISITOR)
+        forget(client, pages_let_through=READS_PER_VISITOR)
 
 
-def test_removal_requests_are_counted_by_the_day_and_apart_from_searches(seeded):
+def test_a_profile_counts_a_tenth_of_a_page(seeded):
     client = visitor()
+    try:
+        for _ in range(10):
+            assert wait("profile", client) == 0
+        assert abs(ahead(counted_as("read", "visitor", client)) - 86400 / READS_PER_VISITOR) < 30  # one page's worth
+    finally:
+        forget(client, pages_let_through=1)
+
+
+def test_one_network_shares_its_share_whatever_addresses_it_asks_from(seeded):
+    network, clients = visitor(), [visitor() for _ in range(4)]
+    try:
+        with ThreadPoolExecutor(30) as pool:
+            waits = list(pool.map(lambda n: wait("search", clients[n % 4], network), range(4 * READS_PER_VISITOR)))
+        assert waits.count(0) == READS_PER_NETWORK  # four visitors' worth asked, two let in
+    finally:
+        forget(network, *clients, pages_let_through=READS_PER_NETWORK)
+
+
+def test_removal_requests_are_counted_by_the_day_and_apart_from_reads(seeded):
+    network, clients = visitor(), [visitor() for _ in range(3)]
     try:
         with ThreadPoolExecutor(20) as pool:
-            waits = list(pool.map(lambda _: wait("removal", client), range(50)))
+            waits = list(pool.map(lambda _: wait("removal", clients[0], network), range(50)))
         assert waits.count(0) == REMOVALS_PER_VISITOR
-        assert all(0 < seconds <= 2 * 86400 for seconds in waits if seconds)
-        assert wait("search", client) == 0  # a visitor told to wait for removals can still search
-        unknown = db.data_api("POST", "rpc/client_wait", "secret", json={"p_kind": "everything", "p_client": client})
-        assert unknown.status_code == 400 and "unknown kind" in unknown.text
+        assert all(0 < seconds <= 86400 for seconds in waits if seconds)
+        more = [wait("removal", client, network) for client in clients[1:] for _ in range(REMOVALS_PER_VISITOR)]
+        assert more.count(0) == REMOVALS_PER_NETWORK - REMOVALS_PER_VISITOR
+        assert wait("search", clients[0], network) == 0  # told to wait for removals, and free to search
+        unknown = db.data_api(
+            "POST", "rpc/client_wait", "publishable",
+            json={"p_token": TOKEN, "p_kind": "everything", "p_client": clients[0], "p_network": network},
+        )  # fmt: skip
+        assert unknown.status_code == 400 and "cannot count this request" in unknown.text
     finally:
-        forget(client, 1)
+        forget(network, *clients, pages_let_through=1)
 
 
-def test_the_window_before_still_counts_for_its_share_of_the_last_ten_minutes(seeded):
-    """So 60 at the end of one window and 60 at the start of the next do not both get through."""
+def test_the_days_total_holds_reads_back_for_everyone_a_little_at_a_time(seeded):
     client = visitor()
-    window = f"floor(extract(epoch from clock_timestamp()) / {SEARCH_WINDOW})"
-    into = f"(extract(epoch from clock_timestamp()) - {window} * {SEARCH_WINDOW})::float8"
-
-    def after_a_window_of(hits: int) -> dict[str, Any]:
-        """The visitor's last window held `hits`, and this one nothing yet: what one more search is told."""
-        db.sql(f"""
-            update public.client_counts set slot = {window} - 1, hits = {hits}, hits_before = 0
-            where client_key = {counted_as("search", client)}
-        """)
-        return db.sql(f"select public.client_wait('search', '{client}') as wait, {into} as into_slot")[0]
-
+    kept = db.sql("select busy_until from public.client_counts where client_key = 'read everyone'")
     try:
-        assert wait("search", client) == 0
-        # Not in the last seconds of a window: the two calls below must fall in one.
-        while db.sql(f"select {into} as into_slot")[0]["into_slot"] > SEARCH_WINDOW - 8:
-            time.sleep(2)
-        # The window before held 59: whatever share of it is left, one more is within 60.
-        assert after_a_window_of(59)["wait"] == 0
-        # It held 6,000 (a script that kept asking): one more waits until enough of it has slid out, which is
-        # 600 * (1 - 58 / 6,000) seconds into this window.
-        row = after_a_window_of(6000)
-        assert abs(row["wait"] - (SEARCH_WINDOW * (1 - 58 / 6000) - row["into_slot"])) <= 2
-    finally:
-        forget(client, 2)
-
-
-def test_the_days_total_holds_searching_for_everyone_until_the_day_ends(seeded):
-    client = visitor()
-    kept = db.sql("select slot, hits from public.client_counts where client_key = 'search:all'")
-    try:
-        db.sql(f"""
-            insert into public.client_counts (client_key, slot, hits, hits_before)
-            values ('search:all', floor(extract(epoch from clock_timestamp()) / 86400), {SEARCHES_A_DAY}, 0)
-            on conflict (client_key) do update set slot = excluded.slot, hits = excluded.hits
+        db.sql("""
+            insert into public.client_counts (client_key, busy_until)
+            values ('read everyone', extract(epoch from clock_timestamp()) + 86400)
+            on conflict (client_key) do update set busy_until = excluded.busy_until
         """)
-        epoch = "extract(epoch from clock_timestamp())"
-        [row] = db.sql(f"""
-            select public.client_wait('search', '{client}') as wait,
-                   (86400 - ({epoch} - floor({epoch} / 86400) * 86400))::float8 as to_midnight
-        """)
-        assert abs(row["wait"] - row["to_midnight"]) <= 2  # until midnight UTC, for everyone
+        # Full: the next page is let in a 1,000th of a day on, a profile a tenth of that. Not until midnight.
+        assert abs(wait("search", client) - 86400 / READS_A_DAY) <= 2
+        assert abs(wait("profile", client) - 86400 / READS_A_DAY / 10) <= 2
         assert wait("removal", client) == 0  # asking for removal has no day's total
+        # Nothing refused was counted.
+        assert (
+            counts_kept(counted_as("read", "visitor", client)) == 1
+            and ahead(counted_as("read", "visitor", client)) <= 0
+        )
     finally:
         restore = (
-            f"update public.client_counts set slot = {kept[0]['slot']}, hits = {kept[0]['hits']}"
+            f"update public.client_counts set busy_until = {kept[0]['busy_until']}"
             if kept
             else "delete from public.client_counts"
         )
-        db.sql(f"{restore} where client_key = 'search:all'")
+        db.sql(f"{restore} where client_key = 'read everyone'")
         forget(client)
+
+
+def test_the_count_fails_closed_without_what_it_needs(seeded):
+    """Each case is one call, which the database runs as one transaction and undoes at its end (the 1 / 0). The site's
+    token is a stand-in's within it, so the real one never travels in a query."""
+    stand_in = "update public.site_secret set token_hash = public.key_hash('zz-test-token');"
+    count = "select public.client_wait('zz-test-token', 'search', 'zz-test-x', 'zz-test-x');"
+    with pytest.raises(RuntimeError, match="division by zero"):  # with everything there, it counts: the cases are real
+        db.sql(f"{stand_in} {count} select 1 / 0;")
+    for missing, error in (("site_secret", "not the site"), ("removal_secret", "cannot count this request")):
+        with pytest.raises(RuntimeError, match=error):
+            db.sql(f"{stand_in} delete from public.{missing}; {count} select 1 / 0;")
+    secrets_kept = (
+        "select (select count(*) from public.site_secret) + (select count(*) from public.removal_secret) as n"
+    )
+    assert db.sql(secrets_kept) == [{"n": 2}]
+    assert counts_kept(counted_as("read", "visitor", "zz-test-x")) == 0
+
+
+def test_many_calls_at_once_in_any_order_neither_wait_on_each_other_for_ever_nor_undo_a_count(seeded):
+    """40 visitors in 5 networks, 160 reads from each network at once, 30 at a time: none fails (a deadlock would
+    be a failure), and each network lets exactly its share through."""
+    networks, clients = [visitor() for _ in range(5)], [visitor() for _ in range(40)]
+    try:
+        with ThreadPoolExecutor(30) as pool:
+            waits = list(pool.map(lambda n: (n % 5, wait("search", clients[n % 40], networks[n % 5])), range(800)))
+        assert [sum(seconds == 0 for at, seconds in waits if at == n) for n in range(5)] == [READS_PER_NETWORK] * 5
+    finally:
+        forget(*networks, *clients, pages_let_through=5 * READS_PER_NETWORK)
 
 
 QUEUE = """
@@ -1673,7 +1835,7 @@ from public.removal_requests where artist_slug like 'zz-test-%' order by artist_
 """
 
 
-def test_a_code_files_the_request_once_and_asking_again_moves_nothing(seeded):
+def test_a_code_files_the_request_and_asking_for_it_again_starts_its_checks_over(seeded):
     fresh(GONE, STAY)
     ask(GONE, "it is me")  # without a code: for the owner alone, and never looked at by the verifier
     [bare] = db.sql(QUEUE)
@@ -1686,12 +1848,6 @@ def test_a_code_files_the_request_once_and_asking_again_moves_nothing(seeded):
         (GONE["slug"], True, True),
         (STAY["slug"], True, True),
     ]
-    for _ in range(3):  # asked again, with a code and without: nothing moves forward
-        proof_code(GONE)
-        ask(GONE)
-        ask(STAY, "again")
-    assert db.sql(QUEUE) == first
-
     # The verifier moves a request on with the service key; the publishable key cannot touch the table.
     moved = {"due_at": "2099-01-01T00:00:00+00:00"}
     mine = {"artist_slug": f"eq.{GONE['slug']}"}
@@ -1699,9 +1855,26 @@ def test_a_code_files_the_request_once_and_asking_again_moves_nothing(seeded):
     assert denied(db.data_api("PATCH", "removal_requests", "publishable", params=mine, json=moved))
     assert due_later_than(GONE, "70 years")
 
+    time.sleep(1)
+    ask(GONE)
+    ask(STAY, "again")
+    assert db.sql(QUEUE)[1] == first[1]  # asking without a code moves nothing
+    proof_code(GONE)
+    proof_code(STAY)
+    again = db.sql(QUEUE)
+    # Asked for the code again: its checks start over, and it is due at once, unless it was due already, where it
+    # keeps its place.
+    assert again[0]["code_at"] > first[0]["code_at"] and again[0]["due_at_once"]
+    assert again[1]["code_at"] > first[1]["code_at"] and again[1]["due_at"] == first[1]["due_at"]
+
+
+def due_later_than(row: dict[str, Any], interval: str) -> bool:
+    later = f"select due_at > now() + interval '{interval}' as later from public.removal_requests"
+    return db.sql(f"{later} where artist_slug = '{row['slug']}'") == [{"later": True}]
+
 
 def test_the_verifier_removes_through_the_real_queue_and_the_real_confirm_removal(seeded, tmp_path, monkeypatch):
-    """pipeline.removals itself against this database: the due requests, start_removal_proof, confirm_removal. Only
+    """pipeline.removals itself against this database: the due requests, removal_code, confirm_removal. Only
     DeviantArt is a stand-in, which answers for the artists' own accounts. The run reads zz-test- requests only."""
     monkeypatch.setattr(config, "CACHE_DIR", tmp_path / "cache")  # never the real cache
     monkeypatch.setattr(config, "LOCAL_DB", tmp_path / "cache" / "pipeline.sqlite")
@@ -1726,6 +1899,7 @@ def test_the_verifier_removes_through_the_real_queue_and_the_real_confirm_remova
     code = proof_code(GONE)
     proof_code(STAY)  # asked for a code, and has not put it up
     ask(KEEP)  # no code: never looked at
+    db.sql(f"delete from public.artists where slug = '{GONE['slug']}'")  # held back by a push: looked for all the same
     bios = {GONE["da_username"]: f"Please remove me: {code.upper()}", STAY["da_username"]: "Concept artist."}
 
     def deviantart(request: httpx.Request) -> httpx.Response:
@@ -1740,15 +1914,14 @@ def test_the_verifier_removes_through_the_real_queue_and_the_real_confirm_remova
     nowhere = crawl.PoliteFetcher(transport=httpx.MockTransport(lambda request: pytest.fail("a site was asked")))
     removals.run(counts, False, "FAKE-ID", "FAKE-SECRET", transport=httpx.MockTransport(deviantart), fetcher=nowhere)
 
-    assert counts == dict.fromkeys(removals.COUNTS, 0) | {
-        "requests_due": 2,
-        "proven_on_deviantart": 1,
-        "artists_removed": 1,
-        "left_for_owner_no_code_found": 1,
-    }
+    assert all(counts[name] >= 0 for name in removals.TALLY)  # every request in the database, whoever's
+    assert {name: count for name, count in counts.items() if name not in removals.TALLY} == {
+        name: 0 for name in removals.COUNTS if name not in removals.TALLY
+    } | {"requests_due": 2, "proven_on_deviantart": 1, "artists_removed": 1, "left_for_owner_no_code_found": 1}
     hashes = ", ".join(f"'{key_hash}'" for key_hash in GONE_HASHES)
     assert db.sql(f"select count(*)::int as n from public.removed where key_hash in ({hashes})") == [{"n": 2}]
-    assert not visible(GONE) and visible(STAY) and visible(KEEP)
+    assert db.upsert("artists", [GONE], "slug", "slug") == []  # and not listed again
+    assert visible(STAY) and visible(KEEP)
     assert store.is_removed(GONE["da_username"])  # here too, at once
     # STAY is looked at again in an hour; KEEP's request, without a code, was never touched.
     queue = {row["slug"]: row for row in db.sql(QUEUE)}
@@ -1904,21 +2077,21 @@ def test_full_scale_fits_the_budget_and_the_public_timeout():
     numbers = random.Random(5)
     embedding = [round(numbers.uniform(-0.5, 0.5), 4) for _ in range(1024)]
     calls: dict[str, tuple[str, dict[str, Any]]] = {
-        "search with an embedding": ("search_artists", {"q": "painterly fantasy character", "q_embedding": embedding}),
-        "similar": ("similar_artists", {"p_slug": "zz-test-bulk-1"}),
-        "search": ("search_artists", {"q": "painterly fantasy character artist"}),
-        "misspelled search": ("search_artists", {"q": "concpet artist charcter desing"}),
-        "browse": ("search_artists", {"q": "", "p_mediums": ["digital"], "p_open_only": True}),
-        "profile": ("get_artist", {"p_slug": "zz-test-bulk-1"}),
-        "removal request": ("request_removal", {"p_slug": "zz-test-bulk-3", "p_note": "scale test"}),
-        "proof code": ("start_removal_proof", {"p_slug": "zz-test-bulk-3"}),
+        "search with an embedding": ("site_search", {"q": "painterly fantasy character", "q_embedding": embedding}),
+        "similar": ("site_similar", {"p_slug": "zz-test-bulk-1"}),
+        "search": ("site_search", {"q": "painterly fantasy character artist"}),
+        "misspelled search": ("site_search", {"q": "concpet artist charcter desing"}),
+        "browse": ("site_search", {"q": "", "p_mediums": ["digital"], "p_open_only": True}),
+        "profile": ("site_artist", {"p_slug": "zz-test-bulk-1"}),
+        "removal request": ("site_request_removal", {"p_slug": "zz-test-bulk-3", "p_note": "scale test"}),
+        "proof code": ("site_removal_code", {"p_slug": "zz-test-bulk-3"}),
     }
 
     def as_the_public(label: str) -> float:
-        """One call through the publishable key, timed. One that the 3 s limit cuts off raises."""
+        """One call as the site makes it (the publishable key, the token), timed. One the 3 s limit cuts off raises."""
         name, args = calls[label]
         started = time.perf_counter()
-        answer = db.rpc(name, args, "publishable")
+        answer = as_the_site(name, **args)
         took = time.perf_counter() - started
         assert answer is True or CODE.fullmatch(str(answer)) or len(answer) > 0, label
         return took
@@ -2032,10 +2205,10 @@ def test_full_scale_fits_the_budget_and_the_public_timeout():
         # The reload's neighbours, all of them new, in rank order.
         assert similar("bulk-1", p_limit=100) == [f"zz-test-bulk-{41 * k + 1}" for k in range(1, 25)]
         deep = {"q": "", "p_limit": 100, "p_offset": OFFSET_CAP}
-        assert len(db.rpc("search_artists", deep)) == 100  # the deepest page, built for its own rows only
-        assert db.rpc("search_artists", {**deep, "p_offset": OFFSET_CAP + 1}) == []  # and past it, nothing
+        assert len(db.rpc("search_artists", deep, "secret")) == 100  # the deepest page, built for its own rows only
+        assert db.rpc("search_artists", {**deep, "p_offset": OFFSET_CAP + 1}, "secret") == []  # and past it, nothing
         huge = {"q": "", "p_mediums": ["digital", *["zz-none"] * 100_000]}
-        assert len(db.rpc("search_artists", huge)) == 24
+        assert len(db.rpc("search_artists", huge, "secret")) == 24
 
         timings = {
             "search_artists, keywords and embedding": server_ms(

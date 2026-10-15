@@ -1,122 +1,174 @@
--- Limits on what visitors can ask, and the verifier's queue of removal requests. Safe to rerun, and
--- it only adds: a table, two columns, two functions. db.migrate() runs the files in name order in one
--- transaction, so this one runs after 002_functions.sql.
+-- What the site's server may ask the database for, and how much. Safe to rerun, and it only adds: two
+-- tables and the functions below. db.migrate() runs the files in name order in one transaction, so this
+-- one runs after 002_functions.sql, and then sets the site's token from .env (SITE_TOKEN), by its hash.
+--
+-- The site's server functions (web/functions/api/) call the database as the anon role, with the publishable
+-- key, and send the site's token, a secret of the Cloudflare project. The anon role may run the six
+-- functions below and nothing else, and each of them refuses a call without the token. So the publishable
+-- key alone opens nothing, and nothing the site can reach deletes or hides an artist.
 
--- The verifier's queue (pipeline/removals.py). code_at: when a proof code was first given out for the
--- request; null for a request without one, which is the owner's alone and never looked at. due_at:
--- when the verifier looks for the code next; it moves that on after each look.
-alter table public.removal_requests
-  add column if not exists code_at timestamptz,
-  add column if not exists due_at timestamptz;
+-- The hash of the site's token (sha256, as key_hash makes it). Readable by the table owner only. Without
+-- a row, the site is refused everything.
+create table if not exists public.site_secret (
+  only_row boolean primary key default true check (only_row),
+  token_hash text not null check (token_hash ~ '^[0-9a-f]{64}$')
+);
+alter table public.site_secret enable row level security;
+revoke all on table public.site_secret from public, anon, authenticated, service_role;
 
--- Requests counted per visitor, for client_wait. One row per kind and visitor, keyed by an HMAC of the two
--- made with the removal secret, so the table holds no address; one row per kind for the day's total.
--- Rows nobody has been counted in for two days are deleted.
+-- Raises unless p_token is the site's.
+create or replace function public.site_check(p_token text) returns void
+language plpgsql stable set search_path = ''
+as $$
+begin
+  if not exists (select 1 from public.site_secret where token_hash = public.key_hash(p_token)) then
+    raise exception 'not the site' using errcode = 'insufficient_privilege';
+  end if;
+end
+$$;
+
+-- How much each visitor, each network and everyone have been let in, per budget: one number a row,
+-- busy_until (epoch seconds), as the generic cell rate algorithm keeps it. A request let in moves it on
+-- by its share of the day, from now or from where it was, whichever is later; a request is let in when
+-- that leaves it no more than a day ahead of now. A visitor's and a network's rows are keyed by an HMAC
+-- made with the removal secret, so the table holds no address.
 create table if not exists public.client_counts (
   client_key text primary key,
-  slot bigint not null, -- which window of the kind's length `hits` are counted in
-  hits int not null,
-  hits_before int not null, -- in the window before that one
-  seen_at timestamptz not null default now()
+  busy_until float8 not null
 );
+create index if not exists client_counts_busy_until_idx on public.client_counts (busy_until);
 alter table public.client_counts enable row level security;
 revoke all on table public.client_counts from public, anon, authenticated, service_role;
 
--- Service role only: the site's server functions call it first, with the visitor as Cloudflare saw them
--- (an IPv4 address, or the /56 of an IPv6 one). It counts the request, refused or not, and answers how
--- many seconds the visitor should wait before the next one: 0 means go ahead.
---   search:  60 per visitor in any ten minutes, and 1,000 a day over everyone. A person searching,
---            ticking filters and loading more makes a few a minute and seldom 20 in their busiest ten.
---            The day's total keeps searching inside the database's free 5 GB of egress a month: a page of
---            24 cards is about 140 kB before compression (each thumbnail URL carries a signed token of
---            about 1,000 characters), so 1,000 a day is at most about 4 GB a month, and profile pages
---            have the rest. Measure a real page and change the number here if it differs. (A refused
---            search still runs the server function, so this does not guard Cloudflare's 100,000 function
---            requests a day: only a rate limiting rule in front of the site can.)
---   removal: 10 per visitor in any day, for asking for a code and asking without one. An artist needs one
---            or two. There is no total: an artist has one request at most, so everyone together can file
---            no more requests than there are artists.
--- A visitor's count is one row, written by one upsert that returns it, so requests sent all at once are
--- each counted. The window slides: the window before counts for the share of it still within the last
--- ten minutes (or day), so a burst on either side of a window's edge gets no more than the limit through.
--- ponytail: every search let through also writes the day's total, one row for everyone. Ceiling: about a
--- hundred searches a second, far past the free tier; then spread the total over a few rows.
-create or replace function public.client_wait(p_kind text, p_client text) returns int
+-- The site's server calls it first, with the visitor as Cloudflare saw them (an IPv4 address, or the /56
+-- of an IPv6 one) and their network (its /24, or the /48). It answers how many seconds to wait: 0 means
+-- go ahead, and the request is counted. A request told to wait is not counted, so asking again while
+-- told to wait costs nothing.
+--   read: a page of search results or of similar artists counts 1, a profile 0.1 (its size). 50 a day
+--         per visitor, 100 per network, 1,000 for everyone.
+--   removal: asking for a code, or asking without one. 10 a day per visitor, 20 per network. No total:
+--         many networks together must not be able to keep an artist from asking.
+-- "n a day" means n at once, then one every 1/n of a day; so in any 24 hours one visitor gets at most
+-- 2n, as does one network, and day after day n. One visitor is 5% of the day's reads, one network 10%.
+-- The total is a backstop for the free tier's 5 GB of egress a month. A page of 24 cards is 117 kB as
+-- the database writes it and 45 kB gzipped, which the site's server asks for (measured on rows of the
+-- stored shape, every thumbnail's signed token at 640 characters, the longest seen). At most 32,000
+-- pages a month (the first day's burst, then 31 days of 1,000) is 1.4 GB gzipped, 29% of the allowance,
+-- and 3.7 GB if it were not compressed. Change the numbers here if a real page measures larger.
+-- The rows are locked in one order (visitor, network, everyone), so two calls never wait on each other
+-- in a circle. The clock is read once they are all held, and a row only ever moves forward, so the order
+-- in which calls arrive cannot undo a count. Anything missing (the token, the removal secret, a known
+-- kind) is an error, and nothing is let in. (A refused request still runs the server function, so this
+-- does not guard Cloudflare's 100,000 function requests a day: only a rate limiting rule in front of
+-- the site can.)
+create or replace function public.client_wait(p_token text, p_kind text, p_client text, p_network text)
+returns int
 language plpgsql security definer set search_path = ''
 as $$
 declare
-  per_client constant int := case p_kind when 'search' then 60 when 'removal' then 10 end;
-  span constant int := case p_kind when 'search' then 600 when 'removal' then 86400 end; -- seconds
-  per_day constant int := case p_kind when 'search' then 1000 end; -- over everyone; null for no total
-  now_s constant float8 := extract(epoch from clock_timestamp());
-  this_slot constant bigint := floor(now_s / span);
-  into_slot constant float8 := now_s - this_slot * span; -- seconds since this window began
-  counted public.client_counts;
-  total int;
+  budget constant text := case when p_kind in ('search', 'similar', 'profile') then 'read'
+                               when p_kind = 'removal' then 'removal' end;
+  cost constant float8 := case p_kind when 'profile' then 0.1 else 1 end;
+  per_day constant float8[] := case budget when 'read' then '{50, 100, 1000}'::float8[] else '{10, 20, null}'::float8[] end;
+  secret text;
+  keys text[];
+  held float8[];
+  busy float8;
+  now_s float8;
+  wait float8 := 0;
 begin
-  if per_client is null then
-    raise exception 'unknown kind of request' using errcode = 'invalid_parameter_value';
+  perform public.site_check(p_token);
+  select s.secret into secret from public.removal_secret s;
+  if budget is null or secret is null then
+    raise exception 'cannot count this request' using errcode = 'invalid_parameter_value';
   end if;
-  insert into public.client_counts as c (client_key, slot, hits, hits_before)
-  select encode(extensions.hmac(p_kind || ':' || coalesce(p_client, ''), s.secret, 'sha256'), 'hex'), this_slot, 1, 0
-  from public.removal_secret s
-  on conflict (client_key) do update set
-    hits_before = case when c.slot = excluded.slot then c.hits_before
-                       when c.slot = excluded.slot - 1 then c.hits else 0 end,
-    hits = case when c.slot = excluded.slot then c.hits + 1 else 1 end,
-    slot = excluded.slot,
-    seen_at = now()
-  returning * into counted;
-  -- What the last `span` seconds hold: this window, and the share of the one before still inside them.
-  if counted.hits + counted.hits_before * (1 - into_slot / span) > per_client then
-    -- How long until one more would be within the limit, if none is sent meanwhile: later in this window, as
-    -- the one before slides out, or else some way into the next.
-    return greatest(1, ceil(case
-      when counted.hits < per_client and counted.hits_before > 0
-        then span * (1 - (per_client - counted.hits - 1)::float8 / counted.hits_before) - into_slot
-      else span - into_slot + greatest(0, span * (1 - (per_client - 1)::float8 / counted.hits))
-    end))::int;
+  keys := array[
+    encode(extensions.hmac(budget || ' visitor ' || coalesce(p_client, ''), secret, 'sha256'), 'hex'),
+    encode(extensions.hmac(budget || ' network ' || coalesce(p_network, ''), secret, 'sha256'), 'hex'),
+    budget || ' everyone'];
+  for i in 1 .. 3 loop
+    continue when per_day[i] is null;
+    -- The row's lock, the row made if need be, and what it holds.
+    insert into public.client_counts as c (client_key, busy_until) values (keys[i], 0)
+    on conflict (client_key) do update set busy_until = c.busy_until
+    returning c.busy_until into busy;
+    held[i] := busy;
+  end loop;
+  now_s := extract(epoch from clock_timestamp());
+  for i in 1 .. 3 loop
+    continue when per_day[i] is null;
+    wait := greatest(wait, greatest(held[i], now_s) + cost * 86400 / per_day[i] - 86400 - now_s);
+  end loop;
+  if wait > 0 then
+    return ceil(wait)::int;
   end if;
-  if per_day is not null then
-    insert into public.client_counts as c (client_key, slot, hits, hits_before)
-    values (p_kind || ':all', floor(now_s / 86400), 1, 0)
-    on conflict (client_key) do update set
-      hits = case when c.slot = excluded.slot then c.hits + 1 else 1 end, slot = excluded.slot, seen_at = now()
-    returning hits into total;
-    if total = 1 then -- the first of a new day: forget the visitors nobody has counted since the day before
-      delete from public.client_counts where seen_at < now() - interval '2 days';
-    end if;
-    if total > per_day then
-      return ceil((floor(now_s / 86400) + 1) * 86400 - now_s)::int;
-    end if;
-  end if;
+  for i in 1 .. 3 loop
+    continue when per_day[i] is null;
+    update public.client_counts set busy_until = greatest(held[i], now_s) + cost * 86400 / per_day[i]
+    where client_key = keys[i];
+  end loop;
+  -- A row back to nothing says nothing: it goes, and a row another call holds is skipped, not waited for.
+  delete from public.client_counts where client_key in (
+    select client_key from public.client_counts where busy_until < now_s limit 100 for update skip locked);
   return 0;
 end
 $$;
 
--- Tells the artist their code, and from then on the verifier looks for it: the slug's request is filed if
--- it was not, and marked as one a code was given out for, due at once. Asking again changes nothing: not
--- the code, which never changes, and not the request's place in the queue. The answer has the same shape
--- whether the slug is unknown, hidden or visible; only an artist's slug is filed. Service role only: the
--- site's server function calls it once client_wait has let the visitor through, and the verifier calls it
--- for the code to look for.
-create or replace function public.start_removal_proof(p_slug text) returns text
+-- What the site's server asks for once client_wait has let the visitor in. Each checks the token first.
+-- A page of search results is always 24 cards.
+create or replace function public.site_search(
+  p_token text, q text, q_embedding real[] default null, p_mediums text[] default null,
+  p_specialties text[] default null, p_open_only boolean default false, p_offset int default 0
+) returns setof jsonb
+language sql stable security definer set search_path = ''
+as $$
+  select public.site_check(p_token);
+  select public.search_artists(q, q_embedding, p_mediums, p_specialties, p_open_only, 24, p_offset);
+$$;
+
+create or replace function public.site_artist(p_token text, p_slug text) returns setof jsonb
+language sql stable security definer set search_path = ''
+as $$
+  select public.site_check(p_token);
+  select public.get_artist(p_slug);
+$$;
+
+create or replace function public.site_similar(p_token text, p_slug text) returns setof jsonb
+language sql stable security definer set search_path = ''
+as $$
+  select public.site_check(p_token);
+  select public.similar_artists(p_slug, 24);
+$$;
+
+create or replace function public.site_removal_code(p_token text, p_slug text) returns text
 language sql security definer set search_path = ''
 as $$
-  with filed as (
-    insert into public.removal_requests as r (artist_slug, code_at, due_at)
-    select a.slug, now(), now() from public.artists a where a.slug = p_slug
-    on conflict (artist_slug) do update set code_at = now(), due_at = now() where r.code_at is null
-  )
-  select public.removal_code(p_slug)
+  select public.site_check(p_token);
+  select public.start_removal_proof(p_slug);
+$$;
+
+create or replace function public.site_request_removal(p_token text, p_slug text, p_note text) returns boolean
+language sql security definer set search_path = ''
+as $$
+  select public.site_check(p_token);
+  select public.request_removal(p_slug, p_note);
 $$;
 
 revoke all on function
-  public.client_wait(text, text),
-  public.start_removal_proof(text)
+  public.site_check(text),
+  public.client_wait(text, text, text, text),
+  public.site_search(text, text, real[], text[], text[], boolean, int),
+  public.site_artist(text, text),
+  public.site_similar(text, text),
+  public.site_removal_code(text, text),
+  public.site_request_removal(text, text, text)
 from public, anon, authenticated, service_role;
 
 grant execute on function
-  public.client_wait(text, text),
-  public.start_removal_proof(text)
-to service_role;
+  public.client_wait(text, text, text, text),
+  public.site_search(text, text, real[], text[], text[], boolean, int),
+  public.site_artist(text, text),
+  public.site_similar(text, text),
+  public.site_removal_code(text, text),
+  public.site_request_removal(text, text, text)
+to anon;

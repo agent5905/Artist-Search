@@ -71,8 +71,8 @@ Examples from the log:
 | Blind test against DeviantArt's "More Like This" | Lost on the 442-artist pool, 8 to 21 and then 11 to 17. To be rerun on the full pool |
 | Blind test against DeviantArt's own search | Not yet run. The reference results for 36 frozen queries are captured |
 | Profile claims | About one unsupported claim in 20 cards under a strict critic; the owner accepted that in place of the spec's "every claim" |
-| Removal proof | Built, and rebuilt after its critic: `pipeline.removals` looks for the code only where the artist alone can write (their DeviantArt bio or tagline, a tag in their site's head, or a file on it) and removes them at once. It checks requests a code was given out for, oldest due first, less often as they age, 30 a run. Run from the owner's machine on a schedule |
-| Limits | Built, and rebuilt after its critic: counted in the database. Per visitor (an IPv6 /56 counts as one): 60 searches in any ten minutes and 10 removal requests a day; 1,000 searches a day for everyone. Searching and removal requests go only through the site's functions, with a key of their own. Not yet run against the database |
+| Removal proof | Built, and rebuilt after two critics: `pipeline.removals` looks for the code only where the artist alone can write (their DeviantArt bio or tagline, a tag in their site's head, or a file on it) and removes them at once. A request is a lasting record that no push or rename touches; only a proof or the owner's answer closes it. Checked hourly for a day, daily for two weeks, then weekly, 30 a run; asking for the code again starts that over. Run from the owner's machine on a schedule |
+| Limits | Built, and rebuilt after two critics: counted in the database, and a refused request costs nothing. A day's reads (a page of results counts 1, a profile 0.1): 50 per visitor (an IPv6 /56 counts as one), 100 per network (an IPv4 /24, an IPv6 /48), 1,000 for everyone, sized to the free tier's egress. Removal requests: 10 a day per visitor, 20 per network. Every database call goes through the site's functions, with a token of their own; the browser holds no key. Not yet run against the database |
 | Public deployment | Not done. It waits on the owner's approval |
 | Crawling artists' own portfolio sites | The polite crawler is built and tested but not used at scale |
 
@@ -102,11 +102,13 @@ uv run python -m pipeline.push --dry-run
 uv run python -m pipeline.push
 ```
 
-The removal check reads the removal requests that a proof code was given out for and are due, and removes every artist whose code is in their DeviantArt bio or tagline, in a `<meta name="artist-search-removal">` in their own site's head, or in `/.well-known/artist-search-removal.txt` on it. Run it on a schedule, every 15 minutes, with Windows Task Scheduler: the site tells artists the code is checked regularly. With nothing due it asks DeviantArt nothing.
+The removal check reads the removal requests that a proof code was given out for and are due, and removes every artist whose code is in their DeviantArt bio or tagline, in a `<meta name="artist-search-removal">` in their own site's head, or in `/.well-known/artist-search-removal.txt` on it. Run it on a schedule, every 15 minutes, with Windows Task Scheduler: the site tells artists the code is checked hourly for a day, then daily for two weeks, then weekly. With nothing due it asks DeviantArt nothing. Each run prints how many requests are open with a code and without one, proven, and closed. Requests without proof are the owner's to answer:
 
 ```bash
 uv run python -m pipeline.removals --dry-run
 uv run python -m pipeline.removals
+uv run python -m pipeline.removals --pending              # the open requests, by public handle
+uv run python -m pipeline.removals --grant SLUG --reject SLUG
 ```
 
 The analysis stages take days on one GPU at full scale, so a small worker runs them in turns and can be paused. A pause loses nothing: each stage saves every work as it finishes it and holds before its next request to a model.
@@ -126,7 +128,7 @@ npm install
 npm run dev
 ```
 
-The site's functions call the database with `SUPABASE_SERVER_KEY`, a Supabase secret key made for the site alone (Project Settings, API Keys, new secret key). Locally it comes from `.env`; on Cloudflare it is a secret of the Pages project, set with `npx wrangler pages secret put SUPABASE_SERVER_KEY --project-name artist-search`. Apply `sql/003_limits.sql` (`uv run python -m pipeline.db migrate`) before the site that needs it.
+The site's functions call the database with the publishable key and `SITE_TOKEN`, a long random string made once and kept in `.env`; `uv run python -m pipeline.db migrate` gives the database its hash. The publishable key alone opens nothing, and nothing the site can call deletes or hides an artist. On Cloudflare the database's address and publishable key are variables of the Pages project and the token is a secret, set with `npx wrangler pages secret put SITE_TOKEN --project-name artist-search`. Migrate before deploying the site that needs it.
 
 The checks:
 

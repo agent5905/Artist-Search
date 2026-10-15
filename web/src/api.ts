@@ -1,7 +1,6 @@
-// Everything the pages ask for. Search and removal go through the Pages Functions (functions/api/), which count
-// each visitor and call the database with a key of their own; a profile and its similar artists are public
-// database functions, called with the publishable key.
-import { rpc, twice } from './rpc'
+// Everything the pages ask for, all of it from the site's own server functions (functions/api/), which count each
+// visitor and call the database with a token of their own. The browser holds no database key.
+import { twice } from './rpc'
 
 /**
  * A work as the database returns it. The image is never copied: image_url is the source's own thumbnail.
@@ -30,9 +29,6 @@ export type Results = { artists: Artist[]; ranked_by: 'meaning' | 'keywords' | '
 
 export const PAGE = 24 // what /api/search returns at most (functions/api/search.ts)
 
-const call = <T>(name: string, args: object) =>
-  rpc<T>(import.meta.env.VITE_SUPABASE_URL, import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY, name, args)
-
 // Answers are kept for the life of the tab, so going back to a page is instant. A failure is not kept.
 const kept = new Map<string, Promise<unknown>>()
 function once<T>(key: string, load: () => Promise<T>): Promise<T> {
@@ -47,21 +43,24 @@ export class Busy extends Error {
   }
 }
 
+/** One GET of a server function, asked once more if it fails. A 429 is Busy. */
+const get = <T>(path: string) =>
+  twice(async () => {
+    const response = await fetch(path, { signal: AbortSignal.timeout(20_000) })
+    if (response.status === 429) return new Busy(Number(response.headers.get('retry-after')) || 60) // not asked again
+    if (!response.ok) throw new Error(`${path} answered ${response.status}`)
+    return (await response.json()) as T
+  }).then((answer) => (answer instanceof Busy ? Promise.reject(answer) : answer))
+
 /** `filters` is the search page's own query string: q, specialty, medium, open. */
 export const search = (filters: string, offset = 0) =>
-  once(`search ${filters} ${offset}`, () =>
-    twice(async () => {
-      const response = await fetch(`/api/search?${filters}&offset=${offset}`, { signal: AbortSignal.timeout(20_000) })
-      if (response.status === 429) return new Busy(Number(response.headers.get('retry-after')) || 60) // not asked again
-      if (!response.ok) throw new Error(`search answered ${response.status}`)
-      return (await response.json()) as Results
-    }).then((answer) => (answer instanceof Busy ? Promise.reject(answer) : answer)),
-  )
+  once(`search ${filters} ${offset}`, () => get<Results>(`/api/search?${filters}&offset=${offset}`))
 
 export const getArtist = (slug: string) =>
-  once(`artist ${slug}`, async () => (await call<Profile[]>('get_artist', { p_slug: slug }))[0] ?? null)
+  once(`artist ${slug}`, () => get<Profile | null>(`/api/artist?slug=${encodeURIComponent(slug)}`))
 
-export const similarArtists = (slug: string) => once(`similar ${slug}`, () => call<Artist[]>('similar_artists', { p_slug: slug }))
+export const similarArtists = (slug: string) =>
+  once(`similar ${slug}`, () => get<Artist[]>(`/api/artist?slug=${encodeURIComponent(slug)}&similar=1`))
 
 /** One POST to /api/removal (functions/api/removal.ts). Not asked again by itself: each one counts. */
 async function removal<T>(body: object): Promise<T> {

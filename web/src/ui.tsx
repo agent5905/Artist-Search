@@ -1,7 +1,7 @@
 // The pieces every page shares: the artist card, a work's thumbnail, icons, and the loading, empty and error states.
 import { useEffect, useState, type ReactNode } from 'react'
 import { Link } from 'react-router'
-import type { Artist, Work } from './api'
+import { Busy, type Artist, type Work } from './api'
 
 /** "vehicle or mech" reads "Vehicle or mech"; "3d render" reads "3D render". */
 export const label = (value: string) => (value.charAt(0).toUpperCase() + value.slice(1)).replace(/^3d\b/, '3D')
@@ -235,7 +235,8 @@ export function Notice({ title, children }: { title: string; children: ReactNode
   )
 }
 
-export function Failed({ retry }: { retry: () => void }) {
+export function Failed({ retry, error }: { retry: () => void; error?: unknown }) {
+  if (error instanceof Busy) return <Slow seconds={error.seconds} retry={retry} />
   return (
     <Notice title="That didn’t load">
       <p>We asked twice and got no answer. It is usually back within a minute.</p>
@@ -252,13 +253,13 @@ export function about(seconds: number) {
   return minutes === 1 ? 'about a minute' : minutes < 90 ? `about ${minutes} minutes` : `about ${Math.round(minutes / 60)} hours`
 }
 
-/** The search asked to be left alone for a while (Busy): nothing is broken, and it says when to try again. */
-export function Slow({ seconds, retry }: { seconds: number; retry: () => void }) {
+/** The site asked to be left alone for a while (Busy): nothing is broken, and it says when to try again. */
+function Slow({ seconds, retry }: { seconds: number; retry: () => void }) {
   return (
-    <Notice title="That’s a lot of searches for now">
+    <Notice title="That’s a lot of pages for now">
       <p>
-        To keep the search free for everyone, each visitor gets a number of searches every ten minutes, and everyone together a number
-        each day. Searching opens again in {about(seconds)}.
+        To keep the site free for everyone, each visitor gets a number of searches and pages a day, so does each network, and so does
+        everyone together. It opens again in {about(seconds)}.
       </p>
       <button className="btn" onClick={retry}>
         Try again

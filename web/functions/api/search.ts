@@ -1,43 +1,68 @@
 // GET /api/search?q=&specialty=&medium=&open=1&offset=
-// Turns the query into its bge-m3 embedding on Workers AI, then asks the database for artists
-// (search_artists in sql/002_functions.sql). Without an embedding the search still runs, on keywords alone.
-// Before either is asked, the database counts the visitor (client_wait in sql/003_limits.sql): past their limit,
-// or past the day's for everyone, the answer is a 429 that says how long to wait.
-// The database is called with SUPABASE_SERVER_KEY: a Supabase secret key made for this site, which the owner sets
-// as a secret of the Cloudflare Pages project. It is never sent to the browser, and the publishable key the
-// browser holds cannot search at all.
-import { rpc } from '../../src/rpc'
+// Turns the query into its bge-m3 embedding on Workers AI, then asks the database for a page of artists
+// (site_search, which runs search_artists: sql/003_limits.sql and 002_functions.sql). Without an embedding the search
+// still runs, on keywords alone. Before either is asked, the database counts the visitor (client_wait): past their
+// limit, their network's or the day's for everyone, the answer is a 429 that says how long to wait.
+// Every function here calls the database the same way: as its public role, with the publishable key, and with the
+// site's token (SITE_TOKEN), a secret of the Cloudflare Pages project that never reaches the browser. The public
+// role may run the site's six functions and nothing else, and those only with the token. The browser holds no key.
+import { call, rpc } from '../../src/rpc'
 
 export type Env = {
   AI: { run(model: string, input: { text: string[] }): Promise<unknown> }
   VITE_SUPABASE_URL: string
-  SUPABASE_SERVER_KEY: string
+  VITE_SUPABASE_PUBLISHABLE_KEY: string
+  SITE_TOKEN: string
 }
 
 export const MAX_QUERY = 200 // as many characters as search_artists reads
-export const PAGE = 24
 const EMBED_MS = 5_000
 export const TOO_MANY = 'Too many searches for now.'
-const NO_STORE = { 'cache-control': 'no-store' } // a removed artist must not linger in a cached answer
+export const NO_STORE = { 'cache-control': 'no-store' } // a removed artist must not linger in a cached answer
+
+/** The address Cloudflare saw, and nothing a client can set. An IPv4 address written as IPv6 is read as IPv4. */
+const address = (request: Request) => (request.headers.get('cf-connecting-ip') ?? '').replace(/^::ffff:(?=[\d.]+$)/i, '')
+
+/** The first four groups of an IPv6 address, however it is written. */
+function groups(ipv6: string): number[] {
+  const [head, tail] = ipv6.split('::').map((part) => (part ? part.split(':') : []))
+  const written = tail ? [...head, ...Array(Math.max(8 - head.length - tail.length, 0)).fill('0'), ...tail] : head
+  return [0, 1, 2, 3].map((n) => parseInt(written[n], 16) || 0)
+}
 
 /** Who is asking, for the limits: their address, and an IPv6 one by its /56, which one subscriber usually has whole. */
 export function client(request: Request): string {
-  const address = request.headers.get('cf-connecting-ip') ?? ''
-  if (!address.includes(':')) return address
-  const [head, tail] = address.split('::').map((part) => (part ? part.split(':') : []))
-  const written = tail ? [...head, ...Array(Math.max(8 - head.length - tail.length, 0)).fill('0'), ...tail] : head
-  const [a, b, c, d] = written.map((group) => parseInt(group, 16) || 0)
-  return `${[a, b, c, d & 0xff00].map((group) => (group ?? 0).toString(16)).join(':')}::/56`
+  const ip = address(request)
+  if (!ip.includes(':')) return ip
+  const [a, b, c, d] = groups(ip)
+  return `${[a, b, c, d & 0xff00].map((group) => group.toString(16)).join(':')}::/56`
 }
 
+/** The network they ask from, which holds whatever other addresses one person can easily have: an IPv4 /24, an IPv6 /48. */
+export function network(request: Request): string {
+  const ip = address(request)
+  if (!ip.includes(':')) return ip.replace(/\.\d+$/, '.0/24')
+  return `${groups(ip).slice(0, 3).map((group) => group.toString(16)).join(':')}::/48`
+}
+
+/** One of the site's database functions (sql/003_limits.sql), with the token. Asked once more if it fails. */
+export const site = <T>(env: Env, name: string, args: object, fetcher: typeof fetch) =>
+  rpc<T>(env.VITE_SUPABASE_URL, env.VITE_SUPABASE_PUBLISHABLE_KEY, name, { p_token: env.SITE_TOKEN, ...args }, fetcher)
+
 /**
- * Counts this request against the visitor's limit of `kind` (client_wait): the seconds they should wait, 0 to go
- * ahead. The database keeps the count, one upsert that returns it, so requests sent all at once are each counted.
+ * Counts this request against the limits of `kind` (client_wait): the seconds the visitor should wait, 0 to go ahead,
+ * and then it has been counted. Asked once only, so a lost answer never counts one request twice. Only a number lets a
+ * request through: any other answer counts as "wait".
  */
-export async function wait(request: Request, env: Env, kind: 'search' | 'removal', fetcher: typeof fetch): Promise<number> {
-  const args = { p_kind: kind, p_client: client(request) }
-  const seconds = Number(await rpc(env.VITE_SUPABASE_URL, env.SUPABASE_SERVER_KEY, 'client_wait', args, fetcher))
-  return seconds <= 0 ? 0 : Math.ceil(seconds) || 60 // an answer that is not a number counts as "wait"
+export async function wait(
+  request: Request,
+  env: Env,
+  kind: 'search' | 'similar' | 'profile' | 'removal',
+  fetcher: typeof fetch,
+): Promise<number> {
+  const args = { p_token: env.SITE_TOKEN, p_kind: kind, p_client: client(request), p_network: network(request) }
+  const seconds = await call(env.VITE_SUPABASE_URL, env.VITE_SUPABASE_PUBLISHABLE_KEY, 'client_wait', args, fetcher)
+  return typeof seconds === 'number' && seconds <= 0 ? 0 : Math.ceil(Number(seconds)) || 60
 }
 
 /** The answer to a visitor told to wait: a 429 that says how many seconds. */
@@ -77,10 +102,9 @@ export async function handle(request: Request, env: Env, fetcher: typeof fetch =
       p_mediums: list('medium'),
       p_specialties: list('specialty'),
       p_open_only: asked.get('open') === '1',
-      p_limit: PAGE,
       p_offset: Math.min(Math.max(Math.trunc(Number(asked.get('offset'))) || 0, 0), 1000),
     }
-    const artists = await rpc(env.VITE_SUPABASE_URL, env.SUPABASE_SERVER_KEY, 'search_artists', args, fetcher)
+    const artists = await site(env, 'site_search', args, fetcher)
     return Response.json({ artists, ranked_by: q_embedding ? 'meaning' : q ? 'keywords' : 'name' }, { headers: NO_STORE })
   } catch {
     return Response.json({ error: 'The search is not answering right now.' }, { status: 502, headers: NO_STORE })

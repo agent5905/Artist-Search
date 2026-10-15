@@ -6,6 +6,7 @@ Nothing here prints a value from .env. Errors carry the HTTP status and the serv
 never the request URL (it holds the project ref).
 """
 
+import hashlib
 import itertools
 import sys
 import time
@@ -96,9 +97,21 @@ def rpc(name: str, args: dict[str, Any], key: Key = "publishable") -> Any:
 
 
 def migrate() -> None:
-    """Apply sql/*.sql in name order, all or nothing. Every statement is idempotent, so rerunning changes nothing."""
+    """Apply sql/*.sql in name order, all or nothing. Every statement is idempotent, so rerunning changes nothing.
+
+    Then the site's token (SITE_TOKEN in .env), by its sha256 only, in the same call: the database lets the site's
+    server functions in with it (sql/003_limits.sql). Without one in .env the database keeps the one it has, or has
+    none and refuses the site everything.
+    """
+    files = [path.read_text(encoding="utf-8") for path in sorted((ROOT / "sql").glob("*.sql"))]
+    token = load_env().get("SITE_TOKEN")
+    if token:
+        files.append(
+            f"insert into public.site_secret (token_hash) values ('{hashlib.sha256(token.encode()).hexdigest()}') "
+            "on conflict (only_row) do update set token_hash = excluded.token_hash;"
+        )
     # One call, so one transaction: no visitor meets tables of one version under functions of another.
-    sql("\n".join(path.read_text(encoding="utf-8") for path in sorted((ROOT / "sql").glob("*.sql"))))
+    sql("\n".join(files))
     # The Data API reads the schema asynchronously. Wait until it lists every function it can call.
     sql("notify pgrst, 'reload schema'")
     callable_functions = sql("""

@@ -3,7 +3,7 @@ import { useRef, useState, type FormEvent, type ReactNode } from 'react'
 import { Link, useNavigate, useParams, useSearchParams } from 'react-router'
 import { Busy, getArtist, PAGE, removalCode, requestRemoval, search, similarArtists } from './api'
 import facets from './facets.json'
-import { about, availability, Cards, Failed, host, Icon, label, Notice, Skeletons, Slow, sourceName, Tags, Thumb, useLoad, web } from './ui'
+import { about, availability, Cards, Failed, host, Icon, label, Notice, Skeletons, sourceName, Tags, Thumb, useLoad, web } from './ui'
 
 const TITLE = 'Artist Search'
 
@@ -120,7 +120,7 @@ export function Search() {
       </div>
 
       {failed ? (
-        error instanceof Busy ? <Slow seconds={error.seconds} retry={retry} /> : <Failed retry={retry} />
+        <Failed error={error} retry={retry} />
       ) : !data ? (
         <Skeletons />
       ) : artists.length === 0 ? (
@@ -159,7 +159,7 @@ export function Similar() {
   const seed = useLoad(`artist ${slug}`, () => getArtist(slug))
   const near = useLoad(`similar ${slug}`, () => similarArtists(slug))
 
-  if (seed.failed) return <Page><Failed retry={seed.retry} /></Page>
+  if (seed.failed) return <Page><Failed error={seed.error} retry={seed.retry} /></Page>
   if (seed.stale) return <Page><Skeletons /></Page>
   if (!seed.data) return <Gone />
   const artist = seed.data
@@ -188,7 +188,7 @@ export function Similar() {
         <p role="status">{near.stale ? 'Looking…' : near.data?.length ? 'Closest first, judged by how their work looks' : ''}</p>
       </div>
       {near.failed ? (
-        <Failed retry={near.retry} />
+        <Failed error={near.error} retry={near.retry} />
       ) : near.stale || !near.data ? (
         <Skeletons />
       ) : near.data.length === 0 ? (
@@ -209,9 +209,9 @@ export function Similar() {
 
 export function ProfilePage() {
   const { slug = '' } = useParams()
-  const { data, stale, failed, retry } = useLoad(`artist ${slug}`, () => getArtist(slug))
+  const { data, stale, failed, error, retry } = useLoad(`artist ${slug}`, () => getArtist(slug))
 
-  if (failed) return <Page><Failed retry={retry} /></Page>
+  if (failed) return <Page><Failed error={error} retry={retry} /></Page>
   if (stale)
     return (
       <Page>
@@ -398,7 +398,7 @@ function RemoveProfile({ slug }: { slug: string }) {
   const [busy, setBusy] = useState('')
   const [problem, setProblem] = useState<{ kind: string; error: unknown }>()
 
-  if (artist.failed) return <Page narrow><Failed retry={artist.retry} /></Page>
+  if (artist.failed) return <Page narrow><Failed error={artist.error} retry={artist.retry} /></Page>
   if (artist.stale) return <Page narrow><p className="fine" role="status">Loading…</p></Page>
   if (!artist.data) return <Gone />
   const { name, site_url, deviantart_url } = artist.data
@@ -484,8 +484,8 @@ function RemoveProfile({ slug }: { slug: string }) {
             </li>
             <li>
               <span>
-                That is all. We look for the code regularly, and as soon as it is found this profile is deleted and you will not be added
-                again. You can take the code down after that.
+                That is all. We look for the code every hour for a day after you get it, then once a day for two weeks, then once a week.
+                As soon as it is found this profile is deleted and you will not be added again. You can take the code down after that.
               </span>
             </li>
           </ol>
@@ -498,8 +498,9 @@ function RemoveProfile({ slug }: { slug: string }) {
           </>
         )}
         <p className="fine">
-          If this profile is still here a day after you put the code up, check that it is exactly where step 2 says. If it is, or you cannot
-          put it there, send a request below and the site owner will look at it.
+          Putting the code up more than two weeks after you got it? Come back to this page and press “Get my code” again first: the code is
+          the same, and the hourly checks start over. If this profile is still here a day after the code went up, check that it is exactly
+          where step 2 says. If it is, or you cannot put it there, send a request below and the site owner will look at it.
         </p>
       </section>
 
