@@ -4,7 +4,7 @@ A search engine for game concept and character artists.
 
 Type a brief the way a studio would, such as "dark fantasy creature designer, painterly, open for commissions", and get **artists**, not single images. Open an artist and see others who draw in a similar style.
 
-**Status, 2026-10-13: not finished, and not deployed.** It runs on the owner's machine against a real database of 119 artists. The target is 2,000 or more. [PROGRESS.md](PROGRESS.md) is the running log, updated after every round of work.
+**Status, 2026-10-14: not finished, and not deployed.** 3,969 artists and 39,744 of their works are collected, and the local GPU is analysing them, about three days of work. The public database holds 119 artists until that is done. [PROGRESS.md](PROGRESS.md) is the running log, updated after every round of work.
 
 ## Why
 
@@ -22,8 +22,8 @@ discover -> collect -> analyze (local GPU) -> store (Postgres) -> search (edge f
 | Collect | Reads each artist's public profile and about ten recent works. Preview images go to a local cache that git ignores | Owner's machine |
 | Tag | A local vision model (`qwen3.8` in Ollama) tags and describes each work. A second pass checks every claim against the image and drops what it cannot see | Owner's machine |
 | Style | A style model (CSD ViT-L) turns each work into a vector. Each artist's nearest artists are computed locally | Owner's machine |
-| Profile | The model looks at one sheet of an artist's works, proposes what recurs, then counts it. Only claims that pass the count are written into one or two plain sentences, which are embedded with `bge-m3` | Owner's machine |
-| Push | Sends text, links, thumbnail addresses and vectors to the database. It holds back mature, AI-declared and flagged works, and stops if a run would delete more than 10% of what is public | Owner's machine |
+| Profile | One plain sentence per artist, counted from the checked per-work tags (subject, genre, drawing manner, medium) and worded by share: "Character and environment art." The artist's own tags are shown beside it, labelled as theirs. The text is embedded with `bge-m3` for search | Owner's machine |
+| Push | Sends text, links, thumbnail addresses and vectors to the database, from one consistent snapshot of the local store. Every model reading carries a fingerprint of the words or image it was made from, and nothing goes out under a reading of something that has since changed. It holds back mature, AI-declared, unrated and flagged works and artists, honours removals first, and stops rather than delete much at once | Owner's machine |
 | Store | Supabase Postgres with `pgvector`, free tier. Every table is locked; visitors reach the data only through five database functions | Supabase |
 | Search | A Cloudflare Pages Function embeds the query with the same `bge-m3` weights on Workers AI, and a database function blends meaning with keywords | Cloudflare |
 | Site | React pages: search, similar style, artist profile, claim or remove | Cloudflare Pages |
@@ -41,12 +41,16 @@ Examples from the log:
 - **Profiles changed approach.** The first critic called them "too generic to choose by: 19 of 20 say digital painting". Adding specifics from single works brought new errors, such as "mostly elves" on a portfolio with 3 elves in 10 works. The fix was to make the model count each claim across the artist's works before stating it.
 - **Collect failed seven critics in a row.** Each found a way that a bad answer from the API could delete good data. After four rounds of guarding the deletions, the approach changed: the stage stopped deleting and marks what looks wrong. The seventh critic ran 660 failure sequences and lost nothing.
 - **The removal rule was rewritten.** "Any request hides the profile at once" failed twice, because anyone could hide anyone. Removal now needs proof of control and is then immediate and permanent.
+- **We lost the first test against DeviantArt itself.** Its "More Like This" beat our similar-style results on 21 of 29 seed artists. Showing each similar artist's works closest to the seed, not their newest, closed the per-work gap (42% of works judged a real style match, then 56%, against DeviantArt's 58%) but still lost 11 to 17. The critics' notes put the rest down to pool size: 442 artists then, against millions of works. The test is rerun on the full pool.
+- **Profiles stopped at a ceiling the owner accepted.** Seven critic rounds tried four ways of putting specifics on a card: per-work tags, a count on a contact sheet, a per-work yes-or-no check, and the artist's own tags. The plain sentence stayed reliable; every way of adding specifics added errors (the per-work check agreed a dinosaur was a dragon). The owner chose plain cards, with the artist's own tags shown beside them, at about one unsupported claim in 20 under a strict critic.
+- **DeviantArt rate-limited us, and we deserved it.** A day at a fixed one request a second tripped its adaptive limit. The client backed off for one request at a time and then went straight back to full speed, which is what the API's documentation warns against. The pacing was rebuilt to slow down for the whole run, keep its pace across runs, and stop after an hour of refusals; two critics and three rounds later, discovery read 1,659 pages with no rate-limit answer.
+- **Push failed its first two critics on what reaches the public.** The first found that a model's reading was not tied to what it read: a tagline changed after it was checked would go out under the old "no contact details". Every reading now carries a fingerprint. The second found that changes landing during a push could still slip through; the push now builds from one snapshot.
 
 ## How artists' data is handled
 
 - **Nothing is rehosted.** The database holds links and thumbnail addresses. The site loads thumbnails from the source's own image host, with credit and a link back.
 - **Images are cached only on the owner's machine,** in a folder git ignores. A commit hook rejects image files and anything that looks like a secret.
-- **Collection is polite.** It uses the official API at no more than one request every two seconds, identifies itself with a contact address, and when the API asks it to slow down it slows down for the rest of the run, not only for the request that was refused. The crawler for artists' own sites obeys robots.txt and waits three seconds between requests to a host.
+- **Collection is polite.** It uses the official API at no more than one request every two seconds, identifies itself with a contact address, and when the API asks it to slow down it slows down for the rest of the run and the next one, not only for the request that was refused. One process talks to a host at a time. The crawler for artists' own sites obeys robots.txt and waits three seconds between requests to a host.
 - **Only public, professional information is kept:** handle, public bio, specialties, public links, and whether the artist says they are open for work, in their own words. Contact details found in titles or tags are held back.
 - **Left out:** works marked mature or rated suggestive, works the artist declares AI-made, and artists with a large share of either.
 - **No model is trained and no image is generated.** Models only describe and compare.
@@ -58,14 +62,16 @@ Examples from the log:
 
 | | State |
 |---|---|
-| Discover, collect, tag, style, profile, push | Run end to end on real data: 442 artists collected, 4,381 works tagged |
-| Public database | 119 artists, 1,130 works, 17 MB of a 400 MB budget |
+| Discover and collect | Done at scale: 3,969 artists and 39,744 works, with no artist lost |
+| Tag, rate, style, profile | Running on the full set, about three days on one GPU |
+| Public database | 119 artists, 1,130 works, 17 MB of a 400 MB budget, until the larger push |
+| Push | Fixed twice after critics; its third critic is under way. No push until it passes |
 | Search and similar style | Work locally against the real database |
 | Site | Runs locally. Beat ArtStation and Behance pages on 7 of 8 pairs, twice, with the caveat that logos made the test not truly blind |
-| 2,000 or more artists | Not yet. Collection at scale has just been cleared by its critic |
-| Blind tests against DeviantArt's own search and "More Like This" | Not yet run. The reference results are captured |
-| Profile claims | Roughly 9 artists in 10 have no unsupported claim. The bar is all of them |
-| Removal proof | The request and code steps exist. The step that checks the code is not built |
+| Blind test against DeviantArt's "More Like This" | Lost on the 442-artist pool, 8 to 21 and then 11 to 17. To be rerun on the full pool |
+| Blind test against DeviantArt's own search | Not yet run. The reference results for 36 frozen queries are captured |
+| Profile claims | About one unsupported claim in 20 cards under a strict critic; the owner accepted that in place of the spec's "every claim" |
+| Removal proof | The request and code steps exist. The check that finds the code and carries out the removal is being built |
 | Public deployment | Not done. It waits on the owner's approval |
 | Crawling artists' own portfolio sites | The polite crawler is built and tested but not used at scale |
 
