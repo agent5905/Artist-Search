@@ -1,9 +1,9 @@
 // The pages: search, similar style, profile, and claim or remove.
 import { useRef, useState, type FormEvent, type ReactNode } from 'react'
 import { Link, useNavigate, useParams, useSearchParams } from 'react-router'
-import { getArtist, PAGE, removalCode, requestRemoval, search, similarArtists } from './api'
+import { Busy, getArtist, PAGE, removalCode, requestRemoval, search, similarArtists } from './api'
 import facets from './facets.json'
-import { availability, Cards, Failed, host, Icon, label, Notice, Skeletons, sourceName, Tags, Thumb, useLoad, web } from './ui'
+import { availability, Cards, Failed, host, Icon, label, Notice, Skeletons, Slow, sourceName, Tags, Thumb, useLoad, web } from './ui'
 
 const TITLE = 'Artist Search'
 
@@ -28,7 +28,7 @@ export function Search() {
   const [rowEnded, setRowEnded] = useState(false)
   const [more, setMore] = useState({ filters, pages: 1 })
   const pages = more.filters === filters ? more.pages : 1
-  const { data, stale, failed, retry } = useLoad(`${filters} ${pages}`, async () => ({
+  const { data, stale, failed, error, retry } = useLoad(`${filters} ${pages}`, async () => ({
     filters,
     pages: await Promise.all(Array.from({ length: pages }, (_, i) => search(filters, i * PAGE))),
   }))
@@ -120,7 +120,7 @@ export function Search() {
       </div>
 
       {failed ? (
-        <Failed retry={retry} />
+        error instanceof Busy ? <Slow seconds={error.seconds} retry={retry} /> : <Failed retry={retry} />
       ) : !data ? (
         <Skeletons />
       ) : artists.length === 0 ? (
@@ -449,8 +449,8 @@ function RemoveProfile({ slug }: { slug: string }) {
           <p className="thanks" role="status">
             <Icon name="check" size={20} />
             <span>
-              <strong>Thank you.</strong> The site owner has been told the code is on your {place}. They check by hand for now; as soon as they
-              have seen it, this profile is deleted and you will not be added again.
+              <strong>Thank you.</strong> We look for the code on your {place} automatically, usually within the hour, and keep looking while
+              your request is open. As soon as it is seen, this profile is deleted and you will not be added again.
             </span>
           </p>
         ) : (
@@ -473,7 +473,9 @@ function RemoveProfile({ slug }: { slug: string }) {
               </li>
               <li>
                 <span>
-                  Paste it anywhere on your DeviantArt profile (the About section works){site ? ` or on a page of ${host(site)}` : ' or on a page of your own site'}.
+                  Paste it into the About text or the tagline of your DeviantArt profile
+                  {site ? `, or onto the front page of ${host(site)} if that page links to your DeviantArt profile` : ''}. It is looked for
+                  there and nowhere else.
                 </span>
               </li>
               <li>
@@ -485,14 +487,16 @@ function RemoveProfile({ slug }: { slug: string }) {
                     send('proof', `Proof code posted on the artist’s ${place}.`)
                   }}
                 >
-                  <span className="radios" role="radiogroup" aria-label="Where the code is">
-                    {PLACES.map((value) => (
-                      <label className="chip" key={value}>
-                        <input type="radio" name="place" checked={place === value} onChange={() => setPlace(value)} />
-                        On my {value}
-                      </label>
-                    ))}
-                  </span>
+                  {site && ( // without a site on record, the profile is the one place the code is looked for
+                    <span className="radios" role="radiogroup" aria-label="Where the code is">
+                      {PLACES.map((value) => (
+                        <label className="chip" key={value}>
+                          <input type="radio" name="place" checked={place === value} onChange={() => setPlace(value)} />
+                          On my {value}
+                        </label>
+                      ))}
+                    </span>
+                  )}
                   <button className="btn" disabled={busy === 'proof' || !code.data}>
                     {busy === 'proof' ? 'Sending…' : 'I’ve posted the code'}
                   </button>
@@ -501,8 +505,7 @@ function RemoveProfile({ slug }: { slug: string }) {
             </ol>
             {problem === 'proof' && failure}
             <p className="fine">
-              For now the site owner checks for the code by hand; checking it automatically, so that removal is instant, is still being
-              built. You can take the code down once the profile is gone.
+              The code is checked automatically, usually within the hour. You can take it down once this profile is gone.
             </p>
           </>
         )}

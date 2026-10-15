@@ -39,14 +39,22 @@ function once<T>(key: string, load: () => Promise<T>): Promise<T> {
   return kept.get(key) as Promise<T>
 }
 
+/** The search's limit per visitor was reached (functions/api/search.ts): it lifts by itself after `seconds`. */
+export class Busy extends Error {
+  constructor(readonly seconds: number) {
+    super('too many searches')
+  }
+}
+
 /** `filters` is the search page's own query string: q, specialty, medium, open. */
 export const search = (filters: string, offset = 0) =>
   once(`search ${filters} ${offset}`, () =>
     twice(async () => {
       const response = await fetch(`/api/search?${filters}&offset=${offset}`, { signal: AbortSignal.timeout(20_000) })
+      if (response.status === 429) return new Busy(Number(response.headers.get('retry-after')) || 60) // not asked again
       if (!response.ok) throw new Error(`search answered ${response.status}`)
       return (await response.json()) as Results
-    }),
+    }).then((answer) => (answer instanceof Busy ? Promise.reject(answer) : answer)),
   )
 
 export const getArtist = (slug: string) =>

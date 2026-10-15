@@ -8,7 +8,8 @@ import { createElement } from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
 import { MemoryRouter } from 'react-router'
 import { describe, expect, it, vi } from 'vitest'
-import { handle, MAX_QUERY, PAGE, type Env } from '../functions/api/search'
+import { client, handle, LIMIT, MAX_QUERY, PAGE, TOO_MANY, wait, WINDOW, type Env } from '../functions/api/search'
+import { Busy, search } from '../src/api'
 import { Cards } from '../src/ui'
 
 const VECTOR = Array.from({ length: 1024 }, (_, i) => i / 1024)
@@ -117,6 +118,76 @@ describe('GET /api/search', () => {
     expect(response.status).toBe(502)
     expect(await response.json()).toEqual({ error: 'The search is not answering right now.' })
     expect(down.calls).toHaveLength(2)
+  })
+})
+
+/** One Cloudflare location's cache, as the limit uses it: what was put, by key. */
+function memoryCache() {
+  const kept = new Map<string, string>()
+  const cache = {
+    match: async (key: string) => (kept.has(key) ? new Response(kept.get(key)) : undefined),
+    put: async (key: string, response: Response) => void kept.set(key, await response.text()),
+  }
+  return cache as unknown as Cache
+}
+const from = (address: string) =>
+  new Request('https://artist-search.test/api/search?q=mechs', { headers: { 'cf-connecting-ip': address } })
+
+describe('the limit per client', () => {
+  it('answers 429 past the limit, before Workers AI or the database is asked, and holds up nobody else', async () => {
+    const cache = memoryCache()
+    const run = embeds()
+    const db = database()
+    for (let n = 0; n < LIMIT; n++) expect((await handle(from('203.0.113.7'), env(run), db.fetcher, cache)).status).toBe(200)
+
+    const over = await handle(from('203.0.113.7'), env(run), db.fetcher, cache)
+    expect(over.status).toBe(429)
+    expect(Number(over.headers.get('retry-after'))).toBeGreaterThan(0)
+    expect(Number(over.headers.get('retry-after'))).toBeLessThanOrEqual(WINDOW)
+    expect(over.headers.get('cache-control')).toBe('no-store')
+    expect(await over.json()).toEqual({ error: TOO_MANY })
+    expect(run).toHaveBeenCalledTimes(LIMIT)
+    expect(db.calls).toHaveLength(LIMIT)
+
+    expect((await handle(from('198.51.100.1'), env(run), db.fetcher, cache)).status).toBe(200)
+  })
+
+  it('lifts when the window ends, and says how long that is', async () => {
+    const cache = memoryCache()
+    const start = 1_800_000_000_000 - (1_800_000_000 % WINDOW) * 1000 // the first second of a window
+    for (let n = 0; n < LIMIT; n++) expect(await wait(cache, 'https://x.test', 'someone', start)).toBe(0)
+    expect(await wait(cache, 'https://x.test', 'someone', start + 1000)).toBe(WINDOW - 1)
+    expect(await wait(cache, 'https://x.test', 'someone', start + (WINDOW - 1) * 1000)).toBe(1)
+    expect(await wait(cache, 'https://x.test', 'someone', start + WINDOW * 1000)).toBe(0)
+  })
+
+  it('counts an IPv6 address by its /64, however it is written', () => {
+    const key = (address: string) => client(from(address))
+    expect(key('2001:db8:aa:bb::1')).toBe('2001:db8:aa:bb::/64')
+    expect(key('2001:db8:aa:bb:ffff:1:2:3')).toBe('2001:db8:aa:bb::/64')
+    expect(key('2001:0db8:00aa:00bb::9')).toBe('2001:db8:aa:bb::/64')
+    expect(key('2001:db8::1')).toBe('2001:db8:0:0::/64')
+    expect(key('1::2:3:4:5:6:7')).toBe('1:0:2:3::/64')
+    expect(key('2001:db8:aa:bc::1')).not.toBe(key('2001:db8:aa:bb::1'))
+    expect(key('203.0.113.7')).toBe('203.0.113.7')
+  })
+
+  it('lets the search through when the cache fails', async () => {
+    const broken = { match: async () => Promise.reject(new Error('cache down')), put: async () => {} } as unknown as Cache
+    expect((await handle(from('203.0.113.7'), env(embeds()), database().fetcher, broken)).status).toBe(200)
+  })
+
+  it('is not asked again by the page, which is told how long to wait', async () => {
+    const asked = vi.fn(async () => Response.json({ error: TOO_MANY }, { status: 429, headers: { 'retry-after': '150' } }))
+    vi.stubGlobal('fetch', asked)
+    try {
+      const error = await search('q=limited').catch((reason: unknown) => reason)
+      expect(error).toBeInstanceOf(Busy)
+      expect((error as Busy).seconds).toBe(150)
+      expect(asked).toHaveBeenCalledTimes(1)
+    } finally {
+      vi.unstubAllGlobals()
+    }
   })
 })
 

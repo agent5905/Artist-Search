@@ -246,27 +246,46 @@ export function Failed({ retry }: { retry: () => void }) {
   )
 }
 
+/** The search asked to be left alone for a while (Busy): nothing is broken, and it says when to try again. */
+export function Slow({ seconds, retry }: { seconds: number; retry: () => void }) {
+  const minutes = Math.max(1, Math.ceil(seconds / 60))
+  return (
+    <Notice title="That’s a lot of searches in a few minutes">
+      <p>
+        To keep the search free for everyone, each visitor gets a number of searches every ten minutes. Yours come back in about{' '}
+        {minutes === 1 ? 'a minute' : `${minutes} minutes`}.
+      </p>
+      <button className="btn" onClick={retry}>
+        Try again
+      </button>
+    </Notice>
+  )
+}
+
 /**
  * Loads something for `key`. `data` stays the last answer until the next one arrives, with `stale` saying it
- * belongs to an earlier key, so a page can keep showing what it has instead of flashing empty.
+ * belongs to an earlier key, so a page can keep showing what it has instead of flashing empty. `error` is why it
+ * failed, when it has.
  */
 export function useLoad<T>(key: string, load: () => Promise<T>) {
-  const [state, setState] = useState<{ key?: string; data?: T; failed?: boolean }>({})
+  const [state, setState] = useState<{ key?: string; data?: T; failed?: boolean; error?: unknown }>({})
   const [attempt, setAttempt] = useState(0)
   useEffect(() => {
     let current = true
     load().then(
       (data) => current && setState({ key, data }),
-      () => current && setState({ key, failed: true }),
+      (error) => current && setState({ key, failed: true, error }),
     )
     return () => {
       current = false
     }
   }, [key, attempt])
+  const failed = state.key === key && !!state.failed
   return {
     data: state.data,
     stale: state.key !== key,
-    failed: state.key === key && !!state.failed,
+    failed,
+    error: failed ? state.error : undefined,
     retry: () => (setState({}), setAttempt((n) => n + 1)),
   }
 }

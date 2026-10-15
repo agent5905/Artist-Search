@@ -8,5 +8,8 @@ compatibility_date = "2026-10-01"
 binding = "AI"
 remote = true # there is no local Workers AI: local runs call the real one too
 
+# The search's limit per visitor counts in the Cache API (functions/api/search.ts), which needs no binding and no
+# setting. A Pages project cannot hold a rate limiting binding: wrangler refuses `ratelimits` here.
+
 # The function also reads VITE_SUPABASE_URL and VITE_SUPABASE_PUBLISHABLE_KEY, the two browser-safe
 # values: from .dev.vars locally (scripts/dev.mjs writes it), from the Pages project's settings when hosted.
