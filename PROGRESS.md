@@ -1108,3 +1108,32 @@ Nothing has been pushed; none of these reached the public.
 - **Speed:** 1.03 seconds an image, so about 11.5 hours for all 39,744. The worker runs this stage alone, started at 19:50.
 - **Tests:** 4,939 pass.
 - **Next:** a blind critic samples what it held and what it kept, before the push.
+
+### Round 31: the artwork check finished and judged blind; push's and claim-or-remove's final critics (2026-10-19)
+
+**The full run finished** at 10:27 on 10-19. It checked 39,744 works: one failed (held back as unchecked) and 1,463 were held back (3.7%).
+
+| Kind held back | Count |
+|---|---|
+| Photo | 643 |
+| Advertisement | 272 |
+| Placeholder | 231 |
+| Screenshot | 181 |
+| Mostly text | 71 |
+| Meme or template | 41 |
+| Contact card | 24 |
+
+**Blind check.** The sample was 60 held works, weighted to photos, and 60 kept: 30 at random and 30 whose descriptions hint at non-art. Two fresh critics judged each image against the product's definition, without knowing the check's answer.
+
+| | Critic: hold | Critic: show |
+|---|---|---|
+| Check held (60) | 50 | 10, of which the critic was sure of 3 |
+| Check kept (60) | 1 | 59 |
+
+- **Agreement: 109 of 120.**
+- **One miss:** a "your character here" commission sheet with prices.
+- **Three clear wrong holds, all photos of physical artworks:** two clay figures and a needle-felted bust, filed as "photo". The other seven are borderline even to the critic: photoreal renders, a handmade prop, a game-like image, a drawing set into a photo.
+- **Across the pool:** about 5% of the held works are clear mistakes, around 70 works or 0.2% of all, mostly sculpture and craft. An artist shows up to 10 works, so one held back rarely changes whether they appear. Accepted as it is.
+- **Ceiling, if it matters:** a follow-up question for the 643 works held as photos ("a photograph of a physical artwork the artist made?") would take about 11 minutes of GPU.
+
+**Running:** the final critics of push (its fifth) and of claim-or-remove (its fourth). This time the push critic also judges what a build from a copy of the real, fully analysed store would send.
