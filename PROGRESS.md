@@ -30,6 +30,13 @@ Made 2026-10-11, after the DeviantArt terms were read.
 12. **No domain for now (2026-10-19).** This is a portfolio project. The site can launch on `artist-search.pages.dev` without the edge rate-limiting rule, and the risk is accepted: one address could use up Cloudflare's free daily function calls and take search and removal down until the next day. The recipe for the rule stays written up for later.
 13. **Lapsed domains (2026-10-19).** Decision 6 stands. If someone who buys an artist's lapsed domain proves a removal, the artist stays removed, and that is acceptable.
 14. **Adoptable and for-sale sheets (2026-10-19).** The owner is torn: the site showcases work for hire, but prices spoil the art. The lead's default, in place until the owner says otherwise: keep them as the artist's work, but only as filler. They come after every other eligible work in the 10 an artist shows, and they are never picked to show beside another artist.
+15. **Claim-or-remove's accepted limits (2026-10-19).** This is a portfolio project, so these are accepted:
+    - Anyone who controls a domain an artist names (their employer, studio or host, as well as a buyer of a lapsed one) can prove a removal.
+    - A flood of fake codes from 75 to 150 networks can push real looks 12 to 25 hours back.
+    - An office or campus behind one IPv4 address shares one network's 100 daily reads.
+
+    The critic loop for claim-or-remove ends when a critic, given this list and decisions 12 and 13, finds nothing beyond them.
+16. **Hate symbols in fiction (2026-10-19).** Nazi-themed game and film art (Call of Duty zombies, Wolfenstein, Jojo Rabbit) stays held back as hate symbols, about 190 works. It is the safest choice for a studio-facing site.
 
 ## The plan
 
