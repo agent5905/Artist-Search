@@ -1181,4 +1181,14 @@ What fails is the content. Nothing checks fitness beyond sex and gore, so the fi
 - Checks are fair under a flood, and the limits are rebalanced within the free tiers.
 - The edge rule is written up for when a domain exists.
 
+**Removals round 5: merged.** All ten findings of the two critics are fixed:
+- **A removal bars only what it is bound to.** A site's hash names nobody: it keeps the site out of every row and removes no one. A key reached only through a rename link or an account hash that disagree with each other stops the run, instead of widening it. This now holds in push and, since a follow-up the same day, in collect too.
+- **Requests are always filed.** The claim page carries a signed ticket of whom it showed, so a request is filed and bound whether or not the artist is listed at that moment.
+- **The page's promise is kept.** Proof checks run inside collect every 15 minutes, under its pace and lock, so the promised look happens during a collect run too. Outside a collect run it needs the verifier scheduled (at launch).
+- **Fair under a flood:** checks take turns between networks. 120 flooded codes from 4 networks no longer delay a real one.
+- **Limits sized to what they protect,** Supabase's free 5 GB of egress a month: 100 reads a visitor, 100 a network, 3,000 a day. It now takes 30 networks to use up a day, not 10. The edge rule for the function-call allowance is written up in `docs/edge-rate-limit.md`, for when there is a domain (owner decision 12).
+- **Push's gaps:** vectors are made unit length everywhere, real removals of renamed accounts go through without the owner's flag, and the missing test is added.
+- **Tests:** 4,948 Python tests pass, plus 36 web tests.
+- **Not yet proven:** the new SQL has not run against Postgres; `tests/test_db.py` does that against the live database at setup.
+
 **A Pages project of its own.** The project `.env` named is the owner's own August site, on a different Supabase, and the owner keeps it. With the owner's approval, Artist Search now has its own empty project, `artist-search` (`artist-search.pages.dev`, nothing deployed), and `.env` points at it. No domain is needed. The edge rate-limiting rule needs one, but the database's own limits cover visitors, networks and the total.
