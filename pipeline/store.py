@@ -321,9 +321,9 @@ def _removed(conn: sqlite3.Connection, keys: Iterable[str]) -> bool:
 
 def _named_by(conn: sqlite3.Connection, named: set[str]) -> list[str]:
     """The keys of the stored artists these key hashes name by their handle. A site's hash names nobody: a removal
-    bars only what it is bound to, and a site can be in anybody's row, so barring one never removes an artist.
-    Whoever links to a removed site stays out while they do (all_artists), and the collect and push stages hold
-    back whoever's profile names it."""
+    bars only what it is bound to, and a site can be in anybody's row, so barring one never removes an artist, and
+    never holds one back. The site is kept out of every row (keep_own_site) and every candidate for the crawl
+    stage (own_site_candidates), and the push stage sends whoever names it without it."""
     return sorted(key for (key,) in conn.execute("SELECT key FROM artists") if _hash(key) in named)
 
 
@@ -368,7 +368,7 @@ def mark_removed(identifier: str, db: pathlib.Path | str | None = None) -> int:
     """Put an artist or a site on the removal list. Safe to repeat.
 
     A handle bars that handle and deletes that artist's row, and nothing else. A site bars the site and deletes
-    nobody: whoever links to it stays out while they do (see _named_by). Returns how many stored artists it
+    nobody: whoever links to it stays, without it (see _named_by). Returns how many stored artists it
     deleted, so a removal that matched nobody can be seen. ValueError when the identifier names nothing discovery
     could store (see normalize): a removal never silently does nothing.
     """
@@ -381,8 +381,8 @@ def import_removed(key_hashes: Iterable[str], db: pathlib.Path | str | None = No
     """Take removals from the list of record: sha256 hex digests of 'da:<handle>' and 'site:<host>' keys.
 
     Stores them, then removes every stored artist whose handle one of them is, just as mark_removed() would; one
-    whose link is on a removed site, parent domain or www. form stays out while it is. Returns how many artists it
-    deleted. This file can be deleted and refilled; a removal cannot be lost that way.
+    whose link is on a removed site, parent domain or www. form stays, without it (see _named_by). Returns how many
+    artists it deleted. This file can be deleted and refilled; a removal cannot be lost that way.
     """
     hashes = [key_hash.strip().lower() for key_hash in key_hashes]
     if not all(_SHA256.fullmatch(key_hash) for key_hash in hashes):
@@ -396,8 +396,8 @@ def record_listing(username: str, hosts: Iterable[str], db: pathlib.Path | str |
 
     Records, as hashes only, that this artist lists the registrable domain of each host: own_site_candidates()
     counts those. Returns True when one of the hosts is on a removed site (the host, a parent domain or a www.
-    form). That is one answer's word and no proof of anything: nothing is deleted and nobody is barred for it
-    here. The caller leaves the artist as they are and holds them back.
+    form). That is one answer's word and no proof of anything: nothing is deleted, nobody is barred and nobody is
+    held back for it. The caller keeps the site out of what it writes and sends, and counts it.
     """
     key, hosts = artist_key(username), list(hosts)
     listing = [(_hash(f"site:{domain}"), _hash(key)) for host in hosts if (domain := registrable_domain(host))]
@@ -438,9 +438,9 @@ def keep_own_site(username: str, website: str | None, db: pathlib.Path | str | N
     """Write the front page of an artist's own site into their row, as their one link. True when a row changed.
 
     For the collect stage, the one stage that reads a profile: discovery stores an artist with no link.
-    One place then says whose site is whose, and a removal of the site keeps the artist out (see all_artists). Nothing
-    is changed unless the website is an own site (crawl.is_own_site is the rule), the artist has a row, and
-    neither they nor the site are on the removal list.
+    One place then says whose site is whose, for the crawl stage (own_site_candidates). Nothing is changed unless
+    the website is an own site (crawl.is_own_site is the rule), the artist has a row, and neither they nor the site
+    are on the removal list.
     """
     key = artist_key(username)
     if not website or not crawl.is_own_site(website):
@@ -515,16 +515,13 @@ def tally(at_least: int, db: pathlib.Path | str | None = None) -> tuple[int, int
 def all_artists(db: pathlib.Path | str | None = None) -> list[tuple[str, str, str]]:
     """Every stored artist who is not on the removal list, as (key, da_username, da_profile_url), in key order.
 
-    For the collect stage. The removal list is asked again here, about the artist and about the site they link
-    to, so a row that somehow outlived its removal is not handed on.
+    For the collect stage. The removal list is asked again here, about the artist, so a row that somehow outlived
+    its removal is not handed on. Not about the site they link to: a removed site holds nobody back (_named_by),
+    and an artist who changes their website must be read again to be stored with the new one.
     """
     with _open(db) as conn:
-        rows = conn.execute("SELECT key, da_username, da_profile_url, links FROM artists ORDER BY key").fetchall()
-        return [
-            (key, username, profile_url)
-            for key, username, profile_url, links in rows
-            if not _removed(conn, [key, *_link_keys(json.loads(links))])
-        ]
+        rows = conn.execute("SELECT key, da_username, da_profile_url FROM artists ORDER BY key").fetchall()
+        return [row for row in rows if not _removed(conn, [row[0]])]
 
 
 def own_site_candidates(db: pathlib.Path | str | None = None) -> list[tuple[str, str]]:

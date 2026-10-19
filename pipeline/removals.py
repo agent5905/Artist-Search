@@ -18,10 +18,21 @@ removal or the owner's answer closes it, and either removes and bars what it was
 The queue (removal_requests.code_at, due_at and network). A run reads, with the service key, at most MAX_REQUESTS
 of the open requests with a code that are due, in turns between the networks the codes were asked from, the one
 due longest first in each turn (due_removals), and moves each one it looks at on: an hour while its code was asked
-for under a day ago, a day while under two weeks ago, a week after that (_next_look). Asking for the code again
+for under a day ago, six hours while under two weeks ago, a week after that (_next_look). Asking for the code again
 starts that over, and makes the request due at once unless it already was; it never puts a request ahead of one
-due before it in its network's turn. So one network that asks for hundreds of codes holds back only its own. The
-page says so, and tells an artist who puts the code up later than two weeks to ask for it again.
+due before it in its network's turn. So one network that asks for hundreds of codes holds back only its own.
+
+What the page promises: a code put up in the first two weeks is found usually within a few hours, and at most
+within a day; one put up later, after the code is asked for again. That holds while a run is made every EVERY:
+the owner's schedule, or a collect or discovery run's own (discover.look_between). A code is then looked for
+within six hours and EVERY of going up, and a run takes the due request of every network in its turn, MAX_REQUESTS
+networks a run. So it holds under any number of codes asked for from fewer than MAX_REQUESTS networks at once. From
+more, each run takes the requests due longest of MAX_REQUESTS of them, and a look slips by the backlog: about an
+hour for every 120 codes due before it, so a day for 3,000 (150 networks' 20 each: sql/003_limits.sql). That is
+the accepted limit. A flood kept up from that many networks asks for more looks than the runs make (a code is
+looked at 24 times on its first day, and the runs make 2,880 looks a day), so the slip grows while it lasts. An
+artist whose own network is one of those flooding (an office behind one address) waits in its turn, and so does
+one whose site or DeviantArt does not answer.
 
 It looks for the request's code in two places, and nowhere else:
   1. The DeviantArt profile of the handle the request was made for, through the official API: its bio (the About
@@ -56,12 +67,12 @@ Anything less leaves the request open, for the owner and for its next look.
 
 Every request to DeviantArt waits its turn in discover.Pace, and holds the API's lock for that request alone: a
 collect run can start between two of them, and this run then stops at its next one. A collect run holds the API
-for hours, so it makes these runs itself, between two artists, through its own client, at its pace and under its
-lock (collect._look_for_proofs): the hourly look the page promises goes on while it runs. Every request to a site goes
-through the fetcher, and is over within crawl.PROOF_SECONDS_PER_RESPONSE whatever the site does: one that runs
-out of time closes the site for the run, and its request is moved on to its next look like any other. So a run
-takes at most about MAX_REQUESTS such deadlines, and a slow site holds no run, lock or queue. A run with nothing
-due asks neither.
+for hours and a discovery run for an hour or more, so each makes these runs itself, every EVERY between two of its
+own requests, through its own client, at its pace and under its lock (discover.look_between): the look the page
+promises goes on while they run. Every request to a site goes through the fetcher, one a run, and is over within
+crawl.PROOF_SECONDS_PER_RESPONSE whatever the site does: one that runs out of time closes the site for the run,
+and its request is moved on to its next look like any other. So a run takes at most about MAX_REQUESTS such
+deadlines, and a slow site holds no run, lock or queue. A run with nothing due asks neither.
 
 `--dry-run` makes the same reads and requests, and changes nothing: no call to confirm_removal, nothing written to
 the local store, no request moved on. (The API's pace file is kept as for any request to it: discover.Pace.) Stdout
@@ -90,7 +101,7 @@ PROOF_NAME = "artist-search-removal"  # the <meta> name, and the file under /.we
 PROFILE_FIELDS = ("bio", "tagline")  # the profile's own text: see the module's docstring
 MAX_REQUESTS = 30  # looked at in one run: about a minute of the API, and the sites of those that have one
 HOUR, DAY, WEEK = timedelta(hours=1), timedelta(days=1), timedelta(weeks=1)
-EVERY = timedelta(minutes=15)  # how often a run is due: the owner's schedule (README), and a collect run's own
+EVERY = timedelta(minutes=15)  # how often a run is due: the owner's schedule (README), and a long run's own
 _TAG = re.compile(r"<[^>]*>")
 _UNSEEN = re.compile("[­​-‍⁠﻿]")  # a soft hyphen, zero-width spaces and joiners, a BOM
 TALLY = (  # every request in the database, by state, as the run began (removal_tally in sql/002_functions.sql)
@@ -137,11 +148,12 @@ def _holds(text: object, code: str) -> bool:
 
 
 def _next_look(code_at: str, now: datetime) -> datetime:
-    """When a request is looked at again: an hour on while its code was asked for under a day ago, a day on while
-    under two weeks ago, then a week on. So a code put up in its first two weeks is found within a day, and a stale
-    request costs little. The page says this, and that asking for the code again starts it over."""
+    """When a request is looked at again: an hour on while its code was asked for under a day ago, six hours on
+    while under two weeks ago, then a week on. So a code put up in its first two weeks is found within a few hours,
+    well inside the day the page promises (see the module's docstring), and a stale request costs little. The page
+    says that, and that asking for the code again starts it over."""
     age = now - datetime.fromisoformat(code_at)
-    return now + (HOUR if age < DAY else DAY if age < 2 * WEEK else WEEK)
+    return now + (HOUR if age < DAY else 6 * HOUR if age < 2 * WEEK else WEEK)
 
 
 def _move_on(request: dict[str, Any], now: datetime, dry_run: bool) -> None:
@@ -154,7 +166,7 @@ def _move_on(request: dict[str, Any], now: datetime, dry_run: bool) -> None:
 
 def _profile(api: discover._Api, handle: str) -> dict[str, Any] | None:
     """The handle's profile as the API answers it, or None. The API's lock is held for this request alone, unless
-    this run is a collect run's, which holds it already (discover.Pace takes it again for nothing)."""
+    this run is a collect or discovery run's, which holds it already (discover.Pace takes it again for nothing)."""
     with api.pace:
         response = api.get(f"/user/profile/{handle}")
     try:
@@ -216,8 +228,8 @@ def run(
     """One pass over the requests that are due, counted into `counts` (COUNTS) as it goes, so that a run that stops
     still says what it did. discover.Stop when another run holds the API, or the API refuses for too long;
     RuntimeError when the database fails. Either ends the run there: what was removed stays removed, and the
-    request being looked at stays due. Given `api`, a collect run's, it asks through that (its pace, which the
-    collect run holds) and not a client of its own."""
+    request being looked at stays due. Given `api`, a collect or discovery run's, it asks through that (its pace,
+    which that run holds) and not a client of its own."""
     now = datetime.fromtimestamp(discover.now(), UTC)
     tally = db.rpc("removal_tally", {}, "secret")
     counts.update({name: int(tally[name]) for name in TALLY})

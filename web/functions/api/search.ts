@@ -2,11 +2,12 @@
 // Turns the query into its bge-m3 embedding on Workers AI, then asks the database for a page of artists
 // (site_search, which runs search_artists: sql/003_limits.sql and 002_functions.sql). Without an embedding the search
 // still runs, on keywords alone. Before either is asked, the database counts the visitor (client_wait): past their
-// limit, their network's or the day's for everyone, the answer is a 429 that says how long to wait.
+// limit, their network's or the day's for everyone, the answer is a 429 that says how long to wait. Before even that,
+// a call without the header the site's own pages send is refused (crossSite), as every function here refuses it.
 // Every function here calls the database the same way: as its public role, with the publishable key, and with the
 // site's token (SITE_TOKEN), a secret of the Cloudflare Pages project that never reaches the browser. The public
 // role may run the site's seven functions and nothing else, and those only with the token. The browser holds no key.
-import { call, rpc } from '../../src/rpc'
+import { call, OWN_PAGE, rpc } from '../../src/rpc'
 
 export type Env = {
   AI: { run(model: string, input: { text: string[] }): Promise<unknown> }
@@ -44,6 +45,15 @@ export function network(request: Request): string {
   if (!ip.includes(':')) return ip.replace(/\.\d+$/, '.0/24')
   return `${groups(ip).slice(0, 3).map((group) => group.toString(16)).join(':')}::/48`
 }
+
+/**
+ * Whether another site's page may have made the visitor's browser send this: it lacks the header the site's own pages
+ * send (OWN_PAGE). An <img>, a form or a fetch on any page would otherwise spend its visitors' limits here, each from
+ * their own network, and the day's reads for everyone. Every function here refuses such a call before it asks the
+ * database anything, so it is not counted either.
+ */
+export const crossSite = (request: Request) => !request.headers.has(OWN_PAGE)
+export const notHere = () => Response.json({ error: 'Please use the site’s own pages.' }, { status: 403, headers: NO_STORE })
 
 /** One of the site's database functions (sql/003_limits.sql), with the token. Asked once more if it fails. */
 export const site = <T>(env: Env, name: string, args: object, fetcher: typeof fetch) =>
@@ -86,6 +96,7 @@ export async function embed(ai: Env['AI'], q: string): Promise<number[] | null> 
 }
 
 export async function handle(request: Request, env: Env, fetcher: typeof fetch = fetch): Promise<Response> {
+  if (crossSite(request)) return notHere()
   const asked = new URL(request.url).searchParams
   const list = (name: string) => {
     const values = asked.getAll(name).filter(Boolean).slice(0, 20) // search_artists reads no more than 20

@@ -13,9 +13,8 @@ In this order, and the order is the point:
      deleted there. Only after that is what is kept here about them purged. A file that cannot be deleted is
      counted, and the next run tries again: the removal stands meanwhile, here and there, and the run goes on
      (it ends with a status that is not zero, and says why). When writing it down fails the run stops: nothing
-     is purged and nothing is built. A removed site bars nobody, whoever asked for its removal (store._named_by):
-     whoever links to it is not collected while they do, and not sent while their profile names it
-     (site_removed).
+     is purged and nothing is built. A removed site bars nobody, whoever asked for its removal (store._named_by),
+     and holds nobody back: whoever names it is sent without it (site_links_left_out_removed).
   2. The rows are built (see build) from what is left, and only from artists the store still lists, from one
      copy of the store made at one moment.
   3. The database is brought to exactly those rows: an artist or a work it has that is not among them is
@@ -128,7 +127,7 @@ TRIES = 2
 
 # Besides these, one reason for each mark the collect stage has left: "marked_<its reason>" (see _marked).
 ARTIST_REASONS = (
-    *("not_profiled", "profile_excluded", "profile_out_of_date", "site_removed", "declares_ai", "adult_account"),
+    *("not_profiled", "profile_excluded", "profile_out_of_date", "declares_ai", "adult_account"),
     *("account_not_read", "adult_portfolio", "not_all_rated", "too_few_works", "slug_unusable"),
 )
 WORK_REASONS = (
@@ -414,7 +413,9 @@ def build(
 def _build(local: store.Snapshot, removed: Collection[str]) -> tuple[Rows, Rows, Rows, Counter[str]]:
     """build(), from one copy of the store."""
     listed = {key: username for key, username, _ in store.all_artists(local) if not store.covers(removed, key)}
-    marked_artists, marked_works = library.artist_marks(local), library.work_marks(local)
+    # A removed site holds nobody back now: a mark an earlier collect stage left for one goes at their next turn.
+    marked_artists = {key: mark for key, mark in library.artist_marks(local).items() if mark[0] != library.LISTED}
+    marked_works = library.work_marks(local)
     sizes = library.thumb_sizes(local)  # of the thumbnails the works' rows name; a work stored before sizes has none
     written = {row["artist_key"]: row for row in profiles.profiles(local)}
     excluded = profiles.excluded(local)
@@ -444,8 +445,7 @@ def _build(local: store.Snapshot, removed: Collection[str]) -> tuple[Rows, Rows,
         ready: list[tuple[str, str, str | None, list[str], dict[str, Any], tuple[int | None, int | None], str]] = []
         ratings: list[str | None] = []  # of every work that is rated, or has an image to rate: None is "not yet"
         tagline, website, stored = fields.get(key, (None, None, ""))
-        # What the artist's latest answer gave empty is not sent, though it stays kept here: a removed site that
-        # the website kept is on still holds them back (site_removed), as the collect stage holds them.
+        # What the artist's latest answer gave empty is not sent, though it stays kept here.
         tagline_emptied, website_emptied, mature = answers.get(key, (False, False, 0))
         for work_id, page, title, own_tags, thumb, seen, cached, rating in works_of.get(key, []):
             result = results.get(work_id)
@@ -467,6 +467,11 @@ def _build(local: store.Snapshot, removed: Collection[str]) -> tuple[Rows, Rows,
                 own = [tag for tag in json.loads(own_tags) if isinstance(tag, str)]
                 ready.append((*address, title, own, result, _size(sizes.get(work_id)), work_id))
         site_url, site_domain = _own_site(website)
+        # A removed site is never shown, and it holds nobody back: anybody can name it. The artist goes without it,
+        # as without a website their latest answer emptied (the collect stage keeps one that names a removed site so).
+        left_out = site_url is not None and (store.is_removed(site_url, local) or store.covers(removed, site_url))
+        if left_out or website_emptied:
+            site_url = site_domain = None
         slug = _slug(listed[key])
         # The works DeviantArt flags mature are never kept, and count as adult works all the same (library.answers).
         adult, rated = sum(rating in ADULT_RATINGS for rating in ratings) + mature, len(ratings) + mature
@@ -480,9 +485,6 @@ def _build(local: store.Snapshot, removed: Collection[str]) -> tuple[Rows, Rows,
         # the work as it is now. The artist waits for the tagging stage, and then the profile stage, to catch up.
         elif not written[key]["current"]:
             why = "profile_out_of_date"
-        # A removed site the store's own links did not show.
-        elif site_url and (store.is_removed(site_url, local) or store.covers(removed, site_url)):
-            why = "site_removed"
         # An account whose own words declare AI art or adult content, or whose words nobody has read as they are.
         elif accounts.get(key) in HELD_ACCOUNTS:
             why = HELD_ACCOUNTS[accounts.get(key)]
@@ -503,6 +505,7 @@ def _build(local: store.Snapshot, removed: Collection[str]) -> tuple[Rows, Rows,
             counts[f"artists_held_{why}"] += 1
             counts["works_held_artist_held_back"] += len(ready)
             continue
+        counts["site_links_left_out_removed"] += left_out
         # The owner's (2026-10-19): an adoptable or for-sale sheet is the artist's work, but never leads. Sheets go
         # after every other work that may go, so one fills a slot only when there are fewer than MAX_WORKS others.
         filler = {work_id for *_, result, _, work_id in ready if SHEET in (result.get("formats") or [])}
@@ -549,8 +552,8 @@ def _build(local: store.Snapshot, removed: Collection[str]) -> tuple[Rows, Rows,
                 # The account the library keeps for them: a removal request is bound to it when it is filed, and
                 # the verifier reads the bio of that account only (sql/001_schema.sql, artists.da_account).
                 "da_account": library.account_hash(key, local),
-                "site_url": None if website_emptied else site_url,
-                "site_domain": None if website_emptied else site_domain,
+                "site_url": site_url,
+                "site_domain": site_domain,
                 "tagline": next(iter(plain([tagline])), None)
                 if tagline and not tagline_emptied and contacts.get(key) == "no" and said == "fine"
                 else None,
@@ -667,7 +670,7 @@ def _removal(
     (`kept`, the library's keys) under that handle (store.named_by), and their account goes on the list with it,
     so that the account is known for what it is under a handle it takes later, when the purge has deleted the
     profile that names it. An account's hash bars whoever is kept here under it (their profile's hash). A site's
-    bars nobody: it is kept out of every row (store._named_by, site_removed), and anybody can name it. A removal
+    bars nobody: it is kept out of every row (store._named_by, build), and anybody can name it. A removal
     covers the account under every handle it is kept under here, linked to one of those by the collect stage's
     marks (library.same_account), and theirs in turn: each goes on the list too. With `follow` False only whom a
     hash names by handle is barred, and their account goes on the list only where what is kept here agrees on it.
@@ -708,7 +711,8 @@ def run(dry_run: bool, allow_delete: int | None = None, local: pathlib.Path | st
     texts_left_out_for_contact (tags, taglines and other texts of rows that are sent, left out by the plain
     rule); taglines_left_out_profane and taglines_left_out_social (of artists who are sent, the taglines left out
     for swearing or for naming a social handle: tagging.accounts); sheets_sent_as_filler (adoptable or for-sale
-    sheets sent after an artist's other works, to fill their MAX_WORKS: SHEET); neighbours_sent,
+    sheets sent after an artist's other works, to fill their MAX_WORKS: SHEET); site_links_left_out_removed
+    (artists sent without their own site, which is on the removal list); neighbours_sent,
     artists_sent_without_neighbours, and neighbours_skipped_by_database (what db.load said the database would not
     take: a row that names an artist it does not have);
     artists_deleted_from_database, works_deleted_from_database and neighbours_deleted_from_database (rows it had
@@ -813,6 +817,7 @@ def run(dry_run: bool, allow_delete: int | None = None, local: pathlib.Path | st
             "taglines_left_out_profane": held["taglines_left_out_profane"],
             "taglines_left_out_social": held["taglines_left_out_social"],
             "sheets_sent_as_filler": held["sheets_sent_as_filler"],
+            "site_links_left_out_removed": held["site_links_left_out_removed"],
             "neighbours_sent": len(neighbours) - empty,
             "artists_sent_without_neighbours": empty,
             "neighbours_skipped_by_database": 0,

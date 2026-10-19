@@ -10,21 +10,19 @@ does the keeping. Output is counts only.
 
 This stage adds and brings up to date. It never deletes a stored artist or work because of anything the API or
 the image host answered (the lead's decision, round 5, after two rounds of guards on when deleting was allowed
-both failed), but for a profile that names a removed site, below. Two things delete, and nothing else: the
-removal list (hard rule 7), at both ends of every run and again before each artist and each download; and the
-sweep of cached files that no row refers to.
+both failed). Two things delete, and nothing else: the removal list (hard rule 7), at both ends of every run and
+again before each artist and each download; and the sweep of cached files that no row refers to.
   - A stored work that is missing from a later answer stays, with the time it was last seen.
   - A stored work, or an artist, that the API shows as no longer qualifying (mature, not a public image,
-    account gone, a profile that names a removed site) is marked with the reason and the time. Later stages
-    read the marks (library.work_marks, library.artist_marks) and decide what is published. A work the API
-    flags mature is never stored; how many of the artist's gallery page are is kept as a number, and nothing
-    else of them (library.answers), for the push stage's share of adult works.
+    account gone) is marked with the reason and the time. Later stages read the marks (library.work_marks,
+    library.artist_marks) and decide what is published. A work the API flags mature is never stored; how many
+    of the artist's gallery page are is kept as a number, and nothing else of them (library.answers), for the
+    push stage's share of adult works.
   - A removal reaches the artist it names, under every handle of their account, and nobody else. An own site
-    that is kept for an artist is written into the store's row too, which is where the removal of a site looks.
-    A profile that names a removed site, in a link of any shape, or whose website kept from an earlier answer
-    is on one, holds its artist: marked, and nothing more collected. That is all a site does: it is kept out of
-    every row, and never removes anybody, since anybody can name it (store._named_by). Whoever asked for its
-    removal is barred by their handle and account.
+    that is kept for an artist is written into the store's row too, where the crawl stage looks. A removed site
+    is kept out of every row, and that is all it does: it holds back and removes nobody, since anybody can name
+    it (store._named_by). An artist whose profile names one, in a link of any shape, is collected like anybody,
+    and the push stage sends them without it. Whoever asked for its removal is barred by their handle and account.
   - Nothing that is kept is replaced by nothing. An answer that is empty, or that the library's rules refuse,
     leaves what is kept, and for a refused one the artist or the work is marked.
   - A kept work whose thumbnail has come to show another file (library.own_file: not another size or
@@ -45,10 +43,10 @@ failing exits non-zero.
 
 This is the one stage that reads a profile: discovery stores an artist from the tally of the browse pages and
 reads none. So what a profile's website field says is judged here, on the artist's turn, by the rules discovery
-used to enforce: every host the field names is asked of the removal list and recorded for the shared-domain
-rule (store.record_listing), a link is written into the store's row only when the field is, as written, the
-front page of a domain of their own (_external_links), and the summary says which of five kinds each stored
-profile's field was.
+used to enforce: every host the field names is recorded for the shared-domain rule and asked of the removal
+list (store.record_listing), a link is written into the store's row only when the field is, as written, the
+front page of a domain of their own and not on a removed site (_external_links, store.keep_own_site), and the
+summary says which of five kinds each stored profile's field was, and how many named a removed site.
 
 Requests to the API wait their turn in discover.Pace, and downloads from the image host in a Pace of their own:
 either host asking us to slow down slows every later request to it, not only the one that is asked again, and
@@ -56,7 +54,7 @@ either host refusing, by 429, 5XX or no answer, through an hour of the slowest p
 counts each host's refusals of both kinds. A run holds both hosts while it lasts:
 one that finds another run talking to either stops before it touches anything, the closing sweep included. So the
 removal checks, which need the API, cannot run beside it: it makes them itself, every removals.EVERY, between two
-artists (_look_for_proofs).
+artists (discover.look_between).
 
 Endpoints (deviantart.readme.io, read 2026-10-12). Each is documented under the security scheme
 "oauth2AuthorizationCodeOrClientCredentials" with scope "browse", so a client_credentials token is accepted:
@@ -75,7 +73,7 @@ from typing import Any
 
 import httpx
 
-from pipeline import config, crawl, discover, library, removals, store
+from pipeline import config, crawl, discover, library, store
 
 MAX_WORKS = 10  # works kept per artist, each run
 # ponytail: one gallery page, the documented maximum of 24. An artist with fewer than MAX_WORKS qualifying works
@@ -96,6 +94,8 @@ NO_WEBSITE = "of those, no website given"
 ON_PLATFORM = "of those, website on a listed platform"  # DeviantArt itself is one
 OTHER_SHAPE = "of those, website on another domain, not a bare front page"  # a path, subdomain, query or fragment
 NO_HOST = "of those, website names no public host"  # free text, a local name, no registrable domain
+# And apart from the five: a website, kept or given, that names a removed site. The artist is stored like anybody.
+LISTS_REMOVED = "of those, website names a removed site (never sent or crawled)"
 WORKS = "works stored"
 DOWNLOADED = "images downloaded"
 CACHED = "images already cached"
@@ -111,7 +111,6 @@ BAD_NAME = "skipped artists (unreadable handle)"
 REMOVED = "skipped artists (removed)"
 RENAMED = "skipped artists (a removed account under a new handle)"
 UNAVAILABLE = "marked artists (account suspended, inactive or gone)"
-LISTS_REMOVED = "marked artists (their profile names a removed site)"
 ANSWER_REFUSED = "marked artists (an answer not kept, and what was kept stays)"
 NO_IMAGE = "skipped artists (none of their images was served)"
 MARKED = "marked works (stored, and no longer qualifying)"
@@ -125,14 +124,13 @@ IMAGE_FAILED = "skipped works (image not served)"
 IMAGE_LIMITED = "skipped works (image host failing or rate limiting)"
 IMAGE_WRONG_TYPE = "skipped works (image not an accepted type)"
 IMAGE_TOO_LARGE = "skipped works (image over the size cap)"
-PROVEN = "artists removed by the removal checks made during the run"  # see _look_for_proofs
-UNCHECKED = "removal checks made during the run that failed"
+PROVEN, UNCHECKED = discover.PROVEN, discover.UNCHECKED  # the removal checks made during the run (_run)
 IMAGE_HOST = "the image host"  # the name its Pace goes by in the summary
 _COUNTS = (
-    *(PROCESSED, PROFILES, OWN_SITE, NO_WEBSITE, ON_PLATFORM, OTHER_SHAPE, NO_HOST),
+    *(PROCESSED, PROFILES, OWN_SITE, NO_WEBSITE, ON_PLATFORM, OTHER_SHAPE, NO_HOST, LISTS_REMOVED),
     *(WORKS, DOWNLOADED, CACHED, PURGED, ORPHANS, UNDELETED, BAD_KEY),
     *(NOT_STORED, ROW_REFUSED, FAILED, API_FAILED, BAD_NAME, REMOVED, RENAMED, NO_IMAGE),
-    *(UNAVAILABLE, LISTS_REMOVED, ANSWER_REFUSED, MARKED),
+    *(UNAVAILABLE, ANSWER_REFUSED, MARKED),
     *(MALFORMED, NOT_OWN, NOT_IMAGE, MATURE, NO_METADATA, TITLE),
     *(IMAGE_FAILED, IMAGE_LIMITED, IMAGE_WRONG_TYPE, IMAGE_TOO_LARGE, PROVEN, UNCHECKED),
     *(*discover._PACING, *discover.Pace(IMAGE_INTERVAL, IMAGE_HOST).counts()),  # what each host's pace did
@@ -147,7 +145,6 @@ _MARKS = {
     TITLE: "contact details",
 }
 GONE = "account gone"
-LISTED = "lists a removed site"
 
 
 class _ApiFailed(Exception):
@@ -395,22 +392,16 @@ def _collect_artist(
         _remove(key, counts, db, user_id)
         counts[RENAMED] += 1
         return
-    # The removal list is asked about every host the website field names, however it is written, and about the
-    # website kept for them from an earlier answer: emptying the field or changing it takes back nothing their
-    # profile has said. The same hosts are recorded as hashes for the shared-domain rule. A profile that names
-    # a removed site holds the artist: marked, which holds them back from being published, and nothing more is
-    # collected. Nothing is deleted and nobody is barred for it: one such answer given for every profile once
-    # purged and barred every artist, and a site barred for the artist who asked once barred another who names it.
+    # Every host the website field names, however it is written, is recorded as a hash for the shared-domain rule
+    # and asked of the removal list. A removed site holds nobody back and bars nobody: it is anybody's to name, and
+    # one barred for the artist who asked once kept out for good another who names it. The artist is collected
+    # like anybody, and the field is kept as one they emptied: the site's address is written nowhere here, and
+    # neither it nor a website kept from an earlier answer is sent or crawled (push, store.own_site_candidates).
     # ponytail: the website field is the only link the profile response documents. Links typed into the bio
     # are not read, because that means parsing DeviantArt text. Revisit if too few artists have a website.
     website = profile.get("website")
     hosts = store.hosts_in(website)
-    said = hosts | store.hosts_in(library.website(key, db))
-    if store.record_listing(username, said, db):
-        library.mark_artist(key, LISTED, db)
-        library.note_skip(key, db)
-        counts[LISTS_REMOVED] += 1
-        return
+    names_removed = store.record_listing(username, hosts, db)
     page = _body(api.get("/gallery/all", username=username, limit=GALLERY_LIMIT), "gallery lookup", "results")
     if not isinstance(page.get("has_more"), bool):
         raise _ApiFailed("gallery lookup answered with a body of the wrong shape")
@@ -551,7 +542,7 @@ def _collect_artist(
             tagline=profile.get("tagline"),
             specialty=profile.get("artist_specialty"),
             level=profile.get("artist_level"),
-            website=profile.get("website"),
+            website="" if names_removed else website,
             works=kept,
             marks=marks,
             old_keys=old_keys,
@@ -570,14 +561,13 @@ def _collect_artist(
     counts[ANSWER_REFUSED] += bool(refused_fields)
     counts[PROFILES] += 1
     counts[WORKS] += len(kept) - not_stored
-    # The website that is kept now, whichever answer gave it. On a removed site, the mark the store just took
-    # off goes back on. A site of their own is written into the store's row, where a removal of it looks, and
-    # only on an answer whose field is the bare front page as written: the library keeps a website with its
-    # query, fragment or port cut off, and a link of that shape is dropped whole, never trimmed to the root.
+    # The website that is kept now, whichever answer gave it. On a removed site, it is counted and goes no further.
+    # A site of their own is written into the store's row, where the crawl stage looks, and only on an answer whose
+    # field is the bare front page as written: the library keeps a website with its query, fragment or port cut
+    # off, and a link of that shape is dropped whole, never trimmed to the root.
     links = _external_links(website)
     site = library.website(key, db)
-    if store.record_listing(username, store.hosts_in(site), db):
-        library.mark_artist(key, LISTED, db)
+    if names_removed or store.record_listing(username, store.hosts_in(site), db):
         counts[LISTS_REMOVED] += 1
     elif links:
         store.keep_own_site(username, site, db)
@@ -589,22 +579,6 @@ def _where(exc: Exception) -> str:
     traceback: either can quote response data or a request URL."""
     lines = [frame.lineno for frame in traceback.extract_tb(exc.__traceback__) if frame.filename == __file__]
     return f"{type(exc).__name__} at collect.py line {lines[-1] if lines else '?'}"
-
-
-def _look_for_proofs(api: discover._Api, counts: dict[str, int], db: pathlib.Path | str | None) -> None:
-    """One run of the removal checks (pipeline/removals.py), made by this run between two artists. They need the
-    API, which this run holds from start to end, for hours at a time, and an artist who asked for their code is
-    promised a look every hour. Through this run's client, at its pace and under its lock. The database failing
-    them is counted, and this run goes on; the API refusing stops this run, as it would on an artist's turn."""
-    found = dict.fromkeys(removals.COUNTS, 0)
-    try:
-        removals.run(found, False, "", "", local=db, api=api)
-    except discover.Stop:
-        raise
-    except Exception as exc:  # the database: a removal check is no reason to stop collecting
-        counts[UNCHECKED] += 1
-        print(f"a removal check failed: {_where(exc)}", file=sys.stderr)
-    counts[PROVEN] += found["artists_removed"]
 
 
 def _run(
@@ -622,11 +596,9 @@ def _run(
     artists = sorted(store.all_artists(db), key=lambda artist: tried.get(artist[0], ""))
     failed_in_a_row = 0
     refused = [0]  # see _collect_artist: one count for the whole run, or a failing host is never stopped at
-    look = discover.now() + removals.EVERY.total_seconds()  # the removal checks' next run (_look_for_proofs)
     for _, username, _ in artists[: max(max_artists, 0)]:
-        if discover.now() >= look:
-            _look_for_proofs(api, counts, db)
-            look = discover.now() + removals.EVERY.total_seconds()
+        # The removal checks, every removals.EVERY: this run holds the API for hours, and they need it.
+        discover.look_between(api, counts, db)
         try:
             key = store.artist_key(username)
         except ValueError:  # a handle nobody can ask about. It is the store's row that is wrong, not the API.

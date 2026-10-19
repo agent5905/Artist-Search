@@ -1,6 +1,13 @@
 // One call to a database function through the Supabase Data API, from the site's server functions (functions/api/).
 // No browser or Vite globals here: the pages (api.ts) use `twice` too.
 
+/**
+ * The header the site's own pages send with every call to its server functions, which refuse a call without it
+ * (functions/api/search.ts: crossSite). A browser sends a header of a page's own making to another site only once that
+ * site agrees to it in a CORS preflight, and these functions never do: so no other site's page can send it.
+ */
+export const OWN_PAGE = 'x-artist-search'
+
 /** Run it; if it fails, run it once more. A call can stall or fail while the owner loads data. */
 export const twice = <T>(run: () => Promise<T>): Promise<T> => run().catch(run)
 

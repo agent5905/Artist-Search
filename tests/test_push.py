@@ -55,6 +55,7 @@ COUNTS = [
     "works_sent",
     *(f"works_held_{reason}" for reason in push.WORK_REASONS),
     *("texts_left_out_for_contact", "taglines_left_out_profane", "taglines_left_out_social", "sheets_sent_as_filler"),
+    "site_links_left_out_removed",
     *("neighbours_sent", "artists_sent_without_neighbours", "neighbours_skipped_by_database"),
     *("artists_deleted_from_database", "works_deleted_from_database", "neighbours_deleted_from_database"),
     *("removed_artists_deleted_from_database", "removals_added_to_database", "removals_applied_here"),
@@ -521,10 +522,16 @@ def test_nothing_about_a_removed_artist_is_sent_and_what_was_sent_before_is_dele
         fake.removed = [digest(f"site:{BRAVO}.art")]
     counts = push.run(False)
 
+    assert counts["removed_artists_deleted_from_database"] == 1 and counts["artists_deleted_from_database"] == 0
+    if how != "here_before_the_push":
+        # A removed site is no removed artist (the fifth critic's): the row that showed it goes, and BRAVO, who
+        # merely names it, is sent again without it.
+        assert sorted(sent_artists(fake)) == [ALPHA, BRAVO, CHARLIE] and sent_artists(fake)[BRAVO]["site_url"] is None
+        assert f"{BRAVO}.art" not in fake.held() and counts["site_links_left_out_removed"] == 1
+        return
     assert sorted(sent_artists(fake)) == [ALPHA, CHARLIE]
     assert not any(word in json.dumps(fake.loads[-1]).lower() for word in of_artist(BRAVO))
     assert not any(word in fake.held() for word in of_artist(BRAVO))  # their row, their works, and as a neighbour
-    assert counts["removed_artists_deleted_from_database"] == 1 and counts["artists_deleted_from_database"] == 0
     assert counts["artists_sent"] == 2 and counts["works_sent"] == 10 and counts["neighbours_sent"] == 2
 
 
@@ -1930,10 +1937,11 @@ def test_many_hashes_of_nobody_here_are_as_many_people(fake):
 
 
 @pytest.mark.parametrize("linked", ["in_the_stores_row", "in_the_profile_only"])
-def test_a_removed_site_that_several_artists_name_bars_none_of_them_and_none_of_them_is_sent(fake, linked):
+def test_a_removed_site_that_several_artists_name_bars_none_of_them_and_they_are_sent_without_it(fake, linked):
     """A site more than store.OWNERS artists name is shared (store._named_by): its removal never takes them all,
     and never stops a run. Whoever asked is honoured all the same: the site is on both lists for good and is
-    never shown, and every artist who names it is held back, not collected and not sent, while they do."""
+    never shown. And it holds nobody back (the fifth critic's): every artist who names it is collected and sent,
+    without it, and counted."""
     hub = "https://yy-fake-hub.art/"
     artist(ALPHA, angle=0.0)
     named = [BRAVO, CHARLIE, DELTA]
@@ -1948,10 +1956,9 @@ def test_a_removed_site_that_several_artists_name_bars_none_of_them_and_none_of_
     assert fake.removed == [digest("site:yy-fake-hub.art")] and counts["removals_added_to_database"] == 0
     assert counts["artists_purged_here"] == 0 and library.artist_keys() == [f"da:{h}" for h in (ALPHA, *named)]
     assert not any(store.is_removed(handle) for handle in named) and store.is_removed("yy-fake-hub.art")
-    assert list(sent_artists(fake)) == [ALPHA] and [row["slug"] for row in fake.artists.values()] == [ALPHA]
-    listed = [ALPHA] if linked == "in_the_stores_row" else [ALPHA, *named]  # not listed while they link to it
-    assert [key for key, _, _ in store.all_artists()] == [f"da:{handle}" for handle in listed]
-    assert counts["artists_held_site_removed"] == len(listed) - 1  # nor sent while their profile names it
+    assert sorted(sent_artists(fake)) == [ALPHA, *named] and "yy-fake-hub" not in fake.held()
+    assert [key for key, _, _ in store.all_artists()] == [f"da:{handle}" for handle in (ALPHA, *named)]
+    assert counts["site_links_left_out_removed"] == len(named)
 
 
 def test_a_dry_run_changes_nothing_anywhere_and_says_what_the_run_then_does(fake, capsys):
@@ -2095,23 +2102,26 @@ def test_a_database_error_is_scrubbed_of_every_key_before_it_is_cut(monkeypatch)
         assert key[:6] not in str(raised.value) and len(str(raised.value)) <= 520
 
 
-def test_an_artist_public_with_a_removed_site_is_held_back_and_never_barred_for_it(fake):
+def test_an_artist_public_with_a_removed_site_is_sent_without_it_and_never_barred_for_it(fake):
     """The final critic's: a site barred for the artist who proved it theirs is anybody's to name, and the
     database's listing of whoever it showed with the site put their handle and account on the list for good. A
-    site keeps out of every row and removes nobody: the artist shown with it goes from the database and is held
-    back while their profile names it. What is kept here about them, their handle and their account stay."""
+    site keeps out of every row and removes nobody: the row that showed it goes from the database. The fifth
+    critic's: nor does it hold anybody back. The artist is sent again without it, and counted. What is kept here
+    about them, their handle and their account stay."""
     artist(ALPHA)
     artist(BRAVO, website=f"https://www.{BRAVO}.art/", links=[])  # the site is in the library's profile only
     push.run(False)
     assert sent_artists(fake)[BRAVO]["site_domain"] == f"{BRAVO}.art"
     store.mark_removed(f"{BRAVO}.art")  # the request names the site, and the store's own links do not show whose it is
+    library.mark_artist(f"da:{BRAVO}", library.LISTED)  # the mark an earlier collect stage left: it holds nobody back
 
     counts = push.run(False)
 
     assert counts["artists_purged_here"] == 0 and library.artist_keys() == [f"da:{ALPHA}", f"da:{BRAVO}"]
     assert set(fake.removed) == {digest(f"site:{BRAVO}.art")} == push._removed_here(None)
-    assert counts["artists_held_site_removed"] == 1 and sorted(sent_artists(fake)) == [ALPHA]
-    assert not any(word in fake.held() for word in of_artist(BRAVO))
+    assert counts["site_links_left_out_removed"] == 1 and sorted(sent_artists(fake)) == [ALPHA, BRAVO]
+    assert counts["removed_artists_deleted_from_database"] == 1  # the row that showed the site
+    assert sent_artists(fake)[BRAVO]["site_url"] is None and f"{BRAVO}.art" not in fake.held()
     assert not store.is_removed(BRAVO) and not library.account_removed(f"FAKE-USER-{BRAVO}")
 
 
@@ -3027,11 +3037,14 @@ def test_a_tagline_and_a_website_the_artists_latest_answer_empties_are_not_sent_
     row = sent_artists(fake)[ALPHA]
     assert (row["site_url"], row["tagline"]) == (site, f"FAKE-TAGLINE {ALPHA}")
 
-    # Emptied or not, a removed site the kept website is on holds the artist back, as the collect stage does.
+    # Emptied or not, a removed site the kept website is on is never sent, and holds the artist back no more.
     other = artist(BRAVO, angle=0.3, website=f"https://{BRAVO}.art/", links=[])  # a site only the library knows
-    collected_again(BRAVO, other, website="")
     store.mark_removed(f"{BRAVO}.art")
-    assert push.run(False)["artists_held_site_removed"] == 1 and list(sent_artists(fake)) == [ALPHA]
+    for website in ("", f"https://{BRAVO}.art/"):
+        collected_again(BRAVO, other, website=website)
+        counts = push.run(False)
+        assert counts["site_links_left_out_removed"] == 1 and sorted(sent_artists(fake)) == [ALPHA, BRAVO]
+        assert sent_artists(fake)[BRAVO]["site_url"] is None and f"{BRAVO}.art" not in fake.held()
 
 
 def test_works_deviantart_flags_mature_count_towards_an_adult_portfolio_though_none_of_them_is_kept(fake):

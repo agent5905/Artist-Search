@@ -15,7 +15,7 @@ import { claim as claimPage, handle as removal } from '../functions/api/removal'
 import { client, handle, MAX_QUERY, network, onRequestGet, TOO_MANY, type Env } from '../functions/api/search'
 import { Busy, claim, getArtist, removalCode, requestRemoval, search, similarArtists } from '../src/api'
 import { ProofPlaces } from '../src/pages'
-import { call } from '../src/rpc'
+import { call, OWN_PAGE } from '../src/rpc'
 import { Cards } from '../src/ui'
 
 const VECTOR = Array.from({ length: 1024 }, (_, i) => i / 1024)
@@ -61,8 +61,9 @@ function database(...answers: (Response | Error)[]) {
   }
   return db
 }
+const PAGE_HEADER = { [OWN_PAGE]: '1' } // what the site's own pages send with every call (src/api.ts)
 const ask = (query: string, run: Env['AI']['run'], db = database()) =>
-  handle(new Request(`https://artist-search.test/api/search?${query}`), env(run), db.fetcher)
+  handle(new Request(`https://artist-search.test/api/search?${query}`, { headers: PAGE_HEADER }), env(run), db.fetcher)
 
 describe('GET /api/search', () => {
   it('counts the visitor, then asks site_search for the query, its embedding and the filters, with the token', async () => {
@@ -153,7 +154,7 @@ describe('GET /api/search', () => {
 })
 
 const from = (address: string, path = '/api/search?q=mechs') =>
-  new Request(`https://artist-search.test${path}`, { headers: { 'cf-connecting-ip': address } })
+  new Request(`https://artist-search.test${path}`, { headers: { 'cf-connecting-ip': address, ...PAGE_HEADER } })
 
 describe('the limits, which the database keeps', () => {
   it('answers 429 when the database says wait, before Workers AI or the search is asked, and holds up nobody else', async () => {
@@ -296,6 +297,55 @@ describe('the limits, which the database keeps', () => {
   })
 })
 
+describe('a call another site’s page makes the visitor’s browser send', () => {
+  // The fifth critic's: an <img src> or a no-cors fetch on any page was counted and served like the visitor's own
+  // search, so a hostile page could make its visitors spend the day's reads, each from a network of their own.
+  const forced = (path: string, headers: Record<string, string> = {}, init: RequestInit = {}) =>
+    new Request(`https://artist-search.test${path}`, { ...init, headers: { 'cf-connecting-ip': '203.0.113.7', ...headers } })
+  const asSent = { 'sec-fetch-site': 'cross-site', 'sec-fetch-mode': 'no-cors', referer: 'https://hostile.example/thread' }
+
+  it('is refused by every function that spends a limit, before the database is asked anything', async () => {
+    for (const headers of [asSent, {}]) {
+      // As a browser marks it, and as an old browser that marks nothing sends it: neither carries the pages' header.
+      const db = database()
+      const body = JSON.stringify({ slug: 'someone', ticket: 'FAKE-TICKET', proof: true })
+      const answers = [
+        await handle(forced('/api/search?q=knight', headers), env(), db.fetcher),
+        await artistPage(forced('/api/artist?slug=someone', headers), env(), db.fetcher),
+        await artistPage(forced('/api/artist?slug=someone&similar=1', headers), env(), db.fetcher),
+        await claimPage(forced('/api/removal?slug=someone', headers), env(), db.fetcher),
+        await removal(forced('/api/removal', { ...headers, 'content-type': 'application/json' }, { method: 'POST', body }), env(), db.fetcher),
+      ]
+      expect(answers.map((answer) => [answer.status, answer.headers.get('cache-control')])).toEqual(Array(5).fill([403, 'no-store']))
+      expect(db.calls).toEqual([])
+    }
+  })
+
+  it('is told apart from the site’s own pages, which send their header with every call and are served', async () => {
+    const db = database()
+    const sent: (string | null)[] = []
+    vi.stubGlobal('fetch', async (path: string, init: RequestInit = {}) => {
+      const request = forced(path, init.headers as Record<string, string>, { method: init.method, body: init.body })
+      sent.push(request.headers.get(OWN_PAGE))
+      if (path.startsWith('/api/search')) return handle(request, env(), db.fetcher)
+      if (path.startsWith('/api/artist')) return artistPage(request, env(), db.fetcher)
+      return init.method === 'POST' ? removal(request, env(), db.fetcher) : claimPage(request, env(), db.fetcher)
+    })
+    try {
+      await search('q=own+pages')
+      await getArtist('own-pages')
+      await similarArtists('own-pages')
+      await claim('own-pages')
+      await removalCode('own-pages', 'FAKE-TICKET')
+      await requestRemoval('own-pages', 'it is me', 'FAKE-TICKET')
+      expect(sent).toEqual(Array(6).fill('1'))
+      expect(db.called('client_wait').map((call) => call.args.p_kind)).toEqual(['search', 'profile', 'similar', 'claim', 'removal', 'removal'])
+    } finally {
+      vi.unstubAllGlobals()
+    }
+  })
+})
+
 describe('GET /api/artist', () => {
   it('counts a profile, then asks site_artist for it with the token: the card, or null when the artist is not listed', async () => {
     const profile = { slug: 'someone', name: 'Someone', works: [] }
@@ -347,7 +397,7 @@ describe('GET /api/artist', () => {
 const post = (body: unknown, address = '203.0.113.7', type = 'application/json') =>
   new Request('https://artist-search.test/api/removal', {
     method: 'POST',
-    headers: { 'content-type': type, 'cf-connecting-ip': address },
+    headers: { 'content-type': type, 'cf-connecting-ip': address, ...PAGE_HEADER },
     body: JSON.stringify(body),
   })
 
@@ -407,6 +457,19 @@ describe('POST /api/removal', () => {
 
     expect(statuses).toEqual([200, 200, 429, 429])
     expect(db.called('site_removal_code')).toHaveLength(2)
+  })
+
+  it('asks the database once more when filing fails, and only once more, and counts the visitor once', async () => {
+    const down = () => new Response('{"code":"57014"}', { status: 500 })
+    for (const [body, name] of [
+      [{ slug: 'someone', ticket: 'FAKE-TICKET', proof: true }, 'site_removal_code'],
+      [{ slug: 'someone', ticket: 'FAKE-TICKET', note: 'it is me' }, 'site_request_removal'],
+    ] as const) {
+      const db = database(down(), down(), down(), down())
+      const response = await removal(post(body), env(), db.fetcher)
+      expect([response.status, await response.json()]).toEqual([502, { error: 'That did not go through.' }])
+      expect(db.calls.map((call) => call.name)).toEqual(['client_wait', name, name])
+    }
   })
 
   it('reads only a JSON body that names a profile, so another site’s form cannot post here', async () => {
@@ -571,10 +634,23 @@ describe('an artist card', () => {
 })
 
 describe('the claim-or-remove page', () => {
-  const places = (deviantart_proof: boolean, site_url: string | null) => {
+  const places = (deviantart_proof: boolean, site_url: string | null, copyRow = (text: string) => text) => {
     const claim = { slug: 'someone', name: 'Someone', site_url, deviantart_url: 'https://www.deviantart.com/someone', deviantart_proof, ticket: 'FAKE-TICKET' }
-    return renderToStaticMarkup(createElement(ProofPlaces, { claim, code: 'CODE', copyRow: (text: string) => text }))
+    return renderToStaticMarkup(createElement(ProofPlaces, { claim, code: 'CODE', copyRow }))
   }
+
+  it('tells the artist the tag and the file the checks read, word for word', () => {
+    // pipeline/removals.py reads <meta name="artist-search-removal"> in the head, and /.well-known/artist-search-removal.txt
+    // (crawl.read_proof). A property= tag or the file anywhere else is never found, and the artist waits for nothing.
+    const rows: string[] = []
+    places(true, 'https://someone.art/', (text) => (rows.push(text), text))
+    expect(rows).toEqual(['CODE', '<meta name="artist-search-removal" content="CODE">', 'https://someone.art/.well-known/artist-search-removal.txt'])
+  })
+
+  it('promises only what the checks keep: usually within a few hours, at most within a day', () => {
+    // Hourly for a day, every six hours to two weeks, a run every 15 minutes: tests/test_removals.py holds them to it.
+    expect(places(true, 'https://someone.art/')).toContain('Once the code is up, we usually find it within a few hours, and at most within a day.')
+  })
 
   it('offers DeviantArt only for a profile whose account was kept, the site when there is one, and says which', () => {
     expect([places(true, 'https://someone.art/'), places(true, null)].map((page) => page.includes('About text or the tagline'))).toEqual([true, true])

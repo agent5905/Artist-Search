@@ -55,8 +55,9 @@ MAX_CRAWL_DELAY = 60.0  # a host that asks for more patience than this is treate
 MAX_REDIRECTS = 5
 SITE_REQUEST_BUDGET = 60  # requests of one site per process, everything counted. A mistaken site stays a small one
 VERIFY_REQUEST_BUDGET = 3  # all a site is asked until its front page proves whose it is: robots.txt, tdmrep.json, it
-# All a site is asked for a removal proof: robots.txt, the proof file and the front page, each perhaps once more on
-# the other side of an http-to-https or www redirect, which brings a robots.txt of its own.
+# All a site is asked for a removal proof in one run of the checks (one fetcher: see read_proof): robots.txt, the
+# proof file and the front page, each perhaps once more on the other side of an http-to-https or www redirect,
+# which brings a robots.txt of its own.
 PROOF_REQUEST_BUDGET = 8
 PROOF_REDIRECTS = 3
 STALLED_CLOCK_SECONDS = 0.1  # real time. A clock that reads the same for this long has stopped, not just ticked late
@@ -662,8 +663,8 @@ class PoliteFetcher:
 
     Nothing is fetched except through a site opened with open_site, and a site opens only when its front page
     links back to the DeviantArt profile that claims it. Which sites are proven or closed, their clocks and their
-    budgets are shared by every fetcher in the process. The robots.txt cache belongs to one fetcher, so use one
-    for a whole run.
+    budgets are shared by every fetcher in the process. The robots.txt cache and the budget of a removal proof
+    belong to one fetcher, so use one for a whole run.
     """
 
     def __init__(
@@ -691,6 +692,9 @@ class PoliteFetcher:
         self._resolve = resolver
         # ponytail: robots.txt is cached for the life of the fetcher. RFC 9309 says 24 hours at most; a run is shorter.
         self._origins: dict[str, _Robots | Skip] = {}  # scheme://host -> its rules, or why it is closed to us
+        # site -> requests made of it for removal proofs, out of PROOF_REQUEST_BUDGET: this fetcher's, which is one
+        # run of the checks. Not the process's, as _SPENT is: a collect run makes them every 15 minutes for days.
+        self._proofs: dict[str, int] = {}
 
     def open_site(self, root_url: str, profile_url: str) -> "Site | FetchResult":
         """Prove that `root_url` is the own site of the DeviantArt account at `profile_url`, and hand back a Site.
@@ -735,6 +739,8 @@ class PoliteFetcher:
         their own request, is not AI use, so no AI opt-out stops it (noai, an AI crawler shut out, a TDM
         reservation). robots.txt for our own user agent still does: what it disallows us is not fetched. No link
         back to a profile is asked for, and a redirect is followed only within the site, PROOF_REDIRECTS at most.
+        The site is asked PROOF_REQUEST_BUDGET requests at most by this fetcher, which is one run of the checks, and
+        nothing more by it once it runs out of time or answers 429 or 503. The next run's fetcher asks it afresh.
         """
         with _LOCK:
             reason = _own_site_refusal(root_url)
@@ -785,27 +791,29 @@ class PoliteFetcher:
 
         `policy_path` is set when the URL is robots.txt or tdmrep.json itself. No rule can forbid reading those,
         their own headers do not close the host, and they may only redirect to the same path on the same site.
-        `proof` is set for read_proof: its own budget, and robots.txt for us is the only rule that applies.
+        `proof` is set for read_proof: its own budget, this fetcher's (self._proofs), and robots.txt for us is the
+        only rule that applies.
         """
         site, status = _site(url), 0
+        spent = self._proofs if proof else _SPENT
         for _ in range(redirects + 1):
             try:
                 reason, address = self._admit(url, site, policy_path, proof)
                 unproven = PROOF_REQUEST_BUDGET if proof else VERIFY_REQUEST_BUDGET
                 budget = SITE_REQUEST_BUDGET if _OWNERS.get(site) else unproven
-                if not reason and _SPENT.get(site, 0) >= budget:
+                if not reason and spent.get(site, 0) >= budget:
                     reason = "budget"
                 if reason:
                     return FetchResult(str(url), skip=reason)
                 seconds = PROOF_SECONDS_PER_RESPONSE if proof else MAX_SECONDS_PER_RESPONSE
-                response, body = self._send(url, address, cap, seconds)
+                response, body = self._send(url, address, cap, seconds, spent)
                 status = response.status_code
                 if response.has_redirect_location:
                     url = url.join(response.headers["location"])
                     continue
             except (httpx.HTTPError, httpx.InvalidURL, OSError) as error:
                 if proof and isinstance(error, httpx.TimeoutException):  # a slow site costs a proof one deadline a run
-                    _SPENT[site] = SITE_REQUEST_BUDGET
+                    spent[site] = SITE_REQUEST_BUDGET
                 return FetchResult(str(url), skip="error")
             if status in (401, 403):
                 reason = "auth"
@@ -837,9 +845,12 @@ class PoliteFetcher:
         address = next((address for address in addresses if ":" not in address), addresses[0])
         return (None if policy_path else self._origin_refusal(url, proof)), address
 
-    def _send(self, url: httpx.URL, address: str, cap: int, seconds: float) -> tuple[httpx.Response, bytes | None]:
+    def _send(
+        self, url: httpx.URL, address: str, cap: int, seconds: float, spent: dict[str, int]
+    ) -> tuple[httpx.Response, bytes | None]:
         """One rate-limited GET, over within `seconds` of being sent: connecting, a TLS handshake, the head and the
-        body. The body is None when the response failed, redirected or is larger than `cap`.
+        body, counted in `spent` (see _get). The body is None when the response failed, redirected or is larger
+        than `cap`.
 
         Past the deadline it is a timeout (for a removal proof, the site is then closed for the run: see _get).
         Every read of the connection checks the deadline by this fetcher's clock
@@ -864,12 +875,12 @@ class PoliteFetcher:
             elif time.monotonic() - stalled > STALLED_CLOCK_SECONDS:
                 raise TimeoutError("the clock has stopped, so the wait cannot be shown to be over")
         deadline = now + seconds
-        _SPENT[site] = _SPENT.get(site, 0) + 1
+        spent[site] = spent.get(site, 0) + 1
         answer: concurrent.futures.Future[tuple[httpx.Response, bytes | None]] = concurrent.futures.Future()
 
         def exchange() -> None:
             try:
-                answer.set_result(self._exchange(url, address, cap, deadline))
+                answer.set_result(self._exchange(url, address, cap, deadline, spent))
             except Exception as error:  # handed over as it is
                 answer.set_exception(error)
 
@@ -881,7 +892,9 @@ class PoliteFetcher:
         finally:
             _LAST[site] = self._clock()  # the wait runs from the end of a request, and a failed one still counts
 
-    def _exchange(self, url: httpx.URL, address: str, cap: int, deadline: float) -> tuple[httpx.Response, bytes | None]:
+    def _exchange(
+        self, url: httpx.URL, address: str, cap: int, deadline: float, spent: dict[str, int]
+    ) -> tuple[httpx.Response, bytes | None]:
         """The GET itself, for _send."""
         site, host = _site(url), _host(url)
         # The connection goes to the address that was checked, not to whatever the name resolves to by now.
@@ -892,7 +905,7 @@ class PoliteFetcher:
             if self._clock() > deadline:  # however the head came (a transport may have no reads to check)
                 raise httpx.ReadTimeout("the response took too long")
             if response.status_code in (429, 503):  # told to back off: the site is closed for the rest of the run
-                _SPENT[site] = SITE_REQUEST_BUDGET
+                spent[site] = SITE_REQUEST_BUDGET
             declared = response.headers.get("content-length", "")
             if not response.is_success or (declared.isdigit() and int(declared) > cap):
                 return response, None
