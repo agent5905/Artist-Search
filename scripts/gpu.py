@@ -1,4 +1,4 @@
-"""Run, pause and watch the local GPU work: style vectors, tags, formats and profiles for what has been collected.
+"""Run, pause and watch the local GPU work: style vectors, tags, formats, the artwork check and profiles.
 
     uv run python scripts/gpu.py status              what is done, what is left, and whether it is running
     uv run python scripts/gpu.py pause               free the GPU: every stage holds where it is, models are unloaded
@@ -34,6 +34,7 @@ STAGES = {
     "style": ["pipeline.style", "--model", "csd", "--max-works", str(5 * TURN)],
     "tagging": ["pipeline.tagging", "--max-works", str(TURN), "--verifier", profiles.TAGGER],
     "formats": ["pipeline.tagging", "--max-works", str(TURN), "--formats"],
+    "artwork": ["pipeline.tagging", "--max-works", str(TURN), "--artwork"],
     "profiles": ["pipeline.profiles", "--max-artists", str(TURN // 4)],
 }
 _ALL = "SELECT count(*) FROM works w WHERE w.image_file IS NOT NULL"
@@ -51,6 +52,9 @@ _DONE = {
     "sorted by format": "SELECT count(*) FROM works w JOIN work_format f USING (deviation_id) WHERE "
     "w.image_file IS NOT NULL AND f.model = :model AND f.prompt_version = :formats AND f.asked_at > :since "
     f"AND f.fingerprint = {library.IMAGE}",
+    "checked for artwork": "SELECT count(*) FROM works w JOIN work_artwork a USING (deviation_id) WHERE "
+    "w.image_file IS NOT NULL AND a.model = :model AND a.prompt_version = :artwork AND a.asked_at > :since "
+    f"AND a.fingerprint = {library.IMAGE}",
     _PROFILED: "SELECT count(*) FROM artist_profiles WHERE made_at > :since",
 }
 
@@ -68,6 +72,7 @@ def counts(since: str = "") -> dict[str, int]:
         "tags": tagging.PROMPT_VERSION,
         "model": profiles.TAGGER,
         "formats": tagging.FORMAT_VERSION,
+        "artwork": tagging.ARTWORK_VERSION,
         "since": since,
     }
     found = {}

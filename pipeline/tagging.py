@@ -60,7 +60,15 @@ MAX_ATTEMPTS = 3  # per question; then a work is recorded as failed, and a tag a
 MAX_DESCRIPTION = 400  # characters
 LOCK_WAIT = 600  # seconds to wait for another stage to let go of the database before giving up
 RETRY_AFTER = (5, 15, 45, 120)  # seconds waited before each new try of a request that Ollama failed
-WORK_TABLES = ("work_tags", "work_ai_declared", "work_contact", "work_format", "work_second", "work_agreed")
+WORK_TABLES = (
+    "work_tags",
+    "work_ai_declared",
+    "work_contact",
+    "work_format",
+    "work_second",
+    "work_agreed",
+    "work_artwork",
+)
 TABLES = (*WORK_TABLES, "artist_contact")  # this stage's own; it writes to no other
 
 # The fixed vocabularies: value -> what the models are told it means. Search filters on these values.
@@ -373,6 +381,38 @@ differ: each thing the two describe differently: the first one's words, a slash,
 list when they do not differ.
 description: one or two short sentences."""
 
+# Whether an image is a piece of visual art at all, asked on its own: one call an image, beside the rest. As one
+# field among the first pass's many, the flag let an anti-AI text banner ("a dark fantasy illustration") and a
+# screenshot of a profile card through (round 28). The model picks what kind of image it is, then says yes or no.
+# On 449 sampled works the two never disagreed, yet asked for the kind alone it called four more of them art: a
+# contact card, two pages of writing and a banner of words.
+ARTWORK_VERSION = 1  # bump when ARTWORK_PROMPT or KINDS change what a model would answer
+ARTWORK = "artwork"
+KINDS = {
+    ARTWORK: "a drawing, painting, render, sculpture, sketch or study, finished or not. Also a character, creature "
+    "or prop sheet, a turnaround or a callout with labels and notes, a comic page, card art in a frame, a design "
+    "of game interface or icons, a character design offered for adoption, and any picture with a title, a "
+    "signature, a watermark or the artist's handles on it",
+    "screenshot": "a screenshot of software, a website, social media or a profile page, of a drawing or 3D program "
+    "with its tools and panels around the picture, or of a game being played with its interface on screen",
+    "text": "mainly writing: an announcement, a notice, a journal, a list, a banner or a poster of words",
+    "advertisement": "commission prices, slots or terms, a shop or merchandise, or a call to like, follow or buy",
+    "contact card": "social media handles, links or a QR code, laid out to be followed or scanned",
+    "meme or template": "a meme, or a template, chart or challenge filled in or for others to fill in",
+    "photo": "a photograph of real people, places or things, a cosplay too. Not one of a drawing, painting, "
+    "sculpture or craft",
+    "placeholder": "blurred, blank or covered over, so that nothing in it can be made out",
+}
+ARTWORK_PROMPT = f"""You look at one image from an art site, for a search index of game concept and character \
+artists. One question: is the image mainly a piece of visual art?
+
+Answer with one JSON object with these fields.
+
+kind: the one that fits best
+{_listed(KINDS)}
+artwork: yes or no. Yes when it is mainly visual art, whatever labels, notes, panels, frame or title it carries. \
+No only when it is plainly one of the other kinds. When you cannot tell, yes."""
+
 
 def _choices(vocabulary: dict[str, str]) -> dict[str, Any]:
     # maxItems is enforced by Ollama 0.34.2: without it a model can repeat one value until it runs out of tokens.
@@ -440,6 +480,14 @@ _FORMATTED = {
     "required": ["shows", "format", "also", "rating"],
 }
 _SECOND = {"type": "object", "properties": {"description": {"type": "string"}}, "required": ["description"]}
+_ARTWORK = {
+    "type": "object",
+    "properties": {
+        "kind": {"type": "string", "enum": list(KINDS)},
+        "artwork": {"type": "string", "enum": ["yes", "no"]},
+    },
+    "required": ["kind", "artwork"],
+}
 _AGREED = {
     "type": "object",
     "properties": {
@@ -506,6 +554,12 @@ CREATE TABLE IF NOT EXISTS work_second (
 CREATE TABLE IF NOT EXISTS work_agreed (
     deviation_id TEXT NOT NULL, model TEXT NOT NULL, prompt_version INTEGER NOT NULL,  -- AGREE_VERSION
     result TEXT NOT NULL, asked_at TEXT NOT NULL, fingerprint TEXT, PRIMARY KEY (deviation_id, model, prompt_version)
+) STRICT;
+-- Whether the image is a piece of visual art: {"kind": one of KINDS, "artwork": true or false}, NULL when the
+-- model gave no whole answer.
+CREATE TABLE IF NOT EXISTS work_artwork (
+    deviation_id TEXT NOT NULL, model TEXT NOT NULL, prompt_version INTEGER NOT NULL,  -- ARTWORK_VERSION
+    result TEXT, asked_at TEXT NOT NULL, fingerprint TEXT, PRIMARY KEY (deviation_id, model, prompt_version)
 ) STRICT;
 """
 # The fingerprint of a work's words and of an artist's tagline as they are now, for a query that names the rows
@@ -1132,6 +1186,53 @@ def run_formats(
     return {**counts, "seconds_per_image": round(seconds / asked, 2) if asked else 0.0}
 
 
+def _artwork(client: httpx.Client, model: str, image: str) -> dict[str, Any] | None:
+    """Whether one image is a piece of visual art: {"kind": one of KINDS, "artwork": True or False}, or None after
+    MAX_ATTEMPTS bad answers. It is not art only when the model picks another kind than ARTWORK and says no too: a
+    work held back wrongly costs more than one sent wrongly."""
+    for attempt in range(MAX_ATTEMPTS):
+        answer = _chat(client, model, ARTWORK_PROMPT, "Look at this image.", image, _ARTWORK, attempt)
+        if isinstance(answer, dict) and answer.get("kind") in KINDS and answer.get("artwork") in ("yes", "no"):
+            return {"kind": answer["kind"], "artwork": answer["kind"] == ARTWORK or answer["artwork"] == "yes"}
+    return None
+
+
+def run_artwork(
+    max_works: int,
+    model: str = DEFAULT_MODEL,
+    *,
+    ollama_url: str = OLLAMA_URL,
+    db: pathlib.Path | str | None = None,
+    transport: httpx.BaseTransport | None = None,
+) -> dict[str, float]:
+    """Ask of up to `max_works` works that have a cached image whether it is a piece of visual art: one call an image.
+
+    A pass of its own, with ARTWORK_VERSION, as run_formats is. Returns counts only: artwork, not_artwork, failed
+    (no whole answer in MAX_ATTEMPTS; stored, and not asked again), skipped (already had a row, or the image file
+    is gone), and seconds_per_image.
+    """
+    counts = {"artwork": 0, "not_artwork": 0, "failed": 0, "skipped": 0}
+    seconds = 0.0
+    with _client(ollama_url, transport) as client:
+        works = _transact(db, lambda conn: _works_with_images(conn, "work_artwork", model, ARTWORK_VERSION))
+        counts["skipped"] = sum(done for _, _, done in works)
+        pending = [work for work in works if not work[2]][:max_works]
+        if pending:
+            _require_vision(client, model)
+        for work_id, name, _ in pending:
+            image = _image(name)
+            if image is None:
+                counts["skipped"] += 1
+                continue
+            started = time.monotonic()
+            result = _artwork(client, model, image[0])
+            seconds += time.monotonic() - started
+            _insert(db, "work_artwork", image[1], work_id, model, ARTWORK_VERSION, result and json.dumps(result))
+            counts["failed" if result is None else "artwork" if result["artwork"] else "not_artwork"] += 1
+    asked = counts["artwork"] + counts["not_artwork"] + counts["failed"]
+    return {**counts, "seconds_per_image": round(seconds / asked, 2) if asked else 0.0}
+
+
 def run_agreed(
     max_works: int,
     second: str,
@@ -1227,14 +1328,15 @@ def results(
 
     A result has medium, subjects, genres, style_words, description, explicit and not_artwork; what the
     work's own title and tags were read to say: declared_ai ("yes", "no", "unclear": see declared_ai()) and
-    contact_in_text ("yes", "no": see contacts()); and how it is presented and rated: formats (from FORMATS) and
-    rating (from RATINGS: see run_formats). Each of those four is None while that pass has not been run.
-    Flagged works are in it, for the caller to exclude. Failed works, and works the library no longer holds, are
-    not. Nor is a work whose result was read from an image it no longer shows; and each of the four is None
-    again when it was read from words or an image that have changed since.
+    contact_in_text ("yes", "no": see contacts()); how it is presented and rated: formats (from FORMATS) and
+    rating (from RATINGS: see run_formats); and artwork, whether the image is a piece of visual art (True or
+    False: see run_artwork). Each of those five is None while that pass has not been run, and artwork is None
+    when it failed too. Flagged works are in it, for the caller to exclude. Failed works, and works the library
+    no longer holds, are not. Nor is a work whose result was read from an image it no longer shows; and each of
+    the five is None again when it was read from words or an image that have changed since.
     """
     query = (
-        "SELECT t.deviation_id, t.result, a.declared, c.contact, f.result, g.result FROM work_tags t "
+        "SELECT t.deviation_id, t.result, a.declared, c.contact, f.result, g.result, k.result FROM work_tags t "
         "JOIN works w ON w.deviation_id = t.deviation_id "
         "LEFT JOIN work_ai_declared a ON a.deviation_id = t.deviation_id AND a.model = ? AND a.prompt_version = ? "
         f"AND a.fingerprint = {WORDS} "
@@ -1244,18 +1346,21 @@ def results(
         "AND f.fingerprint = t.fingerprint "
         "LEFT JOIN work_agreed g ON g.deviation_id = t.deviation_id AND g.model = ? AND g.prompt_version = ? "
         "AND g.fingerprint = t.fingerprint "
+        "LEFT JOIN work_artwork k ON k.deviation_id = t.deviation_id AND k.model = ? AND k.prompt_version = ? "
+        "AND k.fingerprint = t.fingerprint "
         f"WHERE t.model = ? AND t.prompt_version = ? AND t.result IS NOT NULL AND t.fingerprint = {library.IMAGE}"
     )
     name = result_set(model, verifier)
     key = [model, AI_PROMPT_VERSION, model, CONTACT_PROMPT_VERSION, model, FORMAT_VERSION]
-    key += [f"{name}~{second}", AGREE_VERSION, name, prompt_version]
+    key += [f"{name}~{second}", AGREE_VERSION, model, ARTWORK_VERSION, name, prompt_version]
     rows = _transact(db, lambda conn: conn.execute(query, key).fetchall())
     return {
         work_id: json.loads(result)
         | ({"description": agreed} if second else {})
         | {"declared_ai": declared, "contact_in_text": contact}
         | (json.loads(sorted_as) if sorted_as else {"formats": None, "rating": None})
-        for work_id, result, declared, contact, sorted_as, agreed in rows
+        | {"artwork": json.loads(art)["artwork"] if art else None}
+        for work_id, result, declared, contact, sorted_as, agreed, art in rows
         if agreed or not second
     }
 
@@ -1397,7 +1502,7 @@ def migrate(backup: pathlib.Path | str | None = None, db: pathlib.Path | str | N
         for table in (*TABLES, "style_vectors"):
             if table in tables and "fingerprint" not in {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}:
                 conn.execute(f"ALTER TABLE {table} ADD COLUMN fingerprint TEXT")
-        for table in ("work_tags", "work_format", "work_second", "work_agreed", "style_vectors"):
+        for table in ("work_tags", "work_format", "work_second", "work_agreed", "work_artwork", "style_vectors"):
             if table in tables:
                 counts["readings fingerprinted"] += conn.execute(
                     f"UPDATE {table} SET fingerprint = (SELECT i.fingerprint FROM work_images i "
@@ -1464,6 +1569,7 @@ def main(argv: list[str] | None = None, transport: httpx.BaseTransport | None = 
     parser.add_argument("--verifier", help="the Ollama model that checks each tag; its results are a set of their own")
     parser.add_argument("--ollama-url", default=OLLAMA_URL, help="a loopback address, nothing else is accepted")
     parser.add_argument("--formats", action="store_true", help="with --max-works: sort works by format and rating")
+    parser.add_argument("--artwork", action="store_true", help="with --max-works: ask if each image is visual art")
     parser.add_argument(
         "--second",
         help="a second model. With --max-works: write the description it and the result set agree on. "
@@ -1483,6 +1589,8 @@ def main(argv: list[str] | None = None, transport: httpx.BaseTransport | None = 
     try:
         if args.formats:  # the passes beside the main one: each asked for by name, none of them run by default
             counts = run_formats(args.max_works, args.model, **local)
+        elif args.artwork:
+            counts = run_artwork(args.max_works, args.model, **local)
         elif args.second:
             counts = run_agreed(args.max_works, args.second, args.model, args.verifier, **local)
         else:

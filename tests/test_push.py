@@ -243,7 +243,8 @@ def artist(
 
     Every work is fit to send unless `edits` says otherwise for its place in the list: "result": None (no
     verified tags), "explicit" or "not_artwork": True, "declared" (AI: "yes", "unclear", None for not read),
-    "contact" ("yes", None for not read), "rating" ("suggestive", "explicit", None for not rated), "thumb".
+    "contact" ("yes", None for not read), "rating" ("suggestive", "explicit", None for not rated), "artwork"
+    (False when the artwork check found it is not, None for not checked), "thumb".
     And "size": its thumbnail's (width, height), as the API gave it: without one, none is kept for the work.
     profile: "written", "excluded" (the profile stage ruled them out) or None (no row there yet).
     user: the handle whose account this is, when it is an account that took another handle, and old_keys: the
@@ -293,6 +294,9 @@ def artist(
         if rating := edit.get("rating", "safe"):
             sorted_as = json.dumps({"formats": ["portrait or bust"], "rating": rating})
             rows.append(("work_format", (work["id"], profiles.TAGGER, tagging.FORMAT_VERSION, sorted_as, AT, image)))
+        if (art := edit.get("artwork", True)) is not None:
+            checked = json.dumps({"kind": tagging.ARTWORK if art else "screenshot", "artwork": art})
+            rows.append(("work_artwork", (work["id"], profiles.TAGGER, tagging.ARTWORK_VERSION, checked, AT, image)))
         rows.append(("style_vectors", (work["id"], "csd", style_vector(angle, n), image)))
     if tagline_contact:
         read = tagging.tagline_print(f"FAKE-TAGLINE {handle}")
@@ -588,6 +592,8 @@ def test_a_removal_stays_applied_here_when_the_database_then_fails(fake):
 HELD = {
     "not_tagged": {"result": None},
     "not_artwork": {"not_artwork": True},
+    "checked_not_artwork": {"artwork": False},
+    "artwork_not_checked": {"artwork": None},
     "explicit": {"explicit": True},
     "explicit by rating": {"rating": "explicit"},
     "declared_ai": {"declared": "yes"},
@@ -2117,11 +2123,11 @@ def collected_again(handle, made, *, tagline=None, titles=None, tags=None, thumb
 
 
 def image_read_again(work, data, description):
-    """The tagging and style stages read the image a work has now: tags, a rating and a vector of these bytes."""
+    """The tagging and style stages read the image a work has now: tags, a rating, the artwork check and a vector."""
     read = (library.fingerprint(data), work["id"])
     edit_result(work, description=description)
     with closing(sqlite3.connect(config.LOCAL_DB)) as conn, conn:
-        for table in ("work_tags", "work_format", "style_vectors"):
+        for table in ("work_tags", "work_format", "work_artwork", "style_vectors"):
             conn.execute(f"UPDATE {table} SET fingerprint = ? WHERE deviation_id = ?", read)
 
 
@@ -2308,7 +2314,7 @@ def test_the_migration_ties_a_whole_store_to_what_was_read_and_what_changed_sinc
     assert counts == {
         "stores migrated": 1,
         "images fingerprinted": 24,
-        "readings fingerprinted": 24 * 3 + 24 * 2 + 4,  # tags, ratings and vectors; two readings of words; taglines
+        "readings fingerprinted": 24 * 4 + 24 * 2 + 4,  # tags, ratings, artwork checks, vectors; words twice; taglines
         "readings stale: title changed": 2,
         "readings stale: tags changed": 0,
         "readings stale: tagline changed": 1,
