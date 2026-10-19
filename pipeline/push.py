@@ -131,9 +131,9 @@ ARTIST_REASONS = (
     *("not_all_rated", "too_few_works", "slug_unusable"),
 )
 WORK_REASONS = (
-    *("not_seen_lately", "not_tagged", "not_artwork", "explicit", "declared_ai", "contact_in_words"),
-    *("words_not_read", "not_rated", "suggestive", "contact_by_rule", "bad_address", "artist_held_back"),
-    "over_limit",
+    *("not_seen_lately", "not_tagged", "not_artwork", "checked_not_artwork", "explicit", "declared_ai"),
+    *("contact_in_words", "words_not_read", "not_rated", "suggestive", "artwork_not_checked", "contact_by_rule"),
+    *("bad_address", "artist_held_back", "over_limit"),
 )
 # The local library has nothing to push. Said for a dry run that finds no file too, without making one.
 NO_ARTISTS = (
@@ -225,6 +225,8 @@ def _held(result: dict[str, Any] | None) -> str | None:
     rating, declared, contact = result.get("rating"), result.get("declared_ai"), result.get("contact_in_text")
     if result["not_artwork"]:
         return "not_artwork"
+    if result.get("artwork") is False:  # the check of its own (tagging.run_artwork)
+        return "checked_not_artwork"
     if result["explicit"] or rating == "explicit":
         return "explicit"
     if declared == "yes":
@@ -235,7 +237,7 @@ def _held(result: dict[str, Any] | None) -> str | None:
         return "words_not_read"
     if rating != SAFE_RATING:
         return "suggestive" if rating in ADULT_RATINGS else "not_rated"
-    return None
+    return None if result.get("artwork") else "artwork_not_checked"
 
 
 def _marked(reason: str) -> str:

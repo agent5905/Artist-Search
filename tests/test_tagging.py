@@ -31,7 +31,13 @@ GOOD = {  # a model's first answer
     "not_artwork": False,
 }
 KEPT = {name: value for name, value in GOOD.items() if name != "manner"}  # what is stored of it
-READ = {"declared_ai": "no", "contact_in_text": "no", "formats": None, "rating": None}  # what results() adds
+READ = {
+    "declared_ai": "no",
+    "contact_in_text": "no",
+    "formats": None,
+    "rating": None,
+    "artwork": None,
+}  # results() adds
 COUNTS = re.compile(
     r'\{"analyzed": \d+, "failed": \d+, "flagged": \d+, "skipped": \d+, "removed": \d+, '
     r'"descriptions_changed": \d+, "details_removed": \d+, "declared_yes": \d+, '
@@ -98,6 +104,7 @@ class FakeOllama:
               checked description, a function (work number, description, request) -> either or a whole answer.
     declared: the reader of title and tags for AI: "yes", "no", "unclear", or a function (request) -> an answer.
     contact:  the reader of a text for a private contact: "yes", "no", or a function (request) -> an answer.
+    artwork:  the artwork check's answer, or a function (work number, request) -> that.
     """
 
     def __init__(
@@ -112,7 +119,9 @@ class FakeOllama:
         second="A red circle.",
         agree=None,
         capabilities=("completion", "vision"),
+        artwork=None,
     ):
+        self.artwork, self.arts = artwork or {"kind": tagging.ARTWORK, "artwork": "yes"}, []
         self.formatted = formatted or {"shows": "FAKE-LAYOUT", "format": "none of these", "also": "none of these"}
         self.formatted = self.formatted if callable(formatted) else {"rating": "safe"} | self.formatted
         self.second, self.agree = second, agree  # the second model's description, and the agreed one (None: the first)
@@ -151,6 +160,9 @@ class FakeOllama:
         if prompt == tagging.FORMAT_PROMPT:
             self.sorts.append((n, chat["model"]))
             return self.say(self.formatted(n, chat) if callable(self.formatted) else self.formatted)
+        if prompt == tagging.ARTWORK_PROMPT:
+            self.arts.append((n, chat["model"]))
+            return self.say(self.artwork(n, chat) if callable(self.artwork) else self.artwork)
         if prompt == tagging.SECOND_PROMPT:
             self.seconds.append((n, chat["model"]))
             self.order.append("second")
@@ -503,6 +515,7 @@ def test_a_rerun_asks_nothing_and_stores_nothing_new():
         6,
         3,
         3,
+        0,
         0,
         0,
         0,
@@ -1136,6 +1149,52 @@ def test_the_format_question_carries_the_image_and_its_own_prompt_and_prints_cou
         assert f"- {value}: " in tagging.FORMAT_PROMPT
     with pytest.raises(ValueError, match="loopback"):
         tagging.run_formats(5, ollama_url="http://example.com:11434", transport=httpx.MockTransport(fake))
+
+
+# Whether an image is a piece of visual art at all: a pass of its own, asked for by name.
+
+
+def artwork_run(fake, max_works=500, **kwargs):
+    counts = tagging.run_artwork(max_works, transport=httpx.MockTransport(fake), **kwargs)
+    assert isinstance(counts.pop("seconds_per_image"), float)
+    return counts
+
+
+def test_the_artwork_check_is_kept_by_the_image_it_read_and_asked_again_when_the_image_changes():
+    art, screenshot, unsure, broken = works(1, 2, 3, 4, tagline="FAKE-TAGLINE")
+    answers = {
+        1: {"kind": tagging.ARTWORK, "artwork": "yes"},
+        2: {"kind": "screenshot", "artwork": "no"},
+        3: {"kind": "placeholder", "artwork": "yes"},  # the model is not sure of it: the work stays
+        4: {"kind": "FAKE-KIND", "artwork": "no"},  # not a kind: no answer at all
+    }
+    run(FakeOllama())
+    assert {result["artwork"] for result in tagging.results().values()} == {None}  # not run by default
+    fake = FakeOllama(artwork=lambda n, chat: answers[n])
+    assert artwork_run(fake) == {"artwork": 2, "not_artwork": 1, "failed": 1, "skipped": 0}
+    assert fake.arts.count((4, tagging.DEFAULT_MODEL)) == tagging.MAX_ATTEMPTS and fake.chats == fake.sorts == []
+    read = {key: value["artwork"] for key, value in tagging.results().items()}
+    assert read == {art: True, screenshot: False, unsure: True, broken: None}
+    assert json.loads(stored("work_artwork")[1][3]) == {"kind": "screenshot", "artwork": False}
+    asked = json.loads(next(request.content for request in fake.requests if request.url.path == "/api/chat"))
+    assert asked["messages"][0] == {"role": "system", "content": tagging.ARTWORK_PROMPT}
+    assert asked["messages"][1]["images"] == [base64.b64encode(JPEG + b"1").decode()]
+    for kept_back in (art, "zz-fake-alpha", "fake-title", "faketag", "fake-tagline", "deviantart", ".jpg"):
+        assert kept_back not in json.dumps(asked).lower()
+    again = FakeOllama()
+    assert artwork_run(again)["skipped"] == 4 and again.requests == []  # nothing is asked twice
+
+    collected_again(1, 2, 3, 4, thumbs={2: ANOTHER})  # the thumbnail shows another file; the image is the old one
+    assert screenshot not in tagging.results()
+    waiting = FakeOllama()
+    assert artwork_run(waiting)["skipped"] == 3 and waiting.requests == []  # not read until it is fetched
+
+    collected_again(1, 2, 3, 4, thumbs={2: ANOTHER}, images={2: JPEG + b"102"})
+    fetched = FakeOllama()
+    assert artwork_run(fetched) == {"artwork": 1, "not_artwork": 0, "failed": 0, "skipped": 3}
+    assert fetched.arts == [(102, tagging.DEFAULT_MODEL)]
+    run(fetched)  # and its tags, read again from the new image
+    assert tagging.results()[screenshot]["artwork"] is True and len(stored("work_artwork")) == 4
 
 
 # Round 4. A description two models agree on, stored beside the checked one.
