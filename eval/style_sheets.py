@@ -6,9 +6,13 @@
     uv run python eval/style_sheets.py --a csd:local --b reference --frozen --seeds 30 --name style_ab_r1
     uv run python eval/style_sheets.py --a csd:local:closest --b reference --reference style_ab_r1 \
         --frozen --seeds 30 --name style_ab_r2
+    uv run python eval/style_sheets.py --a site --b reference --reference style_ab_r1 --frozen --seeds 30 \
+        --name style_ab_r3
 
 "reference" is DeviantArt's own More Like This, as captured by eval/style_reference.py under --reference (--name
-when not given). A third part, "closest", shows each similar artist's works nearest the seed's, not their newest.
+when not given). "site" is what the site would show beside the seed, from push.build: its pool, its neighbours and
+their picks, and the seed's own works as sent; a seed the site would not publish is skipped. A third part,
+"closest", shows each similar artist's works nearest the seed's, not their newest.
 Against it both sheets show the same number of works in shuffled order, so one row per artist cannot give our
 side away.
 
@@ -28,11 +32,12 @@ import pathlib
 import random
 import sqlite3
 import sys
+from collections import defaultdict
 
 from PIL import Image
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
-from pipeline import config, library, style  # noqa: E402
+from pipeline import config, library, push, store, style  # noqa: E402
 
 CELL = 300  # pixels per thumbnail
 PER_ARTIST = 4  # works shown per neighbor
@@ -55,6 +60,22 @@ def closest(conn: sqlite3.Connection, artist: str, other: str, model: str) -> li
     marks = ",".join("?" * len(ids))
     files = dict(conn.execute(f"select deviation_id, image_file from works where deviation_id in ({marks})", ids))
     return [library.image_dir() / files[work] for work in ids if files.get(work)]
+
+
+def site(conn: sqlite3.Connection) -> tuple[dict[str, list[list[pathlib.Path]]], dict[str, list[pathlib.Path]]]:
+    """What push would send, by artist key: a row per neighbour, nearest first, of the works the site shows beside
+    the artist (the picks, or the neighbour's newest when there are none); and each artist's own works as sent."""
+    artists, works, neighbours, _ = push.build()
+    keys = {row["slug"]: store.artist_key(row["da_username"]) for row in artists}
+    files = dict(conn.execute("select page_url, image_file from works where image_file is not null"))
+    own: dict[str, list[pathlib.Path]] = defaultdict(list)
+    for row in sorted(works, key=lambda row: row["position"]):
+        own[keys[row["artist_slug"]]].append(library.image_dir() / files[row["page_url"]])
+    rows: dict[str, list[list[pathlib.Path]]] = defaultdict(list)
+    for row in sorted((row for row in neighbours if row["neighbor_slug"]), key=lambda row: row["rank"]):
+        theirs = own[keys[row["neighbor_slug"]]]
+        rows[keys[row["artist_slug"]]].append([theirs[at] for at in (row["picks"] or range(len(theirs)))][:PER_ARTIST])
+    return {key: found[:NEIGHBORS] for key, found in rows.items()}, own
 
 
 def sheet(rows: list[list[pathlib.Path]], out: pathlib.Path) -> None:
@@ -118,6 +139,9 @@ def main() -> int:
     rng = random.Random(args.rng)
     conn = sqlite3.connect(f"file:{config.LOCAL_DB.as_posix()}?mode=ro", uri=True, timeout=60)
     artists = eligible(conn)
+    sent = site(conn) if "site" in (args.a, args.b) else None
+    if sent:
+        artists = [artist for artist in artists if artist in sent[0]]
     answer = []
     seeds = frozen_seeds(artists)[: args.seeds] if args.frozen else rng.sample(artists, args.seeds)
     for n, artist in enumerate(seeds, start=1):
@@ -128,6 +152,9 @@ def main() -> int:
             if model == "reference":
                 captured = config.CACHE_DIR / "review" / (args.reference or args.name) / "reference"
                 rows[model] = [reference(captured, artist)]
+                continue
+            if model == "site" and sent:
+                rows[model] = sent[0][artist]
                 continue
             name, _, rest = model.partition(":")  # "csd", "csd:mutual" or "csd:local:closest"
             rule, _, pick = rest.partition(":")
@@ -142,7 +169,7 @@ def main() -> int:
                 print(f"seed {n}: no reference captured, skipped")
                 continue
             rows = {model: mixed(side, count, rng) for model, side in rows.items()}
-        sheet([works(conn, artist, 6)], out / f"seed_{n:02d}.jpg")
+        sheet([sent[1][artist][:6] if sent else works(conn, artist, 6)], out / f"seed_{n:02d}.jpg")
         for label, model in zip("AB", models, strict=True):
             sheet(rows[model], out / f"seed_{n:02d}_{label}.jpg")
         answer.append({"n": n, "artist": artist, "A": models[0], "B": models[1]})
