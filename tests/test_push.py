@@ -54,7 +54,7 @@ COUNTS = [
     *(f"artists_held_{reason}" for reason in push.ARTIST_REASONS),
     "works_sent",
     *(f"works_held_{reason}" for reason in push.WORK_REASONS),
-    "texts_left_out_for_contact",
+    *("texts_left_out_for_contact", "taglines_left_out_profane", "taglines_left_out_social", "sheets_sent_as_filler"),
     *("neighbours_sent", "artists_sent_without_neighbours", "neighbours_skipped_by_database"),
     *("artists_deleted_from_database", "works_deleted_from_database", "neighbours_deleted_from_database"),
     *("removed_artists_deleted_from_database", "removals_added_to_database", "removals_applied_here"),
@@ -230,6 +230,7 @@ def artist(
     *,
     profile="written",
     tagline_contact="no",
+    account="fine",
     website=None,
     links=None,
     angle=0.0,
@@ -244,9 +245,11 @@ def artist(
     Every work is fit to send unless `edits` says otherwise for its place in the list: "result": None (no
     verified tags), "explicit" or "not_artwork": True, "declared" (AI: "yes", "unclear", None for not read),
     "contact" ("yes", None for not read), "rating" ("suggestive", "explicit", None for not rated), "artwork"
-    (False when the artwork check found it is not, None for not checked), "thumb".
+    (False when the artwork check found it is not, None for not checked), "fit" (False when the content check
+    found it unfit, None for not checked), "formats" (from tagging.FORMATS), "title", "thumb".
     And "size": its thumbnail's (width, height), as the API gave it: without one, none is kept for the work.
     profile: "written", "excluded" (the profile stage ruled them out) or None (no row there yet).
+    account: what their username and tagline were read to say (tagging.ACCOUNT_ANSWERS), or None for not read.
     user: the handle whose account this is, when it is an account that took another handle, and old_keys: the
     keys the collector found that account kept under, which it names when it stores the new one.
     sheet: (pictures on the sheet the profile stage looked at, how many of them it counted as unsuitable).
@@ -265,7 +268,7 @@ def artist(
         work = {
             "id": f"00000000-0000-4000-A000-{base + n:012d}",
             "page": f"https://www.deviantart.com/{handle}/art/FAKE-PAGE-{handle}-{n}",
-            "title": f"FAKE-TITLE {handle} {n}",
+            "title": edit.get("title", f"FAKE-TITLE {handle} {n}"),
             "tags": [f"zzown{word}{n}", f"zzall{word}"],
             "thumb": edit.get("thumb", f"https://images-wixmp-yyfake.wixmp.com/f/FAKE-THUMB-{handle}-{n}.jpg"),
             "description": f"FAKE-DESCRIPTION {handle} {n}.",
@@ -292,17 +295,23 @@ def artist(
             read = (work["id"], profiles.TAGGER, tagging.CONTACT_PROMPT_VERSION, contact, AT, words)
             rows.append(("work_contact", read))
         if rating := edit.get("rating", "safe"):
-            sorted_as = json.dumps({"formats": ["portrait or bust"], "rating": rating})
+            sorted_as = json.dumps({"formats": edit.get("formats", ["portrait or bust"]), "rating": rating})
             rows.append(("work_format", (work["id"], profiles.TAGGER, tagging.FORMAT_VERSION, sorted_as, AT, image)))
         if (art := edit.get("artwork", True)) is not None:
             checked = json.dumps({"kind": tagging.ARTWORK if art else "screenshot", "artwork": art})
             rows.append(("work_artwork", (work["id"], profiles.TAGGER, tagging.ARTWORK_VERSION, checked, AT, image)))
+        if (fit := edit.get("fit", True)) is not None:
+            checked = json.dumps({"shows": tagging.FIT if fit else "fetish", "fit": fit})
+            rows.append(("work_content", (work["id"], profiles.TAGGER, tagging.CONTENT_VERSION, checked, AT, image)))
         rows.append(("style_vectors", (work["id"], "csd", style_vector(angle, n), image)))
     if tagline_contact:
         read = tagging.tagline_print(f"FAKE-TAGLINE {handle}")
         rows.append(
             ("artist_contact", (key, profiles.TAGGER, tagging.CONTACT_PROMPT_VERSION, tagline_contact, AT, read))
         )
+    if account:
+        read = tagging.account_print(key, f"FAKE-TAGLINE {handle}")
+        rows.append(("artist_account", (key, profiles.TAGGER, tagging.ACCOUNT_PROMPT_VERSION, account, AT, read)))
 
     own_site = bool(website) and crawl.is_own_site(website)
     assert store.upsert_artist(
@@ -375,7 +384,8 @@ def rate(work, rating):
 
 def read_again(*works, handle=None):
     """The tagging stage reads words that have changed, and answers what it answered before: its readings of
-    these works' titles and tags, and of this artist's tagline, are now readings of the words as they are."""
+    these works' titles and tags, and of this artist's tagline (with their username), are now readings of the words
+    as they are."""
     with closing(sqlite3.connect(config.LOCAL_DB)) as conn, conn:
         for work in works:
             words = conn.execute("SELECT title, tags FROM works WHERE deviation_id = ?", (work["id"],)).fetchone()
@@ -387,6 +397,8 @@ def read_again(*works, handle=None):
             (tagline,) = conn.execute("SELECT tagline FROM profiles WHERE artist_key = ?", (key,)).fetchone()
             read = (tagging.tagline_print(tagline), key)
             conn.execute("UPDATE artist_contact SET fingerprint = ? WHERE artist_key = ?", read)
+            read = (tagging.account_print(key, tagline), key)
+            conn.execute("UPDATE artist_account SET fingerprint = ? WHERE artist_key = ?", read)
 
 
 def local_state():
@@ -594,6 +606,9 @@ HELD = {
     "not_artwork": {"not_artwork": True},
     "checked_not_artwork": {"artwork": False},
     "artwork_not_checked": {"artwork": None},
+    "unfit_image": {"fit": False},
+    "fit_not_checked": {"fit": None},
+    "unfit_title": {"title": "FAKE-TITLE Vore-verse: zz"},
     "explicit": {"explicit": True},
     "explicit by rating": {"rating": "explicit"},
     "declared_ai": {"declared": "yes"},
@@ -635,6 +650,9 @@ def test_a_work_declared_unclear_about_ai_is_sent_and_only_a_safe_rating_is(fake
 LEFT_OUT = {
     "not_profiled": {"profile": None},
     "profile_excluded": {"profile": "excluded"},
+    "declares_ai": {"account": "ai"},
+    "adult_account": {"account": "adult"},
+    "account_not_read": {"account": None},
     "adult_portfolio": {"count": 10, "edits": {n: {"rating": "suggestive"} for n in (1, 4, 7)}},  # 3 of 10 rated
     "too_few_works": {"count": 5, "edits": {0: {"rating": None}, 3: {"declared": "yes"}}},  # 3 left
 }
@@ -712,6 +730,20 @@ def test_a_tagline_is_sent_only_when_it_was_read_and_holds_no_contact(fake, read
     row = sent_artists(fake)[ALPHA]
     assert row["tagline"] == (f"FAKE-TAGLINE {ALPHA}" if sent else None)
     assert ("fake-tagline" in fake.sent()) is sent
+
+
+@pytest.mark.parametrize("said", ["profane", "social"])
+def test_a_tagline_that_swears_or_names_a_social_handle_is_left_out_and_the_artist_is_sent(fake, said):
+    artist(ALPHA, account=said)
+    artist(BRAVO, angle=0.3)
+    counts = push.run(False)
+    assert sorted(sent_artists(fake)) == [ALPHA, BRAVO] and counts["works_sent"] == 10
+    assert sent_artists(fake)[ALPHA]["tagline"] is None and f"fake-tagline {ALPHA}" not in fake.sent()
+    assert sent_artists(fake)[BRAVO]["tagline"] == f"FAKE-TAGLINE {BRAVO}"
+    assert (
+        counts[f"taglines_left_out_{said}"] == 1
+        and sum(counts[f"artists_held_{why}"] for why in push.ARTIST_REASONS) == 0
+    )
 
 
 @pytest.mark.parametrize("reading", ["yes", None])
@@ -1377,6 +1409,33 @@ def test_at_most_the_ten_most_recently_published_works_that_may_go_are_sent(fake
         assert left["title"] not in row["search_text"] and left["tags"][0] not in row["search_text"]
     own = [works[n]["tags"][0] for n in (1, 2, 4, 5, 6, 7, 8, 9, 10, 11)]
     assert sorted(row["top_tags"]) == sorted([f"zzall{squashed(ALPHA)}", *own])
+
+
+# Adoptable and for-sale sheets: the artist's own work, but never what leads (the owner, 2026-10-19).
+
+SHEET = {"formats": ["character sheet or turnaround", push.SHEET]}
+
+
+def test_an_artists_sheets_go_after_every_other_work_and_only_to_fill_their_ten(fake):
+    full = artist(ALPHA, 12, edits={0: SHEET, 5: SHEET})  # ten others: no sheet goes
+    few = artist(BRAVO, 6, edits={n: SHEET for n in (0, 2, 4)}, angle=0.3)  # three others lead, the sheets follow
+    counts = push.run(False)
+    sent = {
+        slug: [row["page_url"] for row in fake.loads[-1][1] if row["artist_slug"] == slug] for slug in (ALPHA, BRAVO)
+    }
+    assert sent[ALPHA] == [full[n]["page"] for n in (1, 2, 3, 4, 6, 7, 8, 9, 10, 11)]  # by position, most recent first
+    assert sent[BRAVO] == [few[n]["page"] for n in (1, 3, 5, 0, 2, 4)]
+    assert counts["works_held_sheet_over_limit"] == 2 and counts["works_held_over_limit"] == 0
+    assert counts["sheets_sent_as_filler"] == 3 and counts["works_sent"] == 16
+    assert push.SHEET in tagging.FORMATS
+
+
+def test_a_sheet_is_never_picked_to_show_beside_another_artist(fake):
+    artist(ALPHA, 6)
+    artist(BRAVO, 6, edits={n: SHEET for n in range(3)}, angle=0.001)  # alike: four of six would take in a sheet
+    push.run(False)
+    picks = {(row["artist_slug"], row["neighbor_slug"]): row.get("picks") for row in fake.loads[-1][2]}
+    assert len(picks[ALPHA, BRAVO]) >= push.MIN_PICKS and all(pick < 3 for pick in picks[ALPHA, BRAVO])
 
 
 # An adult portfolio, by the profile stage's count over the artist's sheet (round 3).
@@ -2150,11 +2209,11 @@ def collected_again(handle, made, *, tagline=None, titles=None, tags=None, thumb
 
 
 def image_read_again(work, data, description):
-    """The tagging and style stages read the image a work has now: tags, a rating, the artwork check and a vector."""
+    """The tagging and style stages read the image a work has now: tags, a rating, the two checks and a vector."""
     read = (library.fingerprint(data), work["id"])
     edit_result(work, description=description)
     with closing(sqlite3.connect(config.LOCAL_DB)) as conn, conn:
-        for table in ("work_tags", "work_format", "work_artwork", "style_vectors"):
+        for table in ("work_tags", "work_format", "work_artwork", "work_content", "style_vectors"):
             conn.execute(f"UPDATE {table} SET fingerprint = ? WHERE deviation_id = ?", read)
 
 
@@ -2177,8 +2236,8 @@ def test_a_tagline_that_changed_after_it_was_read_is_not_sent_until_it_is_read_a
 
     counts = push.run(False)
 
-    assert counts["artists_sent"] == 1 and counts["works_sent"] == 5  # the artist stays, and their works
-    assert sent_artists(fake)[ALPHA]["tagline"] is None  # without the line nobody has read
+    # Held back until it is read: an unread line may declare the account AI or adult (tagging.accounts).
+    assert counts["artists_sent"] == 0 and counts["artists_held_account_not_read"] == 1
     assert "fakepainter_77" not in fake.sent() and "fakepainter_77" not in fake.held()
     read_again(handle=ALPHA)  # the tagging stage reads it, and what it answers of these words is what counts
     push.run(False)
@@ -2290,9 +2349,10 @@ def test_an_artist_whose_profile_rests_on_a_reading_that_went_stale_is_held_unti
 
 def before_fingerprints():
     """Take the store back to what every store was before readings carried fingerprints: no such column, no note
-    of which image a work has, a basis that says nothing of what a profile rests on, and no mark."""
+    of which image a work has, a basis that says nothing of what a profile rests on, and no mark. The readings
+    that came after the fingerprints keep theirs."""
     with closing(sqlite3.connect(config.LOCAL_DB)) as conn:
-        for table in (*tagging.TABLES, "style_vectors"):
+        for table in {*tagging.TABLES, "style_vectors"} - {"work_content", "artist_account"}:
             conn.execute(f"ALTER TABLE {table} DROP COLUMN fingerprint")
         conn.execute("UPDATE artist_profiles SET basis = substr(basis, 1, length(basis) - 64)")
         conn.execute("DROP TABLE work_images")
@@ -2349,6 +2409,9 @@ def test_the_migration_ties_a_whole_store_to_what_was_read_and_what_changed_sinc
         "works with a replaced image": 1,
         "profiles tied to what they rest on": 4,
     }
+    with closing(sqlite3.connect(config.LOCAL_DB)) as conn, conn:  # the tagging stage reads BRAVO's new line: fine
+        read = (tagging.account_print(f"da:{BRAVO}", said), f"da:{BRAVO}")
+        conn.execute("UPDATE artist_account SET fingerprint = ? WHERE artist_key = ?", read)
     counts = push.run(False, allow_delete=6)  # the stages open the store again, and each change is stale by itself
     assert sorted(sent_artists(fake)) == [BRAVO, DELTA] and counts["artists_held_profile_out_of_date"] == 2
     assert sent_artists(fake)[BRAVO]["tagline"] is None and counts["works_sent"] == 12
@@ -2369,6 +2432,7 @@ TAGLINE = "Commissions open, message me on Discord fakepainter_77"
 READS = [
     *((store, "all_artists"), (library, "artist_marks"), (library, "work_marks"), (library, "thumb_sizes")),
     *((profiles, "profiles"), (profiles, "excluded"), (tagging, "results"), (tagging, "contacts")),
+    (tagging, "accounts"),
     *((push, "_collected"), (style, "all_neighbors"), (style, "all_closest_works")),
 ]
 
@@ -2427,10 +2491,10 @@ def test_a_change_that_lands_while_the_rows_are_built_is_in_what_goes(fake, monk
 
     counts = push.run(False)
 
-    assert sorted(sent_artists(fake)) == [ALPHA, CHARLIE] and counts["artists_held_marked_account_gone"] == 1
+    assert sorted(sent_artists(fake)) == [CHARLIE] and counts["artists_held_marked_account_gone"] == 1
+    assert counts["artists_held_account_not_read"] == 1  # ALPHA's new tagline is not read yet
     assert counts["works_held_words_not_read"] == counts["works_held_not_tagged"] == 1
-    assert counts["works_held_marked_mature"] == 1 and counts["works_sent"] == 5 + 5
-    assert sent_artists(fake)[ALPHA]["tagline"] is None  # the new one is not read yet, and the old one is gone
+    assert counts["works_held_marked_mature"] == 1 and counts["works_sent"] == 5
     for text in ("fakepainter", ANOTHER.lower(), *(made[n]["page"].lower() for n in range(3)), BRAVO):
         assert text not in json.dumps(fake.loads[-1]).lower() and text not in fake.held()
 

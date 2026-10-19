@@ -127,13 +127,31 @@ TRIES = 2
 
 # Besides these, one reason for each mark the collect stage has left: "marked_<its reason>" (see _marked).
 ARTIST_REASONS = (
-    *("not_profiled", "profile_excluded", "profile_out_of_date", "site_removed", "adult_portfolio"),
-    *("not_all_rated", "too_few_works", "slug_unusable"),
+    *("not_profiled", "profile_excluded", "profile_out_of_date", "site_removed", "declares_ai", "adult_account"),
+    *("account_not_read", "adult_portfolio", "not_all_rated", "too_few_works", "slug_unusable"),
 )
 WORK_REASONS = (
-    *("not_seen_lately", "not_tagged", "not_artwork", "checked_not_artwork", "explicit", "declared_ai"),
-    *("contact_in_words", "words_not_read", "not_rated", "suggestive", "artwork_not_checked", "contact_by_rule"),
-    *("bad_address", "artist_held_back", "over_limit"),
+    *("not_seen_lately", "not_tagged", "not_artwork", "checked_not_artwork", "explicit", "unfit_image"),
+    *("unfit_title", "declared_ai", "contact_in_words", "words_not_read", "not_rated", "suggestive"),
+    *("artwork_not_checked", "fit_not_checked", "contact_by_rule", "bad_address", "artist_held_back"),
+    *("sheet_over_limit", "over_limit"),
+)
+SHEET = "adoptable or design-for-sale sheet"  # of tagging.FORMATS: sent after an artist's other works, never picked
+# What an artist's username and tagline say (tagging.accounts) that holds them back; None is not read yet. Of the
+# rest, "profane" and "social" leave the tagline out and send the artist.
+HELD_ACCOUNTS = {"ai": "declares_ai", "adult": "adult_account", None: "account_not_read"}
+# A title with one of these words holds its work back: sexual, fetish, hateful, or naming a minor sexually. Whole
+# words: "carnivore", "inflatable", "Lolita" and "breastplate" go. A list, where the image check (tagging.run_content)
+# is a model, because a work held wrongly costs little: on the 39,744 titles of 2026-10-19 it holds 58, two of them
+# wrongly, where "sex" was not sexual. Not "giantess" or "xxx": in titles they were a female giant and a placeholder.
+# ponytail: what a title only hints at ("Feeding time") passes, and so does a word glued to others; the image
+# check and the rating are behind it.
+UNFIT_TITLE = re.compile(
+    r"\b(?:nsfw|porn\w*|hentai|ecchi|lewd|nudes?|nudity|topless|sexy|sex|sextober|kinktober|kinky?|"
+    r"fetish\w*|bdsm|bondage|erotic\w*|lingerie|boob(?:s|ies)|tits|titties|breasts?|butts?|booty|ass|thicc|milf|"
+    r"oppai|ahegao|futa(?:nari)?|yiff|vore|inflation|inflat(?:ed|ing)|diapers?|abdl|"
+    r"loli(?:con)?|shota(?:con)?|nazis?|reich|swastikas?|hitler|kkk)\b",
+    re.IGNORECASE,
 )
 # The local library has nothing to push. Said for a dry run that finds no file too, without making one.
 NO_ARTISTS = (
@@ -229,6 +247,8 @@ def _held(result: dict[str, Any] | None) -> str | None:
         return "checked_not_artwork"
     if result["explicit"] or rating == "explicit":
         return "explicit"
+    if result.get("fit") is False:  # fetish, a hate symbol or a sexualised minor (tagging.run_content)
+        return "unfit_image"
     if declared == "yes":
         return "declared_ai"
     if contact == "yes":
@@ -237,7 +257,9 @@ def _held(result: dict[str, Any] | None) -> str | None:
         return "words_not_read"
     if rating != SAFE_RATING:
         return "suggestive" if rating in ADULT_RATINGS else "not_rated"
-    return None if result.get("artwork") else "artwork_not_checked"
+    if not result.get("artwork"):
+        return "artwork_not_checked"
+    return None if result.get("fit") else "fit_not_checked"
 
 
 def _marked(reason: str) -> str:
@@ -348,7 +370,8 @@ def build(
     """The rows for db.load (artists, works, neighbours) and the count of what was held back, by reason.
 
     An artist goes when the store lists them, the collect stage has left no mark on them, pipeline/profiles.py
-    gave them a profile, their portfolio is not an adult one (ADULT_PERCENT, by their works' ratings or by the
+    gave them a profile, their own username and tagline were read and declare neither AI art nor adult content
+    (HELD_ACCOUNTS), their portfolio is not an adult one (ADULT_PERCENT, by their works' ratings or by the
     pictures on their sheet, whichever says so), and MIN_WORKS of their works may be sent. `removed` is key
     hashes the store's removal list does not hold yet and will (see _removal): whoever they bar is not built.
 
@@ -358,20 +381,20 @@ def build(
     not_all_rated.
 
     A work may be sent when the collect stage has left no mark on it, it was in the artist's latest answer from
-    DeviantArt, it passes _held, and the plain rule finds no contact in its title or its description. Every
-    other text is held to that rule too, and one that fails is left out and counted (see the module's
-    docstring). The collect stage deletes nothing any more: a work it finds mature,
+    DeviantArt, it passes _held, its title has no word of UNFIT_TITLE, and the plain rule finds no contact in its
+    title or its description. Every other text is held to that rule too, and one that fails is left out and
+    counted (see the module's docstring). The collect stage deletes nothing any more: a work it finds mature,
     somebody else's, no longer public or titled with contact details stays here with a mark, and a work the
     artist has taken down stays with the time it was last seen, which is before their profile was last stored.
     Of the works that may be sent, the MAX_WORKS most recently published are, each with its thumbnail's size
-    when the collect stage has it.
+    when the collect stage has it; an adoptable or for-sale sheet (SHEET) only after all the others, as filler.
 
     Everything in an artist's row that comes from their works comes from the works that are sent, and a
     neighbour is always an artist who is sent too. A neighbour's row says which of their works to show beside
     the artist: of the PICKS closest in style to the artist's (style.all_closest_works), best first, counting only
-    works that are sent on either side, those that pass STYLE_FLOOR. A neighbour with fewer than MIN_PICKS of
-    them is not sent, and the next nearest takes their place. An artist who goes and has no neighbour gets one
-    row that names no neighbour (see the end of _build).
+    works that are sent and are not sheets on either side, those that pass STYLE_FLOOR. A neighbour with fewer
+    than MIN_PICKS of them is not sent, and the next nearest takes their place. An artist who goes and has no
+    neighbour gets one row that names no neighbour (see the end of _build).
 
     Every read is of one copy of the store made at one moment (store.snapshot), so the rows are all of that
     moment: no title goes under the reading of another, and no card is sent of works a mark made since has
@@ -398,6 +421,7 @@ def _build(local: store.Snapshot, removed: Collection[str]) -> tuple[Rows, Rows,
     # ponytail: not the two-model agreed one (results(second=...)), which no critic has judged yet.
     results = tagging.results(profiles.TAGGER, db=local, verifier=profiles.TAGGER)
     contacts = tagging.contacts(profiles.TAGGER, local)
+    accounts = tagging.accounts(profiles.TAGGER, local)
     works_of, fields = _collected(local)
     answers = library.answers(local)  # what each artist's latest answer emptied, and how many works it flags mature
     counts: Counter[str] = Counter()
@@ -413,6 +437,7 @@ def _build(local: store.Snapshot, removed: Collection[str]) -> tuple[Rows, Rows,
     works: Rows = []
     slugs: dict[str, str] = {}  # artist key -> slug, for every artist who goes
     sent: dict[str, list[str]] = {}  # artist key -> the deviation ids of their works that go, by position
+    sheets: set[str] = set()  # of those and the rest, the adoptable or for-sale sheets (SHEET)
     for key in sorted(listed.keys() & (works_of.keys() | fields.keys())):
         # page, thumbnail, title, the artist's tags, verified result, the thumbnail's (width, height), deviation id
         ready: list[tuple[str, str, str | None, list[str], dict[str, Any], tuple[int | None, int | None], str]] = []
@@ -430,6 +455,8 @@ def _build(local: store.Snapshot, removed: Collection[str]) -> tuple[Rows, Rows,
                 reason = _marked(marked_works[work_id][0])
             elif seen < stored:  # not in the answer their profile was last stored with: taken down, as far as is known
                 reason = "not_seen_lately"
+            elif UNFIT_TITLE.search(title or ""):
+                reason = "unfit_title"
             elif result and not reason and any(map(library.holds_contact, (title, result["description"]))):
                 reason = "contact_by_rule"
             # A page is one work in the database: a second work with the same page is not sent.
@@ -455,6 +482,9 @@ def _build(local: store.Snapshot, removed: Collection[str]) -> tuple[Rows, Rows,
         # A removed site the store's own links did not show.
         elif site_url and (store.is_removed(site_url, local) or store.covers(removed, site_url)):
             why = "site_removed"
+        # An account whose own words declare AI art or adult content, or whose words nobody has read as they are.
+        elif accounts.get(key) in HELD_ACCOUNTS:
+            why = HELD_ACCOUNTS[accounts.get(key)]
         # By either measure: the rating each work was given, or the profile stage's count over the artist's sheet
         # (a profile made before it counted has neither number, and is judged on the ratings alone).
         elif _too_many(adult, rated) or _too_many(
@@ -472,8 +502,15 @@ def _build(local: store.Snapshot, removed: Collection[str]) -> tuple[Rows, Rows,
             counts[f"artists_held_{why}"] += 1
             counts["works_held_artist_held_back"] += len(ready)
             continue
-        counts["works_held_over_limit"] += len(ready[MAX_WORKS:])
-        ready = ready[:MAX_WORKS]  # the most recently published: that is the order they were read in
+        # The owner's (2026-10-19): an adoptable or for-sale sheet is the artist's work, but never leads. Sheets go
+        # after every other work that may go, so one fills a slot only when there are fewer than MAX_WORKS others.
+        filler = {work_id for *_, result, _, work_id in ready if SHEET in (result.get("formats") or [])}
+        ready.sort(key=lambda work: work[-1] in filler)  # stable: the most recent first within each, as read
+        counts["works_held_over_limit"] += sum(work[-1] not in filler for work in ready[MAX_WORKS:])
+        counts["works_held_sheet_over_limit"] += sum(work[-1] in filler for work in ready[MAX_WORKS:])
+        ready = ready[:MAX_WORKS]
+        counts["sheets_sent_as_filler"] += sum(work[-1] in filler for work in ready)
+        sheets |= filler
         slugs[key] = slug
         sent[key] = [work_id for *_, work_id in ready]
         profile = written[key]
@@ -500,6 +537,9 @@ def _build(local: store.Snapshot, removed: Collection[str]) -> tuple[Rows, Rows,
         listed_tags = dict.fromkeys(profiles.displayed(tag) for tag in most_used if profiles.approved(tag))
         words = [*facts, *(title for _, _, title, *_ in ready if title), *listed_tags]
         search_text = _search_text(words)  # read whole, as every text that goes, by both rules
+        said = accounts[key]  # "fine", or "profane" or "social": then the tagline is left out and the artist goes
+        if tagline and said != "fine":
+            counts[f"taglines_left_out_{said}"] += 1
         artists.append(
             {
                 "slug": slug,
@@ -511,7 +551,7 @@ def _build(local: store.Snapshot, removed: Collection[str]) -> tuple[Rows, Rows,
                 "site_url": None if website_emptied else site_url,
                 "site_domain": None if website_emptied else site_domain,
                 "tagline": next(iter(plain([tagline])), None)
-                if tagline and not tagline_emptied and contacts.get(key) == "no"
+                if tagline and not tagline_emptied and contacts.get(key) == "no" and said == "fine"
                 else None,
                 "top_tags": shown,
                 "search_text": search_text or None,
@@ -562,8 +602,10 @@ def _build(local: store.Snapshot, removed: Collection[str]) -> tuple[Rows, Rows,
     # the artist's that go and close enough. A work is named by its position among its artist's, never by its
     # deviation id. ponytail: picks for all DEPTH nearest, though most artists fill NEIGHBOURS from the first
     # 48. Measured on 2026-10-18: 7.6 s for 2,967 artists. Go down each artist's list in turn if that grows.
+    # A sheet is never picked, nor measured against: it is shown beside nobody.
     pairs = [(key, other) for key, others in nearest.items() for other, _ in others]
-    closest = style.all_closest_works(pairs, sent, STYLE_MODEL, PICKS, local, STYLE_FLOOR)
+    pickable = {key: [work for work in works if work not in sheets] for key, works in sent.items()}
+    closest = style.all_closest_works(pairs, pickable, STYLE_MODEL, PICKS, local, STYLE_FLOOR)
     going = {
         key: [(other, score) for other, score in others if len(closest[key, other]) >= MIN_PICKS][:NEIGHBOURS]
         for key, others in nearest.items()
@@ -645,8 +687,11 @@ def run(dry_run: bool, allow_delete: int | None = None, local: pathlib.Path | st
     artists_sent and works_sent, each with what was held back by reason (ARTIST_REASONS, WORK_REASONS, and a
     line for each mark of the collect stage that held something back: "..._held_marked_<its reason>");
     texts_left_out_for_contact (tags, taglines and other texts of rows that are sent, left out by the plain
-    rule); neighbours_sent, artists_sent_without_neighbours, and neighbours_skipped_by_database (what db.load
-    said the database would not take: a row that names an artist it does not have);
+    rule); taglines_left_out_profane and taglines_left_out_social (of artists who are sent, the taglines left out
+    for swearing or for naming a social handle: tagging.accounts); sheets_sent_as_filler (adoptable or for-sale
+    sheets sent after an artist's other works, to fill their MAX_WORKS: SHEET); neighbours_sent,
+    artists_sent_without_neighbours, and neighbours_skipped_by_database (what db.load said the database would not
+    take: a row that names an artist it does not have);
     artists_deleted_from_database, works_deleted_from_database and neighbours_deleted_from_database (rows it had
     that are no longer sent; of neighbour rows, those an artist who stays loses and gets no other for);
     removed_artists_deleted_from_database and removals_added_to_database (artists the removal list bars, and key
@@ -743,6 +788,9 @@ def run(dry_run: bool, allow_delete: int | None = None, local: pathlib.Path | st
         | held_back("works", WORK_REASONS)
         | {
             "texts_left_out_for_contact": held["texts_left_out_for_contact"],
+            "taglines_left_out_profane": held["taglines_left_out_profane"],
+            "taglines_left_out_social": held["taglines_left_out_social"],
+            "sheets_sent_as_filler": held["sheets_sent_as_filler"],
             "neighbours_sent": len(neighbours) - empty,
             "artists_sent_without_neighbours": empty,
             "neighbours_skipped_by_database": 0,

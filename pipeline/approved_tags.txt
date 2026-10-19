@@ -409,7 +409,6 @@ creatures
 creepy
 creepyart	creepy art
 creepycute	creepy cute
-creepypasta
 cretaceous
 critter
 crocodile

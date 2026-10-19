@@ -37,12 +37,15 @@ READ = {
     "formats": None,
     "rating": None,
     "artwork": None,
+    "fit": None,
 }  # results() adds
 COUNTS = re.compile(
     r'\{"analyzed": \d+, "failed": \d+, "flagged": \d+, "skipped": \d+, "removed": \d+, '
     r'"descriptions_changed": \d+, "details_removed": \d+, "declared_yes": \d+, '
     r'"declared_no": \d+, "declared_unclear": \d+, "contact_yes": \d+, "contact_no": \d+, '
-    r'"tagline_contact_yes": \d+, "tagline_contact_no": \d+, "seconds_per_image": \d+\.\d+, '
+    r'"tagline_contact_yes": \d+, "tagline_contact_no": \d+, "account_ai": \d+, "account_adult": \d+, '
+    r'"account_profane": \d+, "account_social": \d+, "account_fine": \d+, "account_failed": \d+, '
+    r'"seconds_per_image": \d+\.\d+, '
     r'"seconds_per_verification": \d+\.\d+\}\n'
 )
 
@@ -105,6 +108,8 @@ class FakeOllama:
     declared: the reader of title and tags for AI: "yes", "no", "unclear", or a function (request) -> an answer.
     contact:  the reader of a text for a private contact: "yes", "no", or a function (request) -> an answer.
     artwork:  the artwork check's answer, or a function (work number, request) -> that.
+    account:  the reader of a username and tagline: one of tagging.ACCOUNT_ANSWERS, or a function (request) -> one.
+    content:  the content check's answer, or a function (work number, request) -> that.
     """
 
     def __init__(
@@ -120,8 +125,12 @@ class FakeOllama:
         agree=None,
         capabilities=("completion", "vision"),
         artwork=None,
+        account="fine",
+        content=None,
     ):
         self.artwork, self.arts = artwork or {"kind": tagging.ARTWORK, "artwork": "yes"}, []
+        self.account, self.account_readings = account, []
+        self.content, self.contents = content or {"shows": tagging.FIT, "unfit": "no"}, []
         self.formatted = formatted or {"shows": "FAKE-LAYOUT", "format": "none of these", "also": "none of these"}
         self.formatted = self.formatted if callable(formatted) else {"rating": "safe"} | self.formatted
         self.second, self.agree = second, agree  # the second model's description, and the agreed one (None: the first)
@@ -149,6 +158,10 @@ class FakeOllama:
             answer = self.contact(chat) if callable(self.contact) else self.contact
             found = {"found": "FAKE-FOUND", "contact": answer}
             return self.say(found if answer in tagging.CONTACT_ANSWERS else answer)
+        if prompt == tagging.ACCOUNT_PROMPT:
+            self.account_readings.append(chat)
+            answer = self.account(chat) if callable(self.account) else self.account
+            return self.say({"says": "FAKE-WORDS", "answer": answer} if answer in tagging.ACCOUNT_ANSWERS else answer)
         if prompt == tagging.AGREE_PROMPT:
             self.merges.append(chat)
             self.order.append("merge")
@@ -163,6 +176,9 @@ class FakeOllama:
         if prompt == tagging.ARTWORK_PROMPT:
             self.arts.append((n, chat["model"]))
             return self.say(self.artwork(n, chat) if callable(self.artwork) else self.artwork)
+        if prompt == tagging.CONTENT_PROMPT:
+            self.contents.append((n, chat["model"]))
+            return self.say(self.content(n, chat) if callable(self.content) else self.content)
         if prompt == tagging.SECOND_PROMPT:
             self.seconds.append((n, chat["model"]))
             self.order.append("second")
@@ -519,8 +535,10 @@ def test_a_rerun_asks_nothing_and_stores_nothing_new():
         0,
         0,
         0,
+        0,
         1,
-    ]  # three works, each: two results, two readings; one tagline
+        1,
+    ]  # three works, each: two results, two readings; one tagline, read twice
 
 
 def test_max_works_bounds_a_run_and_the_next_run_does_the_rest():
@@ -1197,6 +1215,48 @@ def test_the_artwork_check_is_kept_by_the_image_it_read_and_asked_again_when_the
     assert tagging.results()[screenshot]["artwork"] is True and len(stored("work_artwork")) == 4
 
 
+# Whether an image is fit to show to studios: a pass of its own, asked for by name.
+
+
+def content_run(fake, max_works=500, **kwargs):
+    counts = tagging.run_content(max_works, transport=httpx.MockTransport(fake), **kwargs)
+    assert isinstance(counts.pop("seconds_per_image"), float)
+    return counts
+
+
+def test_the_content_check_is_kept_by_the_image_it_read_and_asked_again_when_the_image_changes():
+    fit, fetish, unsure, broken = works(1, 2, 3, 4, tagline="FAKE-TAGLINE")
+    answers = {
+        1: {"shows": tagging.FIT, "unfit": "no"},
+        2: {"shows": "fetish", "unfit": "yes"},
+        3: {"shows": "hate symbol", "unfit": "no"},  # the model is not sure of it: the work stays
+        4: {"shows": "FAKE-KIND", "unfit": "yes"},  # not a kind: no answer at all
+    }
+    run(FakeOllama())
+    assert {result["fit"] for result in tagging.results().values()} == {None}  # not run by default
+    fake = FakeOllama(content=lambda n, chat: answers[n])
+    assert content_run(fake) == {"fit": 2, "unfit": 1, "failed": 1, "skipped": 0}
+    assert fake.contents.count((4, tagging.DEFAULT_MODEL)) == tagging.MAX_ATTEMPTS and fake.chats == fake.arts == []
+    read = {key: value["fit"] for key, value in tagging.results().items()}
+    assert read == {fit: True, fetish: False, unsure: True, broken: None}
+    assert json.loads(stored("work_content")[1][3]) == {"shows": "fetish", "fit": False}
+    asked = json.loads(next(request.content for request in fake.requests if request.url.path == "/api/chat"))
+    assert asked["messages"][0] == {"role": "system", "content": tagging.CONTENT_PROMPT}
+    assert asked["messages"][1]["images"] == [base64.b64encode(JPEG + b"1").decode()]
+    for kept_back in (fit, "zz-fake-alpha", "fake-title", "faketag", "fake-tagline", "deviantart", ".jpg"):
+        assert kept_back.lower() not in json.dumps(asked).lower()
+    again = FakeOllama()
+    assert content_run(again)["skipped"] == 4 and again.requests == []  # nothing is asked twice
+
+    collected_again(1, 2, 3, 4, thumbs={2: ANOTHER}, images={2: JPEG + b"102"})  # the artist replaced an image
+    assert fetish not in tagging.results()
+    fetched = FakeOllama()
+    assert content_run(fetched) == {"fit": 1, "unfit": 0, "failed": 0, "skipped": 3}
+    assert fetched.contents == [(102, tagging.DEFAULT_MODEL)]
+    run(fetched)  # and its tags, read again from the new image
+    assert tagging.results()[fetish]["fit"] is True and len(stored("work_content")) == 4
+
+
 # Round 4. A description two models agree on, stored beside the checked one.
 
 CHECKED = "A horned beast with dark scales holds a spiked mace. A watering can on the ground."
@@ -1300,12 +1360,13 @@ def test_a_removed_artist_is_not_read_back_and_their_rows_go_at_the_next_run():
 
 
 def test_nothing_is_stored_for_a_work_once_it_is_removed_even_while_a_model_is_looking_at_it():
-    for step in ("declared", "contact", "answer", "rewrite", "confirm"):
+    for step in ("declared", "contact", "account", "answer", "rewrite", "confirm"):
         works(1, artist=ALPHA, tagline="FAKE-TAGLINE")
 
         def purging(*args, step=step):
             library.purge(ALPHA)  # which also deletes what this stage had stored about the artist until then
-            return {"declared": "yes", "contact": "yes", "answer": GOOD, "rewrite": None, "confirm": True}[step]
+            said = {"declared": "yes", "contact": "yes", "account": "ai", "answer": GOOD, "rewrite": None}
+            return (said | {"confirm": True})[step]
 
         run(FakeOllama(**{step: purging}), verifier="model-v")
         assert [stored(table) for table in tagging.TABLES] == [[] for _ in tagging.TABLES], step
@@ -1388,6 +1449,41 @@ def test_a_tagline_that_changes_after_it_was_read_is_read_again():
     assert stored("artist_contact") == [(ALPHA, tagging.DEFAULT_MODEL, tagging.CONTACT_PROMPT_VERSION, "yes")]
     quiet = FakeOllama()
     assert run(quiet)["tagline_contact_yes"] == 0 and quiet.requests == []  # and it is read once
+
+
+def test_a_username_and_tagline_are_read_for_what_they_say_of_the_account_and_again_when_the_tagline_changes():
+    works(1, tagline="FAKE-TAGLINE no AI")
+    works(2, artist=BRAVO)  # no tagline: the username is read alone
+    fake = FakeOllama(account=lambda chat: "ai" if "bravo" in chat["messages"][1]["content"] else "fine")
+    counts = run(fake, model="model-a")
+    assert (counts["account_ai"], counts["account_fine"], counts["account_failed"]) == (1, 1, 0)
+    assert asked(fake.account_readings) == [
+        "Username: zz-fake-alpha\nTagline: FAKE-TAGLINE no AI",
+        "Username: zz-fake-bravo",
+    ]
+    for chat in fake.account_readings:  # a call of its own, with those words and nothing else
+        assert chat["messages"][0] == {"role": "system", "content": tagging.ACCOUNT_PROMPT}
+        assert set(chat["messages"][1]) == {"role", "content"} and chat["model"] == "model-a"
+        assert chat["format"]["properties"]["answer"]["enum"] == list(tagging.ACCOUNT_ANSWERS)
+    assert tagging.accounts("model-a") == {ALPHA: "fine", BRAVO: "ai"}
+    again = FakeOllama()
+    run(again, model="model-a")
+    assert again.account_readings == []  # nothing is asked twice
+
+    collected_again(1, tagline="FAKE-TAGLINE AI artist")
+    assert tagging.accounts("model-a") == {BRAVO: "ai"}  # the "fine" there is of other words
+    changed = FakeOllama(account="ai")
+    assert run(changed, model="model-a")["account_ai"] == 1
+    assert asked(changed.account_readings) == ["Username: zz-fake-alpha\nTagline: FAKE-TAGLINE AI artist"]
+    assert tagging.accounts("model-a") == {ALPHA: "ai", BRAVO: "ai"} and len(stored("artist_account")) == 2
+
+    collected_again(1, tagline="FAKE-TAGLINE again")
+    broken = FakeOllama(account="maybe")  # no whole answer: stored as none, and not asked again
+    assert run(broken, model="model-a")["account_failed"] == 1
+    assert len(broken.account_readings) == tagging.MAX_ATTEMPTS and tagging.accounts("model-a")[ALPHA] is None
+    quiet = FakeOllama()
+    run(quiet, model="model-a")
+    assert quiet.account_readings == []
 
 
 def test_a_title_or_tags_that_change_after_they_were_read_are_read_again_and_the_image_is_not():

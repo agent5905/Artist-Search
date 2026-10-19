@@ -65,6 +65,36 @@ def test_the_artwork_check_waits_while_paused_before_every_request(tmp_path, mon
     assert waits == [(15, []), (15, ["/api/show"])] and sent == ["/api/show", "/api/chat"]
 
 
+def test_the_content_check_waits_while_paused_before_every_request(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(config, "CACHE_DIR", tmp_path)
+    monkeypatch.setattr(config, "LOCAL_DB", tmp_path / "pipeline.sqlite")
+    work_id = "00000000-0000-4000-A000-000000000001"
+    library.save_image(work_id, "image/jpeg", b"\xff\xd8\xff" + b"FAKE-IMAGE-BYTES")
+    work = {"work_id": work_id, "page_url": "https://www.deviantart.com/zz-fake-alpha/art/FAKE-TITLE-1"}
+    work |= {"title": "FAKE-TITLE", "tags": [], "thumb_url": "https://images-wixmp-zzfake.wixmp.com/f/FAKE.jpg"}
+    work |= {"published": "1"}
+    library.store_artist(
+        "da:zz-fake-alpha", user_id=None, tagline=None, specialty=None, level=None, website=None, works=[work]
+    )
+    (tmp_path / config.PAUSE_FILE).touch()
+    sent, waits = [], []
+
+    def ollama(request):
+        sent.append(request.url.path)
+        (tmp_path / config.PAUSE_FILE).touch()  # the owner pauses again after every request
+        answer = {"shows": "fetish", "unfit": "yes"}
+        return httpx.Response(200, json={"capabilities": ["vision"], "message": {"content": json.dumps(answer)}})
+
+    def sleep(seconds):  # and resumes after one wait
+        waits.append((seconds, list(sent)))
+        (tmp_path / config.PAUSE_FILE).unlink()
+
+    monkeypatch.setattr(time, "sleep", sleep)
+    tagging.main([*gpu.STAGES["content"][1:]], transport=httpx.MockTransport(ollama))  # as the worker runs it
+    assert json.loads(capsys.readouterr().out)["unfit"] == 1
+    assert waits == [(15, []), (15, ["/api/show"])] and sent == ["/api/show", "/api/chat"]
+
+
 def test_status_reads_a_cache_with_no_store_and_a_store_no_stage_has_filled(tmp_path, monkeypatch):
     monkeypatch.setattr(config, "CACHE_DIR", tmp_path)
     monkeypatch.setattr(config, "LOCAL_DB", tmp_path / "pipeline.sqlite")
@@ -99,6 +129,7 @@ def test_status_counts_a_reading_as_done_only_while_it_is_of_the_image_the_work_
         "work_tags": (work_id, verified, tagging.PROMPT_VERSION, json.dumps(result), at, read),
         "work_format": (work_id, profiles.TAGGER, tagging.FORMAT_VERSION, "{}", at, read),
         "work_artwork": (work_id, profiles.TAGGER, tagging.ARTWORK_VERSION, '{"artwork": true}', at, read),
+        "work_content": (work_id, profiles.TAGGER, tagging.CONTENT_VERSION, '{"fit": true}', at, read),
         "artist_profiles": (key, "FAKE-BASIS" + rests, "nothing_clear", json.dumps(facts), "[]"),
     }
     with sqlite3.connect(config.LOCAL_DB) as conn:
@@ -109,14 +140,16 @@ def test_status_counts_a_reading_as_done_only_while_it_is_of_the_image_the_work_
             conn.execute(f"INSERT INTO {table} VALUES ({', '.join('?' * len(row))})", row)
     conn.close()
     done = ("style vectors", "tagged and checked", "sorted by format", "checked for artwork")
-    done += ("artists profiled, or left out for a reason",)
-    assert [gpu.counts()[label] for label in done] == [1, 1, 1, 1, 1]
+    done += ("checked for unfit content", "artists profiled, or left out for a reason")
+    assert [gpu.counts()[label] for label in done] == [1, 1, 1, 1, 1, 1]
     assert "  checked for artwork: 1 done, 0 to go; 0 in the last hour" in gpu.status()
+    assert "  checked for unfit content: 1 done, 0 to go; 0 in the last hour" in gpu.status()
 
     collected("https://images-wixmp-zzfake.wixmp.com/f/FAKE-ANOTHER-FILE.jpg")  # the artist replaced the image
-    assert [gpu.counts()[label] for label in done] == [0, 0, 0, 0, 0] and gpu.counts()["works"] == 1
+    assert [gpu.counts()[label] for label in done] == [0, 0, 0, 0, 0, 0] and gpu.counts()["works"] == 1
     assert "  tagged and checked: 0 done, 1 to go; 0 in the last hour" in gpu.status()
     assert "  checked for artwork: 0 done, 1 to go; 0 in the last hour" in gpu.status()
+    assert "  checked for unfit content: 0 done, 1 to go; 0 in the last hour" in gpu.status()
 
     with sqlite3.connect(config.LOCAL_DB) as conn:
         conn.execute("DELETE FROM artist_profiles")  # nothing for status to ask the profile stage about
