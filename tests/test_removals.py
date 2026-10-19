@@ -14,9 +14,11 @@ import hmac
 import itertools
 import json
 import logging
+import re
 import socket
 import sqlite3
 import time
+from collections import Counter
 from datetime import UTC, datetime, timedelta
 from urllib.parse import urlsplit
 
@@ -63,9 +65,11 @@ class RemovalsDb(FakeDb):
     An artist's row carries da_account, the library's hash of their account, as the push stage sends it (a row sent
     without one gets it here, from the library, which is where the push takes it). A request is filed by
     request_removal (no code) or start_removal_proof (a code given out: its checks start over, due at once unless it
-    already was), bound to the artist listed under the slug then: their handle, site and account. The same handle
-    and site asked about again is the same request, which only counts (and takes an account it lacked); anything
-    else is a request of its own. Nothing a push or a load does touches one. confirm_removal and grant_request close
+    already was, in the turn of the network that asked), bound to whom the claim page showed (its ticket), or
+    without one to the artist listed under the slug then: their handle, site and account, and never one already
+    barred. The same handle and site asked about again is the same request, which only counts (and takes an account
+    it lacked); anything else is a request of its own. due_removals takes the due ones in turns between networks.
+    Nothing a push or a load does touches one. confirm_removal and grant_request close
     an open one, and put on the list the handle and the account it is bound to, and its site when the caller says
     the proof covered it and no other handle is listed with it now: never whoever the slug lists now. That deletes
     whoever they bar, and an open request whose handle or account they bar is closed as "removed". A row with a
@@ -94,13 +98,17 @@ class RemovalsDb(FakeDb):
     def _open(self, request_id):
         return next((name for name in self.requests if self.queue[name]["id"] == request_id), None)
 
-    def file(self, slug, with_code, note=None):
-        """request_removal (without a code) or start_removal_proof (with one), as the database does it."""
+    def file(self, slug, with_code, note=None, network=None, shown=None):
+        """request_removal (without a code) or start_removal_proof (with one), as the database does it. `shown` is the
+        artist row the claim page showed (its ticket: request_binding), `network` the one the code is asked from."""
         listed = next((row for row in self.artists.values() if row["slug"] == slug), None)
-        if listed is None:
+        shown = shown if shown and shown["slug"] == slug else listed
+        if shown is None:
             return
         now = self.now()
-        bound = {name: listed.get(name) for name in ("da_username", "site_url", "site_domain", "da_account")}
+        bound = {name: shown.get(name) for name in ("da_username", "site_url", "site_domain", "da_account")}
+        if {self.made_for(bound)["da_key"], bound["da_account"]} & set(self.removed):
+            return  # gone already: a request would only keep their handle
         same = [name for name in self.requests if self.queue[name]["artist_slug"] == slug]
         same = [name for name in same if self.made_for(self.queue[name]) == self.made_for(bound)]
         if same:
@@ -110,15 +118,16 @@ class RemovalsDb(FakeDb):
                 row |= {"last_at": now, "requests": row["requests"] + 1}
         else:
             row = {"id": next(self._ids), "artist_slug": slug, "note": note, "first_at": now, "last_at": now}
-            row |= bound | {"requests": 1, "code_at": None, "due_at": None, "outcome": None}
+            row |= bound | {"requests": 1, "code_at": None, "due_at": None, "outcome": None, "network": None}
             handle = bound["da_username"]
             self.queue[handle if handle not in self.queue else f"{handle}#{row['id']}"] = row
         if with_code:
             row["code_at"], row["due_at"] = now, min(row["due_at"] or now, now, key=when)
+            row["network"] = network
 
     def close(self, name, outcome):
         row = self.queue.pop(name)
-        gone = dict.fromkeys(("note", "da_username", "site_url", "site_domain", "da_account", "due_at"))
+        gone = dict.fromkeys(("note", "da_username", "site_url", "site_domain", "da_account", "due_at", "network"))
         closed = f"closed:{next(self._ids)}"
         self.queue[closed] = row | gone | {"artist_slug": closed, "outcome": outcome}
 
@@ -148,23 +157,8 @@ class RemovalsDb(FakeDb):
             return httpx.Response(204)
         assert method == "GET" and params["outcome"] == "is.null"  # only open requests are ever read
         rows = [self.queue[name] | self.made_for(self.queue[name]) for name in self.requests]
-        if "due_at" in params:  # a run's queue
-            now = params["due_at"].removeprefix("lte.")
-            assert params == {
-                "select": removals.REQUEST_COLUMNS,
-                "outcome": "is.null",
-                "code_at": "not.is.null",
-                "due_at": f"lte.{now}",
-                "order": "due_at.asc,code_at.asc,id.asc",
-                "limit": str(removals.MAX_REQUESTS),
-                "offset": "0",
-            }
-            due = [row for row in rows if row["code_at"] and when(row["due_at"]) <= when(now)]
-            rows = sorted(due, key=lambda row: (when(row["due_at"]), when(row["code_at"]), row["id"]))
-        else:  # the owner's list, a page at a time
-            assert params["order"] == "first_at.asc,id.asc"
-            rows = sorted(rows, key=lambda row: (when(row["first_at"]), row["id"]))
-        rows = rows[int(params["offset"]) :][: int(params.get("limit", len(rows)))]
+        assert params["order"] == "first_at.asc,id.asc"  # the owner's list, a page at a time
+        rows = sorted(rows, key=lambda row: (when(row["first_at"]), row["id"]))[int(params["offset"]) :]
         columns = params["select"].split(",")
         return httpx.Response(200, json=[{name: row.get(name) for name in columns} for row in rows])
 
@@ -180,6 +174,16 @@ class RemovalsDb(FakeDb):
             }
         if name == "removal_code":
             return self.proofs.get(args["p_slug"], code(args["p_slug"], self.secret))
+        if name == "due_removals":  # in turns between networks, the one due longest first within a turn
+            assert args["p_limit"] == removals.MAX_REQUESTS
+            due = [self.queue[name] for name in self.requests if self.queue[name]["code_at"]]
+            due = [row for row in due if when(row["due_at"]) <= when(args["p_now"])]
+            due.sort(key=lambda row: (when(row["due_at"]), when(row["code_at"]), row["id"]))
+            turns = Counter()
+            turn = [turns.update([row["network"]]) or turns[row["network"]] for row in due]
+            due = [row for _, row in sorted(zip(turn, due, strict=True), key=lambda pair: pair[0])]  # stable
+            columns = ("id", "artist_slug", "code_at", "da_username", "site_url", "site_domain", "da_account")
+            return [{column: row[column] for column in columns} for row in due[: args["p_limit"]]]
         if name == "grant_request":
             return self.grant(args["p_id"], args["p_outcome"], args["p_site"])
         if name == "reject_removal":
@@ -806,16 +810,20 @@ def test_an_ai_opt_out_does_not_stop_the_proof_and_robots_txt_for_us_does(world,
         assert counts == expected(requests_due=1, proven_on_own_site=1, artists_removed=1)
 
 
-@pytest.mark.parametrize("proof", ["made_with_an_old_secret", "no_code_from_the_database", "an_empty_code"])
+@pytest.mark.parametrize(
+    "proof", ["made_with_an_old_secret", "no_code_from_the_database", "an_empty_code", "a_code_of_another_shape"]
+)
 def test_only_the_slugs_code_as_the_database_makes_it_now_proves_anything(world, proof):
     world.list(ALPHA)
-    world.da.profiles[ALPHA] = profile(ALPHA, bio=f"Old code: {code(ALPHA, 'FAKE-OLD-SECRET')}")
+    shape = "artist-search-removal-0123"  # in the bio, and too short to be anybody's code
+    world.da.profiles[ALPHA] = profile(ALPHA, bio=f"Old code: {code(ALPHA, 'FAKE-OLD-SECRET')} {shape}")
     if proof != "made_with_an_old_secret":  # the secret's row is missing, say: removal_code() answers null
-        world.db.proofs[ALPHA] = None if proof == "no_code_from_the_database" else ""
+        world.db.proofs[ALPHA] = {"no_code_from_the_database": None, "an_empty_code": ""}.get(proof, shape)
 
     left = "no_code_found" if proof == "made_with_an_old_secret" else "not_checked"
     assert world.check() == expected(requests_due=1, **{f"left_for_owner_{left}": 1})
     assert world.db.confirmed == [] and len(world.db.artists) == 1
+    assert (world.da.requests == []) == (left == "not_checked")  # a code of no use is not looked for
 
 
 def test_a_code_the_database_refuses_removes_nobody_there_or_here(world):
@@ -963,6 +971,29 @@ def test_a_flood_filed_ahead_of_a_real_request_holds_it_up_one_run_at_most(world
     assert gone(world, ALPHA)
 
 
+def test_codes_asked_for_from_a_few_networks_hold_back_only_their_own(world):
+    """The final critic's flood: a real code behind 600 asked for from a few networks was looked at after 4.75 hours
+    of 15-minute runs, and the more codes, the later. The checks take turns between the networks the codes were
+    asked from (due_removals): the real one is in the first run, however many the others asked for."""
+    for n in range(120):  # filed by a script on four networks, before the artist came
+        handle = f"yy-fake-flood{n:03d}"
+        world.list(handle, account=False, code=False)
+        world.db.file(handle, with_code=True, network=f"FAKE-NETWORK-{n % 4}")
+        world.da.profiles[handle] = profile(handle)
+    world.later(minutes=5)
+    world.list(ALPHA, code=False)
+    world.db.file(ALPHA, with_code=True, network="FAKE-NETWORK-OF-ALPHA")
+    world.da.profiles[ALPHA] = profile(ALPHA, bio=code(ALPHA))
+
+    assert world.check() == expected(
+        requests_due=30, left_for_owner_not_checked=29, proven_on_deviantart=1, artists_removed=1
+    )
+    assert gone(world, ALPHA)
+    looked = [slug for slug, _ in world.db.moved]
+    assert looked[:4] == [f"yy-fake-flood{n:03d}" for n in range(4)]  # each network's one due longest, in turn
+    assert {int(slug[-3:]) % 4 for slug in looked if slug} == {0, 1, 2, 3}
+
+
 def test_newer_requests_filed_again_and_a_throttled_api_do_not_starve_the_oldest(world):
     """The critic's case: 40 requests filed after the real one, and filed again; DeviantArt answers 429 after ten
     lookups. The real request is the one due longest, so it is looked at first."""
@@ -1095,9 +1126,9 @@ def test_the_owner_lists_the_open_requests_by_handle_and_answers_them(world, cap
     assert "me@example.com" not in "".join(lines)  # a note is read in the database, never printed
     assert json.dumps([world.db.queue, world.db.artists, world.db.removed]) == before
 
-    answers = ["--grant", str(ids[BRAVO]), "999999", "--reject", str(ids[CHARLIE]), str(ids[ALPHA])]
+    answers = ["--grant", str(ids[BRAVO]), "999999", "--reject", str(ids[CHARLIE]), str(ids[ALPHA]), "999999"]
     assert removals.main(answers) == 0
-    assert json.loads(capsys.readouterr().out) == {"granted": 1, "rejected": 2}
+    assert json.loads(capsys.readouterr().out) == {"granted": 1, "rejected": 2}  # no open request: not counted
     assert world.db.requests == [] and not gone(world, ALPHA) and not gone(world, CHARLIE)
     account = library.account(f"FAKE-USER-{BRAVO}")
     assert set(world.db.removed) == {digest(f"da:{BRAVO}"), account, digest(f"site:{BRAVO}.art")}
@@ -1185,6 +1216,52 @@ def test_a_proof_found_then_a_push_purges_them_here_and_never_sends_them_again(w
     assert library.artist_keys() == [f"da:{ALPHA}", f"da:{CHARLIE}"]
     assert not any(path.name.startswith(work["id"]) for work in removed for path in library.image_dir().iterdir())
     assert library.account(f"FAKE-USER-{BRAVO}") in world.db.removed  # their account, under any handle it takes
+
+
+def test_a_proof_bars_its_site_and_nobody_else_who_names_it_here_or_in_the_database(world):
+    """The final critic's: ALPHA, listed with shared.art, asks for a code. BRAVO, collected later, names the same site,
+    and the push gives it to neither. ALPHA proves in their own bio, so shared.art is barred with them. The store then
+    took the two who name the site for one person and barred BRAVO's handle, which the next push wrote to the
+    database with BRAVO's account, for good. A proof bars only what its request is bound to: BRAVO is held back
+    while their profile names the site, and nothing of theirs is barred."""
+    shared = "https://yy-fake-shared.art/"
+    artist(ALPHA, angle=0.0, website=shared)
+    artist(CHARLIE, angle=0.5)
+    push.run(False)
+    assert sent_artists(world.db)[ALPHA]["site_domain"] == "yy-fake-shared.art"
+    world.db.file(ALPHA, with_code=True)
+    artist(BRAVO, angle=0.3, website=shared)
+    push.run(False)
+    assert sent_artists(world.db)[BRAVO]["site_domain"] is None  # a site two artists give is neither's
+    world.da.profiles[ALPHA] = profile(ALPHA, bio=code(ALPHA), website=shared)
+
+    assert world.check() == expected(requests_due=1, proven_on_deviantart=1, artists_removed=1)
+    assert digest("site:yy-fake-shared.art") in world.db.removed and barred(world, ALPHA)
+    for _ in range(2):
+        push.run(False)
+        assert not barred(world, BRAVO) and not store.is_removed(BRAVO)
+        assert not library.account_removed(f"FAKE-USER-{BRAVO}") and sorted(sent_artists(world.db)) == [CHARLIE]
+    assert library.artist_keys() == [f"da:{BRAVO}", f"da:{CHARLIE}"]  # BRAVO's own, kept and held back
+
+
+@pytest.mark.parametrize("with_code", [True, False])
+def test_a_request_from_the_page_is_filed_for_whom_it_showed_while_a_push_holds_them_back(world, with_code):
+    """The final critic's: a push held the artist back while their claim-or-remove page was open. "Get my code" showed
+    a code and "Send removal request" said it was sent, and nothing was filed: both filed only the artist listed at
+    that moment. The page's ticket binds the request to whom it showed, listed or not (request_binding)."""
+    artist(ALPHA)
+    listed_as(world, ALPHA, ALPHA)
+    shown = hold_back(world, ALPHA)  # what the page showed, and its ticket; then the push holds them back
+    world.db.file(ALPHA, with_code=with_code)  # without the ticket: nobody is listed under the slug now
+    assert world.db.requests == []
+    world.db.file(ALPHA, with_code=with_code, shown=shown)
+    assert world.db.requests == [ALPHA] and world.db.queue[ALPHA]["da_account"] == library.account(f"FAKE-USER-{ALPHA}")
+    if with_code:  # and the code they put up is found while they are not listed
+        world.da.profiles[ALPHA] = profile(ALPHA, bio=code(ALPHA))
+        assert world.check() == expected(requests_due=1, proven_on_deviantart=1, artists_removed=1)
+        assert barred(world, ALPHA)
+    world.db.file(ALPHA, with_code=True, shown=shown)  # a ticket of an artist barred already files nothing
+    assert world.db.requests == ([] if with_code else [ALPHA])
 
 
 @pytest.mark.parametrize("posted", ["both_codes", "the_new_handles_code"])
@@ -1380,6 +1457,18 @@ def test_a_site_that_takes_too_long_costs_one_look_and_the_queue_moves_on(world)
     assert world.sites.urls == [f"{site}robots.txt"] and [slug for slug, _ in world.db.moved] == [ALPHA, None]
     world.later(minutes=15)
     assert world.check() == expected()  # not due again for an hour: the next run meets other requests first
+
+
+def test_the_sweep_never_waits_on_a_row_a_load_holds():
+    """delete_removed skips a row another transaction holds, so a removal never queues behind a load, and so does
+    client_wait's clean-up. Only Postgres can show that for real (tests/test_db.py, against the owner's database);
+    here the statements are read, so that taking SKIP LOCKED out of either fails without one."""
+    sql = (config.ROOT / "sql" / "002_functions.sql").read_text(encoding="utf-8")
+    limits = (config.ROOT / "sql" / "003_limits.sql").read_text(encoding="utf-8")
+    sweep = sql[sql.index("function public.delete_removed") :]
+    clean_up = limits[limits.index("A row back to nothing says nothing") :]
+    for body in (sweep[: sweep.index("$$;")], clean_up[: clean_up.index("$$;")]):
+        assert re.search(r"for\s+update\s+skip\s+locked", body, re.IGNORECASE)
 
 
 def test_migrate_gives_the_database_the_site_tokens_hash_and_never_the_token(monkeypatch):

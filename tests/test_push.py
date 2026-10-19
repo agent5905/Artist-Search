@@ -2036,36 +2036,24 @@ def test_a_database_error_is_scrubbed_of_every_key_before_it_is_cut(monkeypatch)
         assert key[:6] not in str(raised.value) and len(str(raised.value)) <= 520
 
 
-def test_an_artist_public_with_a_removed_site_stays_out_whatever_site_they_name_next(fake):
+def test_an_artist_public_with_a_removed_site_is_held_back_and_never_barred_for_it(fake):
+    """The final critic's: a site barred for the artist who proved it theirs is anybody's to name, and the
+    database's listing of whoever it showed with the site put their handle and account on the list for good. A
+    site keeps out of every row and removes nobody: the artist shown with it goes from the database and is held
+    back while their profile names it. What is kept here about them, their handle and their account stay."""
     artist(ALPHA)
-    made = artist(BRAVO, website=f"https://www.{BRAVO}.art/", links=[])  # the site is in the library's profile only
+    artist(BRAVO, website=f"https://www.{BRAVO}.art/", links=[])  # the site is in the library's profile only
     push.run(False)
     assert sent_artists(fake)[BRAVO]["site_domain"] == f"{BRAVO}.art"
     store.mark_removed(f"{BRAVO}.art")  # the request names the site, and the store's own links do not show whose it is
 
     counts = push.run(False)
 
-    # The database does: it deletes the artist it shows with that site. So they are removed under their handle.
-    assert counts["artists_purged_here"] == 1 and library.artist_keys() == [f"da:{ALPHA}"]
-    wanted = {digest(f"site:{BRAVO}.art"), digest(f"da:{BRAVO}"), library.account(f"FAKE-USER-{BRAVO}")}
-    assert set(fake.removed) == wanted == push._removed_here(None) and not store.is_removed(ALPHA)
+    assert counts["artists_purged_here"] == 0 and library.artist_keys() == [f"da:{ALPHA}", f"da:{BRAVO}"]
+    assert set(fake.removed) == {digest(f"site:{BRAVO}.art")} == push._removed_here(None)
+    assert counts["artists_held_site_removed"] == 1 and sorted(sent_artists(fake)) == [ALPHA]
     assert not any(word in fake.held() for word in of_artist(BRAVO))
-    # Their profile names another site now. The store will not list them, and if their rows come back all the
-    # same, the next run purges them again and sends nothing.
-    assert not store.upsert_artist(BRAVO, f"https://www.deviantart.com/{BRAVO}", [], 1)
-    work = {"work_id": made[0]["id"], "page_url": made[0]["page"], "title": made[0]["title"], "tags": []}
-    library.store_artist(
-        f"da:{BRAVO}",
-        user_id=f"FAKE-USER-{BRAVO}",
-        tagline=None,
-        specialty=None,
-        level=None,
-        website="https://www.yy-fake-bravo-two.art/",
-        works=[work | {"thumb_url": made[0]["thumb"], "published": str(PUBLISHED)}],
-    )
-    counts = push.run(False)
-    assert counts["artists_purged_here"] == 1 and library.artist_keys() == [f"da:{ALPHA}"]
-    assert sorted(sent_artists(fake)) == [ALPHA] and not any(word in fake.held() for word in of_artist(BRAVO))
+    assert not store.is_removed(BRAVO) and not library.account_removed(f"FAKE-USER-{BRAVO}")
 
 
 def test_a_site_another_artist_kept_here_gives_too_is_nobodys_whether_or_not_they_go(fake):
@@ -2648,6 +2636,63 @@ def test_one_removal_that_reaches_many_artists_through_what_is_kept_here_stops_t
     assert set(fake.removed) == {digest(f"da:{handles[0]}"), library.account(f"FAKE-USER-{handles[0]}")}
     # the purge took the links with the artist they named, and the next run goes as runs do
     assert push.run(False)["artists_sent"] == 11 and len(fake.removed) == 2
+
+
+@pytest.mark.parametrize("where", ["through_the_site", "here"])
+def test_profiles_given_a_removed_accounts_hash_stop_the_run_and_nothing_bars_or_purges_them(fake, where):
+    """The push critic's: one removal, and five profiles here whose account hash a corrupt table made the removed
+    account's, put six artists on the list for good, purged them, and nothing stopped. A key the account's hash ties
+    to it and no rename link does is a disagreement in what is kept here: whom the lists name goes, and the run
+    stops with the rest untouched, until it is told."""
+    handles = [f"yy-fake-h{n}" for n in range(6)]
+    for n, handle in enumerate(handles):
+        artist(handle, 4, angle=0.1 * n)
+    artist(ALPHA, angle=0.9)  # and somebody else
+    push.run(False)
+    account = library.account(f"FAKE-USER-{handles[0]}")
+    with closing(sqlite3.connect(config.LOCAL_DB)) as conn, conn:
+        conn.executemany(
+            "UPDATE profiles SET user_hash = ? WHERE artist_key = ?", [(account, f"da:{h}") for h in handles]
+        )
+    if where == "through_the_site":  # as a proof or the owner's grant leaves it: the handle and the account
+        fake.sql(push._removed_sql({digest(f"da:{handles[0]}"), account}))
+    else:
+        store.mark_removed(handles[0])
+
+    with pytest.raises(push.Stop, match="bar 5 people beyond"):
+        push.run(False)
+
+    # Here, which of the six the account really is cannot be told, so its hash is left to the database's list.
+    assert set(fake.removed) == {digest(f"da:{handles[0]}"), account} - ({account} if where == "here" else set())
+    assert library.artist_keys() == sorted(f"da:{h}" for h in [ALPHA, *handles[1:]])
+    assert not any(store.is_removed(h) for h in handles[1:]) and push._removed_here(None) <= set(fake.removed)
+    assert sorted(row["slug"] for row in fake.artists.values()) == sorted([ALPHA, *handles[1:]])
+    if where == "through_the_site":  # the account is on the list: every run stops until the owner says
+        with pytest.raises(push.Stop, match="bar 5 people beyond"):
+            push.run(False)
+        assert push.run(False, allow_delete=5)["artists_purged_here"] == 5
+        assert library.artist_keys() == [f"da:{ALPHA}"]
+
+
+def test_granted_removals_of_accounts_kept_under_an_older_handle_too_go_through_and_purge_both(fake):
+    """The push critic's: six granted removals, each a handle and its account, each account kept here under an older
+    handle too, stopped every run, and the older handles' works and images stayed here until --allow-delete. What is
+    kept here agrees on whose they are, the rename links and the account hashes alike: they go, and nobody says so."""
+    olds, news = [f"yy-fake-o{n}" for n in range(6)], [f"yy-fake-n{n}" for n in range(6)]
+    for n, (old, new) in enumerate(zip(olds, news, strict=True)):
+        artist(old, 4, angle=0.1 * n)
+        library.mark_artist(f"da:{old}", "account gone")
+        artist(new, 4, angle=0.1 * n + 0.01, user=old, old_keys=[f"da:{old}"])
+    artist(ALPHA, angle=0.9)
+    push.run(False)
+    for old, new in zip(olds, news, strict=True):  # granted (pipeline/removals.py): the handle and the account
+        fake.sql(push._removed_sql({digest(f"da:{new}"), library.account(f"FAKE-USER-{old}")}))
+
+    counts = push.run(False)
+
+    assert counts["artists_purged_here"] == 12 and library.artist_keys() == [f"da:{ALPHA}"]
+    assert set(fake.removed) >= {digest(f"da:{old}") for old in olds} and list(sent_artists(fake)) == [ALPHA]
+    assert all(store.is_removed(old) for old in olds)
 
 
 def test_one_person_under_three_handles_is_removed_at_once_however_far_apart_the_links_are(fake):

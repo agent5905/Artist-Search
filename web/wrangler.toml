@@ -8,7 +8,8 @@ compatibility_date = "2026-10-01"
 binding = "AI"
 remote = true # there is no local Workers AI: local runs call the real one too
 
-# The limits are counted in the database (client_wait in sql/003_limits.sql), so nothing is set here.
+# The limits are counted in the database (client_wait in sql/003_limits.sql), so nothing is set here. The edge rule
+# that guards the free function requests needs a domain: docs/edge-rate-limit.md.
 
 # The functions also read VITE_SUPABASE_URL, VITE_SUPABASE_PUBLISHABLE_KEY and SITE_TOKEN: the database's address,
 # its publishable key, and the site's token, without which the database answers the site nothing. Locally all three

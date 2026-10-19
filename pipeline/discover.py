@@ -121,6 +121,7 @@ class Pace:
     files in the cache folder that hold numbers and nothing else:
       <host>.lock  held through the operating system for as long as the run lasts. A second run that finds it
                    held stops before it does anything. A process that died holds nothing, whatever it left.
+                   Taken again by the run that holds it, it changes nothing, and lets go only the last time.
       <host>.pace  the interval, and the time before which the next request should not go: written whole,
                    before every request and after every answer. The next run begins with that interval,
                    halved for every IDLE_HALVING seconds that have passed since that time. A run that begins
@@ -136,12 +137,16 @@ class Pace:
         # Seconds: waited so far, asked for before the next request, and counted towards the hour that stops a run.
         self.waited = self._asked = self._refused = 0.0
         self._lock: int | None = None
+        self._depth = 0  # times taken again while held: the removal checks a collect run makes (collect.py)
         self.tell: Callable[[], None] = lambda: None  # called before every request: see tell()
 
     def _file(self, kind: str) -> pathlib.Path:
         return config.CACHE_DIR / f"{self.host.replace(' ', '-')}.{kind}"
 
     def __enter__(self) -> "Pace":
+        if self._lock is not None:  # this run has the host already: nothing to take, and the pace is its own
+            self._depth += 1
+            return self
         config.CACHE_DIR.mkdir(parents=True, exist_ok=True)
         # ponytail: the lock is a file in this checkout's cache folder, so two checkouts with cache folders of
         # their own can both talk to a host at once. One checkout runs the stages: that is the operating rule.
@@ -174,7 +179,9 @@ class Pace:
         return self
 
     def __exit__(self, *exc: object) -> None:
-        if self._lock is not None:
+        if self._depth:
+            self._depth -= 1
+        elif self._lock is not None:
             os.close(self._lock)  # which lets the lock go, as the end of the process would
             self._lock = None
 

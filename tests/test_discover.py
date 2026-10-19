@@ -359,7 +359,8 @@ def test_a_later_pass_leaves_the_link_the_collect_stage_wrote_into_a_row(db):
     assert run(world(more=[ALPHA]), db) == 0  # a later pass, in which ALPHA has one work more
     assert stored(db)[0] == expected_row(ALPHA, 5, ["https://zz-fake-alpha.art/"])
     assert stored(db)[1:] == EXPECTED[1:]
-    assert store.mark_removed("site:zz-fake-alpha.art", db) == 1  # and so the removal still finds them
+    assert store.mark_removed("site:zz-fake-alpha.art", db) == 0  # it bars nobody, and still finds them: held out
+    assert f"da:{ALPHA}" not in [key for key, _, _ in store.all_artists(db)]
 
 
 def test_a_removed_artist_is_in_neither_list_handed_to_the_later_stages(db):
@@ -637,18 +638,19 @@ def test_a_removal_in_the_middle_of_a_pass_leaves_no_row_that_names_the_artist_a
     assert (counts["candidates (>= 3 hits)"], counts["skipped (removed)"], counts["artists stored"]) == (9, 1, 8)
 
 
-def test_a_removed_site_removes_the_artists_whose_stored_link_it_is_and_they_stay_out(db):
+def test_a_removed_site_keeps_out_the_artists_whose_stored_link_it_is_and_bars_nobody(db):
+    """The final critic's: a site is anybody's to name, so its removal removes nobody. Whoever links to it stays
+    out while the link is theirs; their handles are not barred."""
     studio = "https://zz-fake-studio.art/"
     assert run(world(), db) == 0
     for name, site in ((ALPHA, studio), (BRAVO, "http://www.zz-fake-studio.art/")):
         assert store.keep_own_site(name, site, db)  # as the collect stage does, once it has read their profile
-    assert store.mark_removed("site:zz-fake-studio.art", db) == 2
-    gone = ("da:zz-fake-alpha", "da:zz-fake-bravo")
-    assert stored(db) == without(*gone)
-    assert store.is_removed(f"da:{ALPHA}", db) and store.is_removed(f"da:{BRAVO}", db)
-    assert run(world(), db) == 0  # whatever site they list next: discovery knows them by their handle
-    assert stored(db) == without(*gone)
-    assert "studio" not in everything_on_disk(db).lower()
+    assert store.mark_removed("site:zz-fake-studio.art", db) == 0
+    left = [key for key, *_ in without("da:zz-fake-alpha", "da:zz-fake-bravo")]
+    assert [key for key, _, _ in store.all_artists(db)] == left
+    assert not store.is_removed(f"da:{ALPHA}", db) and not store.is_removed(f"da:{BRAVO}", db)
+    assert run(world(), db) == 0  # a later pass leaves the link that holds them
+    assert [key for key, _, _ in store.all_artists(db)] == left
 
 
 def test_an_artist_whose_site_was_removed_before_they_were_ever_stored_is_known_here_by_handle_alone(db):
@@ -670,9 +672,9 @@ def test_the_removal_list_of_record_keeps_a_removed_artist_out_of_a_fresh_cache(
     of_record = [key_hash for key_hash, _ in all_rows(db, "removed")]
     db.unlink()  # the local store is a cache: gone
     assert store.import_removed(of_record, db) == 0
-    for _ in range(2):
+    for _ in range(2):  # DELTA's site bars nobody: they are a bare handle again, whom the collect stage holds
         assert run(world(), db) == 0
-        assert stored(db) == without("da:zz-fake-alpha", "da:zz-fake-delta")
+        assert stored(db) == without("da:zz-fake-alpha")
 
 
 def test_hostnames_are_found_in_running_text_and_nothing_else_is():

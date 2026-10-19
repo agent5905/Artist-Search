@@ -13,6 +13,10 @@ drop function if exists public.grant_request(text, text);
 drop function if exists public.confirm_removal(text, text);
 drop function if exists public.reject_removal(text);
 drop function if exists public.purge_removed(text[]);
+-- A request is bound to what the claim-or-remove page showed now (its ticket), and a code to the network it was
+-- asked from.
+drop function if exists public.request_removal(text, text);
+drop function if exists public.start_removal_proof(text);
 
 -- What a removal remembers of an artist without keeping their name (hard rule 7): the hashes of
 -- 'da:<lowercased handle>' and 'site:<registrable domain>'. The same keys as pipeline/store.py, so
@@ -494,16 +498,70 @@ $$;
 -- removal_requests). All of them are the service role's: visitors reach the first two through the site's
 -- server functions (site_removal_code and site_request_removal in sql/003_limits.sql), which count them.
 
--- Logs a request for the artist listed under the slug now, with the first request's note, bound to their
--- handle, site and account. Asking again for the same only counts, and moves nothing in the verifier's
+-- What the claim-or-remove page shows of an artist (site_claim in sql/003_limits.sql) comes with a ticket: whom a
+-- request from the page is to be bound to (p_bound: their slug, handle, site, its domain and their account), in
+-- base64, and signed with the removal secret. So a push that holds the artist back while the page is open loses
+-- nothing the artist then sends, and nobody can bind a request to anything a page did not show.
+-- ponytail: the ticket is signed, not sealed, so it shows the account's hash, a hash of the user id the API
+-- gives anybody. Seal it (pgcrypto's pgp_sym_encrypt) if that ever matters.
+create or replace function public.claim_ticket(p_bound jsonb) returns text
+language sql stable set search_path = ''
+as $$
+  select t.b || '.' || encode(extensions.hmac('claim ticket ' || t.b, s.secret, 'sha256'), 'hex')
+  from (select translate(encode(convert_to(p_bound::text, 'UTF8'), 'base64'), E'\n', '') as b) t,
+       public.removal_secret s
+$$;
+
+-- What a ticket binds a request to; null for anything claim_ticket did not make. In plpgsql, so that nothing a
+-- visitor sends is decoded before its signature holds.
+create or replace function public.ticket_binding(p_ticket text) returns jsonb
+language plpgsql stable set search_path = ''
+as $$
+declare
+  body constant text := split_part(p_ticket, '.', 1);
+begin
+  if exists (select 1 from public.removal_secret s where split_part(p_ticket, '.', 2)
+             = encode(extensions.hmac('claim ticket ' || body, s.secret, 'sha256'), 'hex')) then
+    return convert_from(decode(body, 'base64'), 'UTF8')::jsonb;
+  end if;
+  return null;
+end
+$$;
+
+-- Whom a request for the slug is bound to: what its page showed (the ticket), listed now or not; without a
+-- ticket, the artist listed under the slug now. Nobody whose handle or account is on the removal list already:
+-- they are gone, and a request would only keep their handle.
+create or replace function public.request_binding(p_slug text, p_ticket text)
+returns table (slug text, da_username text, site_url text, site_domain text, da_account text)
+language sql stable set search_path = ''
+as $$
+  select b.slug, b.da_username, b.site_url, b.site_domain, b.da_account
+  from (
+    select 1 as pick, t.bound ->> 'slug' as slug, t.bound ->> 'da_username' as da_username,
+           t.bound ->> 'site_url' as site_url, t.bound ->> 'site_domain' as site_domain,
+           t.bound ->> 'da_account' as da_account
+    from public.ticket_binding(p_ticket) as t (bound)
+    union all
+    select 2, a.slug, a.da_username, a.site_url, a.site_domain, a.da_account from public.artists a
+  ) b
+  where b.slug = p_slug
+    and not exists (select 1 from public.removed gone
+                    where gone.key_hash in (public.key_hash('da:' || lower(b.da_username)), b.da_account))
+  order by b.pick
+  limit 1
+$$;
+
+-- Logs a request for the artist its page showed (request_binding), with the first request's note, bound to
+-- their handle, site and account. Asking again for the same only counts, and moves nothing in the verifier's
 -- queue. Always returns true, whatever the slug, so it gives nothing away.
-create or replace function public.request_removal(p_slug text, p_note text default null) returns boolean
+create or replace function public.request_removal(p_slug text, p_note text default null, p_ticket text default null)
+returns boolean
 language sql security definer set search_path = ''
 as $$
   with logged as (
     insert into public.removal_requests as r (artist_slug, note, da_username, site_url, site_domain, da_account)
-    select a.slug, left(p_note, 300), a.da_username, a.site_url, a.site_domain, a.da_account
-    from public.artists a where a.slug = p_slug
+    select b.slug, left(p_note, 300), b.da_username, b.site_url, b.site_domain, b.da_account
+    from public.request_binding(p_slug, p_ticket) b
     on conflict (artist_slug, da_key, site_key) where outcome is null do update set
       last_at = now(), requests = r.requests + 1, da_account = coalesce(r.da_account, excluded.da_account)
   )
@@ -521,23 +579,46 @@ as $$
   from public.removal_secret
 $$;
 
--- Tells the artist their code, and from then on the verifier looks for it: the request for the artist
--- listed under the slug now is filed if it was not, and its checks start over (hourly for a day, then daily
--- for two weeks, then weekly: pipeline/removals.py), due at once unless it already was. The code never
--- changes. The answer has the same shape whether the slug is unknown, hidden or visible; only an artist's
--- slug is filed.
-create or replace function public.start_removal_proof(p_slug text) returns text
+-- Tells the artist their code, and from then on the verifier looks for it: the request for the artist its
+-- page showed (request_binding) is filed if it was not, and its checks start over (hourly for a day, then
+-- daily for two weeks, then weekly: pipeline/removals.py), due at once unless it already was, in the turn of
+-- the network asking (p_network: due_removals). The code never changes. The answer has the same shape whether
+-- the slug is unknown, hidden or visible; only an artist's slug is filed.
+create or replace function public.start_removal_proof(p_slug text, p_ticket text default null, p_network text default null)
+returns text
 language sql security definer set search_path = ''
 as $$
   with filed as (
     insert into public.removal_requests as r
-      (artist_slug, da_username, site_url, site_domain, da_account, code_at, due_at)
-    select a.slug, a.da_username, a.site_url, a.site_domain, a.da_account, now(), now()
-    from public.artists a where a.slug = p_slug
+      (artist_slug, da_username, site_url, site_domain, da_account, code_at, due_at, network)
+    select b.slug, b.da_username, b.site_url, b.site_domain, b.da_account, now(), now(),
+           encode(extensions.hmac('removal network ' || coalesce(p_network, ''), s.secret, 'sha256'), 'hex')
+    from public.request_binding(p_slug, p_ticket) b, public.removal_secret s
     on conflict (artist_slug, da_key, site_key) where outcome is null do update set
-      code_at = now(), due_at = least(r.due_at, now()), da_account = coalesce(r.da_account, excluded.da_account)
+      code_at = now(), due_at = least(r.due_at, now()), da_account = coalesce(r.da_account, excluded.da_account),
+      network = excluded.network
   )
   select public.removal_code(p_slug)
+$$;
+
+-- Service role only: the open requests a code was given out for that are due by p_now, p_limit at most, for
+-- the verifier (pipeline/removals.py). In turns between the networks the codes were asked from: each one's
+-- request due longest, then each one's next, and so on, the one due longest first within a turn. So a network
+-- that asks for many codes holds back only its own, and a flood from many is as slow as their number, not as
+-- the number of codes they asked for.
+create or replace function public.due_removals(p_now timestamptz, p_limit int)
+returns table (id bigint, artist_slug text, code_at timestamptz, da_username text, site_url text, site_domain text,
+               da_account text)
+language sql stable set search_path = ''
+as $$
+  select q.id, q.artist_slug, q.code_at, q.da_username, q.site_url, q.site_domain, q.da_account
+  from (
+    select r.*, row_number() over (partition by r.network order by r.due_at, r.code_at, r.id) as turn
+    from public.removal_requests r
+    where r.outcome is null and r.code_at is not null and r.due_at <= p_now
+  ) q
+  order by q.turn, q.due_at, q.code_at, q.id
+  limit p_limit
 $$;
 
 -- Service role only. Removes artists outright: their keys go on the removal list, which deletes
@@ -569,7 +650,7 @@ as $$
   with closed as (
     update public.removal_requests
     set artist_slug = 'closed:' || gen_random_uuid(), outcome = p_outcome, note = null, da_username = null,
-        site_url = null, site_domain = null, da_account = null, due_at = null
+        site_url = null, site_domain = null, da_account = null, due_at = null, network = null
     where id = p_id and outcome is null
     returning 1
   )
@@ -664,9 +745,13 @@ revoke all on function
   public.refresh_search_words(),
   public.similar_artists(text, int),
   public.get_artist(text),
-  public.request_removal(text, text),
+  public.claim_ticket(jsonb),
+  public.ticket_binding(text),
+  public.request_binding(text, text),
+  public.request_removal(text, text, text),
   public.removal_code(text),
-  public.start_removal_proof(text),
+  public.start_removal_proof(text, text, text),
+  public.due_removals(timestamptz, int),
   public.remove_artists(text[]),
   public.close_request(bigint, text),
   public.grant_request(bigint, text, boolean),
@@ -695,9 +780,10 @@ grant execute on function
   public.refresh_search_words(),
   public.similar_artists(text, int),
   public.get_artist(text),
-  public.request_removal(text, text),
+  public.request_removal(text, text, text),
   public.removal_code(text),
-  public.start_removal_proof(text),
+  public.start_removal_proof(text, text, text),
+  public.due_removals(timestamptz, int),
   public.remove_artists(text[]),
   public.close_request(bigint, text),
   public.grant_request(bigint, text, boolean),
