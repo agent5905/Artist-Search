@@ -1060,3 +1060,27 @@ Nothing has been pushed; none of these reached the public.
 1. A style round 4 aimed at consistency: rank similar artists by how close their best few works are, and show only works that pass a closeness floor, so fewer and closer rather than 16 with outliers.
 2. A focused "is this artwork?" check on every work, as a GPU stage.
 3. The same 26 seeds again, with fresh critics.
+
+### Round 29: the style test won, narrowly, and confirmed (2026-10-18)
+
+**Style round 4 merged.** A similar artist's card shows only works whose closeness to the artist's own work passes a floor (cosine 0.575), so 2 to 4 works instead of always 4. A similar artist with fewer than two such works drops out, and the next nearest takes their place.
+- **Calibration:** the floor is set where the tagger's medium agreement stops climbing, on 400 published artists, none of them test seeds.
+- **Ranking:** ranking by an artist's best few works did no better on that proxy in any variant, so the ranking is unchanged; the variant stays in the code as rule `few`.
+- **On real data:** 2,536 of 2,967 artists still get all 24 similar artists, 26 get none, and cards show 4 works 38,108 times, 3 works 12,650 times and 2 works 14,913 times.
+- **Tests:** 4,935 pass.
+
+**Piece 6, fourth run: won, by both pairs of judges.**
+
+| | R1 | R2 | R3 | R4, first pair | R4, second pair |
+|---|---|---|---|---|---|
+| Seeds our side won | 8 | 11 | 11 | **14** | **14** |
+| Seeds DeviantArt won | 21 | 17 | 15 | 12 | 12 |
+| Our works judged a real style match | 42% | 56% | 67% | **66%** | **68%** |
+| DeviantArt's works judged a real style match | 59% | 58% | 69% | 61% | 62% |
+
+- **How it was confirmed:** the same 26 seeds and the same sheets, judged blind by two pairs of fresh critics. The pairs agree on 24 of 26 verdicts; each pair split one seed differently from the other, so both come to 14 to 12.
+- **The margin is narrow.** 13 seeds go to us under both pairs and 11 to DeviantArt under both.
+- **What still loses:** subject over style shows up on both sides. On ours, it is a different discipline or glossier card art. On one seed with almost nobody close, only 2 works per side passed, and the critics called that "too small to tell the studio much".
+- **Seen on our side:** an ArtFight profile card (the artwork check below covers it), and five near-copies of one seed's own painting from another artist. The second is looked into next.
+
+**Running:** the "is this artwork?" check is being built; its full run over every work follows on the GPU.
