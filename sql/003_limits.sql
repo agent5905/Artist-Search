@@ -53,24 +53,29 @@ revoke all on table public.client_counts from public, anon, authenticated, servi
 -- of an IPv6 one) and their network (its /24, or the /48). It answers how many seconds to wait: 0 means
 -- go ahead, and the request is counted. A request told to wait is not counted, so asking again while
 -- told to wait costs nothing.
---   read: a page of search results or of similar artists counts 1, a profile 0.1 (its size). 50 a day
---         per visitor, 100 per network, 1,000 for everyone.
+--   read: a page of search results or of similar artists counts 1, a profile 0.1 (its size). 100 a day
+--         per visitor, 100 per network, 3,000 for everyone.
 --   removal: asking for a code, or asking without one, counts 1; the claim-or-remove page itself (site_claim)
 --         0.1. 10 a day per visitor, 20 per network. No total, and apart from the reads: many networks
 --         together must not be able to keep an artist from asking, and a day's reads used up must not either.
 -- "n a day" means n at once, then one every 1/n of a day; so in any 24 hours one visitor gets at most
--- 2n, as does one network, and day after day n. One visitor is 5% of the day's reads, one network 10%.
--- The total is a backstop for the free tier's 5 GB of egress a month. A page of 24 cards is 117 kB as
--- the database writes it and 45 kB gzipped, which the site's server asks for (measured on rows of the
--- stored shape, every thumbnail's signed token at 640 characters, the longest seen). At most 32,000
--- pages a month (the first day's burst, then 31 days of 1,000) is 1.4 GB gzipped, 29% of the allowance,
--- and 3.7 GB if it were not compressed. Change the numbers here if a real page measures larger.
+-- 2n, as does one network, and day after day n.
+-- The total is what the free tier's 5 GB of egress a month allows, and no less: the site is the database's
+-- one big reader, and Workers AI's free 10,000 neurons a day are some 150,000 queries of bge-m3 (1,075 neurons
+-- a million tokens, a query at most 200 characters), so they are not what runs out. A page of 24 cards is 117
+-- kB as the database writes it and 45 kB gzipped, which the site's server asks for (measured on rows of the
+-- stored shape, every thumbnail's signed token at 640 characters, the longest seen). At most 96,000 pages a
+-- month (the first day's burst, then 31 days of 3,000) is 4.3 GB gzipped, 86% of the allowance; the rest is
+-- for the push stage's reads (about 10 MB a run). Change the numbers here if a real page measures larger.
+-- A visitor is one address, an office's or a carrier's shared one too, so a visitor may use what a network
+-- may. One network is 3.3% of the day: it takes 30 networks a day to use it up, and one person on 20 of them
+-- leaves a third. Past that, many networks at once are the edge rule's to stop (docs/edge-rate-limit.md).
 -- The rows are locked in one order (visitor, network, everyone), so two calls never wait on each other
 -- in a circle. The clock is read once they are all held, and a row only ever moves forward, so the order
 -- in which calls arrive cannot undo a count. Anything missing (the token, the removal secret, a known
 -- kind) is an error, and nothing is let in. (A refused request still runs the server function, so this
 -- does not guard Cloudflare's 100,000 function requests a day: only a rate limiting rule in front of
--- the site can.)
+-- the site can, docs/edge-rate-limit.md.)
 create or replace function public.client_wait(p_token text, p_kind text, p_client text, p_network text)
 returns int
 language plpgsql security definer set search_path = ''
@@ -79,7 +84,7 @@ declare
   budget constant text := case when p_kind in ('search', 'similar', 'profile') then 'read'
                                when p_kind in ('removal', 'claim') then 'removal' end;
   cost constant float8 := case when p_kind in ('profile', 'claim') then 0.1 else 1 end;
-  per_day constant float8[] := case budget when 'read' then '{50, 100, 1000}'::float8[] else '{10, 20, null}'::float8[] end;
+  per_day constant float8[] := case budget when 'read' then '{100, 100, 3000}'::float8[] else '{10, 20, null}'::float8[] end;
   secret text;
   keys text[];
   held float8[];
@@ -153,15 +158,19 @@ $$;
 -- What the claim-or-remove page shows of a listed artist, and no more (it is counted as a removal, not a read):
 -- the slug, the name, the two places a code can go, and whether the DeviantArt one can prove anything. It can
 -- only for an artist whose account the library keeps (artists.da_account): without it, whoever holds the handle
--- now could be somebody else (pipeline/removals.py). p_slug may be the artist's DeviantArt username instead, so an
--- artist can reach the page with no search, which is a read. Nothing when the artist is not listed.
+-- now could be somebody else (pipeline/removals.py). And the ticket the page sends back with a request, which
+-- binds it to this artist even if a push holds them back meanwhile (claim_ticket). p_slug may be the artist's
+-- DeviantArt username instead, so an artist can reach the page with no search, which is a read. Nothing when
+-- the artist is not listed.
 create or replace function public.site_claim(p_token text, p_slug text) returns setof jsonb
 language sql stable security definer set search_path = ''
 as $$
   select public.site_check(p_token);
   select jsonb_build_object(
     'slug', a.slug, 'name', a.name, 'site_url', a.site_url,
-    'deviantart_url', 'https://www.deviantart.com/' || a.da_username, 'deviantart_proof', a.da_account is not null)
+    'deviantart_url', 'https://www.deviantart.com/' || a.da_username, 'deviantart_proof', a.da_account is not null,
+    'ticket', public.claim_ticket(jsonb_build_object('slug', a.slug, 'da_username', a.da_username,
+      'site_url', a.site_url, 'site_domain', a.site_domain, 'da_account', a.da_account)))
   from public.artists a
   where (a.slug = p_slug or a.da_key = public.key_hash('da:' || lower(p_slug))) and not a.hidden
     and not exists (select 1 from public.removed gone where gone.key_hash in (a.da_key, a.site_key, a.da_account))
@@ -169,18 +178,26 @@ as $$
   limit 1
 $$;
 
-create or replace function public.site_removal_code(p_token text, p_slug text) returns text
+-- The two a request is filed by: bound to what the page showed (p_ticket), and a code in the turn of the network
+-- that asks for it (p_network, as client_wait is given it).
+drop function if exists public.site_removal_code(text, text);
+drop function if exists public.site_request_removal(text, text, text);
+
+create or replace function public.site_removal_code(
+  p_token text, p_slug text, p_ticket text default null, p_network text default null
+) returns text
 language sql security definer set search_path = ''
 as $$
   select public.site_check(p_token);
-  select public.start_removal_proof(p_slug);
+  select public.start_removal_proof(p_slug, p_ticket, p_network);
 $$;
 
-create or replace function public.site_request_removal(p_token text, p_slug text, p_note text) returns boolean
+create or replace function public.site_request_removal(p_token text, p_slug text, p_note text, p_ticket text default null)
+returns boolean
 language sql security definer set search_path = ''
 as $$
   select public.site_check(p_token);
-  select public.request_removal(p_slug, p_note);
+  select public.request_removal(p_slug, p_note, p_ticket);
 $$;
 
 revoke all on function
@@ -190,8 +207,8 @@ revoke all on function
   public.site_artist(text, text),
   public.site_similar(text, text),
   public.site_claim(text, text),
-  public.site_removal_code(text, text),
-  public.site_request_removal(text, text, text)
+  public.site_removal_code(text, text, text, text),
+  public.site_request_removal(text, text, text, text)
 from public, anon, authenticated, service_role;
 
 grant execute on function
@@ -200,6 +217,6 @@ grant execute on function
   public.site_artist(text, text),
   public.site_similar(text, text),
   public.site_claim(text, text),
-  public.site_removal_code(text, text),
-  public.site_request_removal(text, text, text)
+  public.site_removal_code(text, text, text, text),
+  public.site_request_removal(text, text, text, text)
 to anon;

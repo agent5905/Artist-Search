@@ -288,8 +288,7 @@ def all_neighbors(
     # closeness in a table.
     counts = np.array([len(vectors[key]) for key in keys])
     starts = np.cumsum(counts) - counts  # where each artist's works begin in the stack
-    works = np.stack([vector for key in keys for vector in vectors[key].values()]).astype(np.float32)
-    works /= np.linalg.norm(works, axis=1, keepdims=True)
+    works = _unit([vector for key in keys for vector in vectors[key].values()])
     # best[w, a]: the best cosine match for work w among artist a's works. Made 2,048 works at a time, so
     # the works-by-works table of cosines is never whole in memory.
     best = np.concatenate(
@@ -331,14 +330,21 @@ def closest_works(
     mine, theirs = (artist_vectors(key, model, db) for key in (artist_key, other_key))
     if not mine or not theirs:
         return []
-    seed, others = (np.stack(list(works.values())).astype(np.float32) for works in (mine, theirs))
+    seed, others = (_unit(list(works.values())) for works in (mine, theirs))
     return [list(theirs)[at] for at in _closest(seed, others, top)]
+
+
+def _unit(vectors: Iterable[np.ndarray]) -> np.ndarray:
+    """The vectors as rows of one float32 stack, each of unit length: a stored one need not be (_vectors only
+    makes sure it has a length), and a cosine is a dot product only between these."""
+    stack = np.stack(list(vectors)).astype(np.float32)
+    return stack / np.linalg.norm(stack, axis=1, keepdims=True)
 
 
 def _closest(seed: np.ndarray, others: np.ndarray, top: int, floor: float = -math.inf) -> list[int]:
     """closest_works()'s rule on two stacks of vectors: the rows of `others`, best first, a tie to the lower row.
     Only rows whose best match is `floor` or more."""
-    best = (others @ seed.T).max(axis=1)  # unit length already: a dot product is the cosine
+    best = (others @ seed.T).max(axis=1)  # unit length (_unit): a dot product is the cosine
     return [at for at in np.argsort(-best, kind="stable")[:top].tolist() if best[at] >= floor]
 
 
@@ -363,7 +369,7 @@ def all_closest_works(
     stacks: dict[str, tuple[list[str], np.ndarray]] = {}
     for key, works in _vectors(model, db).items():
         if kept := [work for work in works if work in shown.get(key, ())]:  # in id order: a tie goes to the lower
-            stacks[key] = kept, np.stack([works[work] for work in kept]).astype(np.float32)
+            stacks[key] = kept, _unit(works[work] for work in kept)
     found: dict[tuple[str, str], list[str]] = {}
     for mine, other in pairs:
         found[mine, other] = []

@@ -1191,9 +1191,11 @@ def test_the_artwork_check_is_kept_by_the_image_it_read_and_asked_again_when_the
 
     collected_again(1, 2, 3, 4, thumbs={2: ANOTHER}, images={2: JPEG + b"102"})
     fetched = FakeOllama()
+    run(fetched)  # its tags and its rating read again from the new image, and not the artwork check yet:
+    formats_run(fetched)  # the old image's answer, a screenshot, says nothing about the new one (the push critic's)
+    assert tagging.results()[screenshot]["rating"] == "safe" and tagging.results()[screenshot]["artwork"] is None
     assert artwork_run(fetched) == {"artwork": 1, "not_artwork": 0, "failed": 0, "skipped": 3}
     assert fetched.arts == [(102, tagging.DEFAULT_MODEL)]
-    run(fetched)  # and its tags, read again from the new image
     assert tagging.results()[screenshot]["artwork"] is True and len(stored("work_artwork")) == 4
 
 

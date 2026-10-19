@@ -265,6 +265,8 @@ describe('the limits, which the database keeps', () => {
       await handle(from('203.0.113.7'), env(), Object.assign(database(), { limit: 0 }).fetcher),
       await artistPage(from('203.0.113.7', '/api/artist?slug=x'), env(), database(new Error(TOKEN), new Error(KEY)).fetcher),
       await removal(post({ slug: 'someone', proof: true }), env(), database(new Response(TOKEN, { status: 500 }), new Error(KEY)).fetcher),
+      await claimPage(from('203.0.113.7', '/api/removal?slug=x'), env(), database(new Error(TOKEN), new Error(KEY)).fetcher),
+      await claimPage(from('203.0.113.7', '/api/removal?slug=x'), env(), database(new Response(TOKEN, { status: 500 }), new Error(KEY)).fetcher),
     ]
     for (const answer of answers) {
       const text = (await answer.text()) + JSON.stringify([...answer.headers])
@@ -350,24 +352,33 @@ const post = (body: unknown, address = '203.0.113.7', type = 'application/json')
   })
 
 describe('POST /api/removal', () => {
-  it('counts the visitor, then gives the artist their code, which files their request', async () => {
+  it('counts the visitor, then gives the artist their code, which files their request, with the page’s ticket and network', async () => {
     const db = database(Response.json('artist-search-removal-0123456789abcdef0123456789abcdef'))
-    const response = await removal(post({ slug: 'someone', proof: true }), env(), db.fetcher)
+    const response = await removal(post({ slug: 'someone', ticket: 'FAKE-TICKET', proof: true }), env(), db.fetcher)
 
     expect(await response.json()).toEqual({ code: 'artist-search-removal-0123456789abcdef0123456789abcdef' })
     expect(db.calls.map((call) => [call.name, call.args])).toEqual([
       ['client_wait', { p_token: TOKEN, p_kind: 'removal', p_client: '203.0.113.7', p_network: '203.0.113.0/24' }],
-      ['site_removal_code', { p_token: TOKEN, p_slug: 'someone' }],
+      ['site_removal_code', { p_token: TOKEN, p_slug: 'someone', p_ticket: 'FAKE-TICKET', p_network: '203.0.113.0/24' }],
     ])
     expect(db.calls.every((call) => (call.init.headers as Record<string, string>).apikey === KEY)).toBe(true)
   })
 
   it('files a request without proof, with its note trimmed and cut to 300 characters', async () => {
     const db = database(Response.json(true))
-    const response = await removal(post({ slug: 'someone', note: `  ${'n'.repeat(400)} ` }), env(), db.fetcher)
+    const response = await removal(post({ slug: 'someone', ticket: 'FAKE-TICKET', note: `  ${'n'.repeat(400)} ` }), env(), db.fetcher)
 
     expect(await response.json()).toEqual({ ok: true })
-    expect(db.called('site_request_removal')[0].args).toEqual({ p_token: TOKEN, p_slug: 'someone', p_note: 'n'.repeat(300) })
+    expect(db.called('site_request_removal')[0].args).toEqual({ p_token: TOKEN, p_slug: 'someone', p_note: 'n'.repeat(300), p_ticket: 'FAKE-TICKET' })
+  })
+
+  it('sends a ticket only as the page had it: a text no longer than a ticket can be, or none', async () => {
+    for (const ticket of [undefined, 7, ['FAKE-TICKET'], 'x'.repeat(4097)]) {
+      const db = database(Response.json('code'), Response.json(true))
+      await removal(post({ slug: 'someone', ticket, proof: true }), env(), db.fetcher)
+      await removal(post({ slug: 'someone', ticket }), env(), db.fetcher)
+      expect([ticket, db.called('site_removal_code')[0].args.p_ticket, db.called('site_request_removal')[0].args.p_ticket]).toEqual([ticket, null, null])
+    }
   })
 
   it('gives a code only when proof is asked for with true: anything else is a request without proof', async () => {
@@ -414,13 +425,13 @@ describe('POST /api/removal', () => {
     )
     vi.stubGlobal('fetch', asked)
     try {
-      const error = await removalCode('someone').catch((reason: unknown) => reason)
+      const error = await removalCode('someone', 'FAKE-TICKET').catch((reason: unknown) => reason)
       expect(error).toBeInstanceOf(Busy)
       expect((error as Busy).seconds).toBe(7200)
-      expect(await requestRemoval('someone', '  it is me  ')).toEqual({ ok: true })
+      expect(await requestRemoval('someone', '  it is me  ', 'FAKE-TICKET')).toEqual({ ok: true })
       expect(asked.mock.calls.map(([url, init]) => [url, init.method, JSON.parse(String(init.body))])).toEqual([
-        ['/api/removal', 'POST', { slug: 'someone', proof: true }],
-        ['/api/removal', 'POST', { slug: 'someone', note: 'it is me' }],
+        ['/api/removal', 'POST', { slug: 'someone', ticket: 'FAKE-TICKET', proof: true }],
+        ['/api/removal', 'POST', { slug: 'someone', ticket: 'FAKE-TICKET', note: 'it is me' }],
       ])
     } finally {
       vi.unstubAllGlobals()
@@ -431,8 +442,8 @@ describe('POST /api/removal', () => {
     const asked = vi.fn(async () => Response.json({ code: 'artist-search-removal-0123456789abcdef0123456789abcdef' }))
     vi.stubGlobal('fetch', asked)
     try {
-      await removalCode('pressed-twice')
-      await removalCode('pressed-twice') // the artist comes back to the page, in the same tab, and presses again
+      await removalCode('pressed-twice', 'FAKE-TICKET')
+      await removalCode('pressed-twice', 'FAKE-TICKET') // the artist comes back to the page, in the same tab, and presses again
       expect(asked).toHaveBeenCalledTimes(2)
     } finally {
       vi.unstubAllGlobals()
@@ -465,6 +476,14 @@ describe('GET /api/removal: the claim-or-remove page', () => {
     expect([refused.status, refused.headers.get('retry-after'), over.called('site_claim')]).toEqual([429, '120', []])
   })
 
+  it('says only that it did not load when the database fails, never what the database said', async () => {
+    const said = 'FAKE: relation public.artists, row (zz-fake-someone, FAKE-HANDLE)'
+    for (const answer of [new Response(said, { status: 500 }), new Error(said)]) {
+      const failed = await claimPage(from('203.0.113.7', '/api/removal?slug=someone'), env(), database(answer, answer).fetcher)
+      expect([failed.status, await failed.json()]).toEqual([502, { error: 'That did not load.' }])
+    }
+  })
+
   it('loads, and gives the code, while the day’s reads are used up for everyone', async () => {
     // The critic's case: one person spends the shared read total. The page loads the artist through its own count.
     const counted: string[] = []
@@ -485,7 +504,7 @@ describe('GET /api/removal: the claim-or-remove page', () => {
     try {
       expect(await getArtist('spent-reads').catch((reason: unknown) => reason)).toBeInstanceOf(Busy)
       expect(await claim('spent-reads')).toMatchObject({ name: 'Spent' })
-      expect(await removalCode('spent-reads')).toMatch(/^artist-search-removal-/)
+      expect(await removalCode('spent-reads', 'FAKE-TICKET')).toMatch(/^artist-search-removal-/)
       expect(counted).toEqual(['profile', 'claim', 'removal'])
     } finally {
       vi.unstubAllGlobals()
@@ -553,7 +572,7 @@ describe('an artist card', () => {
 
 describe('the claim-or-remove page', () => {
   const places = (deviantart_proof: boolean, site_url: string | null) => {
-    const claim = { slug: 'someone', name: 'Someone', site_url, deviantart_url: 'https://www.deviantart.com/someone', deviantart_proof }
+    const claim = { slug: 'someone', name: 'Someone', site_url, deviantart_url: 'https://www.deviantart.com/someone', deviantart_proof, ticket: 'FAKE-TICKET' }
     return renderToStaticMarkup(createElement(ProofPlaces, { claim, code: 'CODE', copyRow: (text: string) => text }))
   }
 

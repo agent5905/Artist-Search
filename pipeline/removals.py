@@ -9,18 +9,19 @@
 Hard rule 7 and owner decision 6. On the site an artist asks for their code (start_removal_proof, through the
 site's server function), which files their request as one a code was given out for. A request without a code
 (request_removal) is the owner's alone: a run only counts it. A request is a lasting record (sql/001_schema.sql:
-removal_requests), bound when it is filed to the artist listed under the slug then: their handle, their site and
-the account the library keeps for them (artists.da_account, which the push stage sends). Nothing afterwards changes
-that, and no push, hold-back, rename or deletion of their public row touches it: a slug that passes to another
-handle, or a site to another artist, takes nobody else into the request. Only a proven removal or the owner's
-answer closes it, and either removes and bars what it was bound to and nothing else.
+removal_requests), bound when it is filed to the artist the claim-or-remove page showed, listed then or not: their
+handle, their site and the account the library keeps for them (artists.da_account, which the push stage sends).
+Nothing afterwards changes that, and no push, hold-back, rename or deletion of their public row touches it: a slug
+that passes to another handle, or a site to another artist, takes nobody else into the request. Only a proven
+removal or the owner's answer closes it, and either removes and bars what it was bound to and nothing else.
 
-The queue (removal_requests.code_at and due_at). A run reads, with the service key, at most MAX_REQUESTS of the
-open requests with a code that are due, the one due longest first, and moves each one it looks at on: an hour
-while its code was asked for under a day ago, a day while under two weeks ago, a week after that (_next_look).
-Asking for the code again starts that over, and makes the request due at once unless it already was; it never
-puts a request ahead of one due before it. The page says so, and tells an artist who puts the code up later than
-two weeks to ask for it again.
+The queue (removal_requests.code_at, due_at and network). A run reads, with the service key, at most MAX_REQUESTS
+of the open requests with a code that are due, in turns between the networks the codes were asked from, the one
+due longest first in each turn (due_removals), and moves each one it looks at on: an hour while its code was asked
+for under a day ago, a day while under two weeks ago, a week after that (_next_look). Asking for the code again
+starts that over, and makes the request due at once unless it already was; it never puts a request ahead of one
+due before it in its network's turn. So one network that asks for hundreds of codes holds back only its own. The
+page says so, and tells an artist who puts the code up later than two weeks to ask for it again.
 
 It looks for the request's code in two places, and nowhere else:
   1. The DeviantArt profile of the handle the request was made for, through the official API: its bio (the About
@@ -54,7 +55,9 @@ by the database as that happens.
 Anything less leaves the request open, for the owner and for its next look.
 
 Every request to DeviantArt waits its turn in discover.Pace, and holds the API's lock for that request alone: a
-collect run can start between two of them, and this run then stops at its next one. Every request to a site goes
+collect run can start between two of them, and this run then stops at its next one. A collect run holds the API
+for hours, so it makes these runs itself, between two artists, through its own client, at its pace and under its
+lock (collect._look_for_proofs): the hourly look the page promises goes on while it runs. Every request to a site goes
 through the fetcher, and is over within crawl.PROOF_SECONDS_PER_RESPONSE whatever the site does: one that runs
 out of time closes the site for the run, and its request is moved on to its next look like any other. So a run
 takes at most about MAX_REQUESTS such deadlines, and a slow site holds no run, lock or queue. A run with nothing
@@ -68,6 +71,7 @@ never printed.
 """
 
 import argparse
+import contextlib
 import html
 import json
 import pathlib
@@ -86,6 +90,7 @@ PROOF_NAME = "artist-search-removal"  # the <meta> name, and the file under /.we
 PROFILE_FIELDS = ("bio", "tagline")  # the profile's own text: see the module's docstring
 MAX_REQUESTS = 30  # looked at in one run: about a minute of the API, and the sites of those that have one
 HOUR, DAY, WEEK = timedelta(hours=1), timedelta(days=1), timedelta(weeks=1)
+EVERY = timedelta(minutes=15)  # how often a run is due: the owner's schedule (README), and a collect run's own
 _TAG = re.compile(r"<[^>]*>")
 _UNSEEN = re.compile("[­​-‍⁠﻿]")  # a soft hyphen, zero-width spaces and joiners, a BOM
 TALLY = (  # every request in the database, by state, as the run began (removal_tally in sql/002_functions.sql)
@@ -106,18 +111,17 @@ COUNTS = (
     "left_for_owner_no_code_found",
     "left_for_owner_not_checked",  # a place could not be read, or there is none we may read: looked at again later
 )
-REQUEST_COLUMNS = "id,artist_slug,code_at,da_username,site_url,site_domain,da_account"
 
 
 def _rows(table: str, **params: str) -> list[dict[str, Any]]:
     """Rows of a table of the public database, read through the Data API with the service key: every row, a page at
-    a time, since the Data API answers at most its max-rows (1,000 by default) and says nothing of the rest. With a
-    limit, the one page. `order` must make the order total, or a page can repeat a row and miss another."""
+    a time, since the Data API answers at most its max-rows (1,000 by default) and says nothing of the rest.
+    `order` must make the order total, or a page can repeat a row and miss another."""
     rows: list[dict[str, Any]] = []
     while True:
         page = db._checked(db.data_api("GET", table, "secret", params=params | {"offset": str(len(rows))}))
         rows += page
-        if not page or "limit" in params:
+        if not page:
             return rows
 
 
@@ -149,7 +153,8 @@ def _move_on(request: dict[str, Any], now: datetime, dry_run: bool) -> None:
 
 
 def _profile(api: discover._Api, handle: str) -> dict[str, Any] | None:
-    """The handle's profile as the API answers it, or None. The API's lock is held for this request alone."""
+    """The handle's profile as the API answers it, or None. The API's lock is held for this request alone, unless
+    this run is a collect run's, which holds it already (discover.Pace takes it again for nothing)."""
     with api.pace:
         response = api.get(f"/user/profile/{handle}")
     try:
@@ -206,36 +211,32 @@ def run(
     local: pathlib.Path | str | None = None,
     transport: httpx.BaseTransport | None = None,
     fetcher: crawl.PoliteFetcher | None = None,
+    api: discover._Api | None = None,
 ) -> None:
     """One pass over the requests that are due, counted into `counts` (COUNTS) as it goes, so that a run that stops
     still says what it did. discover.Stop when another run holds the API, or the API refuses for too long;
     RuntimeError when the database fails. Either ends the run there: what was removed stays removed, and the
-    request being looked at stays due."""
+    request being looked at stays due. Given `api`, a collect run's, it asks through that (its pace, which the
+    collect run holds) and not a client of its own."""
     now = datetime.fromtimestamp(discover.now(), UTC)
     tally = db.rpc("removal_tally", {}, "secret")
     counts.update({name: int(tally[name]) for name in TALLY})
-    due = _rows(
-        "removal_requests",
-        select=REQUEST_COLUMNS,
-        outcome="is.null",
-        code_at="not.is.null",  # a request no code was given out for is the owner's alone
-        due_at=f"lte.{now.isoformat()}",
-        order="due_at.asc,code_at.asc,id.asc",  # the one due longest first
-        limit=str(MAX_REQUESTS),
-    )
+    # Only requests a code was given out for: one without is the owner's alone.
+    due = db.rpc("due_removals", {"p_now": now.isoformat(), "p_limit": MAX_REQUESTS}, "secret") or []
     counts["requests_due"] = len(due)
     if not due:
         return
     fetcher = fetcher or crawl.PoliteFetcher()
-    # The API client the collect stage uses: the project's user agent, no redirect followed, no URL logged.
-    with (
-        discover._http_logs_off(),
-        httpx.Client(
-            headers={"User-Agent": config.USER_AGENT}, transport=transport, timeout=30, follow_redirects=False
-        ) as http,
-        store.snapshot(local) as kept,
-    ):
-        api = discover._Api(http, client_id, client_secret)
+    with contextlib.ExitStack() as held:
+        if api is None:  # the API client the collect stage uses: the user agent, no redirect followed, no URL logged
+            held.enter_context(discover._http_logs_off())
+            http = held.enter_context(
+                httpx.Client(
+                    headers={"User-Agent": config.USER_AGENT}, transport=transport, timeout=30, follow_redirects=False
+                )
+            )
+            api = discover._Api(http, client_id, client_secret)
+        kept = held.enter_context(store.snapshot(local))
         for request in due:
             code = db.rpc("removal_code", {"p_slug": request["artist_slug"]}, "secret")
             found = _look(api, fetcher, request, code, kept) if CODE.fullmatch(str(code)) else ("not_checked", False)

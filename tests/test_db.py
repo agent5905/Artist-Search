@@ -74,6 +74,7 @@ SERVICE_FUNCTIONS = [
     "close_request",
     "confirm_removal",
     "delete_removed",
+    "due_removals",
     "grant_request",
     "refresh_search_words",
     "reject_removal",
@@ -82,7 +83,7 @@ SERVICE_FUNCTIONS = [
     "remove_artists",
     "replace_neighbors",
 ]
-READS_PER_VISITOR, READS_PER_NETWORK, READS_A_DAY = 50, 100, 1000  # client_wait in sql/003_limits.sql, a day
+READS_PER_VISITOR, READS_PER_NETWORK, READS_A_DAY = 100, 100, 3000  # client_wait in sql/003_limits.sql, a day
 REMOVALS_PER_VISITOR, REMOVALS_PER_NETWORK = 10, 20  # a day
 HELPER_FUNCTIONS = [
     "artist_card",
@@ -90,13 +91,16 @@ HELPER_FUNCTIONS = [
     "artist_keys",
     "artists_before_write",
     "artists_not_removed",
+    "claim_ticket",
     "clean_url",
     "host_under",
     "key_hash",
     "query_embedding",
     "removed_after_insert",
+    "request_binding",
     "short_list",
     "site_check",
+    "ticket_binding",
     "url_host",
     "works_before_write",
 ]
@@ -888,20 +892,20 @@ def test_publishable_key_runs_the_sites_functions_only_and_only_with_the_token()
     assert slugs(as_the_site("site_search", q=WORD)) == ["zz-test-alpha", "zz-test-beta"]
     assert as_the_site("site_request_removal", p_slug="zz-test-nobody", p_note=None) is True
     assert CODE.fullmatch(as_the_site("site_removal_code", p_slug="zz-test-nobody"))
-    # The claim-or-remove page's artist, by slug or by DeviantArt username in any case (no search needed).
-    assert (
-        as_the_site("site_claim", p_slug="ZZ-Test-Alpha")
-        == as_the_site("site_claim", p_slug="zz-test-alpha")
-        == [
-            {
-                "slug": "zz-test-alpha",
-                "name": BY_SLUG["zz-test-alpha"]["name"],
-                "site_url": BY_SLUG["zz-test-alpha"]["site_url"],
-                "deviantart_url": "https://www.deviantart.com/zz-test-alpha",
-                "deviantart_proof": False,  # no account sent for it: a code on DeviantArt could be anybody's
-            }
-        ]
-    )
+    # The claim-or-remove page's artist, by slug or by DeviantArt username in any case (no search needed), with the
+    # ticket a request from the page is bound by (claim_ticket): the same for the same artist.
+    claimed = as_the_site("site_claim", p_slug="zz-test-alpha")
+    assert as_the_site("site_claim", p_slug="ZZ-Test-Alpha") == claimed
+    assert [{name: value for name, value in row.items() if name != "ticket"} for row in claimed] == [
+        {
+            "slug": "zz-test-alpha",
+            "name": BY_SLUG["zz-test-alpha"]["name"],
+            "site_url": BY_SLUG["zz-test-alpha"]["site_url"],
+            "deviantart_url": "https://www.deviantart.com/zz-test-alpha",
+            "deviantart_proof": False,  # no account sent for it: a code on DeviantArt could be anybody's
+        }
+    ]
+    assert re.fullmatch(r"[A-Za-z0-9+/=]+\.[0-9a-f]{64}", claimed[0]["ticket"])
     assert (
         as_the_site("site_claim", p_slug="zz-test-hidden") == as_the_site("site_claim", p_slug="zz-test-nobody") == []
     )
@@ -1381,9 +1385,10 @@ def test_key_on_the_removal_list_deletes_the_artist_it_bars(seeded):
     # The owner removes a site by hand (what pipeline/store.py's mark_removed does) while its artist is here.
     site_key = key_hashes(KEEP)[1]
     assert db.upsert("removed", [{"key_hash": site_key}], "key_hash", "key_hash") == [{"key_hash": site_key}]
-    # Nothing of that artist stays: not the row, not the works, not the words only they used, and their request
-    # is closed, with nothing of them in it.
-    assert db.sql(left) == [{"artists": 0, "works": 0, "requests": 0, "words": 0}]
+    # The site is kept out of every row: the row that has it goes, its works and the words only it used. The
+    # artist's request stays open: a site alone closes nobody's, since it can pass to somebody else, and the
+    # artist the request is bound to is still there to ask (removed_after_insert).
+    assert db.sql(left) == [{"artists": 0, "works": 0, "requests": 1, "words": 0}]
     assert visible(BY_SLUG["zz-test-alpha"])  # and nobody else went with them
 
 
@@ -1818,7 +1823,7 @@ def test_600_reads_at_once_from_one_visitor_let_their_share_through_and_the_rest
         with ThreadPoolExecutor(30) as pool:
             waits = list(pool.map(lambda _: wait("search", client), range(600)))
         assert waits.count(0) == READS_PER_VISITOR
-        # The next is let in once a 50th of a day has passed, and the 550 refused moved that on by nothing.
+        # The next is let in once a 100th of a day has passed, and the 500 refused moved that on by nothing.
         assert all(0 < seconds <= 86400 / READS_PER_VISITOR + 1 for seconds in waits if seconds)
         assert 86400 - 60 < ahead(counted_as("read", "visitor", client)) <= 86400
         assert 0 < wait("search", client) <= 86400 / READS_PER_VISITOR + 1
@@ -1849,7 +1854,7 @@ def test_one_network_shares_its_share_whatever_addresses_it_asks_from(seeded):
     try:
         with ThreadPoolExecutor(30) as pool:
             waits = list(pool.map(lambda n: wait("search", clients[n % 4], network), range(4 * READS_PER_VISITOR)))
-        assert waits.count(0) == READS_PER_NETWORK  # four visitors' worth asked, two let in
+        assert waits.count(0) == READS_PER_NETWORK  # four visitors' worth asked, one let in
     finally:
         forget(network, *clients, pages_let_through=READS_PER_NETWORK)
 
@@ -1882,7 +1887,7 @@ def test_the_days_total_holds_reads_back_for_everyone_a_little_at_a_time(seeded)
             values ('read everyone', extract(epoch from clock_timestamp()) + 86400)
             on conflict (client_key) do update set busy_until = excluded.busy_until
         """)
-        # Full: the next page is let in a 1,000th of a day on, a profile a tenth of that. Not until midnight.
+        # Full: the next page is let in a 3,000th of a day on, a profile a tenth of that. Not until midnight.
         assert abs(wait("search", client) - 86400 / READS_A_DAY) <= 2
         assert abs(wait("profile", client) - 86400 / READS_A_DAY / 10) <= 2
         assert wait("removal", client) == 0  # asking for removal has no day's total
@@ -1970,6 +1975,51 @@ def test_a_code_files_the_request_and_asking_for_it_again_starts_its_checks_over
     assert again[1]["code_at"] > first[1]["code_at"] and again[1]["due_at"] == first[1]["due_at"]
 
 
+def test_a_request_from_the_page_is_bound_to_whom_it_showed_while_a_push_holds_them_back(seeded):
+    """The final critic's: a push held the artist back while their claim-or-remove page was open, and both buttons
+    filed nothing. The page's ticket (site_claim) binds the request to whom it showed, listed or not; a ticket
+    claim_ticket did not make binds nothing."""
+    fresh({**GONE, "da_account": account(GONE)})
+    [shown] = as_the_site("site_claim", p_slug=GONE["slug"])
+    db.sql(f"delete from public.artists where slug = '{GONE['slug']}'")  # the push holds them back
+    forged = shown["ticket"][:-1] + ("1" if shown["ticket"].endswith("0") else "0")
+    for ticket in (None, forged, "x", ""):  # nobody is listed under the slug: without the page's ticket, nothing
+        code = as_the_site("site_removal_code", p_slug=GONE["slug"], p_ticket=ticket, p_network="zz-test-net")
+        assert CODE.fullmatch(code)
+        assert as_the_site("site_request_removal", p_slug=GONE["slug"], p_note=None, p_ticket=ticket) is True
+    assert db.sql(QUEUE) == []
+    assert as_the_site("site_request_removal", p_slug=GONE["slug"], p_note="it is me", p_ticket=shown["ticket"])
+    as_the_site("site_removal_code", p_slug=GONE["slug"], p_ticket=shown["ticket"], p_network="zz-test-net")
+    made = db.sql(
+        "select da_username, site_domain, da_account, code_at is not null as coded, note, network is not null as net "
+        f"from public.removal_requests where artist_slug = '{GONE['slug']}' and outcome is null"
+    )
+    assert made == [
+        {
+            "da_username": GONE["da_username"],
+            "site_domain": GONE["site_domain"],
+            "da_account": account(GONE),
+            "coded": True,
+            "note": "it is me",
+            "net": True,
+        }
+    ]
+
+
+def test_the_verifier_takes_turns_between_the_networks_codes_were_asked_from(seeded):
+    """The final critic's flood: codes asked for from one network ahead of a real one held it back by their number.
+    due_removals takes each network's request due longest in turn, so a flood holds back only its own."""
+    flood = CROWD[:3]
+    fresh(*flood, STAY)
+    for row in flood:
+        as_the_site("site_removal_code", p_slug=row["slug"], p_network="zz-test-flood")
+    time.sleep(1)
+    as_the_site("site_removal_code", p_slug=STAY["slug"], p_network="zz-test-artist")
+    due = db.rpc("due_removals", {"p_now": "2999-01-01T00:00:00+00:00", "p_limit": None}, "secret")
+    mine = [row["artist_slug"] for row in due if row["artist_slug"].startswith("zz-test-")]
+    assert mine == [flood[0]["slug"], STAY["slug"], flood[1]["slug"], flood[2]["slug"]]
+
+
 def due_later_than(row: dict[str, Any], interval: str) -> bool:
     later = f"select due_at > now() + interval '{interval}' as later from public.removal_requests"
     return db.sql(f"{later} where artist_slug = '{row['slug']}'") == [{"later": True}]
@@ -1982,14 +2032,15 @@ def test_the_verifier_removes_through_the_real_queue_and_the_real_confirm_remova
     monkeypatch.setattr(config, "LOCAL_DB", tmp_path / "cache" / "pipeline.sqlite")
     monkeypatch.setattr(time, "sleep", lambda seconds: None)
     monkeypatch.setattr(discover, "now", lambda: time.time() + 60)  # a minute ahead of the database, in case
-    rows = removals._rows
-    monkeypatch.setattr(
-        removals,
-        "_rows",
-        lambda table, **params: rows(
-            table, **params, **({"artist_slug": "like.zz-test-*"} if table == "removal_requests" else {})
-        ),
-    )
+    rpc = db.rpc
+
+    def zz_test_only(name: str, args: dict[str, Any], key: str) -> Any:  # the due requests of zz-test- slugs alone
+        if name != "due_removals":
+            return rpc(name, args, key)
+        due = rpc(name, args | {"p_limit": None}, key)  # however many real ones there are
+        return [row for row in due if row["artist_slug"].startswith("zz-test-")][: args["p_limit"]]
+
+    monkeypatch.setattr(db, "rpc", zz_test_only)
     fresh(*({**row, "da_account": account(row) if row is not KEEP else None} for row in (GONE, STAY, KEEP)))
     for row in (GONE, STAY):  # the library keeps their accounts, and the push sent them
         handle = row["da_username"]

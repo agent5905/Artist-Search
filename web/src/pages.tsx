@@ -467,7 +467,7 @@ function RemoveProfile({ asked }: { asked: string }) {
   if (artist.failed) return <Page narrow><Failed error={artist.error} retry={artist.retry} /></Page>
   if (artist.stale) return <Page narrow><p className="fine" role="status">Loading…</p></Page>
   if (!artist.data) return <Gone />
-  const { slug, name, site_url, deviantart_proof } = artist.data
+  const { slug, name, site_url, deviantart_proof, ticket } = artist.data
   const site = web(site_url)
 
   const ask = async (kind: 'code' | 'request', run: () => Promise<void>) => {
@@ -527,7 +527,7 @@ function RemoveProfile({ asked }: { asked: string }) {
               className={code ? 'btn quiet' : 'btn'}
               type="button"
               disabled={busy === 'code'}
-              onClick={() => ask('code', async () => setCode(await removalCode(slug)))}
+              onClick={() => ask('code', async () => setCode(await removalCode(slug, ticket)))}
             >
               {busy === 'code' ? 'Getting your code…' : code ? 'Get my code again' : 'Get my code'}
             </button>
@@ -559,7 +559,7 @@ function RemoveProfile({ asked }: { asked: string }) {
             onSubmit={(event) => {
               event.preventDefault()
               const note = String(new FormData(event.currentTarget).get('note') ?? '')
-              ask('request', async () => (await requestRemoval(slug, note), setSent(true)))
+              ask('request', async () => (await requestRemoval(slug, note, ticket), setSent(true)))
             }}
           >
             <label htmlFor="note">Anything the owner should know (optional)</label>

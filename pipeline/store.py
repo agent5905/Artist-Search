@@ -83,10 +83,6 @@ _SPACED_DOT = re.compile(f" ?{_MARK} ?")
 _IDNA_2003_ONLY = "".join(map(chr, (0xDF, 0x1E9E, 0x3C2, 0x200C, 0x200D)))  # sharp s twice, final sigma, two joiners
 _SHA256 = re.compile(r"[0-9a-f]{64}")
 _OTHERS = "SELECT 1 FROM listed WHERE domain_hash = ? AND artist_hash != ?"  # is a domain listed by anybody else
-# The most profiles that can list one site and it still be somebody's own, for a removal of it: two accounts of
-# one person. A site more profiles list is shared, and nobody's alone to answer for (see removed_site_of_few and
-# _named_by).
-OWNERS = 2
 
 
 def canonical_host(host: str) -> str | None:
@@ -324,40 +320,23 @@ def _removed(conn: sqlite3.Connection, keys: Iterable[str]) -> bool:
 
 
 def _named_by(conn: sqlite3.Connection, named: set[str]) -> list[str]:
-    """The keys of the stored artists these key hashes name: by their handle, or by the site their stored link is
-    on when it is a site of few. A site that more than OWNERS artists list (in the profiles the collect stage
-    read, as removed_site_of_few counts them) or link to here is shared: it names none of them. They stay out
-    while they link to it (all_artists), and the push stage holds back whoever's profile names it."""
-    # ponytail: reads every artist row per removal. Fine at a few thousand rows; index the link hosts if it grows.
-    rows = [(key, json.loads(links)) for key, links in conn.execute("SELECT key, links FROM artists")]
-    found = {key for key, _ in rows if _hash(key) in named}
-    linking: dict[str, set[str]] = {}  # a removed site's registrable domain -> the stored artists who link to it
-    for key, links in rows:
-        for host in filter(None, map(_host, links)):
-            if named & {_hash(covering) for covering in _host_keys(host)}:
-                linking.setdefault(registrable_domain(host) or host, set()).add(key)
-    listing = "SELECT artist_hash FROM listed WHERE domain_hash = ?"
-    for domain, keys in linking.items():
-        listers = {artist_hash for (artist_hash,) in conn.execute(listing, (_hash(f"site:{domain}"),))}
-        if len(listers | {_hash(key) for key in keys}) <= OWNERS:
-            found |= keys
-    return sorted(found)
+    """The keys of the stored artists these key hashes name by their handle. A site's hash names nobody: a removal
+    bars only what it is bound to, and a site can be in anybody's row, so barring one never removes an artist.
+    Whoever links to a removed site stays out while they do (all_artists), and the collect and push stages hold
+    back whoever's profile names it."""
+    return sorted(key for (key,) in conn.execute("SELECT key FROM artists") if _hash(key) in named)
 
 
 def _remove(conn: sqlite3.Connection, key_hashes: Iterable[str]) -> int:
-    """Put key hashes on the removal list and delete the stored artists they name. Returns how many that was.
+    """Put key hashes on the removal list and delete the stored artists whose handle they are. Returns how many.
 
-    A hash names an artist by their handle, or by the site their stored link is on when few link to it (see
-    _named_by). An artist deleted for their site has their handle put on the list too, so that they stay out
-    when the link is gone from their profile.
-    A removal goes no further: a removed handle bars no site, so it never reaches another artist. It works on
-    hashes, so it also works for a site known only as a hash.
+    A removal goes no further: a handle bars no site, and a site bars no handle (see _named_by), so it never
+    reaches another artist. It works on hashes, so it also works for a site known only as a hash.
     """
     named = set(key_hashes)
     gone = _named_by(conn, named)
     conn.executemany("DELETE FROM artists WHERE key = ?", [(key,) for key in gone])
-    barred = sorted(named | {_hash(key) for key in gone})
-    conn.executemany("INSERT OR IGNORE INTO removed VALUES (?, ?)", [(key_hash, _now()) for key_hash in barred])
+    conn.executemany("INSERT OR IGNORE INTO removed VALUES (?, ?)", [(key_hash, _now()) for key_hash in sorted(named)])
     return len(gone)
 
 
@@ -388,11 +367,10 @@ def named_by(key_hashes: Iterable[str], db: pathlib.Path | str | None = None) ->
 def mark_removed(identifier: str, db: pathlib.Path | str | None = None) -> int:
     """Put an artist or a site on the removal list. Safe to repeat.
 
-    A handle bars that handle and deletes that artist's row, and nothing else. A site bars the site, and deletes
-    and bars the artists whose stored link is on it, unless it is shared (see _remove). Returns how many stored
-    artists it deleted,
-    so a removal that matched nobody can be seen. ValueError when the identifier names nothing discovery could
-    store (see normalize): a removal never silently does nothing.
+    A handle bars that handle and deletes that artist's row, and nothing else. A site bars the site and deletes
+    nobody: whoever links to it stays out while they do (see _named_by). Returns how many stored artists it
+    deleted, so a removal that matched nobody can be seen. ValueError when the identifier names nothing discovery
+    could store (see normalize): a removal never silently does nothing.
     """
     key = normalize(identifier)
     with _open(db) as conn:
@@ -402,9 +380,9 @@ def mark_removed(identifier: str, db: pathlib.Path | str | None = None) -> int:
 def import_removed(key_hashes: Iterable[str], db: pathlib.Path | str | None = None) -> int:
     """Take removals from the list of record: sha256 hex digests of 'da:<handle>' and 'site:<host>' keys.
 
-    Stores them, then removes every stored artist whose own key, site, parent domain or www. form matches one,
-    just as mark_removed() would. Returns how many artists it deleted. This file can be deleted and refilled;
-    a removal cannot be lost that way.
+    Stores them, then removes every stored artist whose handle one of them is, just as mark_removed() would; one
+    whose link is on a removed site, parent domain or www. form stays out while it is. Returns how many artists it
+    deleted. This file can be deleted and refilled; a removal cannot be lost that way.
     """
     hashes = [key_hash.strip().lower() for key_hash in key_hashes]
     if not all(_SHA256.fullmatch(key_hash) for key_hash in hashes):
@@ -426,30 +404,6 @@ def record_listing(username: str, hosts: Iterable[str], db: pathlib.Path | str |
     with _open(db) as conn:
         conn.executemany("INSERT OR IGNORE INTO listed VALUES (?, ?)", listing)
         return _removed(conn, [covering for host in hosts for covering in _host_keys(host)])
-
-
-def removed_site_of_few(username: str, hosts: Iterable[str], db: pathlib.Path | str | None = None) -> bool:
-    """True when one of these hosts is on a removed site that the profiles of no more than OWNERS artists, this
-    one among them, were seen to list.
-
-    For the collect stage, after record_listing() has been called for every profile of its run: the case in
-    which a profile's word puts an artist on the removal list. A site that more profiles list, in a link of any
-    shape, is shared and nobody's to answer for: that is the guard against one removal, or one wrong answer
-    given for every profile, taking many artists. It changes nothing.
-
-    ponytail: a listing is only known once the collect stage has read the profile (see own_site_candidates),
-    so an artist whose turn has not come yet is not counted as one who lists the site; and artists are counted
-    by handle, so an account that took a new handle counts twice.
-    """
-    key, hosts = _hash(artist_key(username)), list(hosts)
-    others = "SELECT count(DISTINCT artist_hash) FROM listed WHERE domain_hash = ? AND artist_hash != ?"
-    with _open(db) as conn:
-        return any(
-            _removed(conn, _host_keys(host))
-            and (domain := registrable_domain(host)) is not None
-            and conn.execute(others, (_hash(f"site:{domain}"), key)).fetchone()[0] < OWNERS
-            for host in hosts
-        )
 
 
 def upsert_artist(
@@ -484,7 +438,7 @@ def keep_own_site(username: str, website: str | None, db: pathlib.Path | str | N
     """Write the front page of an artist's own site into their row, as their one link. True when a row changed.
 
     For the collect stage, the one stage that reads a profile: discovery stores an artist with no link.
-    One place then says whose site is whose, and a removal of the site finds the artist (see _remove). Nothing
+    One place then says whose site is whose, and a removal of the site keeps the artist out (see all_artists). Nothing
     is changed unless the website is an own site (crawl.is_own_site is the rule), the artist has a row, and
     neither they nor the site are on the removal list.
     """

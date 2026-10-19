@@ -348,6 +348,13 @@ def test_all_closest_works_is_closest_works_for_many_pairs_from_one_read_and_onl
     }
     assert style.all_closest_works(floored, every, "csd", floor=0.9)[ALPHA, BRAVO] == [work_id(5), work_id(6)]
     assert style.all_closest_works(floored, every, "csd", top=1, floor=1.5) == dict.fromkeys(floored, [])
+    # The push critic's: a vector stored at another length is the same direction, and only the cosine counts.
+    # BRAVO's work at 0.8, stored twice as long, once passed the floor at 1.6.
+    longer = (2 * style.vector(work_id(4), "csd").astype(np.float32)).astype(np.float16).tobytes()
+    with closing(sqlite3.connect(config.LOCAL_DB)) as conn, conn:
+        conn.execute("UPDATE style_vectors SET vector = ? WHERE deviation_id = ?", (longer, work_id(4)))
+    assert style.all_closest_works(floored, every, "csd", floor=0.9)[ALPHA, BRAVO] == [work_id(5), work_id(6)]
+    assert style.closest_works(ALPHA, BRAVO, "csd") == found[ALPHA, BRAVO]  # the same order as at unit length
 
 
 def test_the_mutual_rule_puts_a_consistent_artist_above_one_with_a_bit_of_everything(model, capsys):

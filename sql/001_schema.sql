@@ -156,10 +156,11 @@ create index if not exists search_words_trgm_idx on public.search_words using gi
 
 -- Removal requests (owner decision 6): a lasting record, which nothing but a proven removal or the owner's
 -- answer closes. No load, hold-back, rename or deletion of the artist's row touches it. A request is bound,
--- when it is filed, to the artist listed under the slug then: their handle, their site and the account the
--- local library keeps for them (artists.da_account). Nothing afterwards changes what it is bound to, so the
--- verifier finds that artist while they are not listed, and only that artist: a slug can pass to another
--- handle, and a site to another artist. A later request for the same handle and site is the same request and
+-- when it is filed, to the artist the claim-or-remove page showed (its ticket: claim_ticket in
+-- sql/002_functions.sql), listed then or not: their handle, their site and the account the local library keeps
+-- for them (artists.da_account). Nothing afterwards changes what it is bound to, so the verifier finds that
+-- artist while they are not listed, and only that artist: a slug can pass to another handle, and a site to
+-- another artist. A later request for the same handle and site is the same request and
 -- only counts (and fills in an account that was not known yet); one for anything else is a request of its
 -- own (removal_requests_open_idx below). Nothing a visitor sends can erase what an artist wrote.
 create table if not exists public.removal_requests (
@@ -183,6 +184,9 @@ alter table public.removal_requests
   -- request without one, which only the owner answers. due_at: when the verifier looks for the code next.
   add column if not exists code_at timestamptz,
   add column if not exists due_at timestamptz,
+  -- The network the code was last asked for from, as an HMAC (client_wait keys it so): the verifier takes
+  -- turns between networks (due_removals), so that one asking for many codes holds back only its own.
+  add column if not exists network text,
   -- Null while open. 'proven' (the verifier saw the code), 'granted' or 'rejected' (the owner's answer), or
   -- 'removed' (the artist was removed another way). A closed row keeps nothing of the artist: its slug gives
   -- way to a random key and the handle, site, account and note go.
