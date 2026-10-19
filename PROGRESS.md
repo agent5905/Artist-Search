@@ -1201,4 +1201,25 @@ What fails is the content. Nothing checks fitness beyond sex and gore, so the fi
 
 **Running:** the GPU worker reads accounts, remakes 5 profiles and checks every image (started 13:41). Claim-or-remove's fifth critic is judging round 5. Push's last critic waits for the readings, so it can judge a build on the real data.
 
+**Claim-or-remove's fifth critic: still no.**
+- **Fixed since round 4:** a request is no longer lost when the artist is held back; secrets stay out of the browser, logs and repository; requests are never closed by anything but a proof, the owner or a removal.
+- **Still failing:**
+  - A proof silently drops a bystander who names the same site, for good.
+  - The hourly-look promise is not kept: nothing is scheduled yet, discovery blocks the checks, and collect reads a site only 8 times a run.
+  - Cross-site requests from any hostile page can spend the day's reads.
+  - A narrow database race can open a request for a just-removed artist that is never closed.
+  - A request keeps only its first note.
+  - Five kinds of break go uncaught.
+- **Accepted limits, at a larger scale than first stated:**
+  - Anyone who controls a domain an artist names can prove a removal (an employer, studio or host, not only a buyer).
+  - 75 to 150 networks of fake codes push looks 12 to 25 hours back.
+  - An office behind one address shares 100 searches a day.
+
+**Removals round 6, being built:**
+- A removed site is never shown, but an artist naming it is sent without the link instead of being dropped.
+- Cross-site requests are refused before any database call.
+- The race is closed and the latest note is kept.
+- The page promises what the system keeps ("at most a day").
+- Tests for every uncaught break.
+
 **A Pages project of its own.** The project `.env` named is the owner's own August site, on a different Supabase, and the owner keeps it. With the owner's approval, Artist Search now has its own empty project, `artist-search` (`artist-search.pages.dev`, nothing deployed), and `.env` points at it. No domain is needed. The edge rate-limiting rule needs one, but the database's own limits cover visitors, networks and the total.
