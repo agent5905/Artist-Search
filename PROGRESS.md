@@ -1191,4 +1191,14 @@ What fails is the content. Nothing checks fitness beyond sex and gore, so the fi
 - **Tests:** 4,948 Python tests pass, plus 36 web tests.
 - **Not yet proven:** the new SQL has not run against Postgres; `tests/test_db.py` does that against the live database at setup.
 
+**Fit to show: merged** (4,963 tests pass). Push now holds back, each under its own reason:
+- **AI and adult accounts.** The model reads an artist's username and tagline together, not a word list. Over all 3,969 profiles it found 87 AI and 18 adult or fetish; on today's data 29 artists who would be sent are now held (21 AI, 8 adult), with 255 works. Every "No AI", "AI-free" and "anti-AI" tagline is kept. Two wrong holds are known: a creature artist whose name was read as a fetish word, and one AI hold that looks hand-painted.
+- **Profane or social taglines:** dropped, and the artist stays. 10 profane and 5 with a social handle.
+- **Unfit titles:** a whole-word list holds 58 works (sexual, fetish, hate, "loli"). 2 are wrong holds.
+- **Unfit images:** a new check of every image for fetish content, hate symbols and sexualised minors. On 836 sampled works it held none of 160 dark, horror, gore and armour works, 79 WW2 works or 60 kaiju and mech works. It found 17 unfit works rated safe; 13 are clearly right and 4 are Nazi-themed game or film art (Call of Duty zombies, Wolfenstein, a Jojo Rabbit armband), held as hate symbols. That is the owner's call. The full run takes about 10 hours.
+- **Adoptable and for-sale sheets** (owner decision 14): sent after every other work, and never a similar-style pick. On today's data 692 sheets are sent as filler. 20 artists send only sheets; they lead with one and appear beside nobody.
+- `creepypasta` is off the approved tags.
+
+**Running:** the GPU worker reads accounts, remakes 5 profiles and checks every image (started 13:41). Claim-or-remove's fifth critic is judging round 5. Push's last critic waits for the readings, so it can judge a build on the real data.
+
 **A Pages project of its own.** The project `.env` named is the owner's own August site, on a different Supabase, and the owner keeps it. With the owner's approval, Artist Search now has its own empty project, `artist-search` (`artist-search.pages.dev`, nothing deployed), and `.env` points at it. No domain is needed. The edge rate-limiting rule needs one, but the database's own limits cover visitors, networks and the total.
