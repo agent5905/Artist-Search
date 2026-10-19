@@ -2094,6 +2094,26 @@ def test_an_old_handle_that_answers_again_under_another_user_id_does_not_undo_th
     assert b"zz-fake-alpha" not in stored_bytes and b"zz-fake-renamed" not in stored_bytes
 
 
+def test_a_corrupt_rename_link_to_another_account_does_not_widen_a_removal(capsys):
+    """The final critic's finding, at collect's end: a link that ties another account's handle to a removed one
+    is not believed. Both of the removed account's handles go; the other artist and what is kept of them stay."""
+    world = renamed_world(capsys)
+    world.artist(BRAVO)
+    world.work(BRAVO, 21)
+    assert run(world) == 0
+    with sqlite3.connect(config.LOCAL_DB) as conn:  # the corruption: BRAVO linked to RENAMED's account
+        conn.execute(
+            "INSERT INTO artist_marks (artist_key, reason, marked_at, same_as) VALUES (?, 'renamed', ?, ?)",
+            (key(BRAVO), store._now(), key(RENAMED)),
+        )
+    conn.close()
+    assert key(BRAVO) in library.same_account(key(RENAMED))
+    store.mark_removed(RENAMED)
+    counts_of(world, capsys)
+    assert library.artist_keys() == [key(BRAVO)] and cached() == image_files([21])
+    assert store.is_removed(ALPHA) and store.is_removed(RENAMED) and not store.is_removed(BRAVO)
+
+
 def test_a_removal_of_the_old_handle_purges_what_is_kept_under_the_new_one_too(capsys):
     world = renamed_world(capsys)
     store.mark_removed(ALPHA)

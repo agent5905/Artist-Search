@@ -318,9 +318,12 @@ def _remove(key: str, counts: dict[str, int], db: pathlib.Path | str | None, use
     purge would delete the one thing that says who they were, and the same account under a new handle would be
     collected again (hard rule 7: not re-added later). It is taken from the profiles that were stored, and from
     `user_id` when the removal lands in the artist's own turn, which may be their first.
+
+    A handle a rename link reaches goes too only where what is kept here agrees: one that holds another
+    account's hash is somebody else, whatever a corrupt table of links says (push._removal holds to the same).
     """
-    others = library.same_account(key, db)
     accounts = {account for account in (library.account_hash(key, db), library.account(user_id)) if account}
+    others = [other for other in library.same_account(key, db) if library.account_hash(other, db) in accounts | {None}]
     if accounts:
         store.import_removed(accounts, db)
     done = True
