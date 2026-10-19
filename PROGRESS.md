@@ -1081,6 +1081,7 @@ Nothing has been pushed; none of these reached the public.
 - **How it was confirmed:** the same 26 seeds and the same sheets, judged blind by two pairs of fresh critics. The pairs agree on 24 of 26 verdicts; each pair split one seed differently from the other, so both come to 14 to 12.
 - **The margin is narrow.** 13 seeds go to us under both pairs and 11 to DeviantArt under both.
 - **What still loses:** subject over style shows up on both sides. On ours, it is a different discipline or glossier card art. On one seed with almost nobody close, only 2 works per side passed, and the critics called that "too small to tell the studio much".
-- **Seen on our side:** an ArtFight profile card (the artwork check below covers it), and five near-copies of one seed's own painting from another artist. The second is looked into next.
+- **Seen on our side:** an ArtFight profile card (the artwork check below covers it), and five near-copies of one seed's own painting from another artist. Those were not reposts: none of them comes closer than 0.81 to any of the seed's works.
+- **A scan of the whole collection for one image under two artists** finds almost nothing. 78 of the 80 pairs at cosine 0.98 or more are a single "No AI" banner that 13 artists posted, which the tagger already marks as not artwork. That leaves 3 images shared between two accounts, out of 39,744.
 
 **Running:** the "is this artwork?" check is being built; its full run over every work follows on the GPU.
