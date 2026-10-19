@@ -1229,4 +1229,12 @@ What fails is the content. Nothing checks fitness beyond sex and gore, so the fi
 - The page promises what the system keeps ("at most a day").
 - Tests for every uncaught break.
 
+**Removals round 6: merged.** All six findings are fixed:
+- **No dropped bystanders.** An artist who names a removed site is collected and sent like anyone, without the link, and counted. The address is never written to disk, and a changed website is stored.
+- **Cross-site calls refused.** Every API call from the site's own pages carries a custom header. A call without it is refused with 403 before any database call, so another page cannot spend the reads through its visitors' browsers.
+- **The race is closed.** Filing a request and adding to the removal list share one lock, so a request for a just-removed artist can no longer be opened.
+- **Notes:** the latest non-empty note is kept.
+- **A promise the system keeps:** "usually within a few hours, and at most within a day." The schedule is now hourly on day 1, every 6 hours to two weeks, then weekly. Discovery runs the checks between pages as collect does, and a site's request budget is per run. The worst case is about 6.5 hours, below 30 flooding networks.
+- **Tests:** each break the critic's mutations got past is now caught. 41 web tests pass.
+
 **A Pages project of its own.** The project `.env` named is the owner's own August site, on a different Supabase, and the owner keeps it. With the owner's approval, Artist Search now has its own empty project, `artist-search` (`artist-search.pages.dev`, nothing deployed), and `.env` points at it. No domain is needed. The edge rate-limiting rule needs one, but the database's own limits cover visitors, networks and the total.
