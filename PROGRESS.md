@@ -1,6 +1,6 @@
 # Artist Search: Progress
 
-**Status, 2026-10-14:** Collection is done: 3,969 artists and 39,744 works, against 472 artists two days ago. The GPU is tagging, rating and profiling them, roughly four days of work. Push stays closed until a third critic, once enough artists are fully analysed. Profile cards follow owner decision 11 (option A). 119 artists are public; nothing is deployed.
+**Status, 2026-10-18:** The GPU analysis is finished: all 39,744 works by 3,948 artists are tagged, checked and rated, and 3,656 artists have a profile card. Next come the last blind comparisons (style and text search against DeviantArt) and the final critics of push and claim-or-remove. After that comes the first public deployment, which waits for the owner's approval. 119 artists are public; nothing is deployed.
 
 ## Waiting on the owner
 
@@ -10,7 +10,7 @@ Nothing is blocking. Three things to weigh when convenient, each with a default 
 2. **How strict should the content filter be?** Default in place: works rated suggestive or explicit are held back, and an artist is held back at 30% or more. On today's data that holds back 70 of 470 artists.
 3. **Brief slow-downs during a data load.** Default: the site retries a failed call once.
 
-The GPU work is paused at the owner's request; `uv run python scripts/gpu.py resume` carries on. The first public deployment will be asked for separately when the site reaches its preview stage.
+The GPU worker is stopped because its work is done; `uv run python scripts/gpu.py start` runs it again when new works arrive. The first public deployment will be asked for separately when the site reaches its preview stage.
 
 ## Owner decisions (these amend the spec)
 
@@ -1022,3 +1022,18 @@ Nothing has been pushed; none of these reached the public.
 - **Known limit:** whoever buys a domain an artist let lapse, while the artist's profile still names it, can prove a removal.
 
 **What comes next, to keep cost down:** push and claim-or-remove each get one more critic close to the push, judging the final code on fully analysed data, not one round per change. The GPU worker's pace fell to about 300 works an hour, partly because builders' and critics' test runs compete for the CPU. About four days of analysis remain.
+
+### Round 27: the GPU analysis finished (2026-10-15 to 10-18)
+
+**Every collected work is analysed.** The worker ran from 10-15 to 10-18 and finished at 17:38 on 10-18:
+- **Tags:** 39,744 works tagged and checked. One work failed, a GIF on which both the tagger and the format sorter failed; it has no tags.
+- **Content ratings:** 34,562 safe, 4,997 suggestive, 184 explicit.
+- **Profiles:** 3,656 artists have a card. Left out: 203 mostly AI-declared, 54 with too few works, 31 with nothing clear to say, 4 mostly explicit.
+- **Pace:** about 450 works an hour, against 300 while builders' tests shared the CPU.
+- **Breaks:** the owner paused it three times, and each resume carried on where it stopped. On 10-15 something outside the project killed the worker partway through a turn, without a crash or a reboot. It sat idle for about two hours until the owner asked for it to be started again.
+
+**Next:**
+1. The style comparison against DeviantArt's "More Like This" again, on the full pool.
+2. The text-search comparison against DeviantArt's search.
+3. The final critics of push and claim-or-remove.
+4. The first public deployment, which waits for the owner's approval.
