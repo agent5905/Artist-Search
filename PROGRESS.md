@@ -1037,3 +1037,26 @@ Nothing has been pushed; none of these reached the public.
 2. The text-search comparison against DeviantArt's search.
 3. The final critics of push and claim-or-remove.
 4. The first public deployment, which waits for the owner's approval.
+
+### Round 28: the style test on the full pool, lost again (2026-10-18)
+
+**Piece 6, third run.** This time our side is exactly what the site would show. Push's own output gives the pool (published artists and works only), the neighbours and the closest-work picks. The seeds are 26 of round 2's 29, against the same captured DeviantArt suggestions; the other three are held back by push. Two fresh blind critics judged 13 seeds each.
+
+| | Round 1 | Round 2 | Round 3 |
+|---|---|---|---|
+| Pool | 442 artists, all works | 442, all works | 3,656 published artists, published works |
+| Seeds our side won | 8 | 11 | 11 |
+| Seeds DeviantArt won | 21 | 17 | 15 |
+| Ties | 0 | 1 | 0 |
+| Our works judged a real style match | 42% | 56% | 67% (277 of 411) |
+| DeviantArt's works judged a real style match | 59% | 58% | 69% (285 of 411) |
+
+- **Lost, but closer.** Scale did not turn it. Match rates are not comparable across rounds, since these critics were more generous with both sides; within the round the gap is 2 points.
+- **Why we lost, from the critics' notes matched to the key:** our sets mix in outliers, such as a different discipline (isometric dioramas, lore sheets), a lower finish (value studies, sketch strips), or a different stylisation. DeviantArt loses when it follows the subject. The most damaging failure for both sides was a subject match that brought a different medium or finish with it.
+- **A defect found:** non-artwork reaches the site. On one of our sheets, two of 16 works were an anti-AI text banner and a screenshot of the artist's profile card; the tagger marked both as artwork. A scan of the descriptions finds more, including game screenshots, social-media and QR contact cards, commission price sheets and a meme sheet. Keywords cannot catch them all (the banner was described as an illustration), so it needs its own check.
+- **DeviantArt's side showed unsuitable content on two sheets:** cosplay photos and sexualised anime. Ours showed none.
+
+**Next:**
+1. A style round 4 aimed at consistency: rank similar artists by how close their best few works are, and show only works that pass a closeness floor, so fewer and closer rather than 16 with outliers.
+2. A focused "is this artwork?" check on every work, as a GPU stage.
+3. The same 26 seeds again, with fresh critics.
