@@ -1,11 +1,12 @@
 // GET /api/artist?slug=            -> the artist's profile (site_artist), or null when they are not listed
 // GET /api/artist?slug=&similar=1  -> the artists nearest them in style (site_similar)
 // Counted first, as a search is (client_wait: a profile is a tenth of a page, the similar artists a page).
-import { NO_STORE, refused, site, wait, type Env } from './search'
+import { crossSite, NO_STORE, notHere, refused, site, wait, type Env } from './search'
 
 export const TOO_MANY = 'Too many pages for now.'
 
 export async function handle(request: Request, env: Env, fetcher: typeof fetch = fetch): Promise<Response> {
+  if (crossSite(request)) return notHere()
   const asked = new URL(request.url).searchParams
   const slug = (asked.get('slug') ?? '').slice(0, 80) // no slug is longer (sql/001_schema.sql)
   const similar = asked.get('similar') === '1'

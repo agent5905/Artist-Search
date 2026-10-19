@@ -445,8 +445,8 @@ export function ProofPlaces({ claim, code, copyRow }: { claim: Claim; code: stri
           </li>
           <li>
             <span>
-              That is all. We look for the code every hour for a day after you get it, then once a day for two weeks, then once a week. As
-              soon as it is found this profile is deleted and you will not be added again. You can take the code down after that.
+              That is all. Once the code is up, we usually find it within a few hours, and at most within a day. As soon as it is found
+              this profile is deleted and you will not be added again. You can take the code down after that.
             </span>
           </li>
         </ol>
@@ -534,7 +534,7 @@ function RemoveProfile({ asked }: { asked: string }) {
             {failure('code')}
             <p className="fine">
               Putting the code up more than two weeks after you got it? Come back to this page and press “Get my code” again first: the code
-              is the same, and the hourly checks start over. If this profile is still here a day after the code went up, check that it is
+              is the same, and the checks start over. If this profile is still here a day after the code went up, check that it is
               exactly where step 2 says. If it is, or you cannot put it there, send a request below and the site owner will look at it.
             </p>
           </>

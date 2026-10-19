@@ -31,6 +31,7 @@ from test_push import (
     DELTA,
     FakeDb,
     artist,
+    collected_again,
     digest,
     local_state,
     of_artist,
@@ -68,8 +69,8 @@ class RemovalsDb(FakeDb):
     already was, in the turn of the network that asked), bound to whom the claim page showed (its ticket), or
     without one to the artist listed under the slug then: their handle, site and account, and never one already
     barred. The same handle and site asked about again is the same request, which only counts (and takes an account
-    it lacked); anything else is a request of its own. due_removals takes the due ones in turns between networks.
-    Nothing a push or a load does touches one. confirm_removal and grant_request close
+    it lacked, and a note that says something); anything else is a request of its own. due_removals takes the due
+    ones in turns between networks. Nothing a push or a load does touches one. confirm_removal and grant_request close
     an open one, and put on the list the handle and the account it is bound to, and its site when the caller says
     the proof covered it and no other handle is listed with it now: never whoever the slug lists now. That deletes
     whoever they bar, and an open request whose handle or account they bar is closed as "removed". A row with a
@@ -106,6 +107,7 @@ class RemovalsDb(FakeDb):
         if shown is None:
             return
         now = self.now()
+        note = (note or "").strip()[:300] or None  # left(nullif(btrim(p_note), ''), 300)
         bound = {name: shown.get(name) for name in ("da_username", "site_url", "site_domain", "da_account")}
         if {self.made_for(bound)["da_key"], bound["da_account"]} & set(self.removed):
             return  # gone already: a request would only keep their handle
@@ -115,7 +117,7 @@ class RemovalsDb(FakeDb):
             row = self.queue[same[0]]
             row["da_account"] = row["da_account"] or bound["da_account"]
             if not with_code:
-                row |= {"last_at": now, "requests": row["requests"] + 1}
+                row |= {"last_at": now, "requests": row["requests"] + 1, "note": note or row["note"]}
         else:
             row = {"id": next(self._ids), "artist_slug": slug, "note": note, "first_at": now, "last_at": now}
             row |= bound | {"requests": 1, "code_at": None, "due_at": None, "outcome": None, "network": None}
@@ -912,8 +914,8 @@ def test_a_request_is_looked_at_less_often_as_it_ages(world):
         if world.check()["requests_due"]:
             looked.append(hour)
         world.later(hours=1)
-    # Hourly for the first day, daily for the rest of the first two weeks, weekly after that: as the page says.
-    assert looked == [*range(24), *range(24, 14 * 24, 24), *range(14 * 24, 30 * 24, 7 * 24)]
+    # Hourly for the first day, every six hours for the rest of the first two weeks, weekly after that.
+    assert looked == [*range(24), *range(24, 14 * 24, 6), *range(14 * 24, 30 * 24, 7 * 24)]
 
 
 def test_asking_for_the_code_again_starts_the_checks_over(world):
@@ -929,18 +931,40 @@ def test_asking_for_the_code_again_starts_the_checks_over(world):
     assert world.check() == expected(requests_due=1, proven_on_deviantart=1, artists_removed=1)
 
 
-@pytest.mark.parametrize("posted_after_hours", [0.5, 5, 50, 150, 200, 330])
-def test_a_code_put_up_in_the_first_two_weeks_is_found_within_a_day(world, posted_after_hours):
-    world.list(ALPHA)
+PROMISE = "we usually find it within a few hours, and at most within a day"  # web/src/pages.tsx, step 3
+
+
+@pytest.mark.parametrize("posted_after_hours", [0.1, 0.5, 5, 23.9, 24.05, 24.2, 50, 150, 200, 330, 335.9])
+def test_a_code_put_up_in_the_first_two_weeks_is_found_as_the_page_promises(world, posted_after_hours):
+    """The page: once the code is up, "we usually find it within a few hours, and at most within a day". The fifth
+    critic's: it promised a look every hour, which nothing kept, and a page made to say "daily" went uncaught. It is
+    held to the schedule here. With a run every removals.EVERY, the owner's schedule or a long run's own, at times
+    that are not the code's, a code put up at any moment of its first two weeks is found within an hour and a run
+    in its first day, and within six hours and a run after it."""
+    assert PROMISE in " ".join((config.ROOT / "web" / "src" / "pages.tsx").read_text(encoding="utf-8").split())
+    world.list(ALPHA)  # asked for now
     world.da.profiles[ALPHA] = profile(ALPHA, bio="Concept artist.")
-    hours = 0.0
+    up = world.clock + posted_after_hours * 3600
+    world.later(minutes=7)  # the runs fall where they fall
     while not gone(world, ALPHA):
-        if hours >= posted_after_hours:
+        if world.clock >= up:
             world.da.profiles[ALPHA]["bio"] = f"Concept artist. {code(ALPHA)}"
         world.check()
-        world.later(minutes=15)  # the schedule the README asks for
-        hours += 0.25
-    assert hours - posted_after_hours <= 24
+        world.later(seconds=removals.EVERY.total_seconds())
+    waited = (world.clock - removals.EVERY.total_seconds() - up) / 3600
+    assert 0 <= waited <= (1 if posted_after_hours < 23 else 6) + removals.EVERY.total_seconds() / 3600 < 24
+
+
+def test_the_page_tells_the_artist_the_tag_and_the_file_this_stage_reads():
+    """The fifth critic's uncaught breaks: the page telling artists to write <meta property=...>, or to put the file
+    at another address, would send them to put the code where it is never read. The page's own words are read here,
+    against the name this stage reads and the tag and file that the tests above show it finds."""
+    page = (config.ROOT / "web" / "src" / "pages.tsx").read_text(encoding="utf-8")
+    assert f"const PROOF = '{removals.PROOF_NAME}'" in page
+    assert 'copyRow(`<meta name="${PROOF}" content="${code}">`)' in page
+    assert "copyRow(new URL(`/.well-known/${PROOF}.txt`, site).href)" in page
+    assert meta("${code}") == '<meta name="artist-search-removal" content="${code}">'
+    assert FILE == ".well-known/artist-search-removal.txt" and removals.PROOF_NAME == "artist-search-removal"
 
 
 def test_a_run_looks_at_no_more_than_its_share_and_the_rest_next_run(world):
@@ -1222,8 +1246,8 @@ def test_a_proof_bars_its_site_and_nobody_else_who_names_it_here_or_in_the_datab
     """The final critic's: ALPHA, listed with shared.art, asks for a code. BRAVO, collected later, names the same site,
     and the push gives it to neither. ALPHA proves in their own bio, so shared.art is barred with them. The store then
     took the two who name the site for one person and barred BRAVO's handle, which the next push wrote to the
-    database with BRAVO's account, for good. A proof bars only what its request is bound to: BRAVO is held back
-    while their profile names the site, and nothing of theirs is barred."""
+    database with BRAVO's account, for good. A proof bars only what its request is bound to, and the fifth critic's:
+    a site barred holds back nobody who names it. BRAVO is sent without it, and nothing of theirs is barred."""
     shared = "https://yy-fake-shared.art/"
     artist(ALPHA, angle=0.0, website=shared)
     artist(CHARLIE, angle=0.5)
@@ -1238,10 +1262,104 @@ def test_a_proof_bars_its_site_and_nobody_else_who_names_it_here_or_in_the_datab
     assert world.check() == expected(requests_due=1, proven_on_deviantart=1, artists_removed=1)
     assert digest("site:yy-fake-shared.art") in world.db.removed and barred(world, ALPHA)
     for _ in range(2):
-        push.run(False)
+        counts = push.run(False)
         assert not barred(world, BRAVO) and not store.is_removed(BRAVO)
-        assert not library.account_removed(f"FAKE-USER-{BRAVO}") and sorted(sent_artists(world.db)) == [CHARLIE]
-    assert library.artist_keys() == [f"da:{BRAVO}", f"da:{CHARLIE}"]  # BRAVO's own, kept and held back
+        assert not library.account_removed(f"FAKE-USER-{BRAVO}") and sorted(sent_artists(world.db)) == [BRAVO, CHARLIE]
+        assert sent_artists(world.db)[BRAVO]["site_url"] is None and "yy-fake-shared" not in world.db.held()
+        assert counts["site_links_left_out_removed"] == 1
+    assert library.artist_keys() == [f"da:{BRAVO}", f"da:{CHARLIE}"]
+
+
+def test_an_artist_who_names_a_site_barred_for_another_is_sent_without_it_and_with_the_next_site_they_name(world):
+    """The fifth critic's: ALPHA, listed with shared.art, asks for a code; BRAVO, collected later, names the same
+    site, which the collect stage writes into BRAVO's row; ALPHA proves on DeviantArt. Every push after it dropped
+    BRAVO, counted under no reason: the store's row, which links the barred site, kept BRAVO out of the list the push
+    and the collect stage read. So BRAVO's next website was never read, and BRAVO stayed out for good. BRAVO is
+    sent without the site from the next push, read again, and sent with the next site BRAVO names."""
+    shared, elsewhere = "https://yy-fake-shared.art/", "https://yy-fake-bravo-new.art/"
+    artist(ALPHA, website=shared, angle=0.0)
+    artist(CHARLIE, angle=0.8)
+    push.run(False)
+    world.db.file(ALPHA, with_code=True)
+    made = artist(BRAVO, website=shared, angle=0.4)
+    assert store.keep_own_site(BRAVO, shared)  # what the collect stage writes for a site of their own
+    push.run(False)
+    world.da.profiles[ALPHA] = profile(ALPHA, bio=f"Leaving. {code(ALPHA)}", website=shared)
+    assert world.check() == expected(requests_due=1, proven_on_deviantart=1, artists_removed=1)
+
+    counts = push.run(False)
+    assert counts["site_links_left_out_removed"] == 1 and sorted(sent_artists(world.db)) == [BRAVO, CHARLIE]
+    assert sent_artists(world.db)[BRAVO]["site_url"] is None and not barred(world, BRAVO)
+    assert f"da:{BRAVO}" in [key for key, _, _ in store.all_artists()]  # so the collect stage reads them again
+    collected_again(BRAVO, made, website=elsewhere)  # and keeps their new website (tests/test_collect.py)
+    counts = push.run(False)
+    assert counts["site_links_left_out_removed"] == 0 and sent_artists(world.db)[BRAVO]["site_url"] == elsewhere
+
+
+def test_the_latest_note_that_says_something_is_the_one_the_owner_reads(world):
+    """The fifth critic's: the first request's note won, so a stranger's first try, with no note, hid the artist's
+    own words from the owner. A later request's note takes its place when it says something, cut to 300 characters
+    as before, and one that says nothing changes nothing (request_removal in sql/002_functions.sql, which RemovalsDb
+    follows: the statement itself is read below)."""
+    world.list(ALPHA, code=False)  # a stranger's, with no note
+    words = f"This is my work and I would like it taken down. {'x' * 400}"
+    for note in ("   ", words, None, ""):
+        world.db.file(ALPHA, with_code=False, note=note)
+    assert world.db.queue[ALPHA]["note"] == words[:300] and world.db.queue[ALPHA]["requests"] == 5
+    assert removals.pending()[0].endswith("note: yes")
+    sql = (config.ROOT / "sql" / "002_functions.sql").read_text(encoding="utf-8")
+    body = sql[sql.index("function public.request_removal(") :]
+    body = " ".join(body[: body.index("$$;")].split())
+    assert "left(nullif(btrim(p_note), ''), 300)" in body and "note = coalesce(excluded.note, r.note)" in body
+
+
+def test_a_request_filed_while_its_artist_is_removed_is_never_left_open():
+    """The fifth critic's race: "Get my code" pressed while confirm_removal commits. request_binding read the
+    removal list as it was before the proof committed, and ON CONFLICT, finding the open request closed by then,
+    filed a new one for the artist just removed, looked at for good. Whatever files a request and whatever puts keys
+    on the list take the removals' lock first and hold it until they commit, so each sees what the other did: the
+    request files nothing, or the removal closes it. Only Postgres can run the race; here the functions are read,
+    so that taking the lock out of any of them, or putting it after a read, fails. They are plpgsql, whose every
+    statement reads the database afresh: the statements of an SQL function read it as the first one did."""
+    sql = re.sub(r"--[^\n]*", "", (config.ROOT / "sql" / "002_functions.sql").read_text(encoding="utf-8"))
+    for name in ("request_removal", "start_removal_proof", "grant_request", "removed_after_insert"):
+        body = sql[sql.index(f"function public.{name}(") :]
+        body = body[: body.index("$$;")]
+        assert "language plpgsql" in body, name
+        first = body[body.index("begin") :].split(";")[0].split()
+        assert first == ["begin", "perform", "pg_advisory_xact_lock(4207)"], name
+
+
+def test_a_code_put_up_on_the_site_late_in_a_collect_run_is_read_at_the_next_look(world, monkeypatch):
+    """The fifth critic's: the crawler's budget for a proof was the process's, and a collect run is one process for
+    days. A site was read on two hourly looks, and a code put up after them waited for the collect run to end. Each
+    run of the checks has a fetcher, and a budget, of its own (crawl.read_proof)."""
+    site = f"https://{ALPHA}.art/"
+    world.list(ALPHA, site=site)
+    world.da.profiles[ALPHA] = profile(ALPHA, website=site)
+    real, clock = crawl.PoliteFetcher, Clock()
+    transport = httpx.MockTransport(world.sites._serve)
+    monkeypatch.setattr(
+        crawl,
+        "PoliteFetcher",
+        lambda: real(transport=transport, clock=clock, sleep=clock.sleep, resolver=lambda _: ["93.184.216.34"]),
+    )
+    world.sites.clock = clock
+    for state in (crawl._LAST, crawl._DELAY, crawl._SPENT, crawl._OWNERS):
+        state.clear()  # the collect process begins, and nothing clears them again
+    http = httpx.Client(headers={"User-Agent": config.USER_AGENT}, transport=world.da.transport, follow_redirects=False)
+    api, counts = discover._Api(http, "FAKE-ID", "FAKE-SECRET"), {discover.PROVEN: 0, discover.UNCHECKED: 0}
+    looks = 0
+    with api.pace:  # the collect run holds the API from start to end
+        while not gone(world, ALPHA) and looks < 12:
+            if looks == 6:
+                world.sites.pages[f"{site}{FILE}"] = code(ALPHA)
+            world.later(hours=1)
+            clock.now += 3600
+            discover.look_between(api, counts, None)  # between two artists
+            looks += 1
+    assert looks == 7 and counts == {discover.PROVEN: 1, discover.UNCHECKED: 0}
+    assert len(world.sites.urls) == 3 * 6 + 2  # robots.txt, the file and the front page each look; then the file
 
 
 @pytest.mark.parametrize("with_code", [True, False])

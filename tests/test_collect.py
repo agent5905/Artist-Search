@@ -61,6 +61,7 @@ of those, no website given: 0
 of those, website on a listed platform: 2
 of those, website on another domain, not a bare front page: 0
 of those, website names no public host: 0
+of those, website names a removed site (never sent or crawled): 0
 works stored: 13
 images downloaded: 13
 images already cached: 0
@@ -77,7 +78,6 @@ skipped artists (removed): 0
 skipped artists (a removed account under a new handle): 0
 skipped artists (none of their images was served): 0
 marked artists (account suspended, inactive or gone): 2
-marked artists (their profile names a removed site): 0
 marked artists (an answer not kept, and what was kept stays): 0
 marked works (stored, and no longer qualifying): 0
 skipped works (malformed entry): 0
@@ -1614,36 +1614,35 @@ def test_a_removal_that_lands_before_the_first_image_means_no_image_is_fetched(p
     ],
 )
 @pytest.mark.parametrize("removed", ["before discovery", "between discovery and collection"])
-def test_an_artist_of_whom_nothing_is_kept_and_who_names_a_removed_site_is_held_and_never_barred_for_it(
+def test_an_artist_of_whom_nothing_is_kept_and_who_names_a_removed_site_is_collected_and_never_barred_for_it(
     website, removed, capsys
 ):
     """The final critic's finding: a site barred for the artist who proved it theirs was named by another, and a
     profile's word put that other on the removal list for good. A site is anybody's to name, so it removes nobody:
-    whoever asked is barred by their handle and account (pipeline/removals.py). An artist whose profile names it,
-    in a link of any shape, is held: marked, nothing collected, nothing barred, and the site in nobody's row. Once
-    the profile no longer names it, they are collected like anybody."""
+    whoever asked is barred by their handle and account (pipeline/removals.py). The fifth critic's: nor may it hold
+    anybody back. An artist whose profile names it, in a link of any shape, is collected like anybody and counted:
+    nothing barred, nothing marked, and the site written nowhere here. A site of their own later is kept as any."""
     if removed == "before discovery":
         assert store.mark_removed("zz-fake-gone.art") == 0
     world = solo(website=website)
     if removed != "before discovery":
         assert store.mark_removed("zz-fake-gone.art") == 0  # it matches nobody: the row has a handle and no link
     counts = counts_of(world, capsys)
-    assert counts[collect.LISTS_REMOVED] == 1 and counts[collect.PURGED] == counts[collect.PROFILES] == 0
+    assert counts[collect.LISTS_REMOVED] == counts[collect.PROFILES] == 1 and counts[collect.PURGED] == 0
     assert not store.is_removed(ALPHA) and not library.account_removed(f"FAKE-USERID-{ALPHA}")
-    assert library.artist_keys() == [] and artist_marks() == {key(ALPHA): "lists a removed site"}
+    assert library.artist_keys() == [key(ALPHA)] and artist_marks() == {} and len(kept(ALPHA)) == 4
     assert len(raw("SELECT * FROM removed")) == 1  # the site, and nobody
-    assert [request.url.path for request in world.requests()] == [TOKEN_PATH, PROFILE_PATH + ALPHA]  # and no more
-    assert b"zz-fake-gone" not in config.LOCAL_DB.read_bytes()
-    world.profiles[ALPHA]["website"] = ""  # their profile no longer names it
-    assert counts_of(world, capsys)[collect.PROFILES] == 1 and artist_marks() == {}
+    assert links() == [None] and b"zz-fake-gone" not in config.LOCAL_DB.read_bytes()
+    world.profiles[ALPHA]["website"] = "https://zz-fake-alpha-new.art"  # a site of their own
+    assert counts_of(world, capsys)[collect.LISTS_REMOVED] == 0 and links() == ["https://zz-fake-alpha-new.art/"]
 
 
 def test_a_removed_site_that_three_profiles_list_puts_nobody_on_the_removal_list_on_a_profiles_word(capsys):
     """The guard on the rule above: a site that several artists list must not turn one removal into many, and one
-    answer given for every profile must not bar anybody. BRAVO and DELTA are collected, each with a page on the
-    site as website: not a site of their own, so no removal of it finds them by their row. ALPHA is a bare handle
-    whose profile names its front page. Nobody's word is anybody's removal: all three are held for as long as their
-    profile names it, keep everything, and are collected like anybody once it does not."""
+    answer given for every profile must not bar anybody, or hold anybody back. BRAVO and DELTA are collected,
+    each with a page on the site as website: not a site of their own, so no removal of it finds them by their row.
+    ALPHA is a bare handle whose profile names its front page. Nobody's word is anybody's removal: all three keep
+    everything and are collected like anybody, whatever their profile names."""
     world = solo(2, website="https://zz-fake-shared.art/")
     for name, n in ((BRAVO, 21), (DELTA, 41)):
         world.artist(name, website=f"https://zz-fake-shared.art/folio/{name.lower()}")
@@ -1655,16 +1654,16 @@ def test_a_removed_site_that_three_profiles_list_puts_nobody_on_the_removal_list
     was = stored()
     for _ in range(2):
         counts = counts_of(world, capsys)
-        assert counts[collect.LISTS_REMOVED] == 3 and counts[collect.PURGED] == counts[collect.REMOVED] == 0
-        assert artist_marks() == dict.fromkeys(map(key, (ALPHA, BRAVO, DELTA)), "lists a removed site")
-        assert stored() == was and not any(store.is_removed(name) for name in (ALPHA, BRAVO, DELTA))
+        assert counts[collect.LISTS_REMOVED] == counts[collect.PROFILES] == 3 and artist_marks() == {}
+        assert counts[collect.PURGED] == counts[collect.REMOVED] == 0 and nothing_lost(was) and kept(ALPHA) == [2, 1]
+        assert not any(store.is_removed(name) for name in (ALPHA, BRAVO, DELTA))
         assert len(raw("SELECT * FROM removed")) == 1  # the site
     world.profiles[ALPHA]["website"], world.profiles[BRAVO.lower()]["website"] = "", "https://zz-fake-bravo-new.art"
     world.profiles[DELTA]["website"] = ""
     assert counts_of(world, capsys)[collect.PROFILES] == 3 and artist_marks() == {} and kept(ALPHA) == [2, 1]
 
 
-def test_a_removed_site_two_profiles_list_holds_both_and_bars_neither(capsys):
+def test_a_removed_site_two_profiles_list_holds_back_neither_and_bars_neither(capsys):
     """The final critic's counterexample, from the other side: ALPHA proved the site theirs, and BRAVO, collected
     later, names it too. The site went on the list, and two profiles naming it made both one person's: BRAVO's
     handle and account went on the list for good. A removal bars only what it is bound to: here, the site."""
@@ -1673,7 +1672,7 @@ def test_a_removed_site_two_profiles_list_holds_both_and_bars_neither(capsys):
         world.profiles[name]["website"] = "https://zz-fake-gone.art/"
     assert store.mark_removed("zz-fake-gone.art") == 0
     counts = counts_of(world, capsys)
-    assert counts[collect.LISTS_REMOVED] == 2 and counts[collect.PURGED] == counts[collect.PROFILES] == 0
+    assert counts[collect.LISTS_REMOVED] == counts[collect.PROFILES] == 2 and counts[collect.PURGED] == 0
     assert not any(store.is_removed(name) or library.account_removed(f"FAKE-USERID-{name}") for name in names)
     assert len(raw("SELECT * FROM removed")) == 1 and len(store.all_artists()) == 2  # the site, and nobody
 
@@ -1682,7 +1681,7 @@ def test_a_removed_site_two_profiles_list_holds_both_and_bars_neither(capsys):
 def test_one_removed_website_answered_for_every_profile_in_a_short_run_removes_nobody(short, capsys):
     """The critic's counterexample: one removed site answered for every profile, in a run that read one profile,
     barred that artist for good: theirs was the only listing of the site the run had seen. A profile's word
-    removes nobody now, however many profiles a run reads: the artist it held stays held, and is read again."""
+    removes nobody now, however many profiles a run reads, and holds nobody back."""
     world, names = many(3)
     for name in names:
         world.profiles[name]["website"] = "https://zz-fake-gone.art/"  # the API's one wrong answer, for everybody
@@ -1694,10 +1693,10 @@ def test_one_removed_website_answered_for_every_profile_in_a_short_run_removes_n
         assert run(world) == 1
     capsys.readouterr()
     assert not any(store.is_removed(name) for name in names) and len(raw("SELECT * FROM removed")) == 1  # the site
-    assert artist_marks() == {key(names[0]): "lists a removed site"} and len(store.all_artists()) == 3
+    assert artist_marks() == {} and library.artist_keys() == [key(names[0])] and len(store.all_artists()) == 3
     world.detours.clear()
     counts = counts_of(world, capsys)
-    assert counts[collect.LISTS_REMOVED] == 3 and counts[collect.PURGED] == 0
+    assert counts[collect.LISTS_REMOVED] == counts[collect.PROFILES] == 3 and counts[collect.PURGED] == 0
     assert not any(store.is_removed(name) for name in names) and len(store.all_artists()) == 3
 
 
@@ -1723,18 +1722,17 @@ def test_a_run_that_is_stopped_still_purges_before_it_exits(capsys):
 
 
 @pytest.mark.parametrize("removal", ["zz-fake-alpha.art", "https://www.zz-fake-alpha.art/"])
-def test_an_artist_whose_own_site_is_removed_after_collection_is_held_and_neither_purged_nor_barred(removal, capsys):
+def test_an_artist_whose_own_site_is_removed_after_collection_is_collected_neither_purged_nor_barred(removal, capsys):
     """A site is anybody's to name, so its removal removes nobody: whoever asked for it is removed by their handle
-    and account (pipeline/removals.py). The artist whose row has it stays out: not asked about, not collected."""
+    and account (pipeline/removals.py). The fifth critic's: nor does it hold back the artist whose row has it, who
+    is collected like anybody and counted. The site goes no further: the crawl stage is not given it."""
     world = base()
     assert run(world) == 0
+    assert store.own_site_candidates() == [(key(ALPHA), "https://zz-fake-alpha.art/")]
     assert store.mark_removed(removal) == 0
-    seen = len(world.log)
     counts = counts_of(world, capsys)
-    assert counts[collect.PURGED] == 0 and counts[collect.PROCESSED] == 4
-    assert kept(ALPHA) == ALPHA_KEPT and not store.is_removed(ALPHA)
-    world.log[:] = world.log[seen:]
-    assert world.asked_about(ALPHA) == []
+    assert counts[collect.PURGED] == 0 and counts[collect.PROCESSED] == 5 and counts[collect.LISTS_REMOVED] == 1
+    assert kept(ALPHA) == ALPHA_KEPT and not store.is_removed(ALPHA) and store.own_site_candidates() == []
 
 
 @pytest.mark.parametrize("removal", [ALPHA, f"https://www.deviantart.com/{ALPHA}"])
@@ -1759,9 +1757,9 @@ def test_an_artist_removed_after_collection_is_purged_on_the_next_run(removal, c
 
 def test_the_removal_checks_run_between_two_artists_at_this_runs_pace_and_under_its_lock(monkeypatch, capsys):
     """The final critic's: a collect run holds the API for hours, and every removal check meanwhile stopped at once,
-    though the page promises an artist who asked for their code a look every hour. The run makes the checks itself,
-    every removals.EVERY, between two artists, through its own client: the API stays this run's throughout. The
-    database failing one is counted, and the run goes on."""
+    though the page promises an artist who asked for their code a look within a day. The run makes the checks
+    itself, every removals.EVERY, between two artists, through its own client: the API stays this run's throughout.
+    The database failing one is counted, and the run goes on."""
     world = base()
     monkeypatch.setattr(discover, "now", lambda: world.now)
     world.detours.append(
@@ -1786,8 +1784,30 @@ def test_the_removal_checks_run_between_two_artists_at_this_runs_pace_and_under_
     counts = summary(captured.out)
     assert len(looks) >= 2 and set(looks) == {(False, None)}
     assert counts[collect.PROVEN] == len(looks) and counts[collect.UNCHECKED] == 1
-    assert captured.err.startswith("a removal check failed: RuntimeError at collect.py") and "FAKE" not in captured.err
+    assert captured.err.startswith("a removal check failed: RuntimeError at") and "FAKE" not in captured.err
     assert counts[collect.PROCESSED] == 5 and kept(ALPHA) == ALPHA_KEPT and kept(BRAVO) == BRAVO_KEPT
+
+
+def test_the_api_refusing_a_removal_check_stops_the_run_as_it_would_on_an_artists_turn(monkeypatch, capsys):
+    """The fifth critic's uncaught break: a Stop from the checks swallowed like the database failing, so a run the
+    API kept refusing went on asking it. It stops the run there, and what was finished is kept."""
+    world = base()
+    monkeypatch.setattr(discover, "now", lambda: world.now)
+    world.detours.append(
+        lambda request: setattr(world, "now", world.now + 1000) if PROFILE_PATH in request.url.path else None
+    )
+
+    def refused(counts, *args, **kwargs):
+        raise discover.Stop("rate limited: the API kept refusing")
+
+    monkeypatch.setattr(removals, "run", refused)
+    capsys.readouterr()
+    assert run(world) == 1
+    captured = capsys.readouterr()
+    counts = summary(captured.out)
+    assert captured.err == "stopped: rate limited: the API kept refusing\n"
+    assert counts[collect.UNCHECKED] == counts[collect.PROVEN] == 0 and counts[collect.PROCESSED] == 1
+    assert kept(ALPHA) == ALPHA_KEPT and world.asked_about(BRAVO) == []
 
 
 def test_the_purge_comes_before_any_request_and_survives_a_run_that_fails(capsys, tmp_path):
@@ -1809,27 +1829,23 @@ def test_the_purge_comes_before_any_request_and_survives_a_run_that_fails(capsys
     assert cached() == image_files(ALPHA_KEPT)
 
 
-def test_a_collected_artist_whose_profile_comes_to_name_a_page_on_a_removed_site_is_held_and_never_barred(capsys):
+def test_a_collected_artist_whose_profile_comes_to_name_a_page_on_a_removed_site_is_collected_and_never_barred(
+    capsys,
+):
     """The critic's counterexample, and the final critic's from the other side. A collected artist's website field
-    names a page on a removed site: the profile's word holds them at once, marked, with nothing more collected, so
-    nothing of theirs is published while it does. It removes nobody: a site is anybody's to name, and whoever
-    asked for its removal is barred by their handle and account (pipeline/removals.py)."""
+    names a page on a removed site. It removes nobody: a site is anybody's to name, and whoever asked for its
+    removal is barred by their handle and account (pipeline/removals.py). The fifth critic's: nor does it hold them
+    back. They are collected like anybody, and the field is kept as one they emptied: the site is written nowhere
+    here, and the website kept from before is not sent either (push)."""
     world = base()
     assert run(world) == 0
-    was = rows("works", BRAVO)
     assert store.mark_removed("zz-fake-gone.art") == 0
     world.profiles[BRAVO.lower()] = profile(BRAVO, website="see WWW.ZZ-Fake-Gone.art/folio for more")
-    seen = len(world.log)
     counts = counts_of(world, capsys)
-    assert counts[collect.LISTS_REMOVED] == 1 and counts[collect.PURGED] == 0 and counts[collect.PROFILES] == 2
-    assert rows("works", BRAVO) == was and artist_marks()[key(BRAVO)] == "lists a removed site"
+    assert counts[collect.LISTS_REMOVED] == 1 and counts[collect.PURGED] == 0 and counts[collect.PROFILES] == 3
+    assert kept(BRAVO) == BRAVO_KEPT and key(BRAVO) not in artist_marks() and library.answers()[key(BRAVO)][1]
     assert not store.is_removed(BRAVO) and not library.account_removed(f"FAKE-USERID-{BRAVO}")
-    assert [request.url.path for request in world.since(seen) if "bravo" in str(request.url).lower()] == [
-        PROFILE_PATH + BRAVO
-    ]  # and nothing of theirs was asked for beyond the profile
     assert b"zz-fake-gone" not in config.LOCAL_DB.read_bytes().lower()
-    world.profiles[BRAVO.lower()] = profile(BRAVO)  # their profile no longer names it
-    assert counts_of(world, capsys)[collect.PROFILES] == 3 and key(BRAVO) not in artist_marks()
 
 
 def test_one_website_answered_for_every_profile_and_then_one_removal_takes_only_the_removed(capsys):
@@ -1850,10 +1866,11 @@ def test_one_website_answered_for_every_profile_and_then_one_removal_takes_only_
     assert counts_of(world, capsys)[collect.PROFILES] == 5 and stored()[0] == others  # and the run after it
 
 
-def test_an_own_site_kept_with_the_profile_is_in_the_stores_row_too_and_its_removal_holds_the_artist(capsys):
+def test_an_own_site_kept_with_the_profile_is_in_the_stores_row_too_and_its_removal_takes_it_from_the_crawl(capsys):
     """Round 8, with honest data: discovery saw no site, the artist added one, and a rerun kept it with the profile
-    only. Removing the site then found nobody. One place holds an artist's own site now: the store's row, where a
-    removal of the site holds her out. It removes nobody (store._named_by): she is neither purged nor barred."""
+    only. Removing the site then found nobody. One place holds an artist's own site now: the store's row, where the
+    crawl stage looks, and a removal of the site takes it off that stage's list. It removes nobody, and holds nobody
+    back (store._named_by): she is neither purged nor barred, and a new site of hers is hers to crawl."""
     world = solo(2)  # stored by discovery with no link
     world.artist(BRAVO)
     world.work(BRAVO, 21)
@@ -1861,50 +1878,50 @@ def test_an_own_site_kept_with_the_profile_is_in_the_stores_row_too_and_its_remo
     world.profiles[ALPHA]["website"] = "https://www.zz-fake-alpha.art"  # she adds a site of her own
     assert run(world) == 0 and rows("profiles", ALPHA)[0]["website"] == "https://www.zz-fake-alpha.art/"
     assert store.own_site_candidates() == [(key(ALPHA), "https://www.zz-fake-alpha.art/")]  # the row has it too
-    assert store.mark_removed("site:zz-fake-alpha.art") == 0  # and so the removal finds her, and holds her
-    assert key(ALPHA) not in [artist[0] for artist in store.all_artists()]
+    assert store.mark_removed("site:zz-fake-alpha.art") == 0 and store.own_site_candidates() == []
     world.profiles[ALPHA]["website"] = ""  # whatever she does with the field afterwards
-    seen = len(world.log)
     counts = counts_of(world, capsys)
-    assert counts[collect.PURGED] == 0 and library.artist_keys() == [key(ALPHA), key(BRAVO)]
+    assert counts[collect.PURGED] == 0 and counts[collect.PROFILES] == 2 and counts[collect.LISTS_REMOVED] == 1
+    assert library.artist_keys() == [key(ALPHA), key(BRAVO)] and store.own_site_candidates() == []
     assert not store.is_removed(ALPHA) and not library.account_removed(f"FAKE-USERID-{ALPHA}")
-    assert not [request for request in world.since(seen) if "alpha" in str(request.url).lower()]
+    world.profiles[ALPHA]["website"] = "https://zz-fake-alpha-new.art"
+    assert counts_of(world, capsys)[collect.LISTS_REMOVED] == 0
+    assert store.own_site_candidates() == [(key(ALPHA), "https://zz-fake-alpha-new.art/")]
 
 
 @pytest.mark.parametrize("website", ["https://zz-fake-alpha.art/", "", "N/A", "https://zz-fake-alpha-new.art"])
-def test_the_website_kept_for_an_artist_holds_them_for_a_removed_site_whatever_their_profile_says_now(website, capsys):
+def test_the_website_kept_for_an_artist_on_a_removed_site_is_counted_and_a_new_one_is_kept(website, capsys):
     """Round 8. A profile an earlier version kept, whose own site the store's row does not have, and the site
-    removed before her next turn: no removal found her. The website that is kept is what her profile has said,
-    and emptying the field, or changing it to another site, takes none of it back: she is held as if the field
-    still named the site. Held, and no more: a site removes nobody (store._named_by)."""
+    removed before her next turn: no removal found her. The fifth critic's: the website kept then held her back
+    whatever her profile said after, and one who changed her website stayed out for good. She is collected like
+    anybody. The removed site that is kept is counted and goes no further, and a new site of her own is kept and
+    written into her row. Nobody is barred: a site removes nobody (store._named_by)."""
     world = solo(2, website="https://zz-fake-alpha.art/")
     assert run(world) == 0
     raw("UPDATE artists SET links = '[]'")  # as the earlier version left it: the site is with the profile only
     assert store.mark_removed("site:zz-fake-alpha.art") == 0
     world.profiles[ALPHA]["website"] = website  # it names the site, says nothing, is refused, or names another
     counts = counts_of(world, capsys)
-    assert counts[collect.LISTS_REMOVED] == 1 and counts[collect.PURGED] == counts[collect.PROFILES] == 0
+    new = website == "https://zz-fake-alpha-new.art"
+    assert counts[collect.LISTS_REMOVED] == (not new) and counts[collect.PROFILES] == 1 and counts[collect.PURGED] == 0
     assert not store.is_removed(ALPHA) and not library.account_removed(f"FAKE-USERID-{ALPHA}")
-    assert library.artist_keys() == [key(ALPHA)] and artist_marks() == {key(ALPHA): "lists a removed site"}
+    refused = {key(ALPHA): library.REFUSED} if website == "N/A" else {}  # an answer the library refuses, as ever
+    assert library.artist_keys() == [key(ALPHA)] and artist_marks() == refused
+    assert links() == (["https://zz-fake-alpha-new.art/"] if new else [None])
 
 
-def test_every_profile_naming_a_removed_site_in_one_run_purges_nobody_and_marks_them(capsys):
+def test_every_profile_naming_a_removed_site_in_one_run_purges_nobody_and_holds_back_nobody(capsys):
     world, names = many(6)
     assert run(world) == 0
-    was, before = stored(), (rows("profiles"), rows("works"))
+    was = stored()
     assert store.mark_removed("zz-fake-gone.art") == 0
     for name in names:
         world.profiles[name]["website"] = "https://www.zz-fake-gone.art/"
-    seen = len(world.log)
     counts = counts_of(world, capsys)
-    assert counts[collect.LISTS_REMOVED] == 6 and counts[collect.PURGED] == counts[collect.REMOVED] == 0
-    assert stored() == was and (rows("profiles"), rows("works")) == before and len(cached()) == 6
-    assert artist_marks() == dict.fromkeys(map(key, names), "lists a removed site")
+    assert counts[collect.LISTS_REMOVED] == counts[collect.PROFILES] == 6 and artist_marks() == {}
+    assert counts[collect.PURGED] == counts[collect.REMOVED] == 0 and nothing_lost(was) and len(cached()) == 6
     assert not any(store.is_removed(name) for name in names) and len(raw("SELECT * FROM removed")) == 1  # the site
-    assert len(world.since(seen)) == 1 + 6  # a token and six profiles: nothing more is asked of a marked artist
-    for name in names:
-        world.profiles[name]["website"] = ""
-    assert counts_of(world, capsys)[collect.PROFILES] == 6 and artist_marks() == {} and nothing_lost(was)
+    assert b"zz-fake-gone" not in config.LOCAL_DB.read_bytes().lower()
 
 
 def test_a_removal_noticed_in_the_middle_of_a_run_is_purged_at_once(capsys):
@@ -3963,20 +3980,20 @@ FRONT_PAGE_SPELLINGS = [  # each is the front page of the removed site, in a spe
 @pytest.mark.parametrize("spellings", [FRONT_PAGE_SPELLINGS, odd_spellings("zz-fake-d.art")], ids=["plain", "odd"])
 def test_a_removed_site_is_recognised_however_the_website_field_spells_it(spellings, capsys):
     """Hard rule 7. The removal list is asked about every host the field names, before the own-site rule gets to
-    drop the link. An artist whose profile names a removed site is marked and held back, and nothing of theirs
-    is collected. That is one answer's word, so nobody is barred for it, and the next answer is read afresh."""
+    drop the link. A removed site, however written, goes in nobody's row and is written nowhere here, and holds
+    nobody back (the fifth critic's): the artist is collected like anybody, and counted. That is one answer's word,
+    so nobody is barred for it, and the next answer is read afresh."""
     assert store.mark_removed("site:zz-fake-d.art") == 0
     world, names = crowd(spellings)
     counts = counts_of(world, capsys)
-    assert counts[collect.LISTS_REMOVED] == len(names) and counts[collect.PROFILES] == 0  # in every spelling
-    assert artist_marks() == dict.fromkeys(map(key, names), "lists a removed site") and library.artist_keys() == []
-    assert len(world.requests()) == 1 + len(names)  # a token and a profile each: nothing more is asked of them
+    assert counts[collect.LISTS_REMOVED] == counts[collect.PROFILES] == len(names)  # in every spelling
+    assert artist_marks() == {} and library.artist_keys() == [key(name) for name in names]
     assert not any(store.is_removed(name) for name in names) and len(raw("SELECT * FROM removed")) == 1
     assert links() == [None] * len(names) and b"zz-fake-d" not in config.LOCAL_DB.read_bytes().lower()
-    for n, name in enumerate(names):  # the next run: each shows a clean site of their own, and is stored like anybody
+    for n, name in enumerate(names):  # the next run: each shows a clean site of their own, and it is kept as any
         world.profiles[name]["website"] = f"https://zz-fake-new-{n:02d}.art"
     counts = counts_of(world, capsys)
-    assert counts[collect.PROFILES] == len(names) and artist_marks() == {}
+    assert counts[collect.PROFILES] == len(names) and counts[collect.LISTS_REMOVED] == 0 and artist_marks() == {}
     assert links() == [f"https://zz-fake-new-{n:02d}.art/" for n in range(len(names))]
 
 
@@ -3986,8 +4003,8 @@ def test_a_removed_site_with_a_name_outside_ascii_is_recognised_too(capsys):
     spellings = [f"<https://{name}/folio>", f"{name.upper()} (commissions open)", f"https://www.{name}/?page=2"]
     world, names = crowd(spellings)
     counts = counts_of(world, capsys)
-    assert counts[collect.LISTS_REMOVED] == 3 and library.artist_keys() == []
-    assert not any(store.is_removed(name) for name in names)
+    assert counts[collect.LISTS_REMOVED] == 3 and library.artist_keys() == [key(name) for name in names]
+    assert not any(store.is_removed(name) for name in names) and artist_marks() == {}
 
 
 def test_only_the_website_field_is_read_for_hosts_never_the_bio_or_the_rest_of_the_profile(capsys):

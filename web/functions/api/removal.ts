@@ -7,15 +7,15 @@
 // them back while the page is open (sql/002_functions.sql: request_binding). A code is asked for in the turn of the
 // visitor's network (due_removals). The database counts the visitor first (client_wait: 10 removals a day, 20 a network,
 // the page a tenth of one), apart from the reads and with no total for everyone, so a day's reads used up cannot keep
-// an artist from this page; past that, a 429 that says how long to wait. Called as search.ts calls it. Only a JSON body is
-// read, so a form on another site cannot post here from a visitor's browser without the browser asking this site first,
-// which it never agrees to.
-import { network, NO_STORE, refused, site, wait, type Env } from './search'
+// an artist from this page; past that, a 429 that says how long to wait. Called as search.ts calls it, and like it
+// refused to another site's page (crossSite). Only a JSON body is read, too.
+import { crossSite, network, NO_STORE, notHere, refused, site, wait, type Env } from './search'
 
 export const TOO_MANY = 'Too many removal requests from your connection today.'
 const MAX_TICKET = 4096 // a ticket is the artist's slug, handle, site and account, signed: far less than this
 
 export async function claim(request: Request, env: Env, fetcher: typeof fetch = fetch): Promise<Response> {
+  if (crossSite(request)) return notHere()
   const slug = (new URL(request.url).searchParams.get('slug') ?? '').slice(0, 80) // no slug is longer (sql/001_schema.sql)
   if (!slug) return Response.json({ error: 'Which profile?' }, { status: 400, headers: NO_STORE })
   try {
@@ -29,6 +29,7 @@ export async function claim(request: Request, env: Env, fetcher: typeof fetch = 
 }
 
 export async function handle(request: Request, env: Env, fetcher: typeof fetch = fetch): Promise<Response> {
+  if (crossSite(request)) return notHere()
   const headers = NO_STORE
   const json = (request.headers.get('content-type') ?? '').startsWith('application/json')
   const body = ((json ? await request.json().catch(() => null) : null) ?? {}) as { slug?: unknown; note?: unknown; proof?: unknown; ticket?: unknown }

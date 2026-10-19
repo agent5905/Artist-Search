@@ -187,6 +187,9 @@ RENAMED = "renamed"  # the mark on the key an account was kept under before it t
 # The mark on an artist or a work of which something stayed as it was kept because the answer for it is one the
 # rules here refuse. What is kept may be out of date, so a later stage holds the artist or the work back.
 REFUSED = "answer refused"
+# The mark an earlier collect stage left on an artist whose profile named a removed site. None is made now, and it
+# holds nobody back (push): a site is anybody's to name. store_artist takes it off at the artist's next turn.
+LISTED = "lists a removed site"
 _MARKUP = re.compile(r"<[^<>]*>")
 # Characters that show nothing and are not in Unicode's "other" categories, which _settle removes wholesale:
 # the grapheme joiner, the Hangul and Khmer fillers, the Mongolian and the general variation selectors, blank braille.
@@ -840,8 +843,8 @@ def mark_artist(artist_key: str, reason: str, db: pathlib.Path | str | None = No
 def artist_marks(db: pathlib.Path | str | None = None) -> dict[str, tuple[str, str, str | None]]:
     """Every marked artist: key -> (reason, when, and for RENAMED the key the account goes by now).
 
-    A marked artist is one whose account the API called gone, whose profile names a removed site, whose answer
-    for a profile field was refused while an older one is kept (REFUSED), or whose account took another handle.
+    A marked artist is one whose account the API called gone, whose answer for a profile field was refused while
+    an older one is kept (REFUSED), or whose account took another handle (and, from before, LISTED).
     Their rows are all still here. Whether they are published is for a later stage.
     """
     with _open(db) as conn:

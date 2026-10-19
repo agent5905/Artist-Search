@@ -120,10 +120,12 @@ $$;
 -- request whose handle or account they bar has nothing left to ask, and is closed as 'removed', so it
 -- keeps their handle no longer (close_request is in the removal functions below). Its site alone does
 -- not close it: a site can pass to somebody else, and the request's artist is still there to ask.
+-- The removals' lock first (see request_binding): a request filed meanwhile is closed here, or files nothing.
 create or replace function public.removed_after_insert() returns trigger
 language plpgsql set search_path = ''
 as $$
 begin
+  perform pg_advisory_xact_lock(4207); -- the removals' lock
   perform public.delete_removed(array(select key_hash from added));
   perform public.close_request(r.id, 'removed')
   from public.removal_requests r
@@ -531,6 +533,14 @@ $$;
 -- Whom a request for the slug is bound to: what its page showed (the ticket), listed now or not; without a
 -- ticket, the artist listed under the slug now. Nobody whose handle or account is on the removal list already:
 -- they are gone, and a request would only keep their handle.
+-- That is asked under the removals' lock: a transaction advisory lock that whatever files a request
+-- (request_removal, start_removal_proof) and whatever puts keys on the list (grant_request, removed_after_insert)
+-- takes first and holds until it commits. So one of the two always sees what the other did: "Get my code" pressed
+-- while a proof is confirmed either files nothing or is closed by the removal. Without it, the request read the
+-- list as it was before the proof committed, and filed a new open request for the artist just removed, which
+-- was then looked at for good. Both are plpgsql, whose every statement reads the database afresh: every statement
+-- of an SQL function reads it as the first one did, before the lock was had.
+-- ponytail: one lock for every request and removal, a handful a day. Lock by key if they ever queue on it.
 create or replace function public.request_binding(p_slug text, p_ticket text)
 returns table (slug text, da_username text, site_url text, site_domain text, da_account text)
 language sql stable set search_path = ''
@@ -551,21 +561,24 @@ as $$
   limit 1
 $$;
 
--- Logs a request for the artist its page showed (request_binding), with the first request's note, bound to
--- their handle, site and account. Asking again for the same only counts, and moves nothing in the verifier's
--- queue. Always returns true, whatever the slug, so it gives nothing away.
+-- Logs a request for the artist its page showed (request_binding), bound to their handle, site and account,
+-- with its note. Asking again for the same only counts, and moves nothing in the verifier's queue; a note that
+-- says something takes the place of the one kept, so a stranger's empty first request hides nothing the artist
+-- writes after it. Always returns true, whatever the slug, so it gives nothing away.
 create or replace function public.request_removal(p_slug text, p_note text default null, p_ticket text default null)
 returns boolean
-language sql security definer set search_path = ''
+language plpgsql security definer set search_path = ''
 as $$
-  with logged as (
-    insert into public.removal_requests as r (artist_slug, note, da_username, site_url, site_domain, da_account)
-    select b.slug, left(p_note, 300), b.da_username, b.site_url, b.site_domain, b.da_account
-    from public.request_binding(p_slug, p_ticket) b
-    on conflict (artist_slug, da_key, site_key) where outcome is null do update set
-      last_at = now(), requests = r.requests + 1, da_account = coalesce(r.da_account, excluded.da_account)
-  )
-  select true
+begin
+  perform pg_advisory_xact_lock(4207); -- the removals' lock: see request_binding
+  insert into public.removal_requests as r (artist_slug, note, da_username, site_url, site_domain, da_account)
+  select b.slug, left(nullif(btrim(p_note), ''), 300), b.da_username, b.site_url, b.site_domain, b.da_account
+  from public.request_binding(p_slug, p_ticket) b
+  on conflict (artist_slug, da_key, site_key) where outcome is null do update set
+    last_at = now(), requests = r.requests + 1, da_account = coalesce(r.da_account, excluded.da_account),
+    note = coalesce(excluded.note, r.note);
+  return true;
+end
 $$;
 
 -- The proof code for a slug: derived from the slug and a secret, so it is the same every time, it is
@@ -581,24 +594,25 @@ $$;
 
 -- Tells the artist their code, and from then on the verifier looks for it: the request for the artist its
 -- page showed (request_binding) is filed if it was not, and its checks start over (hourly for a day, then
--- daily for two weeks, then weekly: pipeline/removals.py), due at once unless it already was, in the turn of
--- the network asking (p_network: due_removals). The code never changes. The answer has the same shape whether
--- the slug is unknown, hidden or visible; only an artist's slug is filed.
+-- every six hours for two weeks, then weekly: pipeline/removals.py), due at once unless it already was, in the
+-- turn of the network asking (p_network: due_removals). The code never changes. The answer has the same shape
+-- whether the slug is unknown, hidden or visible; only an artist's slug is filed.
 create or replace function public.start_removal_proof(p_slug text, p_ticket text default null, p_network text default null)
 returns text
-language sql security definer set search_path = ''
+language plpgsql security definer set search_path = ''
 as $$
-  with filed as (
-    insert into public.removal_requests as r
-      (artist_slug, da_username, site_url, site_domain, da_account, code_at, due_at, network)
-    select b.slug, b.da_username, b.site_url, b.site_domain, b.da_account, now(), now(),
-           encode(extensions.hmac('removal network ' || coalesce(p_network, ''), s.secret, 'sha256'), 'hex')
-    from public.request_binding(p_slug, p_ticket) b, public.removal_secret s
-    on conflict (artist_slug, da_key, site_key) where outcome is null do update set
-      code_at = now(), due_at = least(r.due_at, now()), da_account = coalesce(r.da_account, excluded.da_account),
-      network = excluded.network
-  )
-  select public.removal_code(p_slug)
+begin
+  perform pg_advisory_xact_lock(4207); -- the removals' lock: see request_binding
+  insert into public.removal_requests as r
+    (artist_slug, da_username, site_url, site_domain, da_account, code_at, due_at, network)
+  select b.slug, b.da_username, b.site_url, b.site_domain, b.da_account, now(), now(),
+         encode(extensions.hmac('removal network ' || coalesce(p_network, ''), s.secret, 'sha256'), 'hex')
+  from public.request_binding(p_slug, p_ticket) b, public.removal_secret s
+  on conflict (artist_slug, da_key, site_key) where outcome is null do update set
+    code_at = now(), due_at = least(r.due_at, now()), da_account = coalesce(r.da_account, excluded.da_account),
+    network = excluded.network;
+  return public.removal_code(p_slug);
+end
 $$;
 
 -- Service role only: the open requests a code was given out for that are due by p_now, p_limit at most, for
@@ -671,6 +685,9 @@ as $$
 declare
   keys text[];
 begin
+  -- The removals' lock (see request_binding) before the request's row: a request being filed holds the lock and
+  -- may wait on that row, so the other order could deadlock.
+  perform pg_advisory_xact_lock(4207);
   select array_remove(array[r.da_key, r.da_account, case when p_site and not exists (
            select 1 from public.artists a where a.site_key = r.site_key and a.da_key is distinct from r.da_key)
          then r.site_key end], null)

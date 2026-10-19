@@ -1286,6 +1286,19 @@ def test_a_removal_proof_is_read_from_two_addresses_of_an_own_site_and_nothing_e
         assert web.urls == [f"{root}robots.txt", f"{root}.well-known/x.txt", root]
 
 
+def test_a_removal_proof_has_a_budget_for_each_run_and_not_one_for_the_whole_process():
+    """The fifth critic's: a collect run is one process for days, and makes the removal checks every 15 minutes with
+    a fetcher of their own each time. The budget was the process's, so a site was read on two looks and never again
+    until the collect run ended. It is each fetcher's: a code put up after the tenth look is read on the eleventh."""
+    root = "https://janedoe.art/"
+    web = Web({root: reply(200, "<html><head><title>Jane</title></head><body>")})
+    for _ in range(10):
+        assert web.new_fetcher().read_proof(root, "x", lambda said: said == "yes") is False
+    web.routes[root] = reply(200, '<html><head><meta name="x" content="yes"></head><body>')
+    assert web.new_fetcher().read_proof(root, "x", lambda said: said == "yes") is True
+    assert len(web.urls) == 11 * 3 > crawl.PROOF_REQUEST_BUDGET  # robots.txt, the file and the front page, each look
+
+
 @pytest.mark.parametrize(
     ("root", "skip"),
     [
@@ -2100,10 +2113,13 @@ def test_a_site_that_drips_costs_a_proof_one_short_deadline_and_nothing_more_thi
     began = clock.now
     assert fetcher.read_proof(f"{SITE}/", "artist-search-removal", lambda said: True) == "robots"
     assert len(opened) == 1 and clock.now - began <= MIN + crawl.PROOF_SECONDS_PER_RESPONSE + 14.0
-    # Closed for the run: the next look, by any fetcher, asks the site nothing.
-    again, _ = over_the_wire(DRIPPED_HEAD, clock, per_read=14.0)
-    assert again.read_proof(f"{SITE}/", "artist-search-removal", lambda said: True) == "budget"
+    # Closed for the run: another look in it asks the site nothing.
+    assert fetcher.read_proof(f"{SITE}/", "artist-search-removal", lambda said: True) in ("robots", "budget")
     assert len(opened) == 1
+    # The next run, a fetcher of its own in the same process (a collect run makes one every 15 minutes), asks again.
+    again, reopened = over_the_wire(DRIPPED_HEAD, clock, per_read=14.0)
+    assert again.read_proof(f"{SITE}/", "artist-search-removal", lambda said: True) == "robots"
+    assert len(reopened) == 1
 
 
 def test_a_tls_handshake_that_never_ends_is_left_to_the_site_at_the_deadline(monkeypatch):

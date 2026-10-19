@@ -25,7 +25,7 @@ from urllib.parse import parse_qs
 import httpx
 import pytest
 
-from pipeline import config, discover, store
+from pipeline import config, discover, removals, store
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "scripts"))
 import gpu  # noqa: E402
@@ -72,6 +72,8 @@ artists stored: 9
 EXPECTED_STDOUT = (
     EXPECTED_TALLY
     + """\
+artists removed by the removal checks made during the run: 0
+removal checks made during the run that failed: 0
 requests to the API: 20
 rate limit answers from the API: 0
 server errors or no answer from the API: 0
@@ -307,6 +309,8 @@ def isolated(tmp_path, monkeypatch):
     monkeypatch.setattr(config, "LOCAL_DB", tmp_path / "default" / "pipeline.sqlite")
     monkeypatch.chdir(tmp_path)  # a stray relative write lands where everything_on_disk() looks
     monkeypatch.setattr(time, "sleep", lambda seconds: None)
+    # The removal checks a pass makes between its pages (look_between) find nothing due here: they are tested apart.
+    monkeypatch.setattr(removals, "run", lambda counts, *args, **kwargs: None)
 
 
 @pytest.fixture(autouse=True)
@@ -353,14 +357,14 @@ def test_every_candidate_is_stored_straight_from_the_tally_and_no_profile_is_eve
 
 def test_a_later_pass_leaves_the_link_the_collect_stage_wrote_into_a_row(db):
     """Discovery used to write each row's link from the profile it read. It reads none now, and must not blank
-    the own site that collection keeps in the row, which is where the removal of a site looks."""
+    the own site that collection keeps in the row, which is where the crawl stage looks."""
     assert run(world(), db) == 0
     assert store.keep_own_site(ALPHA, "https://zz-fake-alpha.art/", db) is True
     assert run(world(more=[ALPHA]), db) == 0  # a later pass, in which ALPHA has one work more
     assert stored(db)[0] == expected_row(ALPHA, 5, ["https://zz-fake-alpha.art/"])
     assert stored(db)[1:] == EXPECTED[1:]
-    assert store.mark_removed("site:zz-fake-alpha.art", db) == 0  # it bars nobody, and still finds them: held out
-    assert f"da:{ALPHA}" not in [key for key, _, _ in store.all_artists(db)]
+    assert store.mark_removed("site:zz-fake-alpha.art", db) == 0  # it bars nobody, and holds nobody back
+    assert f"da:{ALPHA}" in [key for key, _, _ in store.all_artists(db)] and store.own_site_candidates(db) == []
 
 
 def test_a_removed_artist_is_in_neither_list_handed_to_the_later_stages(db):
@@ -368,8 +372,8 @@ def test_a_removed_artist_is_in_neither_list_handed_to_the_later_stages(db):
     assert store.keep_own_site(ALPHA, "https://zz-fake-alpha.art/", db)  # as the collect stage does
     assert store.keep_own_site(BRAVO, "http://www.zz-fake-bravo.com/", db)
     store.mark_removed(f"da:{FOXTROT}", db)  # stored with no link
-    store.mark_removed("site:zz-fake-alpha.art", db)  # stored with a link
-    left = [key for key, *_ in without("da:zz-fake-foxtrot", "da:zz-fake-alpha")]
+    store.mark_removed("site:zz-fake-alpha.art", db)  # stored with a link: the site goes, and they stay
+    left = [key for key, *_ in without("da:zz-fake-foxtrot")]
     assert [key for key, _, _ in store.all_artists(db)] == left
     assert store.own_site_candidates(db) == [("da:zz-fake-bravo", "http://www.zz-fake-bravo.com/")]
     assert run(world(), db) == 0  # and a later pass brings neither back
@@ -638,25 +642,26 @@ def test_a_removal_in_the_middle_of_a_pass_leaves_no_row_that_names_the_artist_a
     assert (counts["candidates (>= 3 hits)"], counts["skipped (removed)"], counts["artists stored"]) == (9, 1, 8)
 
 
-def test_a_removed_site_keeps_out_the_artists_whose_stored_link_it_is_and_bars_nobody(db):
-    """The final critic's: a site is anybody's to name, so its removal removes nobody. Whoever links to it stays
-    out while the link is theirs; their handles are not barred."""
+def test_a_removed_site_holds_back_none_of_the_artists_whose_stored_link_it_is_and_bars_nobody(db):
+    """The final critic's: a site is anybody's to name, so its removal removes nobody. The fifth critic's: nor does
+    it hold anybody back, or an artist who changes their website stays out for good. Whoever links to it is handed
+    on like anybody; their handles are not barred, and the site is nobody's to crawl."""
     studio = "https://zz-fake-studio.art/"
     assert run(world(), db) == 0
     for name, site in ((ALPHA, studio), (BRAVO, "http://www.zz-fake-studio.art/")):
         assert store.keep_own_site(name, site, db)  # as the collect stage does, once it has read their profile
     assert store.mark_removed("site:zz-fake-studio.art", db) == 0
-    left = [key for key, *_ in without("da:zz-fake-alpha", "da:zz-fake-bravo")]
-    assert [key for key, _, _ in store.all_artists(db)] == left
+    left = [key for key, *_ in EXPECTED]
+    assert [key for key, _, _ in store.all_artists(db)] == left and store.own_site_candidates(db) == []
     assert not store.is_removed(f"da:{ALPHA}", db) and not store.is_removed(f"da:{BRAVO}", db)
-    assert run(world(), db) == 0  # a later pass leaves the link that holds them
+    assert run(world(), db) == 0  # a later pass leaves the link, and it holds them back no more than before
     assert [key for key, _, _ in store.all_artists(db)] == left
 
 
 def test_an_artist_whose_site_was_removed_before_they_were_ever_stored_is_known_here_by_handle_alone(db):
     """Discovery cannot know whose site a removed one is: it reads no profile. The artist is stored as a handle
     with no link. The removed site is written into nobody's row, and the collect stage, which reads the profile,
-    marks them and collects nothing (see its tests)."""
+    collects them like anybody and keeps it out of their row (see its tests)."""
     store.mark_removed("site:www.zz-fake-delta.co.uk", db)
     assert run(world(), db) == 0
     assert stored(db) == EXPECTED and not store.is_removed(f"da:{DELTA}", db)
@@ -1595,3 +1600,41 @@ def test_main_passes_credentials_and_the_limit_to_discover(monkeypatch, capsys):
     assert calls == [(CLIENT_ID, CLIENT_SECRET, 200)]
     out, err = capsys.readouterr()
     assert out + err == ""
+
+
+def test_a_pass_makes_the_removal_checks_between_its_pages_and_a_refusal_in_them_stops_it(db, capsys, monkeypatch):
+    """The fifth critic's: a pass holds the API for 72 minutes and made no removal check, and the scheduled ones
+    stopped at their first lookup, so an artist's code waited past the look the page promised. The pass makes them
+    itself, every removals.EVERY between two pages, through its own client and under its lock. The database failing
+    one is counted and the pass goes on; the API refusing one stops the pass, and is never swallowed."""
+    fake = world()
+    monkeypatch.setattr(removals, "EVERY", timedelta(seconds=10))  # five requests at the base pace
+    looks = []
+
+    def checks(counts, dry_run, client_id, client_secret, *, local=None, api=None):
+        assert (dry_run, local) == (False, db) and api.pace._lock is not None  # this pass's client, its lock held
+        looks.append(fake.clock)
+        counts["artists_removed"] += 1
+        if len(looks) == 2:
+            raise RuntimeError("FAKE-DATABASE-ERROR")
+
+    monkeypatch.setattr(removals, "run", checks)
+    with on_one_clock(fake):
+        assert run(fake, db) == 0
+    out, err = capsys.readouterr()
+    counts = summary(out)
+    assert len(looks) >= 3 and all(later - earlier >= 10 for earlier, later in itertools.pairwise(looks))
+    assert counts[discover.PROVEN] == len(looks) and counts[discover.UNCHECKED] == 1
+    assert err.startswith("a removal check failed: RuntimeError") and "FAKE" not in err
+    assert stored(db) == EXPECTED
+
+    def refused(counts, *args, **kwargs):
+        raise discover.Stop("rate limited: the API kept refusing")
+
+    monkeypatch.setattr(removals, "run", refused)
+    asked = len(fake.log)
+    with on_one_clock(fake):
+        assert run(fake, db) == 1
+    out, err = capsys.readouterr()
+    assert err == "stopped: rate limited: the API kept refusing\n" and summary(out)[discover.UNCHECKED] == 0
+    assert 0 < len(fake.log) - asked < BASE_REQUESTS and stored(db) == EXPECTED  # stopped there, nothing lost

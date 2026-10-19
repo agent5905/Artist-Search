@@ -1,6 +1,6 @@
 // Everything the pages ask for, all of it from the site's own server functions (functions/api/), which count each
 // visitor and call the database with a token of their own. The browser holds no database key.
-import { twice } from './rpc'
+import { OWN_PAGE, twice } from './rpc'
 
 /**
  * A work as the database returns it. The image is never copied: image_url is the source's own thumbnail.
@@ -48,10 +48,10 @@ export class Busy extends Error {
   }
 }
 
-/** One GET of a server function, asked once more if it fails. A 429 is Busy. */
+/** One GET of a server function, asked once more if it fails. A 429 is Busy. With the site's own header (OWN_PAGE). */
 const get = <T>(path: string) =>
   twice(async () => {
-    const response = await fetch(path, { signal: AbortSignal.timeout(20_000) })
+    const response = await fetch(path, { headers: { [OWN_PAGE]: '1' }, signal: AbortSignal.timeout(20_000) })
     if (response.status === 429) return new Busy(Number(response.headers.get('retry-after')) || 60) // not asked again
     if (!response.ok) throw new Error(`${path} answered ${response.status}`)
     return (await response.json()) as T
@@ -71,7 +71,7 @@ export const similarArtists = (slug: string) =>
 async function removal<T>(body: object): Promise<T> {
   const response = await fetch('/api/removal', {
     method: 'POST',
-    headers: { 'content-type': 'application/json' },
+    headers: { 'content-type': 'application/json', [OWN_PAGE]: '1' },
     body: JSON.stringify(body),
     signal: AbortSignal.timeout(20_000),
   })

@@ -16,7 +16,8 @@ for PASS_VALID after its first page. A run that finds an older one forgets it an
 else does: a run that finds a finished pass younger than that has nothing to browse and makes no request.
 
 Every request waits its turn in one place, Pace, which slows down when the API asks: for the rest of the run,
-and for the run after it, which begins at the pace this one ended with. One run talks to the API at a time.
+and for the run after it, which begins at the pace this one ended with. One run talks to the API at a time, and a
+pass holds it for an hour or more, so it makes the removal checks itself, between two pages (look_between).
 While a run is on, tell() keeps a file in the cache folder that says where it is.
 
 A tag the API refuses with a 4XX is noted on standard error and passed over: the run goes on to the next tag,
@@ -137,7 +138,7 @@ class Pace:
         # Seconds: waited so far, asked for before the next request, and counted towards the hour that stops a run.
         self.waited = self._asked = self._refused = 0.0
         self._lock: int | None = None
-        self._depth = 0  # times taken again while held: the removal checks a collect run makes (collect.py)
+        self._depth = 0  # times taken again while held: the removal checks a long run makes (look_between)
         self.tell: Callable[[], None] = lambda: None  # called before every request: see tell()
 
     def _file(self, kind: str) -> pathlib.Path:
@@ -268,7 +269,9 @@ _TALLY = (
     "artists stored",
 )
 _PACING = tuple(Pace(BASE_INTERVAL, "the API").counts())  # the labels of what the API's pace did
-_COUNTS = (*_TALLY, *_PACING)
+PROVEN = "artists removed by the removal checks made during the run"  # see look_between
+UNCHECKED = "removal checks made during the run that failed"
+_COUNTS = (*_TALLY, PROVEN, UNCHECKED, *_PACING)
 
 
 def tell(stage: str, counts: dict[str, int] | None = None) -> None:
@@ -297,6 +300,7 @@ class _Api:
         self._credentials = {"grant_type": "client_credentials", "client_id": client_id, "client_secret": client_secret}
         self._token = ""
         self.pace = Pace(BASE_INTERVAL, "the API")
+        self.looked = now()  # when the run this client is for began, or last made the removal checks (look_between)
 
     def _send(self, method: str, url: str, **kwargs: Any) -> httpx.Response:
         """One request at the pace of the run, asked for again while the answer is one to back off from: a 429
@@ -334,6 +338,28 @@ class _Api:
         return response
 
 
+def look_between(api: _Api, counts: dict[str, int], db: pathlib.Path | str | None) -> None:
+    """One run of the removal checks (pipeline/removals.py), once removals.EVERY has passed since this run began or
+    last made them. For a run that holds the API for long, a discovery run or a collect run: it calls this between
+    two of its own requests. The checks need the API, and an artist who asked for their code is promised a look
+    within a day. Through this run's client, at its pace and under its lock. The database failing them is counted,
+    and the run goes on; the API refusing stops the run, as it would on a request of its own."""
+    from pipeline import removals  # here, not above: removals imports this module
+
+    if now() < api.looked + removals.EVERY.total_seconds():
+        return
+    found = dict.fromkeys(removals.COUNTS, 0)
+    try:
+        removals.run(found, False, "", "", local=db, api=api)
+    except Stop:
+        raise
+    except Exception as exc:  # the database: a removal check is no reason to stop the run
+        counts[UNCHECKED] += 1
+        print(f"a removal check failed: {removals._where(exc)}", file=sys.stderr)
+    api.looked = now()
+    counts[PROVEN] += found["artists_removed"]
+
+
 @contextlib.contextmanager
 def _http_logs_off() -> Iterator[None]:
     """httpx logs every request URL at INFO, and a profile lookup's URL holds a handle. Not during a run."""
@@ -359,6 +385,7 @@ def _run(api: _Api, counts: dict[str, int], max_artists: int, db: pathlib.Path |
     for tag in NICHE_TAGS:
         offset, pages = progress.get(tag, (0, 0))
         while offset is not None and pages < PAGES_PER_TAG:
+            look_between(api, counts, db)  # a pass holds the API for an hour or more: the removal checks go on
             response = api.get("/browse/tags", tag=tag, offset=offset, limit=PAGE_SIZE)
             if 400 <= response.status_code < 500 and response.status_code != 401:  # a 429 never gets here
                 # The API will not serve this tag, and that says nothing of the next one. The tag is ours, so it

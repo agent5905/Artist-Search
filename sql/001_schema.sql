@@ -161,12 +161,13 @@ create index if not exists search_words_trgm_idx on public.search_words using gi
 -- for them (artists.da_account). Nothing afterwards changes what it is bound to, so the verifier finds that
 -- artist while they are not listed, and only that artist: a slug can pass to another handle, and a site to
 -- another artist. A later request for the same handle and site is the same request and
--- only counts (and fills in an account that was not known yet); one for anything else is a request of its
--- own (removal_requests_open_idx below). Nothing a visitor sends can erase what an artist wrote.
+-- only counts (and fills in an account that was not known yet, and takes its note if it has one: the owner
+-- reads the latest that says something); one for anything else is a request of its own
+-- (removal_requests_open_idx below). A request with no note erases no note.
 create table if not exists public.removal_requests (
   id bigint generated always as identity primary key, -- how the verifier and the owner name a request
   artist_slug text not null, -- the slug asked about; its proof code is that slug's. 'closed:<uuid>' once closed
-  note text, -- the first request's note
+  note text, -- the latest note that says something (request_removal)
   first_at timestamptz not null default now(),
   last_at timestamptz not null default now(),
   requests bigint not null default 1
