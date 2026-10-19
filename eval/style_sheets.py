@@ -64,7 +64,8 @@ def closest(conn: sqlite3.Connection, artist: str, other: str, model: str) -> li
 
 def site(conn: sqlite3.Connection) -> tuple[dict[str, list[list[pathlib.Path]]], dict[str, list[pathlib.Path]]]:
     """What push would send, by artist key: a row per neighbour, nearest first, of the works the site shows beside
-    the artist (the picks, or the neighbour's newest when there are none); and each artist's own works as sent."""
+    the artist (the picks, or the neighbour's newest when there are none), up to the page's first NEIGHBORS x
+    PER_ARTIST works, since a card can show fewer than PER_ARTIST; and each artist's own works as sent."""
     artists, works, neighbours, _ = push.build()
     keys = {row["slug"]: store.artist_key(row["da_username"]) for row in artists}
     files = dict(conn.execute("select page_url, image_file from works where image_file is not null"))
@@ -74,8 +75,11 @@ def site(conn: sqlite3.Connection) -> tuple[dict[str, list[list[pathlib.Path]]],
     rows: dict[str, list[list[pathlib.Path]]] = defaultdict(list)
     for row in sorted((row for row in neighbours if row["neighbor_slug"]), key=lambda row: row["rank"]):
         theirs = own[keys[row["neighbor_slug"]]]
-        rows[keys[row["artist_slug"]]].append([theirs[at] for at in (row["picks"] or range(len(theirs)))][:PER_ARTIST])
-    return {key: found[:NEIGHBORS] for key, found in rows.items()}, own
+        found = rows[keys[row["artist_slug"]]]
+        left = NEIGHBORS * PER_ARTIST - sum(map(len, found))
+        if left > 0:
+            found.append([theirs[at] for at in (row["picks"] or range(len(theirs)))][: min(left, PER_ARTIST)])
+    return rows, own
 
 
 def sheet(rows: list[list[pathlib.Path]], out: pathlib.Path) -> None:

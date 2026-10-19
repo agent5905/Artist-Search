@@ -445,10 +445,11 @@ $$;
 -- Other artists nearest in style: the artist's stored neighbours, best first, read by key. Nothing is
 -- computed here, so a call costs a handful of rows whatever the size of the index. An artist with no
 -- stored neighbours gets an empty answer. At most 24 are returned, whatever p_limit says, and a
--- hidden or removed neighbour takes up none of them. Each card leads with the neighbour's works that
--- were picked as closest to the seed's (artist_neighbors.picks); with none picked, their first four.
+-- hidden or removed neighbour takes up none of them. Each card shows the neighbour's works that were
+-- picked as closest to the seed's (artist_neighbors.picks), however few, and no others; with none
+-- picked, their first four.
 -- ponytail: a pick is a position, read when the card is built. Ceiling: while a load is between an
--- artist's works and the neighbour rows that name them, a card can lead with other works of theirs.
+-- artist's works and the neighbour rows that name them, a card can show other works of theirs.
 create or replace function public.similar_artists(p_slug text, p_limit int default 24) returns setof jsonb
 language sql stable security definer set search_path = ''
 as $$
@@ -464,7 +465,7 @@ as $$
     order by n.rank
     limit least(greatest(coalesce(p_limit, 24), 1), 24)
   )
-  select public.artist_card(page.neighbor_id, 4, null, page.picks)
+  select public.artist_card(page.neighbor_id, coalesce(cardinality(page.picks), 4), null, page.picks)
   from page
   order by page.rank
 $$;

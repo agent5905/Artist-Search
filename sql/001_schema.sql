@@ -131,8 +131,9 @@ create table if not exists public.artist_neighbors (
   neighbor_id bigint not null references public.artists (id) on delete cascade,
   rank smallint not null, -- 1 is the nearest
   score real not null,
-  -- Which of the neighbour's works to show beside this artist, best first: those closest in style to this
-  -- artist's own, each named by its works.position. Null when none were picked: the neighbour's own order.
+  -- Which of the neighbour's works to show beside this artist, best first, and no others: those closest in
+  -- style to this artist's own and close enough (pipeline/push.py), each named by its works.position. Null in
+  -- a row from before picks: the neighbour's own order.
   picks smallint[],
   primary key (artist_id, rank),
   constraint artist_neighbors_not_itself check (neighbor_id <> artist_id)
@@ -285,8 +286,10 @@ begin
       ('works', 'works_dimensions',
        'check ((width is null) = (height is null) and width between 1 and 100000 and height between 1 and 100000)'),
       ('works', 'works_one_per_key', 'unique (artist_id, key)'),
-      -- As many as a card shows, so the list is too short to carry anything else (hard rule 1).
+      -- As many as a card shows, so the list is too short to carry anything else (hard rule 1). And never none:
+      -- the card would show no work.
       ('artist_neighbors', 'artist_neighbors_few_picks', 'check (cardinality(picks) <= 4)'),
+      ('artist_neighbors', 'artist_neighbors_some_picks', 'check (cardinality(picks) >= 1)'),
       ('removal_requests', 'removal_requests_short', 'check (length(artist_slug) <= 80 and length(note) <= 300)'),
       ('removal_requests', 'removal_requests_outcome',
        $$check (outcome in ('proven', 'granted', 'rejected', 'removed'))$$),

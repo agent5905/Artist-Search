@@ -940,9 +940,9 @@ def test_a_site_two_artists_give_is_sent_for_neither(fake):
 def test_each_artist_gets_the_24_nearest_of_those_who_go_from_one_pass(fake, monkeypatch):
     handles = [f"yy-fake-n{n:02d}" for n in range(28)]
     for n, handle in enumerate(handles):
-        artist(handle, 4, angle=0.05 * n)
-    artist(BRAVO, 4, angle=0.0501, profile=None)  # two who do not go, in the middle of the others
-    artist(CHARLIE, 4, angle=0.4001, edits={0: {"rating": None}})
+        artist(handle, 4, angle=0.02 * n)  # all close enough to each other (push.STYLE_FLOOR)
+    artist(BRAVO, 4, angle=0.0201, profile=None)  # two who do not go, in the middle of the others
+    artist(CHARLIE, 4, angle=0.1601, edits={0: {"rating": None}})
     going = {f"da:{handle}": handle for handle in handles}
     asked, one_pass = [], style.all_neighbors
 
@@ -958,7 +958,8 @@ def test_each_artist_gets_the_24_nearest_of_those_who_go_from_one_pass(fake, mon
     counts = push.run(False)
     neighbours = fake.loads[-1][2]
 
-    assert asked == [("csd", 24, "local", set(going))]  # once, and the pool is the artists who go
+    # Once, and the pool is the artists who go. Deeper than 24, for those who are not close enough to be shown.
+    assert asked == [("csd", push.DEPTH, "local", set(going))]
     assert counts["artists_sent"] == 28 and counts["neighbours_sent"] == len(neighbours) == 28 * 24
     assert counts["artists_sent_without_neighbours"] == counts["neighbours_skipped_by_database"] == 0
     wanted = one_pass("csd", 24, "local", set(going))
@@ -979,7 +980,7 @@ def test_each_artist_gets_the_24_nearest_of_those_who_go_from_one_pass(fake, mon
     assert sorted(row["rank"] for row in push.build()[2] if row["artist_slug"] == handles[0]) == list(range(1, 25))
 
 
-def test_a_neighbour_is_sent_with_their_works_closest_to_the_artists_counting_only_the_works_that_go(fake):
+def test_a_neighbour_is_sent_with_their_works_closest_to_the_artists_and_close_enough_of_those_that_go(fake):
     mine = artist(ALPHA, 12)  # ten go: the two oldest are over the limit
     theirs = artist(BRAVO, 6)
     bare = artist(CHARLIE, 12)
@@ -996,17 +997,43 @@ def test_a_neighbour_is_sent_with_their_works_closest_to_the_artists_counting_on
         conn.executemany("DELETE FROM style_vectors WHERE deviation_id = ?", [(work["id"],) for work in bare[:10]])
 
     push.run(False)
-    picks = {(row["artist_slug"], row["neighbor_slug"]): row["picks"] for row in fake.loads[-1][2]}
+    picks = {(row["artist_slug"], row["neighbor_slug"]): row.get("picks") for row in fake.loads[-1][2]}
 
-    assert len(picks) == 6  # each is sent as a neighbour of the other two
-    # By position, best first: BRAVO's copy of ALPHA's ninth work, then 0.8 and 0.6 with it, then the first of
-    # those like nothing of ALPHA's that goes. The copy of the two that do not go is one of those: it does not lead.
-    assert picks[ALPHA, BRAVO] == [4, 5, 3, 0]
+    # By position, best first: BRAVO's copy of ALPHA's ninth work, then 0.8 and 0.6 with it (the floor is
+    # 0.575). Not the works like nothing of ALPHA's that goes, though four would fit: the copy of the two that
+    # do not go is one of those.
+    assert picks[ALPHA, BRAVO] == [4, 5, 3]
     # And of ALPHA's works, only those that go are picked from: the two oldest, BRAVO's third exactly, are not.
-    assert picks[BRAVO, ALPHA] == [8, 7, 9, 0]
-    # Nothing to measure with, or nothing to measure: no picks, and the neighbour's newest works are shown.
-    assert [picks[pair] for pair in picks if CHARLIE in pair] == [None] * 4
+    assert picks[BRAVO, ALPHA] == [8, 7, 9]
+    # Nothing to measure with, or nothing to measure: CHARLIE is nobody's neighbour, and has none.
+    assert picks == {(ALPHA, BRAVO): [4, 5, 3], (BRAVO, ALPHA): [8, 7, 9], (CHARLIE, None): None}
     assert not any(work["id"].lower() in fake.sent() for work in mine + theirs + bare)  # a position is no id
+
+
+def test_a_neighbour_without_enough_works_close_enough_makes_way_for_the_next(fake, monkeypatch):
+    artist(ALPHA, angle=0.0)
+    artist(BRAVO, angle=1.0)  # every work of theirs 0.54 from every one of ALPHA's: under the floor
+    lone = artist(CHARLIE, angle=1.0)
+    artist(DELTA, angle=0.3)  # 0.96: all of them close enough
+    with closing(sqlite3.connect(config.LOCAL_DB)) as conn, conn:  # one work of CHARLIE's is ALPHA's own style
+        conn.execute(
+            "UPDATE style_vectors SET vector = ? WHERE deviation_id = ?", (style_vector(0.0, 0), lone[2]["id"])
+        )
+    # The style stage ranks them CHARLIE, BRAVO, DELTA for ALPHA, and only one is to be sent.
+    ranked = [(f"da:{handle}", 1 - n / 10) for n, handle in enumerate((CHARLIE, BRAVO, DELTA))]
+    monkeypatch.setattr(style, "all_neighbors", lambda model, top, rule, among, db: {f"da:{ALPHA}": ranked})
+    monkeypatch.setattr(push, "NEIGHBOURS", 1)
+
+    def sent():
+        return [(row["neighbor_slug"], row.get("picks")) for row in push.build()[2] if row["artist_slug"] == ALPHA]
+
+    # CHARLIE has one work close enough, which can be chance; BRAVO has none. DELTA takes the place, with four.
+    [(slug, picks)] = sent()
+    assert slug == DELTA and len(picks) == push.PICKS
+    monkeypatch.setattr(push, "MIN_PICKS", 1)  # one is enough now: CHARLIE, with that work alone
+    assert sent() == [(CHARLIE, [2])]
+    monkeypatch.setattr(push, "STYLE_FLOOR", 0.5)  # and with a lower floor, all four of CHARLIE's closest
+    assert [len(picks) for _, picks in sent()] == [push.PICKS]
 
 
 def test_an_artist_who_goes_without_neighbours_loses_the_ones_they_had(fake):
@@ -1682,7 +1709,7 @@ def test_a_removal_covers_the_account_under_every_handle_it_is_kept_under(fake, 
 
 def test_neighbour_rows_going_all_at_once_are_not_believed(fake, capsys):
     for n in range(12):
-        artist(f"yy-fake-s{n:02d}", 4, angle=0.1 * n)
+        artist(f"yy-fake-s{n:02d}", 4, angle=0.05 * n)  # all close enough to each other (push.STYLE_FLOOR)
     push.run(False)
     before = list(fake.neighbors)
     assert len(before) == 12 * 11
@@ -1705,7 +1732,7 @@ def test_neighbour_rows_going_all_at_once_are_not_believed(fake, capsys):
 def test_a_neighbour_row_that_is_replaced_or_goes_with_its_artist_is_not_a_row_lost(fake):
     handles = [f"yy-fake-r{n:02d}" for n in range(27)]
     for n, handle in enumerate(handles):
-        artist(handle, 4, angle=0.05 * n)
+        artist(handle, 4, angle=0.02 * n)  # all close enough to each other (push.STYLE_FLOOR)
     assert push.run(False)["neighbours_sent"] == 27 * 24
     with closing(sqlite3.connect(config.LOCAL_DB)) as conn, conn:  # one stops qualifying: 24 artists name them
         conn.execute("DELETE FROM artist_profiles WHERE artist_key = ?", (f"da:{handles[3]}",))

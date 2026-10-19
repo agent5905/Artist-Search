@@ -40,7 +40,7 @@ ALPHA, BRAVO, CHARLIE, DELTA = "zz-fake-alpha", "ZZ-Fake-Bravo", "zz-fake-charli
 ECHO, FOXTROT, RENAMED = "zz-fake-echo", "zz-fake-foxtrot", "zz-fake-renamed"
 
 # What a response carries that must never be kept, printed or logged (hard rule 6), and the numbers that go with it.
-PRIVATE = (
+PRIVATE: tuple[str, ...] = (
     "FAKE-EMAIL",
     "REALNAME",
     "FAKE-COUNTRY",
@@ -1344,7 +1344,8 @@ def test_a_work_that_left_the_gallery_stays_and_one_that_stopped_qualifying_is_m
     assert run(world) == 0 and work_marks() == {}  # and a mark goes when the reason does
 
 
-GIVEN = {  # what an entry of the documented shape can give for a field, when it gives nothing that can be kept
+# What an entry of the documented shape can give for a field, when it gives nothing that can be kept.
+GIVEN: dict[str, list[object]] = {
     "title": ["missing", None, 7, ["FAKE"], "", "  "],
     "published_time": ["missing", None, "FAKE", ["FAKE"]],
     "thumbs": ["missing", None, 7, [], ["FAKE"], [{"FAKE": 1}]],
