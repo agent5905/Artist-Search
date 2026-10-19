@@ -1161,4 +1161,21 @@ What fails is the content. Nothing checks fitness beyond sex and gore, so the fi
 - **Images:** a new GPU check of every image for fetish content, hate symbols and sexualised minors. Ordinary game violence, monsters and horror stay.
 - **Next:** the code gaps follow in a small push round after the claim-or-remove critic reports.
 
+**Claim-or-remove's fourth critic: not ready for the public.**
+- **Holds:** removals are permanent, no secret reaches the browser, a log or the repository, and the SQL is sound as written. The tests caught 106 of 109 breaks.
+- **Fails:**
+  1. **A barred site removes whoever else names it.** One artist's own proof can permanently remove a second artist who never asked. The local store treats two artists naming a site as one person.
+  2. **A request is lost** if push holds the artist back while their claim page is open.
+  3. **The page promises an hourly look,** but a collect run holds the API for hours.
+  4. **Under a flood of codes,** a real artist's look waits hours, and up to a day.
+  5. **About 10 networks can use up the day's 1,000 reads.** One address can burn Cloudflare's 100,000 free daily function calls, which only an edge rule (a domain) prevents.
+- **Still a known limit:** whoever buys a domain an artist let lapse can prove a removal.
+
+**Removals round 5, being built,** together with push's gaps that share the root:
+- A proof or grant bars only the keys its request is bound to, and corrupt local data stops a run instead of widening a removal.
+- Requests are filed whatever the artist's state.
+- The page promises only what is true.
+- Checks are fair under a flood, and the limits are rebalanced within the free tiers.
+- The edge rule is written up for when a domain exists.
+
 **A Pages project of its own.** The project `.env` named is the owner's own August site, on a different Supabase, and the owner keeps it. With the owner's approval, Artist Search now has its own empty project, `artist-search` (`artist-search.pages.dev`, nothing deployed), and `.env` points at it. No domain is needed. The edge rate-limiting rule needs one, but the database's own limits cover visitors, networks and the total.
