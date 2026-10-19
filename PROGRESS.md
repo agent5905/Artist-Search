@@ -1137,3 +1137,28 @@ Nothing has been pushed; none of these reached the public.
 - **Ceiling, if it matters:** a follow-up question for the 643 works held as photos ("a photograph of a physical artwork the artist made?") would take about 11 minutes of GPU.
 
 **Running:** the final critics of push (its fifth) and of claim-or-remove (its fourth). This time the push critic also judges what a build from a copy of the real, fully analysed store would send.
+
+### Round 32: push's fifth critic, no on content; a Pages project of its own (2026-10-19)
+
+**Push's fifth critic: "do not run the first real load yet."** The code holds: removal, the deletion guard, the snapshot, reruns, the database's constraints, the closeness floor (0 of 219,412 picks under it, recomputed independently) and the tag list (no unlisted tag gets through, by any trick tried). The tests caught 35 of 36 breaks.
+- **What a build on the real data would send:** 2,948 artists and 27,245 works.
+- **Held back:** 689 artists with an adult portfolio and 292 whose profile was excluded. Works held back include 4,194 suggestive, 1,986 declared AI, 765 that failed the artwork check and 709 the tagger marked not artwork.
+
+What fails is the content. Nothing checks fitness beyond sex and gore, so the first load would show studios:
+- **AI accounts:** 12 artists whose taglines declare AI art, with 101 works; AI was read only per work.
+- **Taglines:** one explicit sexual phrase, three announcing fetish interests, two "18+ only", about seven profane, and three naming a social handle.
+- **Works rated safe:** fetish art (vore, body inflation), a poster dominated by swastikas, and two titles containing "loli".
+- **Smaller code gaps:**
+  - Corrupted local account hashes can widen a removal.
+  - Granted removals of an account with an older handle stop every run until `--allow-delete`.
+  - One path does not make vectors unit length.
+  - One test gap.
+  - The tag `creepypasta` comes off the list.
+
+**Fit-to-show round, being built:**
+- **Artists' own words:** read by the model, not a word list, since many artists write "NO AI". An artist declaring AI art or an adult or fetish account is held back; profanity or a social handle drops the tagline only.
+- **Titles:** checked for sexual, fetish and hate content.
+- **Images:** a new GPU check of every image for fetish content, hate symbols and sexualised minors. Ordinary game violence, monsters and horror stay.
+- **Next:** the code gaps follow in a small push round after the claim-or-remove critic reports.
+
+**A Pages project of its own.** The project `.env` named is the owner's own August site, on a different Supabase, and the owner keeps it. With the owner's approval, Artist Search now has its own empty project, `artist-search` (`artist-search.pages.dev`, nothing deployed), and `.env` points at it. No domain is needed. The edge rate-limiting rule needs one, but the database's own limits cover visitors, networks and the total.
