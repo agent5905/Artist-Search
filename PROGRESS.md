@@ -1085,3 +1085,26 @@ Nothing has been pushed; none of these reached the public.
 - **A scan of the whole collection for one image under two artists** finds almost nothing. 78 of the 80 pairs at cosine 0.98 or more are a single "No AI" banner that 13 artists posted, which the tagger already marks as not artwork. That leaves 3 images shared between two accounts, out of 39,744.
 
 **Running:** the "is this artwork?" check is being built; its full run over every work follows on the GPU.
+
+### Round 30: the artwork check, built and running (2026-10-18)
+
+**A focused question for every image:** is it mainly a piece of visual art? Merged as a stage of its own. The tag and format readings and their prompts are untouched, so the blind-checked ratings do not shift.
+- **Held back:** screenshots, mainly-text images, commission or price adverts, contact and QR cards, memes and templates, photos that are not of art, and blurred placeholders.
+- **Kept on purpose:** design sheets, turnarounds and callouts with labels, comic pages and framed card art. When the model cannot tell, the work is kept.
+- **Push:** it holds back a work the check finds is not art, and one not yet checked. So push waits for the full run.
+
+**Measured by the builder on 449 real works it drew itself:**
+
+| Group | Held back |
+|---|---|
+| The two known leaks (the anti-AI banner, the profile card) | 2 of 2 |
+| Works whose descriptions hint at non-art | 121 of 157 |
+| Works the tagger already marks not artwork | 39 of 40 |
+| Labelled design sheets, other sheets, comic pages, card art | 7 of 130, all of them correct |
+| A random sample | 3 of 120, all of them correct |
+
+- **Errors:** one clear wrong hold (photos of a handmade plush) and three arguable ones; about 8 misses among the hinted works, such as a "meet the artist" template and a shop collage.
+- **Lead's defaults on the arguable kinds:** screenshots of drawing programs showing work in progress stay held, since the artist's finished works show the same. Adoptable design sheets with prices stay in. Photoreal renders the model calls photos stay held.
+- **Speed:** 1.03 seconds an image, so about 11.5 hours for all 39,744. The worker runs this stage alone, started at 19:50.
+- **Tests:** 4,939 pass.
+- **Next:** a blind critic samples what it held and what it kept, before the push.
