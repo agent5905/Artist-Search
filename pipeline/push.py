@@ -101,8 +101,17 @@ SAFE_RATING = "safe"  # the only rating a work is sent with
 ADULT_RATINGS = ("suggestive", "explicit")
 NEIGHBOURS = 24  # similar artists sent for each artist: as many as similar_artists ever returns
 # Of a similar artist's works, those picked to show beside the artist: as many as a card shows, and as the
-# database takes (sql/001_schema.sql: artist_neighbors_few_picks).
-PICKS = 4
+# database takes (sql/001_schema.sql: artist_neighbors_few_picks). Only a work whose best style match among the
+# artist's works is STYLE_FLOOR or more is picked, and a similar artist is sent only with MIN_PICKS such works:
+# one close work can be chance. Those who drop out make way for the next, of the DEPTH nearest.
+PICKS, MIN_PICKS = 4, 2
+DEPTH = 4 * NEIGHBOURS  # measured: 22.1 similar artists an artist on average, 22.4 at 200 deep
+# How the floor was set (2026-10-18, 400 published artists drawn at random, none of the test seeds): the share
+# of candidate works whose medium the tagging stage reads as the artist's main one climbs with the cosine, from
+# 0.59 under 0.45 to 0.80 at 0.55 to 0.575, and holds at 0.82 to 0.86 from 0.575 up. The manner (anime, cartoon,
+# realistic) levels off there too; the format keeps rising slowly. About a quarter of an artist's own works are
+# further than 0.575 from their nearest other one.
+STYLE_FLOOR = 0.575
 # Of the artists the database holds, of their works or of their neighbour rows: more than this going at once is
 # not believed.
 DELETE_PERCENT = 10
@@ -110,7 +119,7 @@ DELETE_PERCENT = 10
 # removals may always bar beyond those the two removal lists name (see run).
 DELETE_FLOOR = 5
 TEST_SLUG = "zz-"  # how the other builders' test rows begin. Never sent, and a database that has one is left alone
-STYLE_MODEL, STYLE_RULE = "csd", "local"  # round 7's blind test chose them
+STYLE_MODEL, STYLE_RULE = "csd", "local"  # round 7's blind test chose them; "few" did no better on the tags
 MAX_SEARCH_TEXT = 4000  # sql/001_schema.sql: artists_own_words_sizes
 # Builds a run makes when the store changes under them (see build); the last is sent. ponytail: two, because with
 # collection running a commit lands in nearly every build (10 s on 2026-10-13), and a third would be as stale.
@@ -357,9 +366,10 @@ def build(
 
     Everything in an artist's row that comes from their works comes from the works that are sent, and a
     neighbour is always an artist who is sent too. A neighbour's row says which of their works to show beside
-    the artist: the PICKS closest in style to the artist's (style.all_closest_works), best first, counting only
-    works that are sent on either side. An artist who goes and has no neighbour gets one row that names no
-    neighbour (see the end of _build).
+    the artist: of the PICKS closest in style to the artist's (style.all_closest_works), best first, counting only
+    works that are sent on either side, those that pass STYLE_FLOOR. A neighbour with fewer than MIN_PICKS of
+    them is not sent, and the next nearest takes their place. An artist who goes and has no neighbour gets one
+    row that names no neighbour (see the end of _build).
 
     Every read is of one copy of the store made at one moment (store.snapshot), so the rows are all of that
     moment: no title goes under the reading of another, and no card is sent of works a mark made since has
@@ -537,19 +547,25 @@ def _build(local: store.Snapshot, removed: Collection[str]) -> tuple[Rows, Rows,
             row["site_url"] = row["site_domain"] = None
     # One pass, with the artists who go as the whole pool. What comes back is still held to that pool here: this
     # is the last place an artist who was left out could get into a row.
-    near = style.all_neighbors(STYLE_MODEL, NEIGHBOURS, STYLE_RULE, set(slugs), local)
-    going = {
+    near = style.all_neighbors(STYLE_MODEL, DEPTH, STYLE_RULE, set(slugs), local)
+    nearest = {
         key: [
             (other, score)
             for other, score in near.get(key, [])
             if other in slugs and other != key and math.isfinite(score)
-        ][:NEIGHBOURS]
+        ]
         for key in slugs
     }
     # What a neighbour is shown with beside the artist: of the neighbour's works that go, the closest in style to
-    # the artist's that go. A work is named by its position among its artist's, never by its deviation id.
-    pairs = [(key, other) for key, others in going.items() for other, _ in others]
-    closest = style.all_closest_works(pairs, sent, STYLE_MODEL, PICKS, local)
+    # the artist's that go and close enough. A work is named by its position among its artist's, never by its
+    # deviation id. ponytail: picks for all DEPTH nearest, though most artists fill NEIGHBOURS from the first
+    # 48. Measured on 2026-10-18: 7.6 s for 2,967 artists. Go down each artist's list in turn if that grows.
+    pairs = [(key, other) for key, others in nearest.items() for other, _ in others]
+    closest = style.all_closest_works(pairs, sent, STYLE_MODEL, PICKS, local, STYLE_FLOOR)
+    going = {
+        key: [(other, score) for other, score in others if len(closest[key, other]) >= MIN_PICKS][:NEIGHBOURS]
+        for key, others in nearest.items()
+    }
     neighbours: Rows = []
     for key, slug in slugs.items():
         # replace_neighbors (sql/002_functions.sql) leaves an artist it gets no row for with the neighbours they
@@ -561,8 +577,7 @@ def _build(local: store.Snapshot, removed: Collection[str]) -> tuple[Rows, Rows,
                 "neighbor_slug": slugs[other],
                 "rank": rank,
                 "score": round(score, 4),
-                # None when either has no work that goes with a style vector: the neighbour's newest are shown.
-                "picks": [sent[other].index(work) for work in closest[key, other]] or None,
+                "picks": [sent[other].index(work) for work in closest[key, other]],  # MIN_PICKS to PICKS of them
             }
             for rank, (other, score) in enumerate(going[key], start=1)
         ] or [{"artist_slug": slug, "neighbor_slug": None, "rank": None, "score": None}]

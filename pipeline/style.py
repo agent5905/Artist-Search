@@ -19,6 +19,7 @@ import argparse
 import contextlib
 import io
 import json
+import math
 import os
 import pathlib
 import sqlite3
@@ -35,8 +36,9 @@ from pipeline import library
 DIMENSIONS = 768  # sql/001_schema.sql: works.style_embedding is halfvec(768)
 BATCH = 16
 WRITE_EVERY = 256  # works a transaction. The file is shared, and a commit can take seconds when the disk is busy
-RULES = ("best", "mutual", "local")  # how all_neighbors() scores a candidate
-NEAREST = 10  # rule "local": how many of an artist's nearest artists their usual closeness is taken over
+RULES = ("best", "mutual", "local", "few")  # how all_neighbors() scores a candidate
+NEAREST = 10  # rules "local" and "few": how many of an artist's nearest artists their usual closeness is taken over
+FEW = 4  # rule "few": how many of an artist's works are judged, as many as a card shows (push.PICKS)
 
 # model -> (repository on huggingface.co, pinned commit, the files needed). Nothing else is ever fetched.
 WEIGHTS = {
@@ -255,7 +257,7 @@ def all_neighbors(
     """For every artist with vectors: the artists most like them, best first, as (artist key, score).
 
     `among`, when given, is the pool: the artist keys that count. An artist outside it has no entry, is in
-    nobody's list, and is not one of anybody's nearest artists for rule "local".
+    nobody's list, and is not one of anybody's nearest artists for rules "local" and "few".
 
     rule "best" is the mean, over the seed's works, of the best cosine match among the candidate's works. One
     work of a candidate can be the best match for all of them, so it favors an artist with a bit of everything.
@@ -265,6 +267,10 @@ def all_neighbors(
     rule "local" corrects "mutual" for artists who are fairly near everyone, and so turn up for every seed:
     twice the pair's mutual score, less each one's usual closeness, which is the mean of their mutual scores
     with their NEAREST nearest artists (all the others, when there are fewer). It can be negative.
+    rule "few" is "local" with each side judged by its FEW works most like the other's alone (all its works,
+    when it has fewer): the mean of the FEW highest of the candidate's works' best matches among the seed's,
+    and the same the other way round. So the rest of a portfolio neither helps nor counts against it, as a
+    card shows only those few.
 
     Ties go to the lower key. Never the artist themselves, and never an artist without vectors, who has no
     entry either. ValueError for any other rule.
@@ -289,11 +295,16 @@ def all_neighbors(
     best = np.concatenate(
         [np.maximum.reduceat(works[at : at + 2048] @ works.T, starts, axis=1) for at in range(0, len(works), 2048)]
     )
-    scores = np.add.reduceat(best, starts, axis=0) / counts[:, None]  # scores[a, b]: "best", seed a, candidate b
+    if rule == "few":  # scores[a, b]: the mean of the FEW highest of a's works' best matches among b's
+        scores = np.stack(
+            [np.sort(best[at : at + n], axis=0)[-FEW:].mean(axis=0) for at, n in zip(starts, counts, strict=True)]
+        )
+    else:
+        scores = np.add.reduceat(best, starts, axis=0) / counts[:, None]  # scores[a, b]: "best", seed a, candidate b
     if rule != "best":
         scores = (scores + scores.T) / 2
     np.fill_diagonal(scores, -np.inf)  # an artist is not their own neighbor, nor one of their own nearest
-    if rule == "local":
+    if rule in ("local", "few"):
         usual = np.sort(scores, axis=1)[:, -min(NEAREST, len(keys) - 1) :].mean(axis=1)
         scores = 2 * scores - usual[:, None] - usual
     found = {}
@@ -324,10 +335,11 @@ def closest_works(
     return [list(theirs)[at] for at in _closest(seed, others, top)]
 
 
-def _closest(seed: np.ndarray, others: np.ndarray, top: int) -> list[int]:
-    """closest_works()'s rule on two stacks of vectors: the rows of `others`, best first, a tie to the lower row."""
+def _closest(seed: np.ndarray, others: np.ndarray, top: int, floor: float = -math.inf) -> list[int]:
+    """closest_works()'s rule on two stacks of vectors: the rows of `others`, best first, a tie to the lower row.
+    Only rows whose best match is `floor` or more."""
     best = (others @ seed.T).max(axis=1)  # unit length already: a dot product is the cosine
-    return np.argsort(-best, kind="stable")[:top].tolist()
+    return [at for at in np.argsort(-best, kind="stable")[:top].tolist() if best[at] >= floor]
 
 
 def all_closest_works(
@@ -336,16 +348,18 @@ def all_closest_works(
     model: str,
     top: int = 4,
     db: pathlib.Path | str | None = None,
+    floor: float = -math.inf,
 ) -> dict[tuple[str, str], list[str]]:
     """closest_works() for every (artist key, other key) pair, from one read of the vectors.
 
     `shown` is the works that count, as each artist's deviation ids: the other's are measured against the
     artist's works in it, and the answer comes from the other's works in it. So what is shown beside an artist
-    is chosen by what is shown of them. Empty for a pair when either has no such work with a vector.
+    is chosen by what is shown of them. Of those `top`, only the works whose best match is `floor` or more are
+    answered with, so a pair can have fewer. Empty for a pair when either has no such work with a vector.
     """
     # ponytail: reads every vector again after all_neighbors, and scores a pair at a time. Measured: 2 s and
-    # 0.2 GB for 72,000 pairs (3,000 artists with 10 works each, 24 others each). It grows with the pairs. If
-    # that gets slow, score one artist's others in one product.
+    # 0.2 GB for 72,000 pairs (3,000 artists with 10 works each, 24 others each); 7.6 s for push's 285,000 on
+    # 2026-10-18. It grows with the pairs. If that gets slow, score one artist's others in one product.
     stacks: dict[str, tuple[list[str], np.ndarray]] = {}
     for key, works in _vectors(model, db).items():
         if kept := [work for work in works if work in shown.get(key, ())]:  # in id order: a tie goes to the lower
@@ -355,7 +369,7 @@ def all_closest_works(
         found[mine, other] = []
         if mine in stacks and other in stacks:
             ids, others = stacks[other]
-            found[mine, other] = [ids[at] for at in _closest(stacks[mine][1], others, top)]
+            found[mine, other] = [ids[at] for at in _closest(stacks[mine][1], others, top, floor)]
     return found
 
 

@@ -1368,6 +1368,13 @@ code {
     gap: 20px;
   }
 
+  /* Cards stand side by side. A similar artist can show two works, only those close to the seed's: they fill
+     the box four would, side by side and each as tall as two. (Three do already, the third across both.) */
+  .mosaic .thumb:first-child:nth-last-child(2),
+  .mosaic .thumb:first-child:nth-last-child(2) + .thumb {
+    aspect-ratio: 2 / 3;
+  }
+
   .works.natural {
     columns: 5 200px;
     column-gap: 16px;

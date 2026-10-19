@@ -338,6 +338,16 @@ def test_all_closest_works_is_closest_works_for_many_pairs_from_one_read_and_onl
         (ALPHA, ECHO): [],  # the one that counts has no vector
     }
     assert style.all_closest_works(pairs, every, "siglip2") == dict.fromkeys(pairs, [])
+    # With a floor, only the works whose best match reaches it: BRAVO's two copies and the work at 0.8, then
+    # the copies alone. A pair can be left with none.
+    floored = [(ALPHA, BRAVO), (BRAVO, ALPHA), (CHARLIE, BRAVO)]
+    assert style.all_closest_works(floored, every, "csd", floor=0.7) == {
+        (ALPHA, BRAVO): [work_id(5), work_id(6), work_id(4)],
+        (BRAVO, ALPHA): [work_id(1), work_id(2)],
+        (CHARLIE, BRAVO): [work_id(3)],
+    }
+    assert style.all_closest_works(floored, every, "csd", floor=0.9)[ALPHA, BRAVO] == [work_id(5), work_id(6)]
+    assert style.all_closest_works(floored, every, "csd", top=1, floor=1.5) == dict.fromkeys(floored, [])
 
 
 def test_the_mutual_rule_puts_a_consistent_artist_above_one_with_a_bit_of_everything(model, capsys):
@@ -389,6 +399,53 @@ def test_the_mutual_rule_puts_a_consistent_artist_above_one_with_a_bit_of_everyt
     assert printed("--rule", "mutual") == [(CHARLIE, 0.8), (BRAVO, 0.75)]
     with pytest.raises(SystemExit):
         style.main(["--neighbors", ALPHA, "--model", "csd", "--rule", "closest"])
+
+
+def test_the_few_rule_judges_each_artist_by_their_closest_works_alone(model, monkeypatch):
+    model.table = {  # as in the test above
+        1: [1, 0, 0],  # ALPHA, the seed
+        2: [0, 1, 0],  # ALPHA
+        3: [1, 0, 0],  # BRAVO, a mixed portfolio: ALPHA's first work exactly,
+        4: [0, 1, 0],  # ALPHA's second exactly,
+        5: [0, 0, 1],  # and two works like nothing of ALPHA's
+        6: [0, 0, 0, 1],
+        7: [4, 3, 0],  # CHARLIE, consistent: cosine 0.8 and 0.6 with ALPHA's two
+        8: [3, 4, 0],  # CHARLIE: 0.6 and 0.8
+        9: [0, 1, 1],  # DELTA, one work: cosine 0 and 0.7071 with ALPHA's two
+    }
+    for artist, shades in ((ALPHA, (1, 2)), (BRAVO, (3, 4, 5, 6)), (CHARLIE, (7, 8)), (DELTA, (9,))):
+        collect(artist, *shades)
+    style.run("csd", 500)
+
+    def nearest(seed, rule):
+        return [(key, pytest.approx(score, abs=1e-3)) for key, score in style.neighbors(seed, "csd", rule=rule)]
+
+    # Nobody has more than FEW (4) works, so each is judged by all of them: "few" is "local".
+    few = style.all_neighbors("csd", rule="few")
+    assert {key: [(other, pytest.approx(score, abs=1e-6)) for other, score in rows] for key, rows in few.items()} == (
+        style.all_neighbors("csd", rule="local")
+    )
+    assert [key for key, _ in few[ALPHA]] == [CHARLIE, BRAVO, DELTA]
+
+    # By their two closest works, BRAVO's two unrelated ones count for nothing. Each pair, both ways round:
+    # ALPHA and BRAVO 1 (two exact matches each way), ALPHA and CHARLIE 0.8, BRAVO and CHARLIE 0.8 (BRAVO's
+    # two copies find 0.8, and CHARLIE's two find 0.8), BRAVO and DELTA 0.7071 (BRAVO's works 4 and 5 find it,
+    # it finds them). ALPHA and DELTA, and CHARLIE and DELTA, as with "mutual": 0.5303.
+    monkeypatch.setattr(style, "FEW", 2)
+    half = 2**-0.5
+    usual = {  # the mean of each one's scores with the other three: fewer than NEAREST
+        ALPHA: (1 + 0.8 + 3 * half / 4) / 3,
+        BRAVO: (1 + 0.8 + half) / 3,
+        CHARLIE: (0.8 + 0.8 + 3 * half / 4) / 3,
+        DELTA: (3 * half / 4 + half + 3 * half / 4) / 3,
+    }
+    assert nearest(ALPHA, "few") == [
+        (BRAVO, 2 * 1 - usual[ALPHA] - usual[BRAVO]),  # first now: "local" put CHARLIE first
+        (CHARLIE, 2 * 0.8 - usual[ALPHA] - usual[CHARLIE]),
+        (DELTA, 2 * 3 * half / 4 - usual[ALPHA] - usual[DELTA]),
+    ]
+    assert nearest(DELTA, "few")[0] == (BRAVO, 2 * half - usual[BRAVO] - usual[DELTA])
+    assert style.main(["--neighbors", ALPHA, "--model", "csd", "--rule", "few", "--top", "1"]) == 0
 
 
 def collect_an_artist_near_everyone(model):

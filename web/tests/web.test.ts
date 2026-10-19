@@ -532,6 +532,23 @@ describe('an artist card', () => {
 
     expect([...html.matchAll(/class="thumb" href="[^"]*work-(\d+)"/g)].map((found) => Number(found[1]))).toEqual([7, 0, 10, 3])
   })
+
+  it('shows only the works it is given when there are fewer than four', () => {
+    // A similar artist comes with their works close enough to the seed's and no others: two or three make a card.
+    const works = [5, 2].map((n) => ({
+      page_url: `https://www.deviantart.com/someone/art/work-${n}`,
+      image_url: `https://images-wixmp-x.wixmp.com/f/${n}.jpg`,
+      title: `Work ${n}`,
+      source: 'deviantart',
+      width: null,
+      height: null,
+    }))
+    const artist = { slug: 'someone', name: 'Someone', tagline: null, profile: null, specialties: null, mediums: null, open_for_work: null, works }
+    const html = renderToStaticMarkup(createElement(MemoryRouter, null, createElement(Cards, { artists: [artist] })))
+
+    expect([...html.matchAll(/class="thumb" href="[^"]*work-(\d+)"/g)].map((found) => Number(found[1]))).toEqual([5, 2])
+    expect(html.match(/class="mosaic"/g)).toHaveLength(1)
+  })
 })
 
 describe('the claim-or-remove page', () => {

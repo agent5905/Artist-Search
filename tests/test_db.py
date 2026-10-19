@@ -809,7 +809,7 @@ def test_a_load_that_changes_neighbours_leaves_no_stale_row(seeded):
     assert similar("alpha") == ALPHA_SIMILAR and similar("beta") == ["zz-test-alpha"]
 
 
-def test_a_similar_artist_leads_with_the_works_picked_for_the_seed(seeded):
+def test_a_similar_artist_shows_the_works_picked_for_the_seed_and_no_others(seeded):
     def shown(of: str) -> dict[str, list[str]]:
         cards = db.rpc("similar_artists", {"p_slug": f"zz-test-{of}"}, "secret")
         return {card["slug"]: [work["title"] for work in card["works"]] for card in cards}
@@ -833,13 +833,17 @@ def test_a_similar_artist_leads_with_the_works_picked_for_the_seed(seeded):
         assert shown("beta") == {"zz-test-alpha": ["alpha 7", "alpha 0", "alpha 10", "alpha 3"]}
         assert shown("alpha") == unpicked[1]  # a row's picks are its own: nobody else's card changes
         assert replace({**row, "picks": [7, 0, 10, 3]}).json() == 0 and db.sql(stored) == [first]  # not rewritten
-        # Fewer than a card shows, and one that names no work: the rest follow in the artist's own order.
+        # Fewer than a card shows: those alone, since the rest of alpha's are not close enough to beta's.
+        assert replace({**row, "picks": [9, 2]}).json() == 0
+        assert shown("beta") == {"zz-test-alpha": ["alpha 9", "alpha 2"]}
+        # A pick that names no work (the works were loaded anew) gives way to the first of the rest.
         assert replace({**row, "picks": [9, 99]}).json() == 0
-        assert shown("beta") == {"zz-test-alpha": ["alpha 9", "alpha 0", "alpha 1", "alpha 2"]}
-        # More than a card shows is refused, and changes nothing.
+        assert shown("beta") == {"zz-test-alpha": ["alpha 9", "alpha 0"]}
+        # More than a card shows is refused, and so is none: each changes nothing.
         assert refused(replace({**row, "picks": [0, 1, 2, 3, 4]}), "artist_neighbors_few_picks")
+        assert refused(replace({**row, "picks": []}), "artist_neighbors_some_picks")
         assert db.sql(stored)[0]["picks"] == [9, 99]
-        # A row sent without picks has none: the first four again.
+        # A row sent without picks, as before there were any, has none: the first four again.
         assert replace(row).json() == 0
         assert db.sql(stored)[0]["picks"] is None and (shown("beta"), shown("alpha")) == unpicked
     finally:
