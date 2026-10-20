@@ -1351,6 +1351,12 @@ Deadlocks are gone as written, and nothing else stands beyond the accepted limit
   
   Two of these tests also leaked an account into later tests. Each now sets the account it means.
 
+**The image content check finished** (by 08:00 on 10-20). It checked 39,744 works; one failed and is held back as unchecked.
+- **Held back:** 123 (0.31%): 94 fetish, 26 hate symbol and 3 as a possible sexualised minor.
+- **The 3 possible minors** stay held back and are kept out of every review sample: no critic is shown them.
+
+**Running:** a blind check of the content check (50 held, 35 kept whose own tags or descriptions hint at fetish or hate, and 35 kept at random), and push's sixth critic, judging a build on the real, fully analysed data.
+
 **The disk filled up.** Drive F: reached 0 bytes free at about 19:45 on 10-19, and two image-check turns failed to open the store and were retried. The cause was this project: 20 finished builder worktrees, each with its own Python environment (73 GB), and critics' temporary test folders (9.5 GB).
 - **Every branch was merged,** so the worktrees were removed, with the branches kept, and the temporary folders deleted. F: has 83 GB free.
 - **The store's integrity check passes.** No reading was lost.
