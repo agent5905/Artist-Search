@@ -1237,4 +1237,15 @@ What fails is the content. Nothing checks fitness beyond sex and gore, so the fi
 - **A promise the system keeps:** "usually within a few hours, and at most within a day." The schedule is now hourly on day 1, every 6 hours to two weeks, then weekly. Discovery runs the checks between pages as collect does, and a site's request budget is per run. The worst case is about 6.5 hours, below 30 flooding networks.
 - **Tests:** each break the critic's mutations got past is now caught. 41 web tests pass.
 
+**Claim-or-remove's sixth critic, judging against the accepted limits (decision 15): close, two small fixes first.**
+- **Holds:** proof, permanence, secrets, the limits and the SQL. The page's promises work during collect and discovery runs, cross-site calls are refused, a shared site no longer takes anyone else, and the tests caught 54 of 55 breaks.
+- **Beyond the accepted limits:**
+  1. A stranger's later note replaces the artist's own on an open request.
+  2. A corrupt store that holds one account hash on two unlinked profiles lets one proof delete both. Collect does not create this state, but push should not send it.
+  3. Anyone who re-asks the code moves the artist's request into their own network's turn. That lets 10 networks, not 75, push a look 18.5 hours back, still within the page's "at most a day".
+  4. One untested regression.
+  5. The code and the ticket share one secret without separation.
+
+**Removals round 7, being built:** keep every note, never send an account hash two unlinked profiles hold, give a request asked from several networks a turn of its own, add the missing test, and separate the secret's two uses.
+
 **A Pages project of its own.** The project `.env` named is the owner's own August site, on a different Supabase, and the owner keeps it. With the owner's approval, Artist Search now has its own empty project, `artist-search` (`artist-search.pages.dev`, nothing deployed), and `.env` points at it. No domain is needed. The edge rate-limiting rule needs one, but the database's own limits cover visitors, networks and the total.
