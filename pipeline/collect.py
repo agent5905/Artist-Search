@@ -19,11 +19,12 @@ again before each artist and each download; and the sweep of cached files that n
     of the artist's gallery page are is kept as a number, and nothing else of them (library.answers), for the
     push stage's share of adult works.
   - A removal reaches the artist it names, under every handle of their account, and nobody else: a handle names
-    whoever holds it now, never an account that has left it for another (_sweep). An own site
+    whoever holds it now, never an account that has left it for another (_sweep). It bars their account, which
+    every profile read is asked about, and a handle by name only when no account is known (_remove). An own site
     that is kept for an artist is written into the store's row too, where the crawl stage looks. A removed site
     is kept out of every row, and that is all it does: it holds back and removes nobody, since anybody can name
     it (store._named_by). An artist whose profile names one, in a link of any shape, is collected like anybody,
-    and the push stage sends them without it. Whoever asked for its removal is barred by their handle and account.
+    and the push stage sends them without it. Whoever asked for its removal is barred by their account.
   - Nothing that is kept is replaced by nothing. An answer that is empty, or that the library's rules refuse,
     leaves what is kept, and for a refused one the artist or the work is marked.
   - A kept work whose thumbnail has come to show another file (library.own_file: not another size or
@@ -320,8 +321,13 @@ def _remove(key: str, counts: dict[str, int], db: pathlib.Path | str | None, use
 
     A handle a rename link reaches goes too only where what is kept here agrees: one that holds another
     account's hash is somebody else, whatever a corrupt table of links says (push._removal holds to the same).
-    One the account has left (marked RENAMED) is purged and not barred: DeviantArt can give it to somebody else.
     So `key` is the handle the artist holds now, or one the list names by its account (_sweep).
+
+    No handle is barred by name while the account is known: the account bars the artist under every handle (every
+    profile read is asked: library.account_removed), and DeviantArt gives a handle an account has left to somebody
+    else, sometimes before this stage has seen the rename. The purge takes the store's row of each handle all the
+    same (library.purge), so nobody asks about it again. Only with no account known is a handle barred, one the
+    account has not left, as all there is to bar the artist by.
     """
     accounts = {account for account in (library.account_hash(key, db), library.account(user_id)) if account}
     others = [other for other in library.same_account(key, db) if library.account_hash(other, db) in accounts | {None}]
@@ -329,8 +335,8 @@ def _remove(key: str, counts: dict[str, int], db: pathlib.Path | str | None, use
     if accounts:
         store.import_removed(accounts, db)
     done = True
-    for other in others:  # the handle the account had before, or took after: purged, and barred unless it was left
-        if other not in left:
+    for other in others:  # the handle the account had before, or took after: purged, and barred only without one
+        if not accounts and other not in left:
             store.mark_removed(other.removeprefix("da:"), db)
         done = _purge(other, counts, db) and done
     return _purge(key, counts, db) and done
@@ -405,10 +411,9 @@ def _collect_artist(
     for other in old_keys:  # the same account under another handle: believed only of a handle that is gone
         if marked.get(other, ("",))[0] not in (GONE, library.RENAMED):
             raise _ApiFailed("profile lookup answered with a user id that another artist has")
-    # Hard rule 7. An account removed under one handle is the same account under the next: the new handle is
-    # barred through the store, and nothing is collected.
+    # Hard rule 7. An account removed under one handle is the same account under the next: nothing is collected,
+    # and the purge takes the store's row for the handle, which the account bars (and only while it holds it).
     if library.account_removed(user_id, db):
-        store.mark_removed(username, db)
         _remove(key, counts, db, user_id)
         counts[RENAMED] += 1
         return
@@ -544,7 +549,6 @@ def _collect_artist(
     # And once more before anything is written, of the handle and of the account: a removal may have come under
     # either while the images were fetched. What was downloaded is swept up.
     if store.is_removed(key, db) or library.account_removed(user_id, db):
-        store.mark_removed(username, db)
         _remove(key, counts, db, user_id)
         counts[REMOVED] += 1
         return

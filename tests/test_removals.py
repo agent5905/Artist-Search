@@ -1209,8 +1209,8 @@ def test_a_proof_bars_the_account_and_no_handle_by_name_not_the_old_one_somebody
     proved under CHARLIE, and the proof barred BRAVO too, the request's handle: the stranger was barred there and here
     for good. A proof bars the account the request is bound to and no handle by name, on DeviantArt or on the artist's
     own site (the ninth critic's uncaught break: an own-site proof that bars the request's handle). The account bars
-    the artist under every handle, so the pushes after it purge both handles' data here, bar the one the account
-    holds now (CHARLIE) by name too, and bar the old one nowhere."""
+    the artist under every handle, so the pushes after it purge both handles' data here and bar neither handle by
+    name: the account may leave CHARLIE too, before the collect stage sees it, and DeviantArt give it to anybody."""
     site = f"https://{CHARLIE}.art/" if place == "own_site" else None
     artist(ALPHA, angle=0.0)
     artist(BRAVO, angle=0.2)
@@ -1227,16 +1227,23 @@ def test_a_proof_bars_the_account_and_no_handle_by_name_not_the_old_one_somebody
     account = library.account(f"FAKE-USER-{BRAVO}")
     barred = {account, *([digest(f"site:{CHARLIE}.art")] if site else [])}
     assert set(world.db.removed) == barred == store.removed_hashes()
-    barred.add(digest(f"da:{CHARLIE}"))  # what the pushes add: the handle the account holds here now
-    for run in range(2):
+    for run in range(2):  # the pushes add nothing: the account bars them, there and here
         assert push.run(False)["artists_purged_here"] == (2 if run == 0 else 0)
         assert set(world.db.removed) == barred == store.removed_hashes()
     assert library.artist_keys() == [f"da:{ALPHA}"] and sorted(sent_artists(world.db)) == [ALPHA]
-    assert store.upsert_artist(BRAVO, f"https://www.deviantart.com/{BRAVO}", None, 9)  # the stranger may be listed
-    assert not store.upsert_artist(CHARLIE, f"https://www.deviantart.com/{CHARLIE}", None, 9)
-    stranger = {"slug": BRAVO, "name": BRAVO, "da_username": BRAVO, "site_url": None, "site_domain": None}
-    world.db.load([stranger | {"da_account": library.account("FAKE-USER-yy-fake-stranger")}], [], [])
-    assert not gone(world, BRAVO)  # and there too
+    # Never taken in again under any handle: the collect stage asks every profile's account of the list, and the
+    # database refuses a row with it.
+    assert library.account_removed(f"FAKE-USER-{BRAVO}")
+    row = {"slug": DELTA, "name": DELTA, "da_username": DELTA, "site_url": None, "site_domain": None}
+    world.db.load([row | {"da_account": account}], [], [])  # the account under yet another handle
+    assert gone(world, DELTA)
+    # And whoever holds either handle later is listed like anybody, here and there.
+    assert store.upsert_artist(BRAVO, f"https://www.deviantart.com/{BRAVO}", None, 9)
+    assert store.upsert_artist(CHARLIE, f"https://www.deviantart.com/{CHARLIE}", None, 9)
+    for handle in (BRAVO, CHARLIE):
+        row = {"slug": handle, "name": handle, "da_username": handle, "site_url": None, "site_domain": None}
+        world.db.load([row | {"da_account": library.account(f"FAKE-USER-{STRANGER}-{handle}")}], [], [])
+        assert not gone(world, handle)
 
 
 LEFT, STRANGER = "yy-fake-newname", "yy-fake-stranger"  # a handle one account left and DeviantArt gave to another
@@ -1293,8 +1300,8 @@ def test_the_owners_grant_bars_the_account_and_not_the_old_handle_a_stranger_now
     account = library.account(f"FAKE-USER-{BRAVO}")
     assert world.db.removed == [account] and not gone(world, BRAVO)  # the stranger stays
     assert library.account_removed(f"FAKE-USER-{BRAVO}") and not store.is_removed(BRAVO)
-    push.run(False)  # the push after it: the artist here under both handles, the stranger nowhere
-    assert set(world.db.removed) == {account, digest(f"da:{CHARLIE}")} and library.artist_keys() == [f"da:{ALPHA}"]
+    push.run(False)  # the push after it: the artist here under both handles, by the account; the stranger nowhere
+    assert world.db.removed == [account] and library.artist_keys() == [f"da:{ALPHA}"]
     assert store.upsert_artist(BRAVO, f"https://www.deviantart.com/{BRAVO}", None, 9)
     # The statement RemovalsDb.grant follows (tests/test_db.py runs it): the account, and without one the request's
     # own handle only when the caller says the profile answers under it now. Nothing to bar, nothing done.
@@ -2016,6 +2023,35 @@ def test_the_database_failing_one_request_leaves_it_due_and_the_queue_moves_on(w
     assert removals.main([]) == 1
     out, err = capsys.readouterr()
     assert json.loads(out)["left_due_database_failed"] == 2 and "failed for 2 requests, which stay due" in err
+
+
+def test_six_proofs_between_two_pushes_stop_nothing_and_take_nobody_else(world):
+    """The lead's, after round 10: a proof bars an account, and the collect stage, purging the artist before the
+    next push, barred their handle here by name, a hash that only this machine's list then held. Six of those were
+    more than the push believes of a store (DELETE_FLOOR) and stopped it as a broken one. No handle goes on a list
+    by name while the account is known, so six proofs go through as one does, whether the push or a collect run
+    purges them first. A store that adds hashes that name nobody still stops the run (tests/test_push.py:
+    test_many_hashes_that_name_nobody_kept_here_stop_the_run_and_whom_the_two_lists_name_goes_all_the_same)."""
+    proven = [f"yy-fake-p{n}" for n in range(12)]
+    for n, handle in enumerate([*proven, ALPHA]):
+        artist(handle, angle=0.07 * n)
+    push.run(False)
+    accounts = {library.account(f"FAKE-USER-{handle}") for handle in proven}
+    for batch, sweep_first in ((proven[:6], True), (proven[6:], False)):
+        for handle in batch:
+            world.db.file(handle, with_code=True)
+            world.da.profiles[handle] = profile(handle, bio=f"Please remove me. {code(handle)}")
+        world.later(seconds=1)
+        assert world.check() == expected(requests_due=6, proven_on_deviantart=6, artists_removed=6)
+        if sweep_first:  # a collect run ends between the proofs and the push, and purges them itself
+            swept = dict.fromkeys(collect._COUNTS, 0)
+            collect._sweep(swept, None)
+            assert swept[collect.PURGED] == 6
+        counts = push.run(False)  # no Stop
+        assert counts["removals_added_to_database"] == 0 and counts["artists_purged_here"] == (0 if sweep_first else 6)
+    assert set(world.db.removed) == accounts == store.removed_hashes()  # the accounts, and no handle
+    assert sorted(sent_artists(world.db)) == [ALPHA] and library.artist_keys() == [f"da:{ALPHA}"]
+    assert [key for key, _, _ in store.all_artists()] == [f"da:{ALPHA}"]  # their store rows went with the purge
 
 
 def test_an_artist_newly_listed_with_a_site_barred_during_a_push_is_counted_and_sent_without_it_next(

@@ -120,6 +120,7 @@ class FakeDb:
             for artist_id, row in self.artists.items():
                 da_key, site_key = self.keys(row)
                 artist = {"artist_id": artist_id, "slug": row["slug"], "da_key": da_key, "site_key": site_key}
+                artist["da_account"] = row.get("da_account")
                 artist["neighbours"] = sum(near["artist_slug"] == row["slug"] for near in self.neighbors)
                 mine = [(work_id, work) for work_id, work in self.works.items() if work["artist_slug"] == row["slug"]]
                 rows += [artist | {"work_id": work_id, "page_url": work["page_url"]} for work_id, work in mine] or [
@@ -138,8 +139,9 @@ class FakeDb:
             if added := re.fullmatch(insert, statement):
                 new = [key_hash for key_hash in re.findall("[0-9a-f]{64}", added[1]) if key_hash not in self.removed]
                 self.removed += new
-                for artist_id in [key for key, row in self.artists.items() if set(self.keys(row)) & set(new)]:
-                    self._delete_artist(artist_id)
+                for artist_id, row in list(self.artists.items()):  # by handle, site or account (delete_removed)
+                    if {*self.keys(row), row.get("da_account")} & set(new):
+                        self._delete_artist(artist_id)
             elif emptied := re.fullmatch(blank, statement):
                 for row_id in set(map(int, emptied[1].split(", "))) & set(self.artists):
                     self.artists[row_id] |= {"search_text": "", "top_tags": []}
@@ -1766,9 +1768,13 @@ def test_a_removal_covers_the_account_under_every_handle_it_is_kept_under(fake, 
         fake.sql(push._removed_sql({library.account(f"FAKE-USER-{BRAVO}")}))
     else:
         store.mark_removed(CHARLIE)
-    # The handle the account has left is barred nowhere: it may be somebody else's now, and the account bars the
-    # artist under it anyway (the eighth critic's).
-    wanted = {digest(f"da:{CHARLIE}"), library.account(f"FAKE-USER-{BRAVO}")}
+    # The account goes on the lists, and no handle but one somebody named: the account bars the artist under every
+    # handle, and DeviantArt can give one it has left to somebody else, the old one here, or the new one later
+    # (the eighth critic's, and the lead's after round 10).
+    wanted = {
+        library.account(f"FAKE-USER-{BRAVO}"),
+        *([] if asked == "the_account_there" else [digest(f"da:{CHARLIE}")]),
+    }
 
     for run in range(3):  # purging one handle frees no other: it stays so, run after run
         counts = push.run(False)
@@ -1777,12 +1783,29 @@ def test_a_removal_covers_the_account_under_every_handle_it_is_kept_under(fake, 
         assert not any(word in fake.held() for word in of_artist(BRAVO) + of_artist(CHARLIE))
         assert set(fake.removed) == wanted == store.removed_hashes()
         assert library.artist_keys() == [f"da:{ALPHA}"] and library.artist_marks() == {}
-    # The new handle is not taken in again, nor the account under a handle it takes later. The old handle is free for
-    # whoever holds it now, and nobody else is touched.
-    assert not store.upsert_artist(CHARLIE, f"https://www.deviantart.com/{CHARLIE}", [], 1)
+    # The account is not taken in again under any handle (every profile the collect stage reads is asked). A handle
+    # is barred only where somebody named it; the old one is free for whoever holds it now, and nobody else is touched.
+    assert store.upsert_artist(CHARLIE, f"https://www.deviantart.com/{CHARLIE}", [], 1) == (
+        asked == "the_account_there"
+    )
     assert store.upsert_artist(BRAVO, f"https://www.deviantart.com/{BRAVO}", [], 1)
     assert library.account_removed(f"FAKE-USER-{BRAVO}") and not library.account_removed(f"FAKE-USER-{ALPHA}")
     assert not store.is_removed(ALPHA) and len(library.work_ids(f"da:{ALPHA}")) == 5
+
+
+def test_an_account_that_joins_the_list_in_this_run_is_known_there_by_its_account(fake):
+    """No handle goes on the lists by name while the account is known, so the database's row of an artist whose
+    account joins its list in this run is known by the account (LISTING_SQL): deleted as a removal, and not counted
+    with the deletions a run is believed about."""
+    for n, handle in enumerate((ALPHA, BRAVO, CHARLIE)):
+        artist(handle, angle=0.3 * n)
+    push.run(False)
+    store.import_removed([library.account(f"FAKE-USER-{BRAVO}")])  # here before there, as the collect stage leaves it
+
+    counts = push.run(False)
+    assert counts["removed_artists_deleted_from_database"] == 1 and counts["artists_deleted_from_database"] == 0
+    assert counts["removals_added_to_database"] == 1 and fake.removed == [library.account(f"FAKE-USER-{BRAVO}")]
+    assert sorted(sent_artists(fake)) == [ALPHA, CHARLIE] and counts["artists_purged_here"] == 1
 
 
 @pytest.mark.parametrize("asked", ["there", "here"])
@@ -2822,7 +2845,7 @@ def test_one_person_under_three_handles_is_removed_at_once_however_far_apart_the
 def test_an_account_on_the_databases_list_is_not_sent_under_the_handle_it_took_when_this_file_is_made_again(fake):
     """The critic's: ALPHA removed through the site, the store made again from nothing, and the same account
     collected under a new handle before any push. The account's hash on the list bars every handle it is kept
-    under here, which then goes on the list too."""
+    under here, by itself: the new handle goes on no list by name, since the account may leave it too."""
     artist(ALPHA, angle=0.0)
     artist(BRAVO, angle=0.3)
     artist(CHARLIE, angle=0.6)
@@ -2839,8 +2862,9 @@ def test_an_account_on_the_databases_list_is_not_sent_under_the_handle_it_took_w
     counts = push.run(False)
 
     assert sorted(sent_artists(fake)) == [BRAVO, CHARLIE] and counts["artists_purged_here"] == 1
-    assert digest("da:yy-fake-newname") in fake.removed and store.is_removed("yy-fake-newname")
+    assert digest("da:yy-fake-newname") not in fake.removed and not store.is_removed("yy-fake-newname")
     assert "newname" not in fake.sent() and library.account_removed(f"FAKE-USER-{ALPHA}")
+    assert "yy-fake-newname" not in json.dumps(local_state()[0])  # purged here
 
 
 @pytest.mark.parametrize("how", ["not_read_at_the_new_prompt_version_yet", "read_again_and_otherwise"])

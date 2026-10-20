@@ -2175,7 +2175,11 @@ def test_an_account_on_the_list_is_swept_under_every_key_kept_for_it_and_only_wh
     swept = dict.fromkeys(collect._COUNTS, 0)
     collect._sweep(swept, None)
     assert swept[collect.PURGED] == 1 and library.artist_keys() == [key(BRAVO)] and cached() == image_files([21])
-    assert store.is_removed(RENAMED) and not store.is_removed(ALPHA) and not store.is_removed(BRAVO)
+    # Barred by the account alone: no handle by name. The purge takes the store's row for each of its handles.
+    assert not any(store.is_removed(handle) for handle in (ALPHA, RENAMED, BRAVO))
+    assert [artist[0] for artist in store.all_artists()] == [key(BRAVO)] and library.account_removed(
+        f"FAKE-USERID-{ALPHA}"
+    )
 
 
 def test_one_user_id_answered_for_every_profile_links_nobody_and_a_removal_then_takes_only_the_removed(capsys):
@@ -2279,7 +2283,8 @@ def test_an_account_removed_under_one_handle_is_not_collected_under_the_next(cap
     """The critic's finding: collected, removed and purged; then the same account under a new handle, which
     discovery had stored, was collected again: a profile, three works and three files for a removed artist.
     The purge now leaves the hash of the account's user id on the store's removal list, and a profile whose
-    user id is on that list has its handle barred through the store and nothing collected."""
+    user id is on that list has nothing collected. The purge takes the store's row for the handle, which goes on
+    no list by name: the account bars them under it, and only while it holds it."""
     world = solo(4)
     assert run(world) == 0
     store.mark_removed(ALPHA)
@@ -2293,7 +2298,7 @@ def test_an_account_removed_under_one_handle_is_not_collected_under_the_next(cap
     assert counts[collect.RENAMED] == 1 and counts[collect.PROFILES] == counts[collect.WORKS] == 0
     assert library.artist_keys() == [] and files(tmp_path) == ["cache/pipeline.sqlite"]
     assert [request.url.path for request in world.since(seen)] == [TOKEN_PATH, PROFILE_PATH + RENAMED]  # and no more
-    assert store.is_removed(RENAMED) and store.all_artists() == []  # barred through the store
+    assert not store.is_removed(RENAMED) and store.all_artists() == []  # purged, and barred by the account alone
     stored = config.LOCAL_DB.read_bytes()
     assert b"FAKE-USERID" not in stored and b"zz-fake-renamed" not in stored and b"zz-fake-alpha" not in stored
     seen = len(world.log)
@@ -2303,7 +2308,8 @@ def test_an_account_removed_under_one_handle_is_not_collected_under_the_next(cap
 def test_an_account_that_goes_on_the_list_while_its_images_are_fetched_is_not_stored_under_any_handle(capsys, tmp_path):
     """The third critic of the push stage: an account removed under another handle, as the push stage brings it
     from the list of record, while this turn fetches images. The list is asked once more before anything is
-    written, of the account as well as of the handle: nothing is stored, and the handle is barred too."""
+    written, of the account as well as of the handle: nothing is stored, and the purge takes the store's row for
+    the handle, which the account bars."""
     world = solo(4)
 
     def removal_arrives(request):
@@ -2314,7 +2320,7 @@ def test_an_account_that_goes_on_the_list_while_its_images_are_fetched_is_not_st
     counts = counts_of(world, capsys)
     assert counts[collect.REMOVED] == 1 and counts[collect.PROFILES] == counts[collect.WORKS] == 0
     assert library.artist_keys() == [] and files(tmp_path) == ["cache/pipeline.sqlite"]
-    assert store.is_removed(ALPHA) and store.all_artists() == []
+    assert not store.is_removed(ALPHA) and store.all_artists() == [] and library.account_removed(f"FAKE-USERID-{ALPHA}")
 
 
 def trio():

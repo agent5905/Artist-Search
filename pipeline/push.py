@@ -7,8 +7,9 @@
 In this order, and the order is the point:
   1. Removal (hard rule 7), in both directions. It is worked out first, with nothing changed (see _removal),
      from the two removal lists and from nothing else: the database's `removed` table and the store's. Whoever
-     they bar is purged under every handle their account is kept under here and barred under each but one the
-     account has left (which may be somebody else's now), and the account goes on the list too. Then it is
+     they bar is purged under every handle their account is kept under here, and the account goes on the list,
+     which bars them under any handle; a handle goes on it by name only for somebody with no account kept, since
+     DeviantArt gives a handle an account has left to somebody else. Then it is
      written down, here first (store.import_removed) and then in the database: the hashes its list lacks are
      added, so a removal made here outlives this machine, and the artists the list bars are deleted there. Only
      after that is what is kept here about them purged. A file that cannot be deleted is counted, and the next
@@ -33,7 +34,7 @@ Four things stop a run, each with a message and a status that is not zero:
     Or the store's list would add more than DELETE_FLOOR hashes that are no handle or account of anybody barred
     here (a site, a handle nobody here has). A handle of somebody kept here is on the store's list because
     somebody named it (store.mark_removed), so the owner's removals here go through however many there are, and
-    so do the other handles of a removed account that the links and the hashes agree on. A disagreement is how a
+    so does a removed account under every key the links and the hashes agree on. A disagreement is how a
     broken local store shows, and nobody's wish: a corrupt table of rename links once turned one removal through
     the site into twelve, and five profiles given a removed account's hash made it six. Whom the two lists name
     is removed all the same, here and there. Nothing else is done, and `--allow-delete N` lets N of them through.
@@ -163,11 +164,11 @@ NO_ARTISTS = (
 )
 
 REMOVED_SQL = "select key_hash from public.removed"
-# Every artist the database has, with the two hashes its removal list knows them by and how many neighbour rows
-# they have, and every work: what a run compares its rows with.
+# Every artist the database has, with the three hashes its removal list knows them by (handle, site, account) and
+# how many neighbour rows they have, and every work: what a run compares its rows with.
 # ponytail: one answer with a row a work, about 8 MB at 30,000 works. Page it by artist id if that is refused.
 LISTING_SQL = (
-    "select a.id as artist_id, a.slug, a.da_key, a.site_key, w.id as work_id, w.page_url, "
+    "select a.id as artist_id, a.slug, a.da_key, a.site_key, a.da_account, w.id as work_id, w.page_url, "
     "(select count(*) from public.artist_neighbors n where n.artist_id = a.id) as neighbours "
     "from public.artists a left join public.works w on w.artist_id = a.id"
 )
@@ -674,8 +675,10 @@ def _removal(
     account's hash bars every key kept here under it (their profile's hash). A site's bars nobody: it is kept out of
     every row (store._named_by, build), and anybody can name it. A removal covers the account under every handle it
     is kept under here, linked to one of those by the collect stage's marks (library.same_account), and theirs in
-    turn: each goes on the list too, but a handle the account has left, which is purged here and barred nowhere by
-    name. With `follow` False only whom a hash names by handle is barred, and their account goes on the list only
+    turn: all are purged here, and the account's hash is what goes on the lists, which bars the artist under any
+    handle, there (artists.da_account) and here (library.account_removed). A handle goes on them by name only for
+    a key with no account kept: the account may have left it, unseen here, and DeviantArt given it to somebody
+    else. With `follow` False only whom a hash names by handle is barred, and their account goes on the list only
     where what is kept here agrees on it.
 
     What is kept here can be wrong: a corrupt table of rename links once turned one removal into twelve, and five
@@ -702,7 +705,7 @@ def _removal(
             odd |= keys - named
             disputed.add(held)
     barred = reached if follow else named
-    hashes |= {store._hash(key) for key in barred - left}
+    hashes |= {store._hash(key) for key in barred - left if not account.get(key)}  # by name: no account kept
     hashes |= {held for key in barred if (held := account.get(key)) and (follow or held not in disputed)}
     return hashes, barred, len(store.named_by(hashes, local)), odd
 
@@ -770,14 +773,14 @@ def run(dry_run: bool, allow_delete: int | None = None, local: pathlib.Path | st
     # The artists the list bars go with it, whatever happens further down: the database deletes them itself when
     # their hash arrives, and one it had to leave (a load held the row) is deleted here by id.
     unlisted = hashes - remote
-    barred = {int(row["artist_id"]) for row in there if hashes & {row["da_key"], row["site_key"]}}
+    barred = {int(row["artist_id"]) for row in there if hashes & {row["da_key"], row["site_key"], row["da_account"]}}
     removal = ([_removed_sql(unlisted)] if unlisted else []) + ([_delete_sql("artists", barred)] if barred else [])
     stuck = 0
     if not dry_run:
         store.import_removed(hashes, local)  # here first, then there, and only then is a file deleted
         if removal:
             db.sql("; ".join(removal))
-        for key in purge:
+        for key in purge:  # the store's row for each handle with it (library.purge): no handle needs barring for that
             try:
                 library.purge(key, local)
             except OSError:  # a file somebody holds open: the rows that name it stay, and the next run finds them
