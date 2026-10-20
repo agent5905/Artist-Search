@@ -1448,6 +1448,29 @@ Deadlocks are gone as written, and nothing else stands beyond the accepted limit
   - A dry run built artists the real run would not.
 - **Added by the lead the same afternoon:** an artist's own whole tag that is sexual, fetish or hateful holds that work back. 168 works of 53 artists carry one (`nsfw` 91, `vore` 40, `fetish` 10, ...), among them sent works tagged `futa`, `nsfw` and `nazi` that the checks passed. "carnivore" and "nsfwfree" do not count.
 
+**Push's eighth critic: no, on word lists only.**
+- **What passes:**
+  - the snapshot, reruns and dry runs on the real copy;
+  - every pick and neighbour row against the database's constraints;
+  - tags and secrets;
+  - removal of a bad local state.
+- **No bulk wrong holds were found.** A build sends 2,990 artists and 27,733 works.
+- **What still gets through, all hand-made word lists too short for the class they name:**
+  - 162 works with sexual or fetish own tags the 14-word list misses (`nude`, `sexy`, `bigboobs`, `pinup`, `bondagefetish`);
+  - one fetish-genre portfolio of hypnosis comics;
+  - "Now on Bluesky!" and similar titles;
+  - a hand-held artist who renames.
+- **The lead keeps, as designed, two removal behaviours the critic flags:**
+  - More than 5 handles removed here at once need `--allow-delete`, the owner's explicit confirmation that guards against a corrupt local list.
+  - A legacy handle-only entry on the database's list would take its current holder. None can arise any more, since push refuses artists with no account and grants bar accounts, and the live list is empty.
+- **Outside the owner's rules, noted for later:** AI-made work that never says so (a "NEURAL" watermark, Gemini's mark) leads some cards.
+
+**Push round 11, being built:**
+- Sexual and fetish tags matched as glued words.
+- More services in the service list.
+- The hand-held list follows the account.
+- The two missing tests.
+
 **The disk filled up.** Drive F: reached 0 bytes free at about 19:45 on 10-19, and two image-check turns failed to open the store and were retried. The cause was this project: 20 finished builder worktrees, each with its own Python environment (73 GB), and critics' temporary test folders (9.5 GB).
 - **Every branch was merged,** so the worktrees were removed, with the branches kept, and the temporary folders deleted. F: has 83 GB free.
 - **The store's integrity check passes.** No reading was lost.
