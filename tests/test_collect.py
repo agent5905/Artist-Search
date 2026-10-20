@@ -2033,12 +2033,19 @@ def test_cached_files_with_no_row_are_deleted_at_the_start_of_every_run(capsys, 
     assert world.asked_about(ALPHA) == []  # and nothing of the removed artist's is asked for again
 
 
-def test_an_account_under_a_new_handle_is_linked_once_the_old_handle_is_gone_and_a_removal_purges_both(capsys):
+def test_an_account_under_a_new_handle_is_linked_once_the_old_handle_is_gone_and_a_removal_purges_both(
+    capsys, monkeypatch
+):
     """Collected as one handle, found again as another. While the old handle still answers, the same user id under
     a new one is the API failing, and nobody is linked: round 6, after one wrong id tied two artists together.
     Once the API calls the old handle gone, the two keys are linked by a mark, and nothing is deleted for it.
     Hard rule 7 is not weakened: when the handle the account holds now is removed, or the account, everything under
-    both goes."""
+    both goes.
+
+    The clock stands still: a run visits whoever was tried longest ago first, and a second ticking over between the
+    two handles' turns put the new handle first, before the old one's answer had said it was gone (one run later
+    it is linked all the same). Tied, the old handle goes first, as this test means it to."""
+    monkeypatch.setattr(store, "_now", lambda: iso(1_800_000_000))
     world = solo(4)
     world.artist(BRAVO)
     world.work(BRAVO, 21)

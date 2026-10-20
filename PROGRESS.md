@@ -1383,7 +1383,27 @@ Deadlocks are gone as written, and nothing else stands beyond the accepted limit
 
 **The owner's answers (decisions 17 to 20):** blood shows and pin-ups do not; any AI-declared work holds the artist back; the mature counts are not filled in; political content about real people is held back. The lead's defaults: sheets also by title, profanity held, hate words matched inside words, the removal applied by account, and three tests.
 
-**Running:** push round 9, building all of these.
+**Push round 9: merged.** Measured on a copy of the store, push would send 2,863 artists and 26,502 works, down from 2,919 and 26,935.
+- **Blood shows, pin-ups do not:**
+  - A new reading asks each of the 4,997 suggestive works why.
+  - On 150 sampled works, no pin-up or lingerie was called blood-only, so about 420 should become safe to show.
+  - A few blood works with something else in them stay held.
+  - The full run is about 1 h 35 min.
+- **Any AI-declared work:** holds back 52 more artists who would be sent, with their 386 works.
+- **Political content about real people:**
+  - A cheap filter finds 131 candidates, and the model holds 26 of them: 22 clearly right, 4 arguable.
+  - The model checks each image, and also the title and tags on their own, since two caricatures show no name.
+  - Posters for a real-world cause that show no real person (9) are kept, as the decision reads.
+- **Sheets by title:**
+  - 871 sent works titled as sheets were not read as sheets. Now none is a pick, and they go as filler.
+  - 77 artists send only sheets and lead with one.
+  - About 23 finished "YCH" commissions also go as filler.
+- **Profanity:** 14 titles held, none wrongly; 3 handles held, none wrongly.
+- **Hate words glued into titles:** 3 more held (1 right, 2 wrong: a character named "Nazi..." and a made-up word).
+- **Removal by account:** a removal the lists name only by account is now applied here even when the guard stops.
+- **Tests:** the critic's three uncaught breaks are now caught; 5,024 tests pass.
+
+**Running:** the two new GPU stages, suggestive and political (started 10:40, about 1 h 40 min). Then push's seventh critic on the real data.
 
 **The disk filled up.** Drive F: reached 0 bytes free at about 19:45 on 10-19, and two image-check turns failed to open the store and were retried. The cause was this project: 20 finished builder worktrees, each with its own Python environment (73 GB), and critics' temporary test folders (9.5 GB).
 - **Every branch was merged,** so the worktrees were removed, with the branches kept, and the temporary folders deleted. F: has 83 GB free.
