@@ -85,12 +85,12 @@ class RemovalsDb(FakeDb):
     earlier one: the latest from each of the ten networks heard from last); anything else is a request of its own.
     due_removals takes the due ones in turns between networks, each in the first turn it has in any of its networks.
     Nothing a push or a load does touches one. A run moves one on only while its code_at is the one the run read.
-    confirm_removal and
-    grant_request close an open one, and put on the list the handle and the account it is bound to, and its site
-    when the caller says the proof covered it and no other handle is listed with it now: never whoever the slug
-    lists now. That deletes whoever they bar, and an open request whose handle or account they bar is closed as
-    "removed". A row with a removed handle, site or account is not loaded again (artists_before_write). A closed
-    request keeps nothing of the artist. `queue` names an open request by its handle (by its handle and id when the
+    confirm_removal and grant_request close an open one, and put on the list the account it is bound to and the
+    handle the proof was found under (p_handle; the request's own for the owner's grant), and its site when the
+    caller says the proof covered it and no other handle is listed with it now: never whoever the slug lists now.
+    That deletes whoever they bar, and an open request whose handle or account they bar is closed as "removed". A
+    row with a removed handle, site or account is not loaded again (artists_before_write). A closed request keeps
+    nothing of the artist. `queue` names an open request by its handle (by its handle and id when the
     handle has two)."""
 
     def __init__(self):
@@ -152,12 +152,13 @@ class RemovalsDb(FakeDb):
         closed = f"closed:{next(self._ids)}"
         self.queue[closed] = row | gone | {"artist_slug": closed, "outcome": outcome, "notes": [], "networks": []}
 
-    def grant(self, request_id, outcome, site):
+    def grant(self, request_id, outcome, site, handle=None):
         name = self._open(request_id)
         if name is None:
             return None
         row = self.queue[name]
         da_key, site_key = self.made_for(row).values()
+        da_key = digest(f"da:{handle.lower()}") if handle else da_key
         listed = [self.keys(other) for other in self.artists.values()]
         taken = any(other_site == site_key and other_da != da_key for other_da, other_site in listed)
         keys = [key for key in (da_key, row["da_account"], site_key if site and not taken else None) if key]
@@ -209,7 +210,7 @@ class RemovalsDb(FakeDb):
             columns = ("id", "artist_slug", "code_at", "da_username", "site_url", "site_domain", "da_account")
             return [{column: row[column] for column in columns} for row in due[: args["p_limit"]]]
         if name == "grant_request":
-            return self.grant(args["p_id"], args["p_outcome"], args["p_site"])
+            return self.grant(args["p_id"], args["p_outcome"], args["p_site"], args.get("p_handle"))
         if name == "reject_removal":
             request = self._open(args["p_id"])
             return request is not None and not self.close(request, "rejected")
@@ -219,7 +220,8 @@ class RemovalsDb(FakeDb):
         self.confirmed.append((slug, args["p_code"]))
         if slug is None or args["p_code"] != code(slug, self.secret):
             return None
-        return self.grant(args["p_id"], "proven", args["p_site"])
+        assert store.HANDLE.fullmatch(args["p_handle"])  # the verifier always says where it found the proof
+        return self.grant(args["p_id"], "proven", args["p_site"], args["p_handle"])
 
     def sql(self, query):
         answer = super().sql(query)
@@ -465,6 +467,13 @@ def test_a_code_on_another_artists_page_proves_nothing_for_either(world):
 
     assert world.check() == expected(requests_due=2, left_for_owner_no_code_found=2)
     assert world.db.confirmed == [] and len(world.db.artists) == 2 and world.db.removed == []
+    # The eighth critic's uncaught breaks: confirm_removal taking any code, and a code made without its slug.
+    # RemovalsDb follows the statements read here (tests/test_db.py runs them).
+    assert (
+        "if not coalesce(p_code = (select public.removal_code(r.artist_slug) from public.removal_requests r "
+        "where r.id = p_id and r.outcome is null), false) then return null; end if;" in function_body("confirm_removal")
+    )
+    assert "hmac('removal code ' || coalesce(p_slug, ''), secret, 'sha256')" in function_body("removal_code")
 
 
 @pytest.mark.parametrize(
@@ -1022,6 +1031,11 @@ def test_the_page_tells_the_artist_the_tag_and_the_file_this_stage_reads():
     assert "copyRow(new URL(`/.well-known/${PROOF}.txt`, site).href)" in page
     assert meta("${code}") == '<meta name="artist-search-removal" content="${code}">'
     assert FILE == ".well-known/artist-search-removal.txt" and removals.PROOF_NAME == "artist-search-removal"
+    # The eighth critic's: the page promising the tagline alone where the bio (the About text) is read too, and the
+    # page no longer saying that robots.txt for our crawler keeps the check out (as the opt-out test above shows).
+    said = " ".join(page.split())
+    assert "paste it into the About text or the tagline of" in said and removals.PROFILE_FIELDS == ("bio", "tagline")
+    assert f"and unless your robots.txt keeps out our crawler, {config.ROBOTS_TOKEN}." in said
 
 
 def test_a_run_looks_at_no_more_than_its_share_and_the_rest_next_run(world):
@@ -1181,6 +1195,32 @@ def test_a_renamed_account_that_answers_only_to_its_new_handle_is_still_found(wo
     assert world.check() == expected(requests_due=1, left_for_owner_not_checked=1)
 
 
+def test_a_proof_under_the_accounts_new_handle_bars_that_handle_and_not_the_old_one_somebody_else_holds(world):
+    """The eighth critic's: BRAVO's account renamed itself CHARLIE, and DeviantArt gave BRAVO to a stranger. The artist
+    proved under CHARLIE, and the proof barred BRAVO too, the request's handle: the stranger was barred there and here
+    for good. A proof bars the account and the handle the profile answers under now (confirm_removal's p_handle). The
+    account bars the artist under every handle, so the pushes after it purge both handles' data here and bar the old
+    one nowhere."""
+    artist(ALPHA, angle=0.0)
+    artist(BRAVO, angle=0.2)
+    library.mark_artist(f"da:{BRAVO}", "account gone")
+    artist(CHARLIE, angle=0.21, user=BRAVO, old_keys=[f"da:{BRAVO}"])  # the collect stage links the two handles
+    world.list(BRAVO)
+    hold_back(world, BRAVO)
+    world.da.profiles[BRAVO] = profile(BRAVO, user="yy-fake-stranger")  # somebody else holds the old handle
+    world.da.profiles[CHARLIE] = profile(CHARLIE, user=BRAVO, bio=code(BRAVO))
+
+    assert world.check() == expected(requests_due=1, proven_on_deviantart=1, artists_removed=1)
+    barred = {digest(f"da:{CHARLIE}"), library.account(f"FAKE-USER-{BRAVO}")}
+    assert set(world.db.removed) == barred == push._removed_here(None)
+    for run in range(2):
+        assert push.run(False)["artists_purged_here"] == (2 if run == 0 else 0)
+        assert set(world.db.removed) == barred == push._removed_here(None)
+    assert library.artist_keys() == [f"da:{ALPHA}"] and sorted(sent_artists(world.db)) == [ALPHA]
+    assert store.upsert_artist(BRAVO, f"https://www.deviantart.com/{BRAVO}", None, 9)  # the stranger may be listed
+    assert not store.upsert_artist(CHARLIE, f"https://www.deviantart.com/{CHARLIE}", None, 9)
+
+
 def test_a_request_whose_artist_is_removed_another_way_is_closed_and_keeps_no_handle(world):
     world.list(ALPHA, code=False)
     world.db.sql(push._removed_sql({digest(f"da:{ALPHA}")}))  # removed by the owner's hand, or under another handle
@@ -1188,6 +1228,12 @@ def test_a_request_whose_artist_is_removed_another_way_is_closed_and_keeps_no_ha
     assert world.db.requests == [] and world.check() == expected()
     assert world.tally == TALLY | {"requests_closed": 1}
     assert ALPHA not in json.dumps(world.db.queue)
+    # The eighth critic's uncaught break: a closed request that keeps its notes (RemovalsDb.close follows this).
+    assert (
+        "set artist_slug = 'closed:' || gen_random_uuid(), outcome = p_outcome, note = null, notes = '[]', "
+        "da_username = null, site_url = null, site_domain = null, da_account = null, due_at = null, networks = '{}'"
+        in function_body("close_request")
+    )
 
 
 def test_the_owner_lists_the_open_requests_by_handle_and_answers_them(world, capsys):
@@ -1417,6 +1463,13 @@ def test_a_code_asked_for_from_another_network_takes_nothing_from_the_artist(wor
     )
     sql = " ".join((config.ROOT / "sql" / "002_functions.sql").read_text(encoding="utf-8").split())
     assert "else r.networks || excluded.networks end;" in sql and "select q.id, min(q.turn) as turn" in sql
+    # The eighth critic's uncaught breaks: turns taken by request, not by network, and fewer networks kept than a run
+    # looks at.
+    turns = function_body("due_removals")
+    assert "left join lateral unnest(r.networks) as n (network) on true" in turns
+    assert "row_number() over (partition by n.network order by r.due_at, r.code_at, r.id) as turn" in turns
+    kept = f"networks = case when cardinality(r.networks) >= {removals.MAX_REQUESTS} or excluded.networks"
+    assert kept in function_body("start_removal_proof")
 
 
 def test_an_account_hash_two_unlinked_keys_hold_is_sent_for_neither_and_a_proof_takes_nobody_else(world):
@@ -1470,6 +1523,52 @@ def test_a_request_filed_while_its_artist_is_removed_is_never_left_open():
         assert "language plpgsql" in body, name
         first = body[body.index("begin") :].split(";")[0].split()
         assert first == ["begin", "perform", "pg_advisory_xact_lock(4207)"], name
+
+
+def test_every_write_to_the_artists_and_what_names_them_takes_the_removals_lock_before_a_row():
+    """The eighth critic's deadlock: a removal locked the artist and deleted it, and the cascade waited for a works or
+    neighbour row that a load's batch, the sweep after a load or a push's delete had locked, while that one's
+    foreign-key check waited for the artist. Postgres aborted one. Every statement that writes the artists, their
+    works, their neighbour rows or the removal list takes the removals' lock first, by a statement trigger, which runs
+    before the statement touches a row. Only Postgres can run the race (tests/test_db.py); here the statements are
+    read, so that taking the lock out of any table fails without one."""
+    sql = re.sub(r"--[^\n]*", "", (config.ROOT / "sql" / "002_functions.sql").read_text(encoding="utf-8"))
+    made = re.findall(
+        r"create or replace trigger removals_lock (before [a-z ]+) on public\.(\w+)\s+"
+        r"for each statement execute function public\.removals_lock\(\);",
+        sql,
+    )
+    every = "before insert or update or delete"
+    assert sorted(made) == [
+        ("before insert", "removed"),
+        *((every, table) for table in ("artist_neighbors", "artists", "works")),
+    ]
+    assert function_body("removals_lock").endswith(
+        "language plpgsql set search_path = '' as $$ begin perform pg_advisory_xact_lock(4207); return null; end"
+    )
+
+
+def test_a_batch_that_named_an_artist_removed_while_it_waited_is_written_once_more(monkeypatch):
+    """A batch reads its artists before the removals' lock lets it in. One a removal deleted meanwhile fails the
+    batch on its foreign key (23503); written again, the batch reads the artists anew and leaves them out. Once more
+    only: a second failure is no race."""
+    monkeypatch.setattr(time, "sleep", lambda seconds: None)
+    refused = RuntimeError('HTTP 409: {"code":"23503","message":"FAKE violates foreign key constraint"}')
+    tries = []
+
+    def write(batch):
+        tries.append(batch)
+        if len(tries) == 1:
+            raise refused
+        return 1
+
+    assert db._paced([["FAKE-BATCH"]], write) == 1 and tries == [["FAKE-BATCH"]] * 2
+
+    def always(batch):
+        raise refused
+
+    with pytest.raises(RuntimeError, match="23503"):
+        db._paced([["FAKE-BATCH"]], always)
 
 
 def test_a_code_put_up_on_the_site_late_in_a_collect_run_is_read_at_the_next_look(world, monkeypatch):
@@ -1528,6 +1627,15 @@ def test_a_request_from_the_page_is_filed_for_whom_it_showed_while_a_push_holds_
     assert (
         f"and not exists (select 1 from public.removed gone where gone.key_hash in {barred_already}"
         in function_body("request_binding")
+    )
+    # The eighth critic's: whoever is listed now put before the ticket, and a ticket read before its signature holds.
+    assert "order by b.pick limit 1" in function_body("request_binding")
+    binding = function_body("ticket_binding")
+    assert binding[binding.index(" declare ") :] == (
+        " declare body constant text := split_part(p_ticket, '.', 1); begin if exists (select 1 from "
+        "public.removal_secret s where split_part(p_ticket, '.', 2) = encode(extensions.hmac('claim ticket ' || body, "
+        "s.secret, 'sha256'), 'hex')) then return convert_from(decode(body, 'base64'), 'UTF8')::jsonb; end if; "
+        "return null; end"
     )
 
 
@@ -1648,6 +1756,14 @@ def test_a_site_the_artist_has_left_is_not_barred_and_whoever_holds_it_now_stays
         assert digest(f"site:{ALPHA}-new.art") in world.db.removed
     assert gone(world, ALPHA) and not gone(world, BRAVO) and world.db.requests == []
     assert digest(f"site:{ALPHA}-old.art") not in world.db.removed and f"{old}robots.txt" not in world.sites.urls
+    # The eighth critic's uncaught break: the site barred whoever lists it now. RemovalsDb.grant follows this, and
+    # the handle it is held to, the one the proof was found under.
+    granting = function_body("grant_request")
+    assert "lateral (select coalesce(public.key_hash('da:' || lower(p_handle)), r.da_key) as da_key) h" in granting
+    assert (
+        "case when p_site and not exists ( select 1 from public.artists a where a.site_key = r.site_key "
+        "and a.da_key is distinct from h.da_key) then r.site_key end" in granting
+    )
 
 
 def test_a_proof_on_deviantart_bars_the_site_only_while_the_profile_names_it(world):
@@ -1687,6 +1803,9 @@ def test_another_artists_removal_by_a_site_leaves_this_artists_request_open(worl
     assert world.check() == expected(requests_due=1, proven_on_deviantart=1, artists_removed=1)
     assert gone(world, BRAVO) and digest(f"site:{ALPHA}-old.art") in world.db.removed
     assert not gone(world, ALPHA) and world.db.requests == [ALPHA]
+    # By the handle or the account, never the site alone (removed_after_insert, which RemovalsDb.sql follows).
+    closing = "and (r.da_key in (select key_hash from added) or r.da_account in (select key_hash from added));"
+    assert closing in function_body("removed_after_insert")
 
 
 def test_the_owner_sees_every_open_request_however_many_the_data_api_answers_at_once(world, monkeypatch):
@@ -1731,15 +1850,42 @@ def test_a_site_that_takes_too_long_costs_one_look_and_the_queue_moves_on(world,
 
 
 def test_the_sweep_never_waits_on_a_row_a_load_holds():
-    """delete_removed skips a row another transaction holds, so a removal never queues behind a load, and so does
-    client_wait's clean-up. Only Postgres can show that for real (tests/test_db.py, against the owner's database);
-    here the statements are read, so that taking SKIP LOCKED out of either fails without one."""
+    """delete_removed skips a row another transaction holds (a load holds none by then: removals_lock, so it is one
+    locked by hand), and so does client_wait's clean-up. Only Postgres can show that for real (tests/test_db.py,
+    against the owner's database); here the statements are read, so that taking SKIP LOCKED out of either fails
+    without one."""
     sql = (config.ROOT / "sql" / "002_functions.sql").read_text(encoding="utf-8")
     limits = (config.ROOT / "sql" / "003_limits.sql").read_text(encoding="utf-8")
     sweep = sql[sql.index("function public.delete_removed") :]
     clean_up = limits[limits.index("A row back to nothing says nothing") :]
     for body in (sweep[: sweep.index("$$;")], clean_up[: clean_up.index("$$;")]):
         assert re.search(r"for\s+update\s+skip\s+locked", body, re.IGNORECASE)
+
+
+def test_the_public_role_may_run_the_sites_functions_alone_and_each_checks_the_token_first():
+    """The eighth critic's uncaught breaks: site_check granted to the public role too, and a site function that does
+    not check the token. Only the owner's database can show what the public may call (tests/test_db.py); here every
+    grant in sql/ is read."""
+    sql = re.sub(
+        r"--[^\n]*",
+        "",
+        "\n".join(
+            (config.ROOT / "sql" / f).read_text(encoding="utf-8")
+            for f in sorted(("001_schema.sql", "002_functions.sql", "003_limits.sql"))
+        ),
+    )
+    grants = re.findall(r"\bgrant\s+([^;]*?)\s+to\s+(\w+)\s*;", sql)
+    assert sorted(role for _, role in grants) == ["anon", "service_role", "service_role"]
+    [public] = [what for what, role in grants if role == "anon"]
+    site = ["site_search", "site_artist", "site_similar", "site_claim", "site_removal_code", "site_request_removal"]
+    assert re.findall(r"public\.(\w+)\(", public) == ["client_wait", *site]
+    assert "begin perform public.site_check(p_token);" in function_body("client_wait")
+    for name in site:
+        assert " as $$ select public.site_check(p_token); select " in function_body(name), name
+    # And how much: reads 100 a visitor, 1,000 a network and 3,000 in all; removals 10 and 20, and no total (owner
+    # decision 15). tests/test_db.py holds the database to them.
+    budgets = "then '{100, 1000, 3000}'::float8[] else '{10, 20, null}'::float8[] end;"
+    assert budgets in function_body("client_wait")
 
 
 def test_what_the_secret_signs_begins_with_words_of_its_own_for_each_use():

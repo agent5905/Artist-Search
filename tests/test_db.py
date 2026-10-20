@@ -97,6 +97,7 @@ HELPER_FUNCTIONS = [
     "key_hash",
     "query_embedding",
     "removed_after_insert",
+    "removals_lock",
     "request_binding",
     "short_list",
     "site_check",
@@ -221,6 +222,7 @@ KEEP = artist("keep", tagline="zzqxkeepword studies", **site("keep"))
 RACE = artist("race")
 HELD = artist("held")
 CROWD = [artist(f"crowd-{n:02d}") for n in range(30)]
+RENAMED = artist("renamed")  # the handle GONE's account takes, in the eighth critic's case
 
 
 def key_hashes(row: dict[str, Any]) -> list[str]:
@@ -243,7 +245,7 @@ TWINS = [
 FORGET = "delete from public.removed where key_hash in ({})".format(
     ", ".join(
         f"'{key_hash}'"
-        for row in (*ARTISTS, GONE, STAY, KEEP, RACE, HELD, *CROWD, *TWINS)
+        for row in (*ARTISTS, GONE, STAY, KEEP, RACE, HELD, *CROWD, *TWINS, RENAMED)
         for key_hash in [*key_hashes(row), account(row)]
     )
 )
@@ -1380,6 +1382,37 @@ def test_a_proof_removes_the_artist_it_was_bound_to_and_not_whoever_the_slug_lis
     assert not visible(second)
 
 
+def test_a_proof_under_the_accounts_new_handle_bars_that_handle_and_not_the_old_one(seeded):
+    """The eighth critic's: the account took a new handle and DeviantArt gave the old one to a stranger. The proof,
+    found under the new handle (p_handle, as the verifier sends it), bars that handle and the account, which deletes
+    the artist under any handle; not the request's own, which is the stranger's now."""
+    fresh({**GONE, "da_account": account(GONE)})
+    found = {"p_id": request_id(GONE), "p_code": proof_code(GONE), "p_site": False, "p_handle": RENAMED["da_username"]}
+    assert sorted(db.rpc("confirm_removal", found, "secret") or []) == sorted([key_hashes(RENAMED)[0], account(GONE)])
+    assert not visible(GONE)
+    stranger = artist("stranger", da_username=GONE["da_username"])  # whoever holds the old handle now
+    try:
+        assert db.upsert("artists", [stranger], "slug", "slug") == [{"slug": "zz-test-stranger"}] and visible(stranger)
+    finally:
+        db.sql("delete from public.artists where slug = 'zz-test-stranger'")
+
+
+def test_a_ticket_binds_the_request_to_whom_the_page_showed_though_the_slug_lists_somebody_else_now(seeded):
+    """The eighth critic's uncaught break: request_binding putting whoever the slug lists now before the page's
+    ticket. The page showed the first twin, the next push lists the second under the slug, and the first's "Get my
+    code" files the first's request."""
+    first, second = TWINS
+    fresh(first)
+    [shown] = as_the_site("site_claim", p_slug=first["slug"])
+    db.sql(f"delete from public.artists where slug = '{first['slug']}'")
+    db.upsert("artists", [second], "slug", "slug")
+    as_the_site("site_removal_code", p_slug=first["slug"], p_ticket=shown["ticket"], p_network="zz-test-net")
+    made_for = (
+        "select da_username, da_account from public.removal_requests where artist_slug = '{}' and outcome is null"
+    )
+    assert db.sql(made_for.format(first["slug"])) == [{"da_username": "zz-test-twin", "da_account": account(first)}]
+
+
 def test_granting_an_artist_who_left_their_site_does_not_bar_whoever_lists_it_now(seeded):
     """The third critic's stale site key: STAY asked while listed with their site, moved on, and KEEP lists it now."""
     fresh(STAY, KEEP)
@@ -1548,39 +1581,47 @@ def test_a_write_racing_a_removal_does_not_survive_it(seeded):
     assert not visible(RACE)
 
 
-def test_a_removal_does_not_wait_for_a_load(seeded):
+def test_a_removal_and_a_load_take_turns_and_neither_is_aborted(seeded):
+    """The eighth critic's deadlock. A load has rewritten a neighbour row that names the artist, and goes on to write a
+    work of theirs. A removal meanwhile locked the artist and deleted it, and the cascade waited for that neighbour
+    row, while the load's work waited for the artist (its foreign key): Postgres aborted the load. Every write takes
+    the removals' lock first now (removals_lock), so the removal waits for the load to commit, and then removes the
+    artist with all that names them."""
     fresh(HELD, STAY)
     assert db.rpc("replace_neighbors", {"p_rows": [neighbor("stay", "held", 1, 0.5)]}, "secret") == 0
     assert similar("stay") == [HELD["slug"]]
+    [held] = db.sql(f"select id from public.artists where slug = '{HELD['slug']}'")
+    [work] = works_of("held", 1, artist_id=held["id"])
     code = proof_code(HELD)
     load_failed: list[str] = []
 
-    def hold_the_row() -> None:
-        # A load that has rewritten the artist's row and keeps its transaction open for eight seconds.
+    def load() -> None:
         try:
-            db.sql(f"update public.artists set tagline = 'held' where slug = '{HELD['slug']}'; select pg_sleep(8);")
+            db.sql(f"""
+                update public.artist_neighbors set score = 0.25 where neighbor_id = {held["id"]};
+                select pg_sleep(4);
+                insert into public.works (artist_id, source, page_url, image_url)
+                values ({held["id"]}, '{work["source"]}', '{work["page_url"]}', '{work["image_url"]}');
+            """)
         except RuntimeError as error:
             load_failed.append(str(error))
 
-    holder = threading.Thread(target=hold_the_row)
-    holder.start()
-    time.sleep(1.5)
+    loading = threading.Thread(target=load)
+    loading.start()
+    lock_held = "select count(*)::int as n from pg_locks where locktype = 'advisory' and objid = 4207 and granted"
     try:
+        for _ in range(20):  # until the load has written the neighbour row, and holds the removals' lock
+            if db.sql(lock_held) == [{"n": 1}]:
+                break
+            time.sleep(0.1)
         started = time.perf_counter()
-        assert confirm(HELD, code) is True  # answered at once, not after the load, and not with a timeout
-        assert time.perf_counter() - started < 3
-        # The row is still there, held by the load, but the public no longer sees the artist.
-        count = f"select count(*)::int as n from public.artists where slug = '{HELD['slug']}'"
-        assert db.sql(count) == [{"n": 1}]
-        assert not visible(HELD)
-        assert HELD["slug"] not in slugs(db.rpc("search_artists", {"q": "held"}, "secret"))
-        assert similar("stay") == []  # nor as anybody's neighbour, though that row is still there too
+        assert confirm(HELD, code)
+        assert 1 < time.perf_counter() - started < 8  # it waited for the load, and no longer than a batch may take
     finally:
-        holder.join()
-    # The load's write could not commit onto a removed artist, and the sweep after a load takes the row.
-    assert len(load_failed) == 1 and "removed artist" in load_failed[0]
-    assert db.rpc("delete_removed", {}, "secret") == 1
-    assert db.sql(count) == [{"n": 0}]
+        loading.join()
+    assert load_failed == []  # neither was aborted
+    assert not visible(HELD) and similar("stay") == []
+    assert db.sql(f"select count(*)::int as n from public.works where artist_id = {held['id']}") == [{"n": 0}]
 
 
 # The removal list of record is the `removed` table, and pipeline/store.py imports it. These hosts are never
@@ -1941,9 +1982,12 @@ def test_the_days_total_holds_reads_back_for_everyone_a_little_at_a_time(seeded)
     client = visitor()
     kept = db.sql("select busy_until from public.client_counts where client_key = 'read everyone'")
     try:
+        # The day's reads used up, and a full row for removals too, which nothing may read: they have no total (the
+        # eighth critic's uncaught break gave them one).
         db.sql("""
             insert into public.client_counts (client_key, busy_until)
-            values ('read everyone', extract(epoch from clock_timestamp()) + 86400)
+            values ('read everyone', extract(epoch from clock_timestamp()) + 86400),
+                   ('removal everyone', extract(epoch from clock_timestamp()) + 86400)
             on conflict (client_key) do update set busy_until = excluded.busy_until
         """)
         # Full: the next page is let in a 3,000th of a day on, a profile a tenth of that. Not until midnight.
@@ -1963,6 +2007,7 @@ def test_the_days_total_holds_reads_back_for_everyone_a_little_at_a_time(seeded)
             else "delete from public.client_counts"
         )
         db.sql(f"{restore} where client_key = 'read everyone'")
+        db.sql("delete from public.client_counts where client_key = 'removal everyone'")
         forget(client)
 
 
@@ -2098,6 +2143,11 @@ def test_the_verifier_takes_turns_between_the_networks_codes_were_asked_from(see
     due = db.rpc("due_removals", {"p_now": "2999-01-01T00:00:00+00:00", "p_limit": None}, "secret")
     mine = [row["artist_slug"] for row in due if row["artist_slug"].startswith("zz-test-")]
     assert mine == [flood[0]["slug"], STAY["slug"], flood[1]["slug"], flood[2]["slug"]]
+    # The eighth critic's uncaught break: fewer networks kept than a run looks at. The first 30 are, and no more.
+    for n in range(removals.MAX_REQUESTS + 5):
+        as_the_site("site_removal_code", p_slug=STAY["slug"], p_network=f"zz-test-net-{n}")
+    networks = f"select cardinality(networks) as n from public.removal_requests where artist_slug = '{STAY['slug']}'"
+    assert db.sql(networks) == [{"n": removals.MAX_REQUESTS}]
 
 
 def due_later_than(row: dict[str, Any], interval: str) -> bool:

@@ -19,6 +19,9 @@ drop function if exists public.request_removal(text, text);
 drop function if exists public.start_removal_proof(text);
 -- And a note to the network it came from.
 drop function if exists public.request_removal(text, text, text);
+-- A proof bars the handle the artist's profile answers under now, not an older one (grant_request).
+drop function if exists public.grant_request(bigint, text, boolean);
+drop function if exists public.confirm_removal(bigint, text, boolean);
 
 -- What a removal remembers of an artist without keeping their name (hard rule 7): the hashes of
 -- 'da:<lowercased handle>' and 'site:<registrable domain>'. The same keys as pipeline/store.py, so
@@ -69,7 +72,8 @@ create or replace trigger artists_before_write before insert or update on public
 for each row execute function public.artists_before_write();
 
 -- A write that races a removal passes the check above, because the removal had not committed yet.
--- This one runs when the write commits, by which time it has: the write then fails as a whole.
+-- This one runs when the write commits, by which time it has: the write then fails as a whole. (Every write
+-- waits for a removal now, under removals_lock below: this is what holds if one ever does not.)
 create or replace function public.artists_not_removed() returns trigger
 language plpgsql set search_path = ''
 as $$
@@ -94,9 +98,9 @@ $$;
 
 -- Service role only. Deletes the artists that keys on the removal list bar (works cascade), found by
 -- index. p_keys null means every key on the list: db.after_load() runs that as a sweep. A row another
--- transaction holds is skipped rather than waited for, so a removal never queues behind a load; the
--- public functions leave such a row out until it is swept. Removal requests are not touched: only a
--- proven removal or the owner's answer closes one. Returns how many artists were deleted.
+-- transaction holds is skipped rather than waited for: no load holds one by then (removals_lock), so that is
+-- one locked by hand, and the public functions leave it out until it is swept. Removal requests are not
+-- touched: only a proven removal or the owner's answer closes one. Returns how many artists were deleted.
 create or replace function public.delete_removed(p_keys text[] default null) returns int
 language plpgsql set search_path = ''
 as $$
@@ -141,6 +145,34 @@ $$;
 create or replace trigger removed_after_insert after insert on public.removed
 referencing new table as added
 for each statement execute function public.removed_after_insert();
+
+-- Every statement that writes the artists, their works, their neighbour rows or the removal list takes the
+-- removals' lock (see request_binding) before it touches a row, and holds it until it commits: a load's batch and a
+-- removal run one at a time. Without it a removal locked the artist and deleted it, and the cascade waited for a
+-- works or neighbour row that a load's batch, the sweep after a load or a push's delete had locked, while that
+-- one's foreign-key check waited for the artist: Postgres aborted one of the two. A statement still reads what it
+-- read before it waited, so a batch that names an artist removed meanwhile fails on its foreign key, and db.load
+-- writes it once more (db._paced).
+-- ponytail: one lock for every write. A removal waits for one batch of a load (one Data API call: under a second
+-- as a rule, 8 s at most) and a batch for one removal (the same, mostly the word list's rebuild), and so does a
+-- visitor's "Get my code". Lock by artist if they ever queue on it.
+create or replace function public.removals_lock() returns trigger
+language plpgsql set search_path = ''
+as $$
+begin
+  perform pg_advisory_xact_lock(4207); -- the removals' lock
+  return null;
+end
+$$;
+
+create or replace trigger removals_lock before insert or update or delete on public.artists
+for each statement execute function public.removals_lock();
+create or replace trigger removals_lock before insert or update or delete on public.works
+for each statement execute function public.removals_lock();
+create or replace trigger removals_lock before insert or update or delete on public.artist_neighbors
+for each statement execute function public.removals_lock();
+create or replace trigger removals_lock before insert on public.removed
+for each statement execute function public.removals_lock();
 
 -- A work on the artist's own site must have both URLs on that site (hard rule 1: a thumbnail is
 -- shown from where the artist put it). And an upsert of a work that already holds the same values
@@ -676,16 +708,18 @@ as $$
 $$;
 
 -- Service role only. Removes artists outright: their keys go on the removal list, which deletes
--- them (works cascade) and bars their handle, site and account for good. It reads the artists without
--- locking them and never waits for a load. Returns how many artists were deleted; one that a load
--- held at that moment is not counted, is hidden from the public at once all the same, and goes with
--- the next sweep.
+-- them (works cascade) and bars their handle, site and account for good. It takes the removals' lock first, so
+-- that no load's batch lands between its two counts, and reads the artists without locking them. Returns how many
+-- artists were deleted; one that something else held at that moment is not counted, is hidden from the public at
+-- once all the same, and goes with the next sweep.
 create or replace function public.remove_artists(p_slugs text[]) returns int
 language plpgsql set search_path = ''
 as $$
 declare
-  before int := (select count(*) from public.artists);
+  before int;
 begin
+  perform pg_advisory_xact_lock(4207); -- the removals' lock: see removals_lock
+  before := (select count(*) from public.artists);
   insert into public.removed (key_hash)
   select distinct k
   from public.artists a, unnest(array_remove(public.artist_keys(a.da_username, a.site_domain) || a.da_account, null)) k
@@ -715,11 +749,15 @@ $$;
 -- what it was bound to goes on the removal list in one statement (which deletes whoever that bars), and the
 -- request is closed. That is the handle and the account, and the site when p_site says the proof covered it
 -- (the owner's grant: always) and no other handle is listed with it now: a site can pass to another artist.
+-- The handle is p_handle when it is given: the one the proof was found under, which the account answers to now
+-- (pipeline/removals.py). Not the request's own when the account has left it: DeviantArt can give a handle to
+-- somebody else, and the account bars the artist under every handle anyway.
 -- Never whoever the slug lists now. Whether the artist is listed at this moment does not matter: the next
 -- push bars and purges them everywhere. Returns the keys it put on the list, for the local store; null, and
 -- nothing changes, without one open, or without a key to bar (a request older than its handle column, for
 -- an artist not listed now).
-create or replace function public.grant_request(p_id bigint, p_outcome text, p_site boolean) returns text[]
+create or replace function public.grant_request(p_id bigint, p_outcome text, p_site boolean, p_handle text default null)
+returns text[]
 language plpgsql set search_path = ''
 as $$
 declare
@@ -728,11 +766,13 @@ begin
   -- The removals' lock (see request_binding) before the request's row: a request being filed holds the lock and
   -- may wait on that row, so the other order could deadlock.
   perform pg_advisory_xact_lock(4207);
-  select array_remove(array[r.da_key, r.da_account, case when p_site and not exists (
-           select 1 from public.artists a where a.site_key = r.site_key and a.da_key is distinct from r.da_key)
+  select array_remove(array[h.da_key, r.da_account, case when p_site and not exists (
+           select 1 from public.artists a where a.site_key = r.site_key and a.da_key is distinct from h.da_key)
          then r.site_key end], null)
   into keys
-  from public.removal_requests r where r.id = p_id and r.outcome is null
+  from public.removal_requests r,
+       lateral (select coalesce(public.key_hash('da:' || lower(p_handle)), r.da_key) as da_key) h
+  where r.id = p_id and r.outcome is null
   for update of r;
   if coalesce(cardinality(keys), 0) = 0 then
     return null;
@@ -744,11 +784,12 @@ end
 $$;
 
 -- Service role only: the verifier calls it once it has seen the request's code where only its artist can
--- write, with p_site true when the artist's profile, as it read it, still names the request's site. When the
--- request is open and the code is its slug's, the artist is removed at once and for good (grant_request),
--- listed at this moment or not, and the keys barred are returned. Null, and nothing changes, for anything
--- else, and when the secret is missing (no code is then anyone's).
-create or replace function public.confirm_removal(p_id bigint, p_code text, p_site boolean) returns text[]
+-- write, with p_site true when the artist's profile, as it read it, still names the request's site, and p_handle
+-- the handle that profile answers under now. When the request is open and the code is its slug's, the artist is
+-- removed at once and for good (grant_request), listed at this moment or not, and the keys barred are returned.
+-- Null, and nothing changes, for anything else, and when the secret is missing (no code is then anyone's).
+create or replace function public.confirm_removal(p_id bigint, p_code text, p_site boolean, p_handle text default null)
+returns text[]
 language plpgsql security definer set search_path = ''
 as $$
 begin
@@ -756,7 +797,7 @@ begin
                             where r.id = p_id and r.outcome is null), false) then
     return null;
   end if;
-  return public.grant_request(p_id, 'proven', p_site);
+  return public.grant_request(p_id, 'proven', p_site, p_handle);
 end
 $$;
 
@@ -793,6 +834,7 @@ revoke all on function
   public.artists_not_removed(),
   public.delete_removed(text[]),
   public.removed_after_insert(),
+  public.removals_lock(),
   public.works_before_write(),
   public.artist_ids(text[]),
   public.artist_card(bigint, int, tsquery, smallint[]),
@@ -811,8 +853,8 @@ revoke all on function
   public.due_removals(timestamptz, int),
   public.remove_artists(text[]),
   public.close_request(bigint, text),
-  public.grant_request(bigint, text, boolean),
-  public.confirm_removal(bigint, text, boolean),
+  public.grant_request(bigint, text, boolean, text),
+  public.confirm_removal(bigint, text, boolean, text),
   public.reject_removal(bigint),
   public.removal_tally()
 from public, anon, authenticated, service_role;
@@ -843,8 +885,8 @@ grant execute on function
   public.due_removals(timestamptz, int),
   public.remove_artists(text[]),
   public.close_request(bigint, text),
-  public.grant_request(bigint, text, boolean),
-  public.confirm_removal(bigint, text, boolean),
+  public.grant_request(bigint, text, boolean, text),
+  public.confirm_removal(bigint, text, boolean, text),
   public.reject_removal(bigint),
   public.removal_tally()
 to service_role;

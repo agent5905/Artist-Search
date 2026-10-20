@@ -627,6 +627,9 @@ def _forget(conn: sqlite3.Connection, key: str) -> int:
         _delete(conn, "deviation_id", work_id)
     _delete(conn, "artist_key", key, but="works")
     conn.execute("DELETE FROM artist_marks WHERE same_as = ?", (key,))  # the key is named there too
+    # And the store's row for the handle, which may name their site: one the account has left is purged with it
+    # and not barred (push._removal), so no removal deletes that row.
+    conn.execute("DELETE FROM artists WHERE key = ?", (key,))
     return stuck
 
 

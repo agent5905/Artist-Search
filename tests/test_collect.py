@@ -2066,7 +2066,8 @@ def test_an_account_under_a_new_handle_is_linked_once_the_old_handle_is_gone_and
     store.mark_removed(RENAMED)
     assert counts_of(world, capsys)[collect.PURGED] == 1
     assert library.artist_keys() == [key(BRAVO)] and cached() == image_files([21])
-    assert [artist[0] for artist in store.all_artists()] == [key(BRAVO)] and store.is_removed(ALPHA)
+    # The handle the account left is purged and not barred: DeviantArt can give it to somebody else.
+    assert [artist[0] for artist in store.all_artists()] == [key(BRAVO)] and not store.is_removed(ALPHA)
     assert rows("skipped") == rows("artist_marks") == [] and library.account_removed(f"FAKE-USERID-{ALPHA}")
     seen = len(world.log)
     assert counts_of(world, capsys)[collect.PROCESSED] == 1
@@ -2106,7 +2107,8 @@ def test_an_old_handle_that_answers_again_under_another_user_id_does_not_undo_th
     assert kept(ALPHA) == [4, 3, 2, 1]
     store.mark_removed(RENAMED)
     counts_of(world, capsys)
-    assert library.artist_keys() == [] and cached() == [] and store.is_removed(ALPHA) and store.all_artists() == []
+    # Purged under the old handle too, which is not barred: the newcomer holds it now.
+    assert library.artist_keys() == [] and cached() == [] and not store.is_removed(ALPHA) and store.all_artists() == []
     stored_bytes = config.LOCAL_DB.read_bytes()
     assert b"zz-fake-alpha" not in stored_bytes and b"zz-fake-renamed" not in stored_bytes
 
@@ -2128,7 +2130,7 @@ def test_a_corrupt_rename_link_to_another_account_does_not_widen_a_removal(capsy
     store.mark_removed(RENAMED)
     counts_of(world, capsys)
     assert library.artist_keys() == [key(BRAVO)] and cached() == image_files([21])
-    assert store.is_removed(ALPHA) and store.is_removed(RENAMED) and not store.is_removed(BRAVO)
+    assert not store.is_removed(ALPHA) and store.is_removed(RENAMED) and not store.is_removed(BRAVO)  # ALPHA: left
 
 
 def test_a_removal_of_the_old_handle_purges_what_is_kept_under_the_new_one_too(capsys):

@@ -59,12 +59,14 @@ handle either. Codes do not expire. One made before the owner replaced the secre
 under words of their own (removal_code: none was given out), is not the slug's code any more, and proves nothing.
 
 A code found where it must be goes to confirm_removal, which checks it again and removes the artist at once and
-for good, listed at that moment or not, and closes the request. What it bars is what the proof covered: the handle
-and the account the request is bound to, and its site only while the profile just read still names it (and no
-other handle is listed with it: grant_request). Those key hashes, as the database answers them, go on the local
-store's list (store.import_removed), so no stage here collects the artist again. The next push or collect purges
-what is kept about them, under every handle of their account, as it does for every removal on the database's
-list. The owner's --grant does the same for an open request without proof (its site included, on the same
+for good, listed at that moment or not, and closes the request. What it bars is what the proof covered: the account
+the request is bound to, the handle the profile just read answers under now, and the request's site only while
+that profile still names it (and no other handle is listed with it: grant_request). Not the request's own handle
+when the account has left it for another: DeviantArt can give it to somebody else, and the account bars the artist
+under every handle anyway. Those key hashes, as the database answers them, go on the local store's list
+(store.import_removed), so no stage here collects the artist again. The next push or collect purges what is kept
+about them, under every handle of their account, as it does for every removal on the database's list. The owner's
+--grant does the same for an open request without proof (with the request's own handle, and its site on the same
 condition). A request whose artist is removed another way (under another handle of their account, say) is closed
 by the database as that happens.
 
@@ -186,13 +188,14 @@ def _profile(api: discover._Api, handle: str) -> dict[str, Any] | None:
 
 def _look(
     api: discover._Api, fetcher: crawl.PoliteFetcher, request: dict[str, Any], code: str, local: store.Snapshot
-) -> tuple[str, bool]:
-    """Where the request's code is: "deviantart" or "own_site", and whether the profile just read still names the
-    request's site, so that the proof covers it. Or why it was not found: "no_code_found" when every place it may be
-    in was read, "not_checked" when one could not be, or there is none we may read."""
+) -> tuple[str, bool, str]:
+    """Where the request's code is: "deviantart" or "own_site", whether the profile just read still names the
+    request's site, so that the proof covers it, and the handle that profile answers under now, which it covers too.
+    Or why it was not found: "no_code_found" when every place it may be in was read, "not_checked" when one could
+    not be, or there is none we may read."""
     handle, kept = request["da_username"], request["da_account"]
     if not isinstance(handle, str) or not store.HANDLE.fullmatch(handle):
-        return "not_checked", False
+        return "not_checked", False, ""
     # The profile of the account the request is bound to, under whatever handle it answers now. Not a profile the
     # handle has passed to another account, and not one answer given for every lookup, which the API did once. A
     # request bound to no account has only the handle's own profile, which may only vouch for the site.
@@ -203,23 +206,23 @@ def _look(
         user_id, name = (user.get("userid"), user.get("username")) if isinstance(user, dict) else (None, None)
         if not kept or kept in (library.account(user_id), library.account(user_id, "da-user")):
             break
-    if profile is None:
-        return "not_checked", False
+    if profile is None or not (isinstance(name, str) and store.HANDLE.fullmatch(name)):
+        return "not_checked", False, ""
     named = {store.registrable_domain(host) for host in store.hosts_in(profile.get("website"))}
     covered = bool(request["site_url"]) and request["site_domain"] in named
     if kept:
         if kept not in (library.account(user_id), library.account(user_id, "da-user")):
-            return "not_checked", False
+            return "not_checked", False, ""
         if any(_holds(profile.get(field), code) for field in PROFILE_FIELDS):
-            return "deviantart", covered
-    elif not (isinstance(name, str) and name.lower() == handle.lower()):
-        return "not_checked", False
+            return "deviantart", covered, name
+    elif name.lower() != handle.lower():
+        return "not_checked", False, ""
     if not covered:
-        return "no_code_found" if kept else "not_checked", False
+        return "no_code_found" if kept else "not_checked", False, ""
     found = fetcher.read_proof(request["site_url"], PROOF_NAME, lambda said: _plain(said).strip() == code)
     if isinstance(found, str):  # robots.txt shuts us out, no answer in time, a redirect off the site
-        return "not_checked", False
-    return "own_site" if found else "no_code_found", True
+        return "not_checked", False, ""
+    return "own_site" if found else "no_code_found", True, name
 
 
 def run(
@@ -259,13 +262,15 @@ def run(
         kept = held.enter_context(store.snapshot(local))
         for request in due:
             code = db.rpc("removal_code", {"p_slug": request["artist_slug"]}, "secret")
-            found = _look(api, fetcher, request, code, kept) if CODE.fullmatch(str(code)) else ("not_checked", False)
-            where, site = found
+            found = (
+                _look(api, fetcher, request, code, kept) if CODE.fullmatch(str(code)) else ("not_checked", False, "")
+            )
+            where, site, under = found
             if where not in ("deviantart", "own_site"):
                 counts[f"left_for_owner_{where}"] += 1
             else:
                 counts[f"proven_on_{where}"] += 1
-                args = {"p_id": request["id"], "p_code": code, "p_site": site}
+                args = {"p_id": request["id"], "p_code": code, "p_site": site, "p_handle": under}
                 if dry_run:
                     counts["artists_removed"] += 1
                 # The database first: it is the judge of the code. Here only once it has removed them, and only

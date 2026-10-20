@@ -440,6 +440,15 @@ describe('POST /api/removal', () => {
       await removal(post({ slug: 'someone', ticket }), env(), db.fetcher)
       expect([ticket, db.called('site_removal_code')[0].args.p_ticket, db.called('site_request_removal')[0].args.p_ticket]).toEqual([ticket, null, null])
     }
+    // The eighth critic's: a cap cut below a real ticket drops it, and the request is bound to nobody. The longest a
+    // ticket can be (claim_ticket: every field at its longest, sql/001_schema.sql), and the cap itself, go through.
+    const bound = { slug: 's'.repeat(80), da_username: 'h'.repeat(40), site_url: `https://${'a'.repeat(2040)}`, site_domain: 'd'.repeat(253), da_account: '0'.repeat(64) }
+    for (const ticket of [`${btoa(JSON.stringify(bound))}.${'f'.repeat(64)}`, 'x'.repeat(4096)]) {
+      const db = database(Response.json('code'), Response.json(true))
+      await removal(post({ slug: 'someone', ticket, proof: true }), env(), db.fetcher)
+      await removal(post({ slug: 'someone', ticket }), env(), db.fetcher)
+      expect([db.called('site_removal_code')[0].args.p_ticket, db.called('site_request_removal')[0].args.p_ticket]).toEqual([ticket, ticket])
+    }
   })
 
   it('gives a code only when proof is asked for with true: anything else is a request without proof', async () => {
@@ -671,6 +680,8 @@ describe('the claim-or-remove page', () => {
     expect(siteOnly).not.toContain('About text')
     expect(siteOnly).toContain('Not on DeviantArt for this profile, only on your site')
     expect(siteOnly).toContain('On someone.art')
+    // The eighth critic's: robots.txt that keeps our crawler out keeps the check out too (pipeline/removals.py).
+    expect(siteOnly).toContain('and unless your robots.txt keeps out our crawler, ArtistSearchBot.')
 
     const neither = places(false, null)
     expect(neither).toContain('There is no place we can check a code for this profile')
