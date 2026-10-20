@@ -1255,4 +1255,26 @@ What fails is the content. Nothing checks fitness beyond sex and gore, so the fi
 - **One new edge, for the owner:** 30 networks that ask for an artist's code before the artist does fill the request's list of 30, which leaves the artist's own network out. That gives 18 to 20 hours, inside decision 15's 12 to 25 hours but at 30 networks rather than 75, and still within the page's "at most a day".
 - **The missing test** for a proof timeout is added, and the secret's two uses now have separate prefixes.
 
+**Claim-or-remove's seventh critic, against the accepted limits: close.**
+- **Holds:** proof, permanence, secrets, and the verifier's bounds (at most 2,880 DeviantArt lookups a day, and at most 8 requests a run to one site).
+- **Beyond the accepted limits:**
+  1. Whoever files first owns the one note never dropped.
+  2. A rare race can push a re-asked look a week on.
+  3. Read limits per network (a /24, or an IPv6 /48 holding thousands of phones) throttle ordinary neighbours.
+  4. A removal and a load can deadlock (Postgres aborts one; nothing breaks).
+  5. "Create if not exists" leaves older definitions in the live database.
+  6. Six breaks go uncaught.
+- **The lead counts as covered by the corrupt-store limit:** a tampered local store that moves one account hash onto another artist can redirect a removal. Collect never replaces a stored hash, and the store is on the owner's machine.
+
+**Removals round 8, being built:**
+- Notes kept per network, and the race closed.
+- Read limits of 100 per visitor, 1,000 per network and 3,000 overall. Decision 12 already accepts that one actor can take the API down, so a tight per-network cap mostly hurt real visitors.
+- One lock for removals and loads, and `db.migrate` catches older live definitions.
+- Tests for every uncaught break.
+
+**The disk filled up.** Drive F: reached 0 bytes free at about 19:45 on 10-19, and two image-check turns failed to open the store and were retried. The cause was this project: 20 finished builder worktrees, each with its own Python environment (73 GB), and critics' temporary test folders (9.5 GB).
+- **Every branch was merged,** so the worktrees were removed, with the branches kept, and the temporary folders deleted. F: has 83 GB free.
+- **The store's integrity check passes.** No reading was lost.
+- **From now on,** worktrees are removed after each merge.
+
 **A Pages project of its own.** The project `.env` named is the owner's own August site, on a different Supabase, and the owner keeps it. With the owner's approval, Artist Search now has its own empty project, `artist-search` (`artist-search.pages.dev`, nothing deployed), and `.env` points at it. No domain is needed. The edge rate-limiting rule needs one, but the database's own limits cover visitors, networks and the total.
