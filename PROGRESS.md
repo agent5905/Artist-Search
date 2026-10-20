@@ -1306,6 +1306,19 @@ What fails is the content. Nothing checks fitness beyond sex and gore, so the fi
 - **Deadlocks:** every write to artists, works, neighbours and the removal list takes the removal lock first, through statement-level triggers, so loads and removals take turns. A batch that read its data before waiting is retried once.
 - **Tests:** all 19 SQL breaks the critic tried, and all 3 page breaks, are now caught offline. `tests/test_db.py` gains live tests for the deadlock, the handle rule, the ticket's precedence and the 30-network cap. The live suite at setup is the last gate the eighth critic named.
 
+**Claim-or-remove's ninth critic: no, for one root cause.** Removals bar DeviantArt handles, and handles change owners. When DeviantArt gives a renamed artist's old handle to someone else, two paths remove a person who proved nothing:
+- **Another artist's own proof:** it bars the handle, and the store follows it back to the renamed artist.
+- **The owner's grant:** it falls back to the request's old handle.
+
+Deadlocks are gone as written, and nothing else stands beyond the accepted limits. Only 2 of its 13 SQL breaks are caught offline.
+
+**Removals round 10, being built:**
+- A removal bars the account whenever the account is known; it bars a handle only when no account is known, and only the one the profile answers under at that moment.
+- Push and collect never follow a handle back to an account that has left it.
+- The owner's grant uses the request's account.
+- A database failure on one request no longer stalls the queue.
+- More SQL-text tests, and live tests for what nothing tests on its own.
+
 **The disk filled up.** Drive F: reached 0 bytes free at about 19:45 on 10-19, and two image-check turns failed to open the store and were retried. The cause was this project: 20 finished builder worktrees, each with its own Python environment (73 GB), and critics' temporary test folders (9.5 GB).
 - **Every branch was merged,** so the worktrees were removed, with the branches kept, and the temporary folders deleted. F: has 83 GB free.
 - **The store's integrity check passes.** No reading was lost.
