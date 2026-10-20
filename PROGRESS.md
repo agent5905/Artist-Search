@@ -1283,6 +1283,24 @@ What fails is the content. Nothing checks fitness beyond sex and gore, so the fi
 - **Tests:** all 11 test-gap breaks are now caught.
 - **Not yet run against Postgres:** none of the new SQL; `tests/test_db.py` exercises it at setup. The first live migration may stop on older functions left from round 8, which will need dropping.
 
+**Claim-or-remove's eighth critic: yes, once `tests/test_db.py` passes against the migrated database.**
+- **Holds within the accepted limits:**
+  - Proof: only domain control works (limit 1).
+  - The page's promises, permanence and secrets.
+  - The limits: nothing beyond limits 2 and 4.
+  - Requests and notes: a note is lost only from ten networks, and a stranger on the artist's own network falls under limit 4.
+  - The verifier's bounds: at most 31 DeviantArt requests a run, and 8 to one site, at least 3 s apart.
+- **Two things still beyond the limits:**
+  1. If DeviantArt gives a renamed artist's old handle to someone new, a proof under the new handle also bars the old one, and so the stranger.
+  2. A removal and a data load can deadlock in rare orders. Postgres aborts one and it is retried, but it breaks "cannot deadlock".
+- **Its biggest gap:** offline, most SQL breaks are caught only by `tests/test_db.py`, which has not yet run against this version.
+- **To check by hand at setup:** that the API's `bio` carries the profile's About text, and that a tagline can hold the 54-character code.
+
+**Removals round 9, being built:**
+- A proof bars the account and the handle it was found under, not older handles by name.
+- Every path that writes artists, works or neighbours takes the removal lock first.
+- Static SQL tests where they can catch a break offline, and a live test for each of the rest.
+
 **The disk filled up.** Drive F: reached 0 bytes free at about 19:45 on 10-19, and two image-check turns failed to open the store and were retried. The cause was this project: 20 finished builder worktrees, each with its own Python environment (73 GB), and critics' temporary test folders (9.5 GB).
 - **Every branch was merged,** so the worktrees were removed, with the branches kept, and the temporary folders deleted. F: has 83 GB free.
 - **The store's integrity check passes.** No reading was lost.
