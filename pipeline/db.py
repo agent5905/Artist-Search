@@ -36,12 +36,27 @@ def _send(method: str, url: str, headers: dict[str, str], **kwargs: Any) -> http
         raise RuntimeError(f"request failed: {type(error).__name__}") from None
 
 
+SHOWN = 8  # characters of a .env value in a row that an error may not show: none of it, whole or in part
+
+
+def _masked(message: str, values: Iterable[str]) -> str:
+    """The message with every run of SHOWN or more characters of any of these values in it put as "***": a reply
+    that echoes a token but its last few characters shows none of it. ponytail: a scan for each run of SHOWN, a few
+    hundred finds over a short error."""
+    hidden = [False] * len(message)
+    for value in values:
+        for start in range(len(value) - SHOWN + 1):
+            at = message.find(value[start : start + SHOWN])
+            while at != -1:
+                hidden[at : at + SHOWN] = [True] * SHOWN
+                at = message.find(value[start : start + SHOWN], at + 1)
+    runs = itertools.groupby(zip(message, hidden, strict=True), key=lambda pair: pair[1])
+    return "".join("***" if masked else "".join(char for char, _ in run) for masked, run in runs)
+
+
 def _checked(response: httpx.Response) -> Any:
     if response.is_error:
-        message = response.text
-        for value in load_env().values():
-            if len(value) >= 8:
-                message = message.replace(value, "***")
+        message = _masked(response.text, load_env().values())
         # Cut after the values are out of it: cut first, the start of one could be left at the end.
         raise RuntimeError(f"HTTP {response.status_code}: {message[:500]}")
     return response.json() if response.content else None

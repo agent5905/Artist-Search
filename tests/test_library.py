@@ -1420,14 +1420,17 @@ def locked(*names):
 
 
 def test_a_file_that_cannot_be_deleted_does_not_keep_the_rest_of_the_purge_from_happening(monkeypatch, tmp_path):
-    """Everything else goes. The stuck work keeps its row, so the artist is still listed and the purge can be rerun."""
+    """Everything else goes. The stuck work keeps its row, so the artist is still listed and the purge can be rerun,
+    and so does the profile, whose account hash is what names the artist for that purge (a removal bars the
+    account, and no handle while the account is known)."""
     two_artists()
     with monkeypatch.context() as patch:
         patch.setattr("pathlib.Path.unlink", locked(f"{ID1}.jpg"))
         with pytest.raises(OSError):
             library.purge(ALPHA)
     assert [(row["artist_key"], row["deviation_id"]) for row in rows("works")] == [(ALPHA, ID1), (BRAVO, ID3)]
-    assert [row["artist_key"] for row in rows("profiles")] == [BRAVO]
+    assert [row["artist_key"] for row in rows("profiles")] == [ALPHA, BRAVO]
+    assert library.account_hash(ALPHA) is not None
     assert files(tmp_path) == [f"cache/images/{ID1}.jpg", f"cache/images/{ID3}.jpg", "cache/pipeline.sqlite"]
     assert library.artist_keys() == [ALPHA, BRAVO]
     library.purge(ALPHA)

@@ -1420,6 +1420,23 @@ def test_a_proof_or_a_grant_bars_the_account_and_no_handle_by_name(seeded):
         db.sql("delete from public.artists where slug in ('zz-test-stranger', 'zz-test-other')")
 
 
+def test_removing_artists_outright_bars_the_account_and_the_site_and_a_handle_only_without_an_account(seeded):
+    """The seventh push critic's: remove_artists put the handle on the list with the account, so the handle an earlier
+    holder was removed under named whoever took it next, and the push barred that one's account too. As a proof and a
+    grant do, it bars the account when it is known and the handle only when it is not; and the artist's site."""
+    fresh({**STAY, "da_account": account(STAY)}, {**KEEP, "da_account": None})
+    assert db.sql("select public.remove_artists(array['zz-test-stay', 'zz-test-keep']) as n") == [{"n": 2}]
+    asked = [*key_hashes(STAY), account(STAY), *key_hashes(KEEP), account(KEEP)]
+    listed = db.sql(f"select key_hash from public.removed where key_hash in ({', '.join(map(repr, asked))})")
+    assert {row["key_hash"] for row in listed} == {account(STAY), key_hashes(STAY)[1], *key_hashes(KEEP)}
+    assert not visible(STAY) and not visible(KEEP)
+    stranger = artist("stranger", da_username=STAY["da_username"])  # whoever holds STAY's handle next
+    try:
+        assert slugs(db.upsert("artists", [stranger], "slug", "slug")) == ["zz-test-stranger"] and visible(stranger)
+    finally:
+        db.sql("delete from public.artists where slug = 'zz-test-stranger'")
+
+
 def test_a_ticket_binds_the_request_to_whom_the_page_showed_though_the_slug_lists_somebody_else_now(seeded):
     """The eighth critic's uncaught break: request_binding putting whoever the slug lists now before the page's
     ticket. The page showed the first twin, the next push lists the second under the slug, and the first's "Get my

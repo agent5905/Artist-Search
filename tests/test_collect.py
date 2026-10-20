@@ -2449,8 +2449,10 @@ def test_one_file_that_cannot_be_deleted_does_not_keep_another_removed_artist_on
     counts = summary(captured.out)
     assert captured.err == "incomplete: something that had to be deleted could not be. Run again.\n"
     assert counts[collect.UNDELETED] == 2 and counts[collect.PURGED] == 1  # tried at the start and at the end
-    assert rows("profiles", BRAVO) == rows("works", BRAVO) == [] and rows("profiles", ALPHA) == []
+    assert rows("profiles", BRAVO) == rows("works", BRAVO) == []
     assert [row["deviation_id"] for row in rows("works")] == [uuid(7)]  # the row stays for as long as its file does
+    # and so does the profile, whose account hash names the artist for the purge that finishes it (library.purge)
+    assert [row["artist_key"] for row in rows("profiles", ALPHA)] == [key(ALPHA)]
     assert files(tmp_path) == [f"cache/images/{uuid(7)}.jpg", "cache/pipeline.sqlite"]
     assert counts[collect.PROCESSED] == 3  # and the artists who are not removed were collected all the same
 

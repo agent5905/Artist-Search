@@ -596,14 +596,17 @@ def _cached_name(work_id: str, named: str | None = None) -> str | None:
     return next((name for name in names if name != named), named if named in names else None)
 
 
-def _delete(conn: sqlite3.Connection, column: str, value: str, but: str = "") -> None:
-    """Delete the rows with this value in this column from every table in the file that has such a column.
+def _delete(conn: sqlite3.Connection, column: str, value: str, but: tuple[str, ...] = ()) -> None:
+    """Delete the rows with this value in this column from every table in the file that has such a column, but
+    those named.
 
     Hard rule 7 with no list of tables to keep up to date: the analysis stages keep tables of their own here,
     by deviation_id and by artist_key, and a purge that knew only this module's tables left their rows behind.
     """
     having = "SELECT m.name FROM sqlite_master AS m JOIN pragma_table_info(m.name) AS c WHERE m.type = 'table' "
-    for (table,) in conn.execute(having + "AND lower(c.name) = ? AND m.name != ?", (column, but)).fetchall():
+    for (table,) in conn.execute(having + "AND lower(c.name) = ?", (column,)).fetchall():
+        if table in but:
+            continue
         quoted = table.replace('"', '""')
         conn.execute(f'DELETE FROM "{quoted}" WHERE {column} = ?', (value,))
 
@@ -613,7 +616,8 @@ def _forget(conn: sqlite3.Connection, key: str) -> int:
     profile, the marks, the note that they were passed over, and whatever another stage keeps.
 
     Returns how many works are stuck: a file of theirs could not be deleted, so their rows stay to say so, and
-    the rest are deleted all the same.
+    the rest are deleted all the same. Their profile stays with them: its account hash is what names the artist for
+    the purge that finishes it, since a removal bars the account and no handle while the account is known.
     """
     stuck = 0
     for (work_id,) in conn.execute("SELECT deviation_id FROM works WHERE artist_key = ?", (key,)).fetchall():
@@ -625,7 +629,7 @@ def _forget(conn: sqlite3.Connection, key: str) -> int:
             stuck += 1
             continue
         _delete(conn, "deviation_id", work_id)
-    _delete(conn, "artist_key", key, but="works")
+    _delete(conn, "artist_key", key, but=("works", "profiles") if stuck else ("works",))
     conn.execute("DELETE FROM artist_marks WHERE same_as = ?", (key,))  # the key is named there too
     # And the store's row for the handle, which may name their site: one the account has left is purged with it
     # and not barred (push._removal), so no removal deletes that row.

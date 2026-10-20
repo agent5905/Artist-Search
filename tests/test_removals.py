@@ -2126,6 +2126,11 @@ def test_the_statements_the_live_tests_run_are_as_written():
         "insert into public.removed"
     )
     assert "perform public.refresh_search_words(); return null;" in function_body("removed_after_insert")
+    # Removing an artist outright bars the account when it is known and the handle only when it is not, as a grant
+    # does (the seventh push critic's: a handle an earlier holder was removed under named whoever took it next).
+    outright = function_body("remove_artists")
+    assert "unnest(array_remove(array[coalesce(a.da_account, a.da_key), a.site_key], null)) k" in outright
+    assert "artist_keys(" not in outright and "|| a.da_account" not in outright
 
 
 def test_the_page_sends_its_ticket_with_either_button():
