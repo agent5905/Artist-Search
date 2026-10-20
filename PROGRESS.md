@@ -1410,7 +1410,25 @@ Deadlocks are gone as written, and nothing else stands beyond the accepted limit
 - **Political:** all 131 candidates checked.
 - **A flaky collect test was fixed:** it depended on whether a second ticked over between two handles' turns. It now has a still clock and passes 10 of 10.
 
-**Running:** push's seventh critic, judging a build on the real data against the owner's content rules.
+**Push's seventh critic, against the owner's content rules: no, but close.**
+- **What a build would send:** 2,926 artists and 27,272 works.
+- **Holds:** snapshots, reruns, dry runs, tags and no private data. A random 18 sent works and 7 blood-only works all fit the rules.
+- **What still fails:**
+  - **AI:** two artists whose own words declare AI are sent ("Ai realistic", "AI-assisted"), and a missing AI reading holds no artist.
+  - **Sale sheets:** "SOLD", "SALE" and "FFA" sheets are not caught by title.
+  - **Contact and ad leads:** a "Moving To Instagram" card and a Discord banner lead their artists.
+  - **Missed by the image checks:** two implied-nudity works rated safe, and a WW2 war dog with the Wehrmacht eagle.
+  - **Wrongly held as adult:** 79 artists held by the profile sheet's count alone, which still counts gore.
+  - **Removal safety:** a corrupt local removal list could wipe the database with no stop, and site removals trip the flood guard. Neither bites today: both lists are empty.
+- **Small items:** a secret echoed in part is not masked, and three breaks go uncaught.
+
+**Push round 10, being built:**
+- A deterministic AI-words check over what is sent, and a missing AI reading holds the artist.
+- Sale and sheet words added to the sheet titles, and a title that names a social service is held.
+- The adult share uses per-work readings only, not the sheet count.
+- A local hand-held list (`cache/held_by_hand.txt`, git-ignored) for stragglers a critic finds.
+- Local removals count against the flood guard, sites do not, and the owner's `remove_artists` bars only the account when it is known.
+- Partial masking of secrets, and the tests.
 
 **The disk filled up.** Drive F: reached 0 bytes free at about 19:45 on 10-19, and two image-check turns failed to open the store and were retried. The cause was this project: 20 finished builder worktrees, each with its own Python environment (73 GB), and critics' temporary test folders (9.5 GB).
 - **Every branch was merged,** so the worktrees were removed, with the branches kept, and the temporary folders deleted. F: has 83 GB free.
