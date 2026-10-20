@@ -55,7 +55,7 @@ COUNTS = [
     "works_sent",
     *(f"works_held_{reason}" for reason in push.WORK_REASONS),
     *("texts_left_out_for_contact", "taglines_left_out_profane", "taglines_left_out_social", "sheets_sent_as_filler"),
-    "site_links_left_out_removed",
+    *("site_links_left_out_removed", "accounts_left_out_shared"),
     *("neighbours_sent", "artists_sent_without_neighbours", "neighbours_skipped_by_database"),
     *("artists_deleted_from_database", "works_deleted_from_database", "neighbours_deleted_from_database"),
     *("removed_artists_deleted_from_database", "removals_added_to_database", "removals_applied_here"),

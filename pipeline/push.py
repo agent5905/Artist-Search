@@ -35,7 +35,9 @@ Four things stop a run, each with a message and a status that is not zero:
     so do the other handles of a removed account that the links and the hashes agree on. A disagreement is how a
     broken local store shows, and nobody's wish: a corrupt table of rename links once turned one removal through
     the site into twelve, and five profiles given a removed account's hash made it six. Whom the two lists name
-    is removed all the same, here and there. Nothing else is done, and `--allow-delete N` lets N of them through;
+    is removed all the same, here and there. Nothing else is done, and `--allow-delete N` lets N of them through.
+    (An account hash kept for two keys no link ties together is not sent for either, so no proof there can bar
+    it before this guard has looked: build, accounts_left_out_shared);
   - the local library has no artists. An empty or a new file is no reason to empty the database;
   - more would be deleted than a run is believed about: more than DELETE_PERCENT of the artists the database
     holds, of their works or of their neighbour rows, and more than DELETE_FLOOR. A changed prompt version, a
@@ -427,6 +429,13 @@ def _build(local: store.Snapshot, removed: Collection[str]) -> tuple[Rows, Rows,
     works_of, fields = _collected(local)
     answers = library.answers(local)  # what each artist's latest answer emptied, and how many works it flags mature
     counts: Counter[str] = Counter()
+    # An account hash kept here for two keys that no rename mark links is a broken store (_removal's rule), and is
+    # sent for neither: a proof bound to it would bar it there, and the database would delete the other at once.
+    account_of = {other: held for other in library.artist_keys(local) if (held := library.account_hash(other, local))}
+    holders: dict[str, set[str]] = {}
+    for other, held in account_of.items():
+        holders.setdefault(held, set()).add(other)
+    disputed = {held for held, keys in holders.items() if len(keys) > 1 and not keys <= _linked({min(keys)}, local)}
 
     def plain(texts: list[str], model: bool = False) -> list[str]:
         """Of these texts, the ones the plain rule finds no contact in, and of a `model`'s words the ones that
@@ -506,6 +515,10 @@ def _build(local: store.Snapshot, removed: Collection[str]) -> tuple[Rows, Rows,
             counts["works_held_artist_held_back"] += len(ready)
             continue
         counts["site_links_left_out_removed"] += left_out
+        account = account_of.get(key)
+        if account in disputed:
+            account = None
+            counts["accounts_left_out_shared"] += 1
         # The owner's (2026-10-19): an adoptable or for-sale sheet is the artist's work, but never leads. Sheets go
         # after every other work that may go, so one fills a slot only when there are fewer than MAX_WORKS others.
         filler = {work_id for *_, result, _, work_id in ready if SHEET in (result.get("formats") or [])}
@@ -551,7 +564,7 @@ def _build(local: store.Snapshot, removed: Collection[str]) -> tuple[Rows, Rows,
                 "da_username": listed[key],
                 # The account the library keeps for them: a removal request is bound to it when it is filed, and
                 # the verifier reads the bio of that account only (sql/001_schema.sql, artists.da_account).
-                "da_account": library.account_hash(key, local),
+                "da_account": account,
                 "site_url": site_url,
                 "site_domain": site_domain,
                 "tagline": next(iter(plain([tagline])), None)
@@ -712,7 +725,9 @@ def run(dry_run: bool, allow_delete: int | None = None, local: pathlib.Path | st
     rule); taglines_left_out_profane and taglines_left_out_social (of artists who are sent, the taglines left out
     for swearing or for naming a social handle: tagging.accounts); sheets_sent_as_filler (adoptable or for-sale
     sheets sent after an artist's other works, to fill their MAX_WORKS: SHEET); site_links_left_out_removed
-    (artists sent without their own site, which is on the removal list); neighbours_sent,
+    (artists sent without their own site, which is on the removal list); accounts_left_out_shared (artists sent
+    without their account, whose hash another key kept here holds and no rename mark ties to them: a broken
+    store, so only the owner can remove them, on a request without proof); neighbours_sent,
     artists_sent_without_neighbours, and neighbours_skipped_by_database (what db.load said the database would not
     take: a row that names an artist it does not have);
     artists_deleted_from_database, works_deleted_from_database and neighbours_deleted_from_database (rows it had
@@ -818,6 +833,7 @@ def run(dry_run: bool, allow_delete: int | None = None, local: pathlib.Path | st
             "taglines_left_out_social": held["taglines_left_out_social"],
             "sheets_sent_as_filler": held["sheets_sent_as_filler"],
             "site_links_left_out_removed": held["site_links_left_out_removed"],
+            "accounts_left_out_shared": held["accounts_left_out_shared"],
             "neighbours_sent": len(neighbours) - empty,
             "artists_sent_without_neighbours": empty,
             "neighbours_skipped_by_database": 0,

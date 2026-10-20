@@ -161,13 +161,13 @@ create index if not exists search_words_trgm_idx on public.search_words using gi
 -- for them (artists.da_account). Nothing afterwards changes what it is bound to, so the verifier finds that
 -- artist while they are not listed, and only that artist: a slug can pass to another handle, and a site to
 -- another artist. A later request for the same handle and site is the same request and
--- only counts (and fills in an account that was not known yet, and takes its note if it has one: the owner
--- reads the latest that says something); one for anything else is a request of its own
--- (removal_requests_open_idx below). A request with no note erases no note.
+-- only counts (and fills in an account that was not known yet, and keeps its note if it has one, beside the
+-- others: the owner reads them all); one for anything else is a request of its own
+-- (removal_requests_open_idx below). A request with no note erases no note, and neither does one with a note.
 create table if not exists public.removal_requests (
   id bigint generated always as identity primary key, -- how the verifier and the owner name a request
   artist_slug text not null, -- the slug asked about; its proof code is that slug's. 'closed:<uuid>' once closed
-  note text, -- the latest note that says something (request_removal)
+  note text, -- an earlier version's one note: see notes below
   first_at timestamptz not null default now(),
   last_at timestamptz not null default now(),
   requests bigint not null default 1
@@ -185,13 +185,22 @@ alter table public.removal_requests
   -- request without one, which only the owner answers. due_at: when the verifier looks for the code next.
   add column if not exists code_at timestamptz,
   add column if not exists due_at timestamptz,
-  -- The network the code was last asked for from, as an HMAC (client_wait keys it so): the verifier takes
-  -- turns between networks (due_removals), so that one asking for many codes holds back only its own.
-  add column if not exists network text,
+  -- The networks the code was asked for from, each as an HMAC (client_wait keys it so), the first 30 of them:
+  -- the verifier takes turns between networks (due_removals), so that one asking for many codes holds back only
+  -- its own, and one asking for somebody else's code takes nothing from them.
+  add column if not exists networks text[] not null default '{}',
+  -- Every note left with the request that says something (request_removal), with its time: {"at", "note"}, the
+  -- first and the latest four, so a stranger can neither hide what the artist wrote nor fill the row.
+  add column if not exists notes jsonb not null default '[]',
   -- Null while open. 'proven' (the verifier saw the code), 'granted' or 'rejected' (the owner's answer), or
   -- 'removed' (the artist was removed another way). A closed row keeps nothing of the artist: its slug gives
-  -- way to a random key and the handle, site, account and note go.
+  -- way to a random key and the handle, site, account and notes go.
   add column if not exists outcome text;
+-- A note an earlier version kept is the first of the request's notes. It fills only what is empty: rerun, it
+-- changes nothing. ponytail: nothing writes the column note now; drop it once no database has one filled.
+update public.removal_requests
+set notes = jsonb_build_array(jsonb_build_object('at', last_at, 'note', note))
+where note is not null and notes = '[]';
 -- An open request filed before those columns gets the handle and site its artist is listed with now, so
 -- that it can be granted while they are not listed. It fills only what is empty: rerun, it changes nothing.
 update public.removal_requests r
@@ -296,6 +305,9 @@ begin
       ('artist_neighbors', 'artist_neighbors_few_picks', 'check (cardinality(picks) <= 4)'),
       ('artist_neighbors', 'artist_neighbors_some_picks', 'check (cardinality(picks) >= 1)'),
       ('removal_requests', 'removal_requests_short', 'check (length(artist_slug) <= 80 and length(note) <= 300)'),
+      -- Five notes of 300 characters, each of them escaped at its longest (\u0001 for one character).
+      ('removal_requests', 'removal_requests_few_notes',
+       $$check (jsonb_typeof(notes) = 'array' and length(notes::text) <= 10000)$$),
       ('removal_requests', 'removal_requests_outcome',
        $$check (outcome in ('proven', 'granted', 'rejected', 'removed'))$$),
       ('removed', 'removed_key_is_a_hash', $$check (key_hash ~ '^[0-9a-f]{64}$')$$)

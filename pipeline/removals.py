@@ -15,12 +15,15 @@ Nothing afterwards changes that, and no push, hold-back, rename or deletion of t
 that passes to another handle, or a site to another artist, takes nobody else into the request. Only a proven
 removal or the owner's answer closes it, and either removes and bars what it was bound to and nothing else.
 
-The queue (removal_requests.code_at, due_at and network). A run reads, with the service key, at most MAX_REQUESTS
+The queue (removal_requests.code_at, due_at and networks). A run reads, with the service key, at most MAX_REQUESTS
 of the open requests with a code that are due, in turns between the networks the codes were asked from, the one
 due longest first in each turn (due_removals), and moves each one it looks at on: an hour while its code was asked
 for under a day ago, six hours while under two weeks ago, a week after that (_next_look). Asking for the code again
 starts that over, and makes the request due at once unless it already was; it never puts a request ahead of one
-due before it in its network's turn. So one network that asks for hundreds of codes holds back only its own.
+due before it in its network's turn. So one network that asks for hundreds of codes holds back only its own. A
+request is in the turns of every network that asked for its code (the first MAX_REQUESTS of them) and is taken in
+the first it comes to, so a stranger who asks for an artist's code, before or after the artist, takes nothing from
+them: asking only ever brings a request forward.
 
 What the page promises: a code put up in the first two weeks is found usually within a few hours, and at most
 within a day; one put up later, after the code is asked for again. That holds while a run is made every EVERY:
@@ -32,7 +35,8 @@ hour for every 120 codes due before it, so a day for 3,000 (150 networks' 20 eac
 the accepted limit. A flood kept up from that many networks asks for more looks than the runs make (a code is
 looked at 24 times on its first day, and the runs make 2,880 looks a day), so the slip grows while it lasts. An
 artist whose own network is one of those flooding (an office behind one address) waits in its turn, and so does
-one whose site or DeviantArt does not answer.
+one whose site or DeviantArt does not answer, and one whose code MAX_REQUESTS of the flooding networks asked for
+before they did.
 
 It looks for the request's code in two places, and nowhere else:
   1. The DeviantArt profile of the handle the request was made for, through the official API: its bio (the About
@@ -50,8 +54,8 @@ It looks for the request's code in two places, and nowhere else:
 Case, the space around the code and HTML entities do not matter, nor do characters that show as nothing. The code
 is the slug's own, so one pasted onto another artist's page proves nothing for them; and it is read only in the
 places of the artist the request is bound to, so a slug that has passed to another handle proves nothing for that
-handle either. Codes do not expire. One made before the owner replaced the secret is not the slug's code any
-more, and proves nothing.
+handle either. Codes do not expire. One made before the owner replaced the secret, or before codes were made
+under words of their own (removal_code: none was given out), is not the slug's code any more, and proves nothing.
 
 A code found where it must be goes to confirm_removal, which checks it again and removes the artist at once and
 for good, listed at that moment or not, and closes the request. What it bars is what the proof covered: the handle
@@ -77,8 +81,8 @@ deadlines, and a slow site holds no run, lock or queue. A run with nothing due a
 `--dry-run` makes the same reads and requests, and changes nothing: no call to confirm_removal, nothing written to
 the local store, no request moved on. (The API's pace file is kept as for any request to it: discover.Pace.) Stdout
 is one JSON object of counts, with how many requests are open with a code and without one, proven, and closed
-otherwise; nothing names an artist. Only --pending prints a handle. The service key is read by pipeline/db.py and
-never printed.
+otherwise; nothing names an artist. Only --pending prints a handle, and what was written in the notes. The service
+key is read by pipeline/db.py and never printed.
 """
 
 import argparse
@@ -271,13 +275,15 @@ def run(
 
 
 def pending() -> list[str]:
-    """One line for each open request, the oldest first, every one of them: the slug, the request's id, the public
-    handle it was made for, when it was first and last asked for and how often, and whether a code was given out and
-    a note left. For the owner, who reads a note in the database's removal_requests table and answers by id with
-    --grant or --reject. A slug can have more than one: the artist listed under it changed, or their site did."""
+    """One entry for each open request, the oldest first, every one of them: a line with the slug, the request's
+    id, the public handle it was made for, when it was first and last asked for and how often, and whether a code
+    was given out; then a line for each note left with it, with when it came (the first and the latest four:
+    request_removal). For the owner, who reads them and answers by id with --grant or --reject. A note is a
+    visitor's words, printed as a quoted string with anything that does not print escaped, so it cannot act on the
+    terminal. A slug can have more than one request: the artist listed under it changed, or their site did."""
     rows = _rows(
         "removal_requests",
-        select="id,artist_slug,da_username,first_at,last_at,requests,code_at,note",
+        select="id,artist_slug,da_username,first_at,last_at,requests,code_at,notes",
         outcome="is.null",
         order="first_at.asc,id.asc",
     )
@@ -285,7 +291,7 @@ def pending() -> list[str]:
         f"{row['artist_slug']}  id {row['id']}  handle {row['da_username'] or '?'}  "
         f"first asked {row['first_at'][:10]}, "
         f"last {row['last_at'][:10]}, {row['requests']} times  code given out: {'yes' if row['code_at'] else 'no'}  "
-        f"note: {'yes' if row['note'] else 'no'}"
+        f"notes: {len(row['notes'])}" + "".join(f"\n    {note['at'][:16]}  {note['note']!r}" for note in row["notes"])
         for row in rows
     ]
 
