@@ -1335,7 +1335,7 @@ Deadlocks are gone as written, and nothing else stands beyond the accepted limit
 
 **The claim-or-remove critic loop ends here,** under decision 15: the last critic found nothing beyond the accepted limits that this fix does not close. Its one remaining gate is `tests/test_db.py` passing against the migrated database at setup.
 
-**The database is set up, and the live suite passes (2026-10-20, about 03:30 to 05:30).** The owner asked the lead to handle these setup tasks.
+**The database is set up, and the live suite passes (2026-10-20, about 03:20 to 03:55).** The owner asked the lead to handle these setup tasks.
 - **Site token:** made at random, written to `.env` (git-ignored), never printed. Only its sha256 is in the database.
 - **Setup files:** `sql/001` to `003` applied to the live database in one transaction. No leftover function stopped them, and the 119 artists from round 8 are intact.
 - **Locked down:**
