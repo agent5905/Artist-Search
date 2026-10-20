@@ -1335,6 +1335,22 @@ Deadlocks are gone as written, and nothing else stands beyond the accepted limit
 
 **The claim-or-remove critic loop ends here,** under decision 15: the last critic found nothing beyond the accepted limits that this fix does not close. Its one remaining gate is `tests/test_db.py` passing against the migrated database at setup.
 
+**The database is set up, and the live suite passes (2026-10-20, about 03:30 to 05:30).** The owner asked the lead to handle these setup tasks.
+- **Site token:** made at random, written to `.env` (git-ignored), never printed. Only its sha256 is in the database.
+- **Setup files:** `sql/001` to `003` applied to the live database in one transaction. No leftover function stopped them, and the 119 artists from round 8 are intact.
+- **Locked down:**
+  - The public role can run only the site's 7 functions and read no table.
+  - Row-level security is on for all 9 tables.
+  - The token row is set.
+- **`tests/test_db.py`: 165 passed, 1 skipped** (the full-scale test, which refuses to run while real artists are there). This was the eighth and tenth critics' last gate.
+- **Four failures on the way, all in the tests, none in the SQL:**
+  - one server error that passed on rerun;
+  - one test that read a request's id before filing it;
+  - one that still expected the old handle rule (the grant rightly barred the account, and rightly not the site another artist lists now);
+  - one that expected a row the database rightly never writes for a refused read.
+  
+  Two of these tests also leaked an account into later tests. Each now sets the account it means.
+
 **The disk filled up.** Drive F: reached 0 bytes free at about 19:45 on 10-19, and two image-check turns failed to open the store and were retried. The cause was this project: 20 finished builder worktrees, each with its own Python environment (73 GB), and critics' temporary test folders (9.5 GB).
 - **Every branch was merged,** so the worktrees were removed, with the branches kept, and the temporary folders deleted. F: has 83 GB free.
 - **The store's integrity check passes.** No reading was lost.

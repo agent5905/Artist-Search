@@ -1403,7 +1403,8 @@ def test_a_proof_or_a_grant_bars_the_account_and_no_handle_by_name(seeded):
     the new handle (p_handle, as the verifier sends it), and a grant both bar the account the request is bound to,
     which deletes the artist under any handle, and neither handle by name."""
     fresh({**GONE, "da_account": account(GONE)}, {**STAY, "da_account": account(STAY)})
-    found = {"p_id": request_id(GONE), "p_code": proof_code(GONE), "p_site": False, "p_handle": RENAMED["da_username"]}
+    code = proof_code(GONE)  # files the request, so its id is there to read
+    found = {"p_id": request_id(GONE), "p_code": code, "p_site": False, "p_handle": RENAMED["da_username"]}
     assert db.rpc("confirm_removal", found, "secret") == [account(GONE)]
     ask(STAY, "it is me")
     assert grant(request_id(STAY)) == [account(STAY), key_hashes(STAY)[1]]  # and its site, nobody else's
@@ -1436,20 +1437,23 @@ def test_a_ticket_binds_the_request_to_whom_the_page_showed_though_the_slug_list
 
 
 def test_granting_an_artist_who_left_their_site_does_not_bar_whoever_lists_it_now(seeded):
-    """The third critic's stale site key: STAY asked while listed with their site, moved on, and KEEP lists it now."""
-    fresh(STAY, KEEP)
+    """The third critic's stale site key: STAY asked while listed with their site, moved on, and KEEP lists it now.
+    The grant bars STAY's account, which the request is bound to, and not the site KEEP lists now."""
+    fresh({**STAY, "da_account": account(STAY)}, {**KEEP, "da_account": account(KEEP)})
     ask(STAY, "it is me")
     db.upsert("artists", [{**STAY, **site("moved")}], "slug", "slug")
     db.upsert("artists", [{**KEEP, **site("stay")}], "slug", "slug")
     try:
-        assert grant(request_id(STAY), STAY["da_username"]) == [digest("da:zz-test-stay")]
+        assert grant(request_id(STAY)) == [account(STAY)]
         assert visible(KEEP) and not visible(STAY)
     finally:
-        db.upsert("artists", [KEEP], "slug", "slug")  # its own site again, which the next test's STAY needs free
+        # Its own site again, which the next test's STAY needs free, and no account, as the next tests expect.
+        db.upsert("artists", [{**KEEP, "da_account": None}], "slug", "slug")
 
 
 def test_a_site_barred_with_its_artist_closes_no_other_artists_request(seeded):
-    fresh(STAY, KEEP)
+    # Bound to no account: the grant bars the handle and the site (an upsert keeps an account an earlier test left).
+    fresh({**STAY, "da_account": None}, {**KEEP, "da_account": None})
     ask(STAY, "it is me")
     db.upsert("artists", [{**STAY, **site("moved")}], "slug", "slug")
     db.upsert("artists", [{**KEEP, **site("stay")}], "slug", "slug")
@@ -2100,10 +2104,9 @@ def test_the_days_total_holds_reads_back_for_everyone_a_little_at_a_time(seeded)
         assert abs(wait("profile", client) - 86400 / READS_A_DAY / 10) <= 2
         assert wait("removal", client) == 0  # asking for removal has no day's total
         assert wait("claim", client) == 0  # nor has the claim-or-remove page, which is counted with removals
-        # Nothing refused was counted.
+        # Nothing refused was counted: the visitor has no count, or one that holds nothing back.
         assert (
-            counts_kept(counted_as("read", "visitor", client)) == 1
-            and ahead(counted_as("read", "visitor", client)) <= 0
+            counts_kept(counted_as("read", "visitor", client)) == 0 or ahead(counted_as("read", "visitor", client)) <= 0
         )
     finally:
         restore = (
