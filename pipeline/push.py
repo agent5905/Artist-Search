@@ -142,7 +142,7 @@ ARTIST_REASONS = (
 )
 WORK_REASONS = (
     *("not_seen_lately", "not_tagged", "not_artwork", "checked_not_artwork", "explicit", "unfit_image"),
-    *("held_by_hand", "political", "unfit_title", "profane_title", "service_in_title", "declared_ai"),
+    *("held_by_hand", "political", "unfit_title", "unfit_tag", "profane_title", "service_in_title", "declared_ai"),
     *("contact_in_words", "words_not_read"),
     *("not_rated", "suggestive", "suggestive_not_checked", "artwork_not_checked", "political_not_checked"),
     *("fit_not_checked", "contact_by_rule", "bad_address", "artist_held_back", "sheet_over_limit", "over_limit"),
@@ -181,6 +181,14 @@ UNFIT_TITLE = re.compile(
     r"oppai|ahegao|futa(?:nari)?|yiff|vore|inflation|inflat(?:ed|ing)|diapers?|abdl|"
     r"loli(?:con)?|shota(?:con)?|nazis?|reich|swastikas?|hitler|kkk)\b",
     re.IGNORECASE,
+)
+# The artist's own tag says what the work is: one of these as a whole tag, case-folded, holds it back. A whole tag
+# only ("nsfw", "vore", "nazi"), never one that merely contains one ("carnivore", "nsfwfree"). On 2026-10-20, 168 of
+# the 39,744 works carried one, of 53 artists (nsfw 91, vore 40, fetish 10, inflation 8, softvore 8, lewd 6, ...);
+# the seventh critic found sent works tagged "futa", "nsfw" and "nazi" that the rating and the image check passed.
+UNFIT_TAG = re.compile(
+    r"nsfw|futa(?:nari)?|hentai|porn\w*|lewd|ecchi|r-?18|(?:soft)?vore|(?:body)?inflation|fetish\w*|"
+    r"nazis?|swastikas?|hitler|kkk"
 )
 # These inside any word of the case-folded title too: "spaceNaziMechs". Of the 39,744 titles of 2026-10-20 it holds
 # three more, two of them wrongly: a character's name that begins "Nazi", and a made-up word with "kkk" in it.
@@ -579,6 +587,10 @@ def _build(local: store.Snapshot, removed: Collection[str]) -> tuple[Rows, Rows,
                 reason = "not_seen_lately"
             elif UNFIT_TITLE.search(title or "") or GLUED_HATE.search((title or "").casefold()):
                 reason = "unfit_title"
+            elif any(
+                isinstance(tag, str) and UNFIT_TAG.fullmatch(tag.strip().casefold()) for tag in json.loads(own_tags)
+            ):
+                reason = "unfit_tag"
             elif PROFANE_TITLE.search(title or ""):
                 reason = "profane_title"
             # An announcement ("now on" a social network, a server's banner) or a work sold through a service. On

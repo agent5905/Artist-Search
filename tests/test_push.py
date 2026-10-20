@@ -633,6 +633,7 @@ HELD = {
     "fit_not_checked": {"fit": None},
     "unfit_title": {"title": "FAKE-TITLE Vore-verse: zz"},
     "unfit_title glued to other words": {"title": "FAKE-TITLE spaceNaziMechs zz"},
+    "unfit_tag": {"tags": ["NSFW"]},  # the artist's own whole tag, in any case
     "profane_title": {"title": "FAKE-TITLE Piss off zz"},
     "profane_title glued": {"title": "FAKE-TITLE zzfuckery zz"},
     "explicit": {"explicit": True},
@@ -654,6 +655,14 @@ HELD = {
 def held_by_hand(*lines):
     """The owner's list of what is held back by hand, in the cache, as these lines."""
     (config.CACHE_DIR / push.HELD_BY_HAND).write_text("\n".join(lines), encoding="utf-8")
+
+
+def test_a_tag_that_only_contains_an_unfit_word_holds_nothing(fake):
+    """UNFIT_TAG takes whole tags: "carnivore" is no "vore", and "nsfwfree" says the opposite of "nsfw"."""
+    artist(ALPHA, 8, edits={2: {"tags": ["carnivore", "nsfwfree", "inflatable"]}})
+    artist(BRAVO, angle=0.3)
+    counts = push.run(False)
+    assert counts["works_held_unfit_tag"] == 0 and counts["works_sent"] == 8 + 5
 
 
 @pytest.mark.parametrize("why", HELD)

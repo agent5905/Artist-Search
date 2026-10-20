@@ -1430,6 +1430,24 @@ Deadlocks are gone as written, and nothing else stands beyond the accepted limit
 - Local removals count against the flood guard, sites do not, and the owner's `remove_artists` bars only the account when it is known.
 - Partial masking of secrets, and the tests.
 
+**Push round 10: merged, migrated, and the live suite passes** (5,202 tests). On a copy of the store, push would now send 2,992 artists and 27,769 works.
+- **AI words:**
+  - They hold 3 more artists; 2 are clearly right, and 1 is arguable (a screenshot of an AI summary).
+  - The model had already read 1,773 of the 1,780 works the words match.
+  - Refusals ("no AI") never count. Without that rule, about 33 artists would have been held wrongly through tags like `no_ai_generated_art`.
+- **Sale words in sheet titles:** 188 more titles.
+- **A title naming a social service** is held: 79 sent works, about 8 of them announcements, the rest ordinary art naming where it was sold or made for. The cost is 4 artists; sending them as filler is the alternative, if the owner wants that art.
+- **The adult share is by work only:** 75 artists held by the gore-counting sheet count alone come back, mostly ordinary game, creature and horror art.
+- **The hand-held list** (`cache/held_by_hand.txt`, git-ignored) holds the war-dog design with the Wehrmacht eagle, two implied-nudity works, and one artist of vore close-ups.
+- **Removal safety:**
+  - Local removals now count against the flood guard, so a corrupt local list stops the run with nothing deleted.
+  - Site removals no longer trip it.
+  - `remove_artists` bars the account when it is known (migrated, live test passing).
+- **Two bugs found and fixed:**
+  - A stuck image file stranded a removal.
+  - A dry run built artists the real run would not.
+- **Added by the lead the same afternoon:** an artist's own whole tag that is sexual, fetish or hateful holds that work back. 168 works of 53 artists carry one (`nsfw` 91, `vore` 40, `fetish` 10, ...), among them sent works tagged `futa`, `nsfw` and `nazi` that the checks passed. "carnivore" and "nsfwfree" do not count.
+
 **The disk filled up.** Drive F: reached 0 bytes free at about 19:45 on 10-19, and two image-check turns failed to open the store and were retried. The cause was this project: 20 finished builder worktrees, each with its own Python environment (73 GB), and critics' temporary test folders (9.5 GB).
 - **Every branch was merged,** so the worktrees were removed, with the branches kept, and the temporary folders deleted. F: has 83 GB free.
 - **The store's integrity check passes.** No reading was lost.
