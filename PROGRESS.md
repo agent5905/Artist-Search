@@ -1371,7 +1371,19 @@ Deadlocks are gone as written, and nothing else stands beyond the accepted limit
 - **Outside the bar:** an anti-Muslim image (a pig with the shahada) was held as a hate symbol. The critic noted the bar as written does not cover it; holding it is right.
 - **Ceiling, if it matters:** a second, stricter question asked only of the 120 held works would take about 2 minutes of GPU.
 
-**Running:** push's sixth critic, judging a build on the real, fully analysed data.
+**Push's sixth critic, on the real data: no.**
+- **Holds:** the data guards. None of the earlier critics' counterexamples stands, a bad local state cannot wipe the database, no unlisted tag gets through, no secret is printed, and the tests caught 57 of 60 breaks.
+- **What a build would send:** 2,919 artists, 26,935 works and 63,878 neighbour rows.
+- **What it should not:**
+  - 52 artists who tag some of their own works as AI-made (fewer than half).
+  - 679 adoption or sale sheets the format reading missed, 97 of them leading their artist and picked 6,883 times.
+  - A war-dog design with a Nazi-eagle patch, political posters of a real politician, profane titles and handles, and a hate word glued into a longer title.
+- **What it should show but holds back:** ordinary game art with moderate blood, which the rating counts as suggestive.
+- **Also:** a removal named only by account is not applied here when the flood guard stops for something else.
+
+**The owner's answers (decisions 17 to 20):** blood shows and pin-ups do not; any AI-declared work holds the artist back; the mature counts are not filled in; political content about real people is held back. The lead's defaults: sheets also by title, profanity held, hate words matched inside words, the removal applied by account, and three tests.
+
+**Running:** push round 9, building all of these.
 
 **The disk filled up.** Drive F: reached 0 bytes free at about 19:45 on 10-19, and two image-check turns failed to open the store and were retried. The cause was this project: 20 finished builder worktrees, each with its own Python environment (73 GB), and critics' temporary test folders (9.5 GB).
 - **Every branch was merged,** so the worktrees were removed, with the branches kept, and the temporary folders deleted. F: has 83 GB free.
