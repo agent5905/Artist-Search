@@ -157,9 +157,12 @@ def migrate() -> None:
     raise RuntimeError("the Data API did not pick up the schema within 30 seconds")
 
 
-def load(artists: list[dict[str, Any]], works: list[dict[str, Any]], neighbors: list[dict[str, Any]]) -> int:
+def load(
+    artists: list[dict[str, Any]], works: list[dict[str, Any]], neighbors: list[dict[str, Any]]
+) -> tuple[int, int]:
     """Write artists, their works and their style neighbours a few at a time, so the public never
-    meets a database in mid-rewrite. Returns how many neighbour rows were skipped.
+    meets a database in mid-rewrite. Returns how many artists the database skipped (removed: a handle, site or
+    account on its list, which may have joined it during the load), and how many neighbour rows.
 
     An artist is a row of the artists table: "slug", "name" and "da_username" are required;
     "site_url" with "site_domain" (both or neither), "tagline", "top_tags", "search_text", "profile",
@@ -195,13 +198,13 @@ def load(artists: list[dict[str, Any]], works: list[dict[str, Any]], neighbors: 
     lists: dict[str, list[dict[str, Any]]] = {}
     for row in neighbors:
         lists.setdefault(row["artist_slug"], []).append(row)
-    _paced(itertools.batched(artists, LOAD_BATCH), lambda batch: _load_batch(list(batch), by_artist))
+    refused = _paced(itertools.batched(artists, LOAD_BATCH), lambda batch: _load_batch(list(batch), by_artist))
     skipped = _paced(
         itertools.batched(lists.values(), LOAD_BATCH),  # an artist's list is never split: it is replaced whole
         lambda batch: rpc("replace_neighbors", {"p_rows": [row for rows in batch for row in rows]}, "secret"),
     )
     after_load()
-    return skipped
+    return refused, skipped
 
 
 def _paced(batches: Iterable[Any], write: Callable[[Any], int]) -> int:
@@ -232,7 +235,7 @@ def _load_batch(batch: list[dict[str, Any]], by_artist: dict[str, list[dict[str,
     ids = rpc("artist_ids", {"p_slugs": slugs}, "secret")
     rows = [{**work, "artist_id": ids[slug]} for slug in slugs if slug in ids for work in by_artist.get(slug, [])]
     upsert("works", rows, "artist_id,key", "id")
-    return 0
+    return len(set(slugs) - set(ids))  # the artists it skipped
 
 
 def after_load() -> None:

@@ -18,7 +18,8 @@ again before each artist and each download; and the sweep of cached files that n
     library.artist_marks) and decide what is published. A work the API flags mature is never stored; how many
     of the artist's gallery page are is kept as a number, and nothing else of them (library.answers), for the
     push stage's share of adult works.
-  - A removal reaches the artist it names, under every handle of their account, and nobody else. An own site
+  - A removal reaches the artist it names, under every handle of their account, and nobody else: a handle names
+    whoever holds it now, never an account that has left it for another (_sweep). An own site
     that is kept for an artist is written into the store's row too, where the crawl stage looks. A removed site
     is kept out of every row, and that is all it does: it holds back and removes nobody, since anybody can name
     it (store._named_by). An artist whose profile names one, in a link of any shape, is collected like anybody,
@@ -65,6 +66,7 @@ An image is fetched from the preview address its gallery entry carries, without 
 """
 
 import argparse
+import contextlib
 import pathlib
 import sqlite3
 import sys
@@ -319,6 +321,7 @@ def _remove(key: str, counts: dict[str, int], db: pathlib.Path | str | None, use
     A handle a rename link reaches goes too only where what is kept here agrees: one that holds another
     account's hash is somebody else, whatever a corrupt table of links says (push._removal holds to the same).
     One the account has left (marked RENAMED) is purged and not barred: DeviantArt can give it to somebody else.
+    So `key` is the handle the artist holds now, or one the list names by its account (_sweep).
     """
     accounts = {account for account in (library.account_hash(key, db), library.account(user_id)) if account}
     others = [other for other in library.same_account(key, db) if library.account_hash(other, db) in accounts | {None}]
@@ -335,11 +338,25 @@ def _remove(key: str, counts: dict[str, int], db: pathlib.Path | str | None, use
 
 def _sweep(counts: dict[str, int], db: pathlib.Path | str | None) -> None:
     """Hard rule 7, at both ends of every run: everything kept about an artist who is now on the removal list
-    goes, and so do every cached file no row accounts for and every note about a handle nobody asks about."""
+    goes, and so do every cached file no row accounts for and every note about a handle nobody asks about.
+
+    The list names an artist by the handle they hold now, never by one their account has left (marked RENAMED),
+    which DeviantArt can give to somebody else; or by their account, under every key kept for it, while those keys
+    are linked by marks. A store that says otherwise is broken, and the push stops on it rather than widen a removal
+    (push._removal holds to the same rules)."""
     unreadable = 0
-    for key in sorted({*library.artist_keys(db), *library.last_attempts(db), *library.artist_marks(db)}):
+    removed, marks = store.removed_hashes(db), library.artist_marks(db)
+    keys = sorted({*library.artist_keys(db), *library.last_attempts(db), *marks})
+    under: dict[str, set[str]] = {}  # of the accounts on the list, the keys kept under each
+    for key in keys:
+        with contextlib.suppress(ValueError):  # a key nobody can read: counted below
+            if (account := library.account_hash(key, db)) in removed:
+                under.setdefault(account, set()).add(key)
+    for key in keys:
         try:
-            if store.is_removed(key, db) and _remove(key, counts, db):
+            account = library.account_hash(key, db) or ""
+            named = store.covers(removed, key) and marks.get(key, ("",))[0] != library.RENAMED
+            if (named or account in under and under[account] <= library.linked({key}, db)) and _remove(key, counts, db):
                 counts[PURGED] += 1
         except ValueError:  # a key nobody can read is counted, and the artists after it are purged all the same
             unreadable += 1

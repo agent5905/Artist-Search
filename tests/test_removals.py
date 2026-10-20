@@ -39,7 +39,7 @@ from test_push import (
     unsynced,
 )
 
-from pipeline import config, crawl, db, discover, library, push, removals, store
+from pipeline import collect, config, crawl, db, discover, library, push, removals, store
 
 SECRET = "FAKE-REMOVAL-SECRET"
 START = datetime(2026, 10, 14, 12, tzinfo=UTC).timestamp()
@@ -85,9 +85,10 @@ class RemovalsDb(FakeDb):
     earlier one: the latest from each of the ten networks heard from last); anything else is a request of its own.
     due_removals takes the due ones in turns between networks, each in the first turn it has in any of its networks.
     Nothing a push or a load does touches one. A run moves one on only while its code_at is the one the run read.
-    confirm_removal and grant_request close an open one, and put on the list the account it is bound to and the
-    handle the proof was found under (p_handle; the request's own for the owner's grant), and its site when the
-    caller says the proof covered it and no other handle is listed with it now: never whoever the slug lists now.
+    confirm_removal and grant_request close an open one, and put on the list the account it is bound to (or, for one
+    bound to none, its own handle, when p_handle says the profile answers under it now), and its site when the caller
+    says the proof covered it and nobody else is listed with it now (by account, or without one by handle): never
+    whoever the slug lists now.
     That deletes whoever they bar, and an open request whose handle or account they bar is closed as "removed". A
     row with a removed handle, site or account is not loaded again (artists_before_write). A closed request keeps
     nothing of the artist. `queue` names an open request by its handle (by its handle and id when the
@@ -158,12 +159,16 @@ class RemovalsDb(FakeDb):
             return None
         row = self.queue[name]
         da_key, site_key = self.made_for(row).values()
-        da_key = digest(f"da:{handle.lower()}") if handle else da_key
-        listed = [self.keys(other) for other in self.artists.values()]
-        taken = any(other_site == site_key and other_da != da_key for other_da, other_site in listed)
-        keys = [key for key in (da_key, row["da_account"], site_key if site and not taken else None) if key]
-        if not keys:
+        # The account; without one, the request's own handle, and only when the caller has just seen it answer.
+        who = row["da_account"] or (da_key if handle and digest(f"da:{handle.lower()}") == da_key else None)
+        if who is None:
             return None
+
+        def whose(other):  # an artist listed now, as the request knows its artist: by account, or without, by handle
+            return other.get("da_account") if row["da_account"] else self.keys(other)[0]
+
+        taken = any(self.keys(other)[1] == site_key and whose(other) != who for other in self.artists.values())
+        keys = [key for key in (who, site_key if site and not taken else None) if key]
         self.close(name, outcome)  # first, so the removal does not close it as "removed"
         self.sql(push._removed_sql(set(keys)))
         return keys
@@ -182,6 +187,9 @@ class RemovalsDb(FakeDb):
             return httpx.Response(204)
         assert method == "GET" and params["outcome"] == "is.null"  # only open requests are ever read
         rows = [self.queue[name] | self.made_for(self.queue[name]) for name in self.requests]
+        if "id" in params:  # the owner's grant reads the requests it names: in.(<id>,<id>)
+            asked = {int(n) for n in params["id"].removeprefix("in.(").removesuffix(")").split(",")}
+            rows = [row for row in rows if row["id"] in asked]
         assert params["order"] == "first_at.asc,id.asc"  # the owner's list, a page at a time
         rows = sorted(rows, key=lambda row: (when(row["first_at"]), row["id"]))[int(params["offset"]) :]
         columns = params["select"].split(",")
@@ -409,14 +417,14 @@ def test_the_code_in_the_profiles_own_text_removes_the_artist_there_at_once_and_
     assert world.check() == expected(
         requests_due=2, proven_on_deviantart=1, artists_removed=1, left_for_owner_no_code_found=1
     )
-    # There: gone, the hashes of their handle, account and site on the list, the request answered. The other
-    # artist's request waits for the owner.
+    # There: gone, the hashes of their account and site on the list, the request answered. Not their handle by name:
+    # the account bars them under it and under any other. The other artist's request waits for the owner.
     assert [row["slug"] for row in world.db.artists.values()] == [ALPHA] and world.db.requests == [ALPHA]
     account = library.account(f"FAKE-USER-{BRAVO}")
-    assert set(world.db.removed) == {digest(f"da:{BRAVO}"), account, digest(f"site:{BRAVO}.art")}
-    # Here at once, the same three: no stage collects the handle, the account or the site again.
-    assert store.is_removed(BRAVO) and store.is_removed(f"https://www.{BRAVO}.art/") and not store.is_removed(ALPHA)
-    assert library.account_removed(f"FAKE-USER-{BRAVO}")
+    assert set(world.db.removed) == {account, digest(f"site:{BRAVO}.art")}
+    # Here at once, the same two: no stage collects the account, under any handle, or the site again.
+    assert library.account_removed(f"FAKE-USER-{BRAVO}") and store.is_removed(f"https://www.{BRAVO}.art/")
+    assert not store.is_removed(ALPHA) and not library.account_removed(f"FAKE-USER-{ALPHA}")
     assert world.sites.urls == []  # proven on DeviantArt: the site is not asked
     assert world.da.log_levels == {logging.CRITICAL + 1}  # no request URL, which holds a handle, was logged
 
@@ -1126,7 +1134,7 @@ def test_a_request_without_proof_waits_and_a_code_posted_after_a_look_is_found_b
     world.da.profiles[ALPHA]["bio"] += f" {code(ALPHA)}"
     world.later(hours=1)
     assert world.check() == expected(requests_due=1, proven_on_deviantart=1, artists_removed=1)
-    assert world.db.requests == [] and world.db.artists == {} and store.is_removed(ALPHA)
+    assert world.db.requests == [] and world.db.artists == {} and library.account_removed(f"FAKE-USER-{ALPHA}")
     world.later(hours=1)
     assert world.check() == expected()
 
@@ -1159,7 +1167,7 @@ def test_a_request_outlives_its_artists_row_and_their_code_is_still_looked_for(w
     where = "own_site" if site else "deviantart"
     assert world.check() == expected(requests_due=1, artists_removed=1, **{f"proven_on_{where}": 1})
     assert world.db.requests == [] and world.tally == TALLY | {"requests_open_with_code": 1}
-    assert digest(f"da:{ALPHA}") in world.db.removed and store.is_removed(ALPHA)
+    assert library.account(f"FAKE-USER-{ALPHA}") in world.db.removed and library.account_removed(f"FAKE-USER-{ALPHA}")
     world.db.load([row], [], [])  # the next push lists them again, as it would have
     assert gone(world, ALPHA)
 
@@ -1195,30 +1203,138 @@ def test_a_renamed_account_that_answers_only_to_its_new_handle_is_still_found(wo
     assert world.check() == expected(requests_due=1, left_for_owner_not_checked=1)
 
 
-def test_a_proof_under_the_accounts_new_handle_bars_that_handle_and_not_the_old_one_somebody_else_holds(world):
+@pytest.mark.parametrize("place", ["deviantart", "own_site"])
+def test_a_proof_bars_the_account_and_no_handle_by_name_not_the_old_one_somebody_else_holds(world, place):
     """The eighth critic's: BRAVO's account renamed itself CHARLIE, and DeviantArt gave BRAVO to a stranger. The artist
     proved under CHARLIE, and the proof barred BRAVO too, the request's handle: the stranger was barred there and here
-    for good. A proof bars the account and the handle the profile answers under now (confirm_removal's p_handle). The
-    account bars the artist under every handle, so the pushes after it purge both handles' data here and bar the old
-    one nowhere."""
+    for good. A proof bars the account the request is bound to and no handle by name, on DeviantArt or on the artist's
+    own site (the ninth critic's uncaught break: an own-site proof that bars the request's handle). The account bars
+    the artist under every handle, so the pushes after it purge both handles' data here, bar the one the account
+    holds now (CHARLIE) by name too, and bar the old one nowhere."""
+    site = f"https://{CHARLIE}.art/" if place == "own_site" else None
     artist(ALPHA, angle=0.0)
     artist(BRAVO, angle=0.2)
     library.mark_artist(f"da:{BRAVO}", "account gone")
-    artist(CHARLIE, angle=0.21, user=BRAVO, old_keys=[f"da:{BRAVO}"])  # the collect stage links the two handles
-    world.list(BRAVO)
+    artist(CHARLIE, angle=0.21, user=BRAVO, old_keys=[f"da:{BRAVO}"], website=site)  # the collect stage links them
+    world.list(BRAVO, site=site)
     hold_back(world, BRAVO)
     world.da.profiles[BRAVO] = profile(BRAVO, user="yy-fake-stranger")  # somebody else holds the old handle
-    world.da.profiles[CHARLIE] = profile(CHARLIE, user=BRAVO, bio=code(BRAVO))
+    world.da.profiles[CHARLIE] = profile(CHARLIE, user=BRAVO, bio="" if site else code(BRAVO), website=site)
+    if site:
+        world.sites.pages[site] = page(meta(code(BRAVO)))
 
-    assert world.check() == expected(requests_due=1, proven_on_deviantart=1, artists_removed=1)
-    barred = {digest(f"da:{CHARLIE}"), library.account(f"FAKE-USER-{BRAVO}")}
-    assert set(world.db.removed) == barred == push._removed_here(None)
+    assert world.check() == expected(requests_due=1, artists_removed=1, **{f"proven_on_{place}": 1})
+    account = library.account(f"FAKE-USER-{BRAVO}")
+    barred = {account, *([digest(f"site:{CHARLIE}.art")] if site else [])}
+    assert set(world.db.removed) == barred == store.removed_hashes()
+    barred.add(digest(f"da:{CHARLIE}"))  # what the pushes add: the handle the account holds here now
     for run in range(2):
         assert push.run(False)["artists_purged_here"] == (2 if run == 0 else 0)
-        assert set(world.db.removed) == barred == push._removed_here(None)
+        assert set(world.db.removed) == barred == store.removed_hashes()
     assert library.artist_keys() == [f"da:{ALPHA}"] and sorted(sent_artists(world.db)) == [ALPHA]
     assert store.upsert_artist(BRAVO, f"https://www.deviantart.com/{BRAVO}", None, 9)  # the stranger may be listed
     assert not store.upsert_artist(CHARLIE, f"https://www.deviantart.com/{CHARLIE}", None, 9)
+    stranger = {"slug": BRAVO, "name": BRAVO, "da_username": BRAVO, "site_url": None, "site_domain": None}
+    world.db.load([stranger | {"da_account": library.account("FAKE-USER-yy-fake-stranger")}], [], [])
+    assert not gone(world, BRAVO)  # and there too
+
+
+LEFT, STRANGER = "yy-fake-newname", "yy-fake-stranger"  # a handle one account left and DeviantArt gave to another
+
+
+def test_a_proof_under_a_handle_another_kept_artist_left_takes_the_prover_and_nobody_else(world):
+    """The ninth critic's probe 2: S was kept here as LEFT, renamed DELTA (the collect stage linked the two), and
+    DeviantArt gave LEFT to ALPHA's account, which answers under it and proves with its own bio. The proof barred
+    LEFT by name, and the next push, and every collect run's sweep, read that hash as S's old key, took S's account,
+    and purged and barred S under every handle, here and there. The proof bars ALPHA's account alone, and the sweep
+    and the push take ALPHA, and nobody else."""
+    artist(LEFT, angle=0.4, user=STRANGER)
+    library.mark_artist(f"da:{LEFT}", "account gone")
+    artist(DELTA, angle=0.41, user=STRANGER, old_keys=[f"da:{LEFT}"])
+    artist(ALPHA, angle=0.0)
+    artist(CHARLIE, angle=0.9)
+    push.run(False)
+    world.db.file(ALPHA, with_code=True)
+    world.da.profiles[ALPHA] = profile(LEFT, user=ALPHA, bio=f"Please remove me. {code(ALPHA)}")
+
+    assert world.check() == expected(requests_due=1, proven_on_deviantart=1, artists_removed=1)
+    assert world.db.removed == [library.account(f"FAKE-USER-{ALPHA}")] and store.removed_hashes() == {
+        library.account(f"FAKE-USER-{ALPHA}")
+    }
+    counts = dict.fromkeys(collect._COUNTS, 0)
+    collect._sweep(counts, None)  # what every collect run does at both ends: the account, under the key it holds
+    assert counts[collect.PURGED] == 1 and f"da:{ALPHA}" not in library.artist_keys()
+    for _ in range(2):
+        assert push.run(False)["artists_purged_here"] == 0
+        assert sorted(sent_artists(world.db)) == [CHARLIE, DELTA]
+    theirs = library.account(f"FAKE-USER-{STRANGER}")
+    assert theirs not in world.db.removed and not library.account_removed(f"FAKE-USER-{STRANGER}")
+    assert not store.is_removed(DELTA) and not store.is_removed(LEFT)
+    assert {f"da:{DELTA}", f"da:{LEFT}"} <= set(library.artist_keys())
+
+
+def test_the_owners_grant_bars_the_account_and_not_the_old_handle_a_stranger_now_holds(world):
+    """The ninth critic's probe 1: grant_request fell back to the request's own handle, and the owner's --grant sends
+    none. BRAVO asked without proof, then renamed to CHARLIE (the collect stage linked the two), and DeviantArt gave
+    BRAVO to a stranger, whom a push listed under the slug. The owner's grant deleted the stranger and barred them
+    for good. It bars the account the request is bound to, BRAVO's under any handle, and no handle by name."""
+    artist(BRAVO, angle=0.0)
+    artist(ALPHA, angle=0.8)  # somebody else, so the library is never empty
+    world.list(BRAVO, code=False)
+    request = world.db.queue[BRAVO]["id"]
+    library.mark_artist(f"da:{BRAVO}", "account gone")
+    artist(CHARLIE, angle=0.2, user=BRAVO, old_keys=[f"da:{BRAVO}"])
+    theirs = library.account(f"FAKE-USER-{STRANGER}")
+    row = {"slug": BRAVO, "name": BRAVO, "da_username": BRAVO, "site_url": None, "site_domain": None}
+    world.db.load([row | {"da_account": theirs}], [], [])  # the stranger, listed under the slug
+
+    assert f"handle {BRAVO}" in removals.pending()[0]
+    assert removals.answer([request], []) == {"granted": 1, "rejected": 0, "not_granted": 0}  # bound: no look
+    account = library.account(f"FAKE-USER-{BRAVO}")
+    assert world.db.removed == [account] and not gone(world, BRAVO)  # the stranger stays
+    assert library.account_removed(f"FAKE-USER-{BRAVO}") and not store.is_removed(BRAVO)
+    push.run(False)  # the push after it: the artist here under both handles, the stranger nowhere
+    assert set(world.db.removed) == {account, digest(f"da:{CHARLIE}")} and library.artist_keys() == [f"da:{ALPHA}"]
+    assert store.upsert_artist(BRAVO, f"https://www.deviantart.com/{BRAVO}", None, 9)
+    # The statement RemovalsDb.grant follows (tests/test_db.py runs it): the account, and without one the request's
+    # own handle only when the caller says the profile answers under it now. Nothing to bar, nothing done.
+    granting = function_body("grant_request")
+    assert (
+        "lateral (select coalesce(r.da_account, case when public.key_hash('da:' || lower(p_handle)) = r.da_key "
+        "then r.da_key end) as who) w" in granting
+    )
+    assert "if keys[1] is null then return null; end if;" in granting
+
+
+def test_the_owners_grant_bars_a_handle_only_while_its_profile_answers_under_it(world, capsys):
+    """For a request bound to no account the owner's grant can only bar a handle, which DeviantArt gives to somebody
+    else once an account has left it. It says so, looks at the profile afresh, and bars the handle only while the
+    profile answers under it, with the account kept here for it if one is. Otherwise, or when it cannot look, it
+    grants nothing, leaves the request open, and names it to the owner by its id."""
+    for handle in (ALPHA, BRAVO, CHARLIE):
+        world.list(handle, account=False, code=False)
+    artist(DELTA)  # kept here with its account, though its request was filed without it
+    world.list(DELTA, code=False)
+    world.db.queue[DELTA]["da_account"] = None
+    world.da.profiles[ALPHA] = profile(ALPHA)  # still theirs, as far as anything here can tell
+    world.da.profiles[BRAVO] = profile("yy-fake-renamed", user=BRAVO)  # renamed: the handle is free for anybody
+    world.da.profiles[DELTA] = profile(DELTA, user=STRANGER)  # the handle passed to another account
+    ids = {handle: world.db.queue[handle]["id"] for handle in (ALPHA, BRAVO, CHARLIE, DELTA)}  # CHARLIE: no answer
+    capsys.readouterr()
+
+    answered = removals.answer(list(ids.values()), [], transport=world.da.transport)
+    assert answered == {"granted": 1, "rejected": 0, "not_granted": 3}
+    assert world.db.removed == [digest(f"da:{ALPHA}")] and world.db.requests == [BRAVO, CHARLIE, DELTA]
+    said = capsys.readouterr().err.splitlines()
+    assert said[0] == f"request {ids[ALPHA]}: bound to no account, so its handle alone is barred."
+    assert [line.split(":")[0] for line in said[1:]] == [f"request {ids[handle]}" for handle in (BRAVO, CHARLIE, DELTA)]
+    assert all("not granted, and left open" in line for line in said[1:]) and BRAVO not in "".join(said)
+
+    world.da.profiles[BRAVO] = profile(BRAVO)
+    with discover.Pace(discover.BASE_INTERVAL, "the API"):  # another run holds the API: no look can be made
+        assert removals.answer([ids[BRAVO]], [], transport=world.da.transport)["not_granted"] == 1
+    assert removals.answer([ids[BRAVO]], [], transport=world.da.transport)["granted"] == 1
+    assert digest(f"da:{BRAVO}") in world.db.removed and world.db.requests == [CHARLIE, DELTA]
 
 
 def test_a_request_whose_artist_is_removed_another_way_is_closed_and_keeps_no_handle(world):
@@ -1257,11 +1373,13 @@ def test_the_owner_lists_the_open_requests_by_handle_and_answers_them(world, cap
 
     answers = ["--grant", str(ids[BRAVO]), "999999", "--reject", str(ids[CHARLIE]), str(ids[ALPHA]), "999999"]
     assert removals.main(answers) == 0
-    assert json.loads(capsys.readouterr().out) == {"granted": 1, "rejected": 2}  # no open request: not counted
+    # No open request: not counted.
+    assert json.loads(capsys.readouterr().out) == {"granted": 1, "rejected": 2, "not_granted": 0}
     assert world.db.requests == [] and not gone(world, ALPHA) and not gone(world, CHARLIE)
     account = library.account(f"FAKE-USER-{BRAVO}")
-    assert set(world.db.removed) == {digest(f"da:{BRAVO}"), account, digest(f"site:{BRAVO}.art")}
-    assert store.is_removed(BRAVO) and store.is_removed(f"{BRAVO}.art") and not store.is_removed(ALPHA)
+    assert set(world.db.removed) == {account, digest(f"site:{BRAVO}.art")}  # the account the request is bound to
+    assert library.account_removed(f"FAKE-USER-{BRAVO}") and store.is_removed(f"{BRAVO}.art")
+    assert not store.is_removed(ALPHA) and not library.account_removed(f"FAKE-USER-{ALPHA}")
     assert world.check() == expected() and world.tally == TALLY | {"requests_closed": 3}
     assert not any(handle in json.dumps(world.db.queue) for handle in (ALPHA, BRAVO, CHARLIE))
 
@@ -1478,7 +1596,7 @@ def test_an_account_hash_two_unlinked_keys_hold_is_sent_for_neither_and_a_proof_
     the next push could refuse the store. That account is sent for neither now (the rule _removal holds the store
     to), and counted. An account kept under two handles a rename mark links is one artist's, and is sent. ALPHA's
     code in the bio is then not read (a request bound to no account), and the owner's grant bars ALPHA's handle
-    alone."""
+    alone, once ALPHA's profile is seen to answer under it still."""
     artist(ALPHA, angle=0.0)
     artist(BRAVO, user=ALPHA, angle=0.4)
     artist(CHARLIE, angle=0.8)
@@ -1493,7 +1611,8 @@ def test_an_account_hash_two_unlinked_keys_hold_is_sent_for_neither_and_a_proof_
     world.da.profiles[ALPHA] = profile(ALPHA, bio=f"Leaving. {code(ALPHA)}")
 
     assert world.check() == expected(requests_due=1, left_for_owner_not_checked=1)
-    assert removals.answer([world.db.queue[ALPHA]["id"]], []) == {"granted": 1, "rejected": 0}
+    granted = removals.answer([world.db.queue[ALPHA]["id"]], [], transport=world.da.transport)
+    assert granted == {"granted": 1, "rejected": 0, "not_granted": 0}
     assert world.db.removed == [digest(f"da:{ALPHA}")] and not gone(world, BRAVO)
     with pytest.raises(push.Stop, match="broken local store"):  # what is kept here still ties BRAVO to ALPHA
         push.run(False)
@@ -1735,7 +1854,7 @@ def test_a_slug_twin_through_the_real_push_is_not_purged_for_the_other_s_proof(w
 @pytest.mark.parametrize("proof", ["in_the_bio", "on_the_new_site"])
 def test_a_site_the_artist_has_left_is_not_barred_and_whoever_holds_it_now_stays(world, proof):
     """The critic's stale site: ALPHA asked while listed with old.art, then moved to new.art; BRAVO lists old.art now.
-    ALPHA's proof bars ALPHA's handle and account, and not old.art, which ALPHA's profile no longer names."""
+    ALPHA's proof bars ALPHA's account, and not old.art, which ALPHA's profile no longer names."""
     old, new = f"https://{ALPHA}-old.art/", f"https://{ALPHA}-new.art/"
     world.list(ALPHA, site=old)
     listed_as(world, ALPHA, ALPHA, site=new)
@@ -1756,14 +1875,28 @@ def test_a_site_the_artist_has_left_is_not_barred_and_whoever_holds_it_now_stays
         assert digest(f"site:{ALPHA}-new.art") in world.db.removed
     assert gone(world, ALPHA) and not gone(world, BRAVO) and world.db.requests == []
     assert digest(f"site:{ALPHA}-old.art") not in world.db.removed and f"{old}robots.txt" not in world.sites.urls
-    # The eighth critic's uncaught break: the site barred whoever lists it now. RemovalsDb.grant follows this, and
-    # the handle it is held to, the one the proof was found under.
-    granting = function_body("grant_request")
-    assert "lateral (select coalesce(public.key_hash('da:' || lower(p_handle)), r.da_key) as da_key) h" in granting
+    # The eighth critic's uncaught break: the site barred whoever lists it now. RemovalsDb.grant follows this: barred
+    # only while nobody else is listed with it, by account, or for a request bound to none, by handle.
     assert (
         "case when p_site and not exists ( select 1 from public.artists a where a.site_key = r.site_key "
-        "and a.da_key is distinct from h.da_key) then r.site_key end" in granting
+        "and w.who is distinct from case when r.da_account is null then a.da_key else a.da_account end) "
+        "then r.site_key end" in function_body("grant_request")
     )
+
+
+def test_a_site_the_same_account_is_listed_with_under_its_old_handle_is_barred_with_it(world):
+    """The ninth critic's minor finding: the guard above compared handles, so a site the artist's own account was
+    still listed with under its old handle counted as somebody else's, and was not barred. It compares accounts."""
+    site = f"https://{BRAVO}.art/"
+    artist(BRAVO)
+    world.list(BRAVO, site=site)  # listed with their site, and their request filed, under BRAVO
+    library.mark_artist(f"da:{BRAVO}", "account gone")
+    artist(CHARLIE, user=BRAVO, old_keys=[f"da:{BRAVO}"])  # then renamed: the collect stage links the two handles
+    world.da.profiles[CHARLIE] = profile(CHARLIE, user=BRAVO, bio=code(BRAVO), website=site)  # BRAVO answers 404
+
+    assert world.check() == expected(requests_due=1, proven_on_deviantart=1, artists_removed=1)
+    assert set(world.db.removed) == {library.account(f"FAKE-USER-{BRAVO}"), digest(f"site:{BRAVO}.art")}
+    assert world.db.artists == {} and store.is_removed(site)
 
 
 def test_a_proof_on_deviantart_bars_the_site_only_while_the_profile_names_it(world):
@@ -1772,7 +1905,7 @@ def test_a_proof_on_deviantart_bars_the_site_only_while_the_profile_names_it(wor
     world.da.profiles[ALPHA] = profile(ALPHA, bio=code(ALPHA), website=None)  # a site it no longer names
 
     assert world.check() == expected(requests_due=1, proven_on_deviantart=1, artists_removed=1)
-    assert set(world.db.removed) == {digest(f"da:{ALPHA}"), library.account(f"FAKE-USER-{ALPHA}")}
+    assert set(world.db.removed) == {library.account(f"FAKE-USER-{ALPHA}")}
     assert not store.is_removed(site)
 
 
@@ -1847,6 +1980,122 @@ def test_a_site_that_takes_too_long_costs_one_look_and_the_queue_moves_on(world,
     assert [slug for slug, _ in world.db.moved] == [ALPHA, None]
     world.later(minutes=15)
     assert world.check() == expected()  # not due again for an hour: the next run meets other requests first
+
+
+def test_the_database_failing_one_request_leaves_it_due_and_the_queue_moves_on(world, monkeypatch, capsys):
+    """The ninth critic's: confirm_removal rebuilds the word list within the Data API's 8 s, and a run had no catch
+    for one request, so one slow rebuild ended the run and held up every request behind it. The failure is counted,
+    that request is not moved on (it stays due, first in the next run), and the next one is looked at."""
+    world.list(ALPHA)
+    world.later(seconds=1)
+    world.list(BRAVO)
+    for handle in (ALPHA, BRAVO):
+        world.da.profiles[handle] = profile(handle, bio=code(handle))
+    failing, rpc = [world.db.queue[ALPHA]["id"]], world.db.rpc
+
+    def times_out(name, args, key):
+        if name == "confirm_removal" and args["p_id"] in failing:
+            raise RuntimeError("HTTP 500: FAKE canceling statement due to statement timeout")
+        return rpc(name, args, key)
+
+    monkeypatch.setattr(world.db, "rpc", times_out)
+    assert world.check() == expected(
+        requests_due=2, proven_on_deviantart=2, artists_removed=1, left_due_database_failed=1
+    )
+    assert gone(world, BRAVO) and not gone(world, ALPHA) and world.db.requests == [ALPHA]
+    assert [slug for slug, _ in world.db.moved] == [None]  # BRAVO's, closed by the proof; ALPHA's not moved on
+    failing.clear()
+    assert world.check() == expected(requests_due=1, proven_on_deviantart=1, artists_removed=1)  # due still
+    assert gone(world, ALPHA) and world.db.requests == []
+
+    def fails(counts, *args, **kwargs):  # and a run that leaves any due so says so, and ends with a status
+        counts["left_due_database_failed"] = 2
+
+    monkeypatch.setattr(config, "load_env", lambda: {"DEVIANT_ART_ID": "FAKE-ID", "DEVIANT_ART_SECRET": "FAKE-KEY"})
+    monkeypatch.setattr(removals, "run", fails)
+    assert removals.main([]) == 1
+    out, err = capsys.readouterr()
+    assert json.loads(out)["left_due_database_failed"] == 2 and "failed for 2 requests, which stay due" in err
+
+
+def test_an_artist_newly_listed_with_a_site_barred_during_a_push_is_counted_and_sent_without_it_next(
+    world, monkeypatch
+):
+    """The ninth critic's minor finding: a proof bars a site after a push has read the removal list and before its
+    load (the removals' lock lets them take turns, no more). An artist the load lists with that site for the first
+    time is then skipped by the database (artists_before_write), and nothing said so. It is counted, and the next
+    push, which reads the list again, sends them without the site."""
+    site = f"https://{BRAVO}.art/"
+    artist(ALPHA, angle=0.0)
+    push.run(False)
+    artist(BRAVO, angle=0.3, website=site)  # new, with a site of their own
+    load = world.db.load
+
+    def barred_meanwhile(artists, works, neighbors):
+        world.db.sql(push._removed_sql({digest(f"site:{BRAVO}.art")}))  # the site's own artist proves, say
+        return load(artists, works, neighbors)
+
+    monkeypatch.setattr(world.db, "load", barred_meanwhile)
+    counts = push.run(False)
+    assert counts["artists_skipped_by_database"] == 1 and counts["artists_sent"] == 2 and gone(world, BRAVO)
+    monkeypatch.setattr(world.db, "load", load)
+    counts = push.run(False)
+    assert counts["artists_skipped_by_database"] == 0 and counts["site_links_left_out_removed"] == 1
+    assert not gone(world, BRAVO) and sent_artists(world.db)[BRAVO]["site_url"] is None
+    assert not barred(world, BRAVO) and not store.is_removed(BRAVO)
+
+
+def test_the_statements_the_live_tests_run_are_as_written():
+    """The ninth critic's eleven SQL breaks that only tests/test_db.py caught, against the owner's database. Each is
+    caught here too, without it: the statement that does it, as sql/ makes it."""
+    # The open-request index: one request for a handle and site, a null key (no site) included.
+    schema = " ".join((config.ROOT / "sql" / "001_schema.sql").read_text(encoding="utf-8").split())
+    assert "'(artist_slug, da_key, site_key) nulls not distinct where outcome is null'" in schema
+    # The verifier's turns: each network's request due longest, then each one's next (RemovalsDb.rpc follows it).
+    assert "order by t.turn, r.due_at, r.code_at, r.id limit p_limit" in function_body("due_removals")
+    # The counts: a day's window, kept for every one of the three rows (the visitor, the network, everyone).
+    counting = function_body("client_wait")
+    assert "wait := greatest(wait, greatest(held[i], now_s) + cost * 86400 / per_day[i] - 86400 - now_s);" in counting
+    assert counting.count("for i in 1 .. 3 loop continue when per_day[i] is null;") == 3
+    # A removed account bars its artist as a handle or a site does: on the way in, at commit, and when it joins
+    # the list; and the commit-time check is a deferred constraint trigger.
+    written = "where key_hash = any (public.artist_keys(new.da_username, new.site_domain) || new.da_account)"
+    assert written in function_body("artists_before_write")
+    committed = "if exists (select 1 from public.removed where key_hash in (new.da_key, new.site_key, new.da_account))"
+    assert f"{committed} then raise exception" in function_body("artists_not_removed")
+    sql = " ".join(
+        re.sub(r"--[^\n]*", "", (config.ROOT / "sql" / "002_functions.sql").read_text(encoding="utf-8")).split()
+    )
+    assert (
+        "create constraint trigger artists_not_removed after insert or update on public.artists deferrable initially "
+        "deferred for each row execute function public.artists_not_removed();" in sql
+    )
+    deleting = "where a.da_key = any (keys) or a.site_key = any (keys) or a.da_account = any (keys) for update"
+    assert deleting in function_body("delete_removed")
+    # Never shown meanwhile (a row a removal had to skip): by any function the public reaches, or in the word list.
+    unseen = (
+        "not exists (select 1 from public.removed gone where gone.key_hash in (a.da_key, a.site_key, a.da_account))"
+    )
+    for name in ("get_artist", "site_claim", "search_artists", "refresh_search_words"):
+        assert unseen in function_body(name), name
+    both = "gone.key_hash in (seed.da_key, seed.site_key, seed.da_account, a.da_key, a.site_key, a.da_account))"
+    assert both in function_body("similar_artists")
+    # A grant closes its request first, so the removal it makes does not close it as 'removed'; and a removal
+    # rebuilds the word list, so none of the removed artist's words is left to steer a search.
+    granting = function_body("grant_request")
+    assert granting.index("perform public.close_request(p_id, p_outcome);") < granting.index(
+        "insert into public.removed"
+    )
+    assert "perform public.refresh_search_words(); return null;" in function_body("removed_after_insert")
+
+
+def test_the_page_sends_its_ticket_with_either_button():
+    """The ninth critic's uncaught break: the page dropping its ticket, so that a request sent while a push holds the
+    artist back files nothing (request_binding: without a ticket, only whoever the slug lists now). The page's words
+    are read here, as above; tests/test_removals.py and web/tests show what a ticket and its request do."""
+    page = " ".join((config.ROOT / "web" / "src" / "pages.tsx").read_text(encoding="utf-8").split())
+    assert "const { slug, name, site_url, deviantart_proof, ticket } = artist.data" in page
+    assert "setCode(await removalCode(slug, ticket))" in page and "await requestRemoval(slug, note, ticket)" in page
 
 
 def test_the_sweep_never_waits_on_a_row_a_load_holds():

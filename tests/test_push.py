@@ -56,7 +56,8 @@ COUNTS = [
     *(f"works_held_{reason}" for reason in push.WORK_REASONS),
     *("texts_left_out_for_contact", "taglines_left_out_profane", "taglines_left_out_social", "sheets_sent_as_filler"),
     *("site_links_left_out_removed", "accounts_left_out_shared"),
-    *("neighbours_sent", "artists_sent_without_neighbours", "neighbours_skipped_by_database"),
+    *("neighbours_sent", "artists_sent_without_neighbours", "artists_skipped_by_database"),
+    "neighbours_skipped_by_database",
     *("artists_deleted_from_database", "works_deleted_from_database", "neighbours_deleted_from_database"),
     *("removed_artists_deleted_from_database", "removals_added_to_database", "removals_applied_here"),
     *("artists_purged_here", "artists_left_to_purge_here"),
@@ -76,7 +77,7 @@ class FakeDb:
     What the real one does by itself, this does too (sql/002_functions.sql): an artist whose hash joins the
     removal list is deleted there and then, with their works and their place as a neighbour; an artist named in
     a load's neighbour rows ends up with exactly the rows whose two artists it has; and load says how many
-    neighbour rows it skipped.
+    artists (`skips`) and neighbour rows it skipped.
     """
 
     def __init__(self):
@@ -171,7 +172,7 @@ class FakeDb:
         named = {row["artist_slug"] for row in neighbors}
         known = [row for row in neighbors if row["artist_slug"] in slugs and row["neighbor_slug"] in slugs]
         self.neighbors = [row for row in self.neighbors if row["artist_slug"] not in named] + known
-        return len(neighbors) - len(known)
+        return len({row["slug"] for row in artists} & self.skips), len(neighbors) - len(known)
 
     def sent(self):
         """Everything any load was given, as one lowercase text to look for a word in."""
@@ -500,7 +501,7 @@ def test_a_removal_made_through_the_site_is_written_down_and_purged_before_any_r
     assert [key for key, _, _ in store.all_artists()] == [f"da:{ALPHA}", f"da:{CHARLIE}"]
     # What the removal reached here goes back to the list of record: their account under any handle.
     reached = {library.account(f"FAKE-USER-{BRAVO}")}
-    assert set(fake.removed) == {digest(f"da:{BRAVO}")} | reached == push._removed_here(None)
+    assert set(fake.removed) == {digest(f"da:{BRAVO}")} | reached == store.removed_hashes()
     assert sorted(sent_artists(fake)) == [ALPHA, CHARLIE]
     assert not any(word in fake.sent() for word in of_artist(BRAVO))
     assert [row["neighbor_slug"] for row in fake.loads[-1][2] if row["artist_slug"] == ALPHA] == [CHARLIE]
@@ -580,7 +581,7 @@ def test_a_file_that_cannot_be_deleted_never_holds_up_the_removal_and_is_tried_a
         counts = json.loads(capsys.readouterr().out)
         assert "not finished" in str(stopped.value.code) and "yy-fake" not in str(stopped.value.code)
         assert counts["artists_left_to_purge_here"] == 1 and counts["artists_purged_here"] == 0
-        assert set(fake.removed) == wanted == push._removed_here(None) and len(fake.removed) == 2
+        assert set(fake.removed) == wanted == store.removed_hashes() and len(fake.removed) == 2
         assert not any(word in fake.held() for word in of_artist(BRAVO))
         assert sorted(sent_artists(fake)) == [ALPHA, CHARLIE] and counts["artists_sent"] == 2
         # Everything else of theirs went all the same: the one work whose file is held is all that is left.
@@ -1576,7 +1577,7 @@ def test_a_removal_made_here_is_added_to_the_databases_list(fake, dry_run):
     if dry_run:
         assert fake.removed == [] and BRAVO in fake.held() and local_state() == before
         return
-    assert push._removed_here(None) == wanted
+    assert store.removed_hashes() == wanted
     assert set(fake.removed) == wanted and len(fake.removed) == 2
     assert not any(word in fake.held() for word in of_artist(BRAVO))
     assert fake.calls[-4:] == ["listing", "removed", "removal", "load"]
@@ -1756,31 +1757,54 @@ def renamed(fake):
     assert sorted(sent_artists(fake)) == [ALPHA, CHARLIE] and BRAVO not in fake.held()
 
 
-@pytest.mark.parametrize("asked", ["the_new_handle_through_the_site", "the_new_handle_here", "the_old_handle_here"])
+@pytest.mark.parametrize("asked", ["the_new_handle_through_the_site", "the_new_handle_here", "the_account_there"])
 def test_a_removal_covers_the_account_under_every_handle_it_is_kept_under(fake, asked):
     renamed(fake)
     if asked == "the_new_handle_through_the_site":  # as remove_artists does: the hash joins the list, the row goes
         fake.sql(push._removed_sql({digest(f"da:{CHARLIE}")}))
+    elif asked == "the_account_there":  # as a proof does (grant_request): the account alone
+        fake.sql(push._removed_sql({library.account(f"FAKE-USER-{BRAVO}")}))
     else:
-        store.mark_removed(CHARLIE if asked == "the_new_handle_here" else BRAVO)
-    # The handle the account has left is barred only where it is the one named: it may be somebody else's now, and
-    # the account bars the artist under it anyway (the eighth critic's).
+        store.mark_removed(CHARLIE)
+    # The handle the account has left is barred nowhere: it may be somebody else's now, and the account bars the
+    # artist under it anyway (the eighth critic's).
     wanted = {digest(f"da:{CHARLIE}"), library.account(f"FAKE-USER-{BRAVO}")}
-    wanted |= {digest(f"da:{BRAVO}")} if asked == "the_old_handle_here" else set()
 
     for run in range(3):  # purging one handle frees no other: it stays so, run after run
         counts = push.run(False)
         assert counts["artists_purged_here"] == (2 if run == 0 else 0)
         assert sorted(sent_artists(fake)) == [ALPHA] and counts["artists_sent"] == 1
         assert not any(word in fake.held() for word in of_artist(BRAVO) + of_artist(CHARLIE))
-        assert set(fake.removed) == wanted == push._removed_here(None)
+        assert set(fake.removed) == wanted == store.removed_hashes()
         assert library.artist_keys() == [f"da:{ALPHA}"] and library.artist_marks() == {}
-    # The new handle is not taken in again, nor the old one where it was named; the account is known under a handle
-    # it takes later, and nobody else is touched.
+    # The new handle is not taken in again, nor the account under a handle it takes later. The old handle is free for
+    # whoever holds it now, and nobody else is touched.
     assert not store.upsert_artist(CHARLIE, f"https://www.deviantart.com/{CHARLIE}", [], 1)
-    assert store.upsert_artist(BRAVO, f"https://www.deviantart.com/{BRAVO}", [], 1) == (asked != "the_old_handle_here")
+    assert store.upsert_artist(BRAVO, f"https://www.deviantart.com/{BRAVO}", [], 1)
     assert library.account_removed(f"FAKE-USER-{BRAVO}") and not library.account_removed(f"FAKE-USER-{ALPHA}")
     assert not store.is_removed(ALPHA) and len(library.work_ids(f"da:{ALPHA}")) == 5
+
+
+@pytest.mark.parametrize("asked", ["there", "here"])
+def test_a_handle_the_account_has_left_names_whoever_holds_it_now_and_never_the_account(fake, asked):
+    """The ninth critic's probe 2: BRAVO's account took the handle CHARLIE, the collect stage linked the two, and
+    DeviantArt gave BRAVO to somebody else, whose removal put BRAVO's hash on a list. The push read that hash as the
+    key BRAVO's account left, took that key's account, and purged and barred the artist under CHARLIE, who asked for
+    nothing. A handle's hash names whoever holds the handle now, which a key marked RENAMED is not: nobody kept here
+    is purged or barred for it, and the hash stays on both lists for whoever holds BRAVO now."""
+    renamed(fake)
+    if asked == "there":
+        fake.sql(push._removed_sql({digest(f"da:{BRAVO}")}))
+    else:
+        store.mark_removed(BRAVO)
+    before = sorted(library.artist_keys())
+
+    for _ in range(2):
+        counts = push.run(False)
+        assert counts["artists_purged_here"] == 0 and sorted(sent_artists(fake)) == [ALPHA, CHARLIE]
+        assert set(fake.removed) == {digest(f"da:{BRAVO}")} == store.removed_hashes()
+    assert sorted(library.artist_keys()) == before and library.artist_marks()[f"da:{BRAVO}"][0] == library.RENAMED
+    assert not library.account_removed(f"FAKE-USER-{BRAVO}") and not store.is_removed(CHARLIE)
 
 
 def test_neighbour_rows_going_all_at_once_are_not_believed(fake, capsys):
@@ -1839,7 +1863,7 @@ def test_an_artist_the_stores_table_lacks_is_nobodys_removal(fake, dry_run):
         # nobody is barred, and neither removal list has a hash it did not have.
         assert stopped.value.counts["artists_purged_here"] == stopped.value.counts["removals_added_to_database"] == 0
         assert local_state() == before and fake.held() == held and len(fake.artists) == 8
-        assert fake.removed == [] and push._removed_here(None) == set()
+        assert fake.removed == [] and store.removed_hashes() == set()
         assert fake.calls[-2:] == ["listing", "removed"]
 
     for handle in handles:  # discovery fills its table again, and everybody is as they were
@@ -2122,7 +2146,7 @@ def test_an_artist_public_with_a_removed_site_is_sent_without_it_and_never_barre
     counts = push.run(False)
 
     assert counts["artists_purged_here"] == 0 and library.artist_keys() == [f"da:{ALPHA}", f"da:{BRAVO}"]
-    assert set(fake.removed) == {digest(f"site:{BRAVO}.art")} == push._removed_here(None)
+    assert set(fake.removed) == {digest(f"site:{BRAVO}.art")} == store.removed_hashes()
     assert counts["site_links_left_out_removed"] == 1 and sorted(sent_artists(fake)) == [ALPHA, BRAVO]
     assert counts["removed_artists_deleted_from_database"] == 1  # the row that showed the site
     assert sent_artists(fake)[BRAVO]["site_url"] is None and f"{BRAVO}.art" not in fake.held()
@@ -2743,7 +2767,7 @@ def test_profiles_given_a_removed_accounts_hash_stop_the_run_and_nothing_bars_or
     # Here, which of the six the account really is cannot be told, so its hash is left to the database's list.
     assert set(fake.removed) == {digest(f"da:{handles[0]}"), account} - ({account} if where == "here" else set())
     assert library.artist_keys() == sorted(f"da:{h}" for h in [ALPHA, *handles[1:]])
-    assert not any(store.is_removed(h) for h in handles[1:]) and push._removed_here(None) <= set(fake.removed)
+    assert not any(store.is_removed(h) for h in handles[1:]) and store.removed_hashes() <= set(fake.removed)
     assert sorted(row["slug"] for row in fake.artists.values()) == sorted([ALPHA, *handles[1:]])
     if where == "through_the_site":  # the account is on the list: every run stops until the owner says
         with pytest.raises(push.Stop, match="bar 5 people beyond"):
