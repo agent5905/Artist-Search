@@ -1248,4 +1248,11 @@ What fails is the content. Nothing checks fitness beyond sex and gore, so the fi
 
 **Removals round 7, being built:** keep every note, never send an account hash two unlinked profiles hold, give a request asked from several networks a turn of its own, add the missing test, and separate the secret's two uses.
 
+**Removals round 7: merged.** All five findings are fixed:
+- **Notes:** every note on a request is kept with its time: the first, and the latest four, each capped at 300 characters. `--pending` prints them all, safely escaped.
+- **Shared account hash:** push sends no `da_account` that two keys hold without a rename link, and counts it. While the store is corrupt, those two artists lose the DeviantArt proof route; their own site and the owner remain.
+- **Re-asking:** a request sits in the turn of every network that asked for it and is taken at its earliest, so a re-ask can only bring it forward. The critic's case, 10 networks re-asking hourly, falls from 18.5 hours to 15 minutes. Below 30 flooding networks a code is found within about 1 hour 15 minutes of going up.
+- **One new edge, for the owner:** 30 networks that ask for an artist's code before the artist does fill the request's list of 30, which leaves the artist's own network out. That gives 18 to 20 hours, inside decision 15's 12 to 25 hours but at 30 networks rather than 75, and still within the page's "at most a day".
+- **The missing test** for a proof timeout is added, and the secret's two uses now have separate prefixes.
+
 **A Pages project of its own.** The project `.env` named is the owner's own August site, on a different Supabase, and the owner keeps it. With the owner's approval, Artist Search now has its own empty project, `artist-search` (`artist-search.pages.dev`, nothing deployed), and `.env` points at it. No domain is needed. The edge rate-limiting rule needs one, but the database's own limits cover visitors, networks and the total.
