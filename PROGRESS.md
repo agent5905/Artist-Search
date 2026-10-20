@@ -37,6 +37,10 @@ Made 2026-10-11, after the DeviantArt terms were read.
 
     The critic loop for claim-or-remove ends when a critic, given this list and decisions 12 and 13, finds nothing beyond them.
 16. **Hate symbols in fiction (2026-10-19).** Nazi-themed game and film art (Call of Duty zombies, Wolfenstein, Jojo Rabbit) stays held back as hate symbols, about 190 works. It is the safest choice for a studio-facing site.
+17. **Blood shows, pin-ups do not (2026-10-20).** A work rated "suggestive" only for moderate blood and wounds is ordinary game art: it is shown and counts as safe in an artist's share. Sexualised pin-ups, lingerie and barely-there outfits stay held back. Only the works rated suggestive are asked again, which settles the question first raised in Round 22.
+18. **Any AI-declared work holds the artist back (2026-10-20).** An artist is not sent if any of their works is declared AI-made, by its own words or tags. About 52 more artists on today's data.
+19. **DeviantArt's mature counts are not filled in (2026-10-20).** The adult-share rule counts only the works kept here. Mature works are never shown, and the owner accepts that an artist whose portfolio is mostly mature, with a few safe works, could be listed.
+20. **Political content about real people is held back (2026-10-20).** A work showing political content about a real person (posters, propaganda, campaign art) is not sent. The rest of the artist's work can be.
 
 ## The plan
 
