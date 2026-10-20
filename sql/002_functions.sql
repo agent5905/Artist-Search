@@ -746,16 +746,17 @@ as $$
 $$;
 
 -- Service role only. Grants an open request, the owner's answer ('granted') or confirm_removal's ('proven'):
--- what it was bound to goes on the removal list in one statement (which deletes whoever that bars), and the
--- request is closed. That is the handle and the account, and the site when p_site says the proof covered it
--- (the owner's grant: always) and no other handle is listed with it now: a site can pass to another artist.
--- The handle is p_handle when it is given: the one the proof was found under, which the account answers to now
--- (pipeline/removals.py). Not the request's own when the account has left it: DeviantArt can give a handle to
--- somebody else, and the account bars the artist under every handle anyway.
+-- whom it was bound to goes on the removal list in one statement (which deletes them), and the request is closed.
+-- That is the account it is bound to, which bars the artist under every handle the account takes. A handle is
+-- barred by name only for a request bound to no account, and then only its own handle, and only when p_handle says
+-- the caller has just seen that handle's profile answer under it (pipeline/removals.py: the verifier's look, or the
+-- owner's grant after a fresh one). DeviantArt gives a handle an account has left to somebody else, so what a
+-- handle was is never a reason to bar it. And the site, when p_site says the proof covered it (the owner's grant:
+-- always) and nobody else is listed with it now: nobody of another account, or for a request without one, of
+-- another handle. A site can pass to another artist.
 -- Never whoever the slug lists now. Whether the artist is listed at this moment does not matter: the next
 -- push bars and purges them everywhere. Returns the keys it put on the list, for the local store; null, and
--- nothing changes, without one open, or without a key to bar (a request older than its handle column, for
--- an artist not listed now).
+-- nothing changes, without one open, or without anybody to bar.
 create or replace function public.grant_request(p_id bigint, p_outcome text, p_site boolean, p_handle text default null)
 returns text[]
 language plpgsql set search_path = ''
@@ -766,17 +767,21 @@ begin
   -- The removals' lock (see request_binding) before the request's row: a request being filed holds the lock and
   -- may wait on that row, so the other order could deadlock.
   perform pg_advisory_xact_lock(4207);
-  select array_remove(array[h.da_key, r.da_account, case when p_site and not exists (
-           select 1 from public.artists a where a.site_key = r.site_key and a.da_key is distinct from h.da_key)
-         then r.site_key end], null)
+  select array[w.who, case when p_site and not exists (
+           select 1 from public.artists a
+           where a.site_key = r.site_key
+             and w.who is distinct from case when r.da_account is null then a.da_key else a.da_account end)
+         then r.site_key end]
   into keys
   from public.removal_requests r,
-       lateral (select coalesce(public.key_hash('da:' || lower(p_handle)), r.da_key) as da_key) h
+       lateral (select coalesce(r.da_account, case when public.key_hash('da:' || lower(p_handle)) = r.da_key
+                                                   then r.da_key end) as who) w
   where r.id = p_id and r.outcome is null
   for update of r;
-  if coalesce(cardinality(keys), 0) = 0 then
+  if keys[1] is null then
     return null;
   end if;
+  keys := array_remove(keys, null);
   perform public.close_request(p_id, p_outcome); -- first, so the removal below does not close it as 'removed'
   insert into public.removed (key_hash) select distinct unnest(keys) on conflict (key_hash) do nothing;
   return keys;
@@ -785,8 +790,9 @@ $$;
 
 -- Service role only: the verifier calls it once it has seen the request's code where only its artist can
 -- write, with p_site true when the artist's profile, as it read it, still names the request's site, and p_handle
--- the handle that profile answers under now. When the request is open and the code is its slug's, the artist is
--- removed at once and for good (grant_request), listed at this moment or not, and the keys barred are returned.
+-- the handle that profile answers under now (which grant_request bars only without an account). When the request
+-- is open and the code is its slug's, the artist is removed at once and for good (grant_request), listed at this
+-- moment or not, and the keys barred are returned.
 -- Null, and nothing changes, for anything else, and when the secret is missing (no code is then anyone's).
 create or replace function public.confirm_removal(p_id bigint, p_code text, p_site boolean, p_handle text default null)
 returns text[]

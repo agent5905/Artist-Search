@@ -7,8 +7,9 @@
 In this order, and the order is the point:
   1. Removal (hard rule 7), in both directions. It is worked out first, with nothing changed (see _removal),
      from the two removal lists and from nothing else: the database's `removed` table and the store's. Whoever
-     they bar is purged under every handle their account is kept under here and barred under each but one the
-     account has left (which may be somebody else's now), and the account goes on the list too. Then it is
+     they bar is purged under every handle their account is kept under here, and the account goes on the list,
+     which bars them under any handle; a handle goes on it by name only for somebody with no account kept, since
+     DeviantArt gives a handle an account has left to somebody else. Then it is
      written down, here first (store.import_removed) and then in the database: the hashes its list lacks are
      added, so a removal made here outlives this machine, and the artists the list bars are deleted there. Only
      after that is what is kept here about them purged. A file that cannot be deleted is counted, and the next
@@ -33,7 +34,7 @@ Four things stop a run, each with a message and a status that is not zero:
     Or the store's list would add more than DELETE_FLOOR hashes that are no handle or account of anybody barred
     here (a site, a handle nobody here has). A handle of somebody kept here is on the store's list because
     somebody named it (store.mark_removed), so the owner's removals here go through however many there are, and
-    so do the other handles of a removed account that the links and the hashes agree on. A disagreement is how a
+    so does a removed account under every key the links and the hashes agree on. A disagreement is how a
     broken local store shows, and nobody's wish: a corrupt table of rename links once turned one removal through
     the site into twelve, and five profiles given a removed account's hash made it six. Whom the two lists name
     is removed all the same, here and there. Nothing else is done, and `--allow-delete N` lets N of them through.
@@ -163,11 +164,11 @@ NO_ARTISTS = (
 )
 
 REMOVED_SQL = "select key_hash from public.removed"
-# Every artist the database has, with the two hashes its removal list knows them by and how many neighbour rows
-# they have, and every work: what a run compares its rows with.
+# Every artist the database has, with the three hashes its removal list knows them by (handle, site, account) and
+# how many neighbour rows they have, and every work: what a run compares its rows with.
 # ponytail: one answer with a row a work, about 8 MB at 30,000 works. Page it by artist id if that is refused.
 LISTING_SQL = (
-    "select a.id as artist_id, a.slug, a.da_key, a.site_key, w.id as work_id, w.page_url, "
+    "select a.id as artist_id, a.slug, a.da_key, a.site_key, a.da_account, w.id as work_id, w.page_url, "
     "(select count(*) from public.artist_neighbors n where n.artist_id = a.id) as neighbours "
     "from public.artists a left join public.works w on w.artist_id = a.id"
 )
@@ -332,13 +333,6 @@ def _search_text(parts: list[str]) -> str:
     return text
 
 
-def _removed_here(local: pathlib.Path | str | None) -> set[str]:
-    """Every key hash on the store's removal list: artists, their sites, and the accounts the collect stage adds.
-    ponytail: the store has no reader for its list, so it is selected here. Move it there when it has."""
-    with store._open(local) as conn:
-        return {key_hash for (key_hash,) in conn.execute("SELECT key_hash FROM removed")}
-
-
 def _collected(
     local: pathlib.Path | str | None,
 ) -> tuple[dict[str, list[tuple[Any, ...]]], dict[str, tuple[str | None, str | None, str]]]:
@@ -436,7 +430,9 @@ def _build(local: store.Snapshot, removed: Collection[str]) -> tuple[Rows, Rows,
     holders: dict[str, set[str]] = {}
     for other, held in account_of.items():
         holders.setdefault(held, set()).add(other)
-    disputed = {held for held, keys in holders.items() if len(keys) > 1 and not keys <= _linked({min(keys)}, local)}
+    disputed = {
+        held for held, keys in holders.items() if len(keys) > 1 and not keys <= library.linked({min(keys)}, local)
+    }
 
     def plain(texts: list[str], model: bool = False) -> list[str]:
         """Of these texts, the ones the plain rule finds no contact in, and of a `model`'s words the ones that
@@ -659,15 +655,6 @@ def _removed_sql(key_hashes: set[str]) -> str:
     return f"insert into public.removed (key_hash) values {values} on conflict (key_hash) do nothing"
 
 
-def _linked(keys: set[str], local: pathlib.Path | str | None) -> set[str]:
-    """These keys, and every key a RENAMED mark links to one of them (library.same_account), and to those in turn."""
-    found, more = set(), set(keys)
-    while more:
-        found |= more
-        more = {other for key in more for other in library.same_account(key, local)} - found
-    return found
-
-
 def _removal(
     listed: set[str], kept: set[str], local: pathlib.Path | str | None, follow: bool = True
 ) -> tuple[set[str], set[str], int, set[str]]:
@@ -680,16 +667,19 @@ def _removal(
     artist the store's `artists` table merely lacks is nobody's removal. That table was emptied once, and the
     run that followed purged the whole library and barred every account.
 
-    A removal bars what it is bound to and nothing else. A handle's hash bars the artist stored or kept here
-    (`kept`, the library's keys) under that handle (store.named_by), and their account goes on the list with it,
-    so that the account is known for what it is under a handle it takes later, when the purge has deleted the
-    profile that names it. An account's hash bars whoever is kept here under it (their profile's hash). A site's
-    bars nobody: it is kept out of every row (store._named_by, build), and anybody can name it. A removal
-    covers the account under every handle it is kept under here, linked to one of those by the collect stage's
-    marks (library.same_account), and theirs in turn: each goes on the list too, but a handle the account has left
-    for another (marked RENAMED). DeviantArt can give that one to somebody else, and the account's hash bars the
-    artist under it anyway, so it is purged here and barred nowhere by name. With `follow` False only whom a
-    hash names by handle is barred, and their account goes on the list only where what is kept here agrees on it.
+    A removal bars what it is bound to and nothing else. A handle's hash bars whoever holds that handle now: the
+    artist stored or kept here (`kept`, the library's keys) under it (store.named_by), and their account goes on the
+    list with it, so that the account is known for what it is under a handle it takes later, when the purge has
+    deleted the profile that names it. Never a key the account has left for another (marked RENAMED): DeviantArt
+    can give that handle to somebody else, whose removal it then is, so that key's account is not taken from it. An
+    account's hash bars every key kept here under it (their profile's hash). A site's bars nobody: it is kept out of
+    every row (store._named_by, build), and anybody can name it. A removal covers the account under every handle it
+    is kept under here, linked to one of those by the collect stage's marks (library.same_account), and theirs in
+    turn: all are purged here, and the account's hash is what goes on the lists, which bars the artist under any
+    handle, there (artists.da_account) and here (library.account_removed). A handle goes on them by name only for
+    a key with no account kept: the account may have left it, unseen here, and DeviantArt given it to somebody
+    else. With `follow` False only whom a hash names by handle is barred, and their account goes on the list only
+    where what is kept here agrees on it.
 
     What is kept here can be wrong: a corrupt table of rename links once turned one removal into twelve, and five
     profiles given a removed account's hash made it six. So the two must agree: every key kept under a removed
@@ -698,24 +688,24 @@ def _removal(
     only with `follow`, which the run asks for only when there is none of them, or it was told to (see run).
     """
     hashes = set(listed)
-    stored = store.named_by(hashes, local)
-    named = {*stored, *(key for key in kept if store.covers(hashes, key))}
+    # The keys accounts have left: a run that bars nobody reads no marks.
+    left = {key for key, mark in library.artist_marks(local).items() if mark[0] == library.RENAMED} if hashes else set()
+    named = {*store.named_by(hashes, local), *(key for key in kept if store.covers(hashes, key))} - left
     account = {key: library.account_hash(key, local) for key in kept}
     removed = {held for held in account.values() if held in hashes}  # the accounts barred: on a list,
     removed |= {held for key in named if (held := account.get(key))}  # or a barred handle's
     holding = {key for key, held in account.items() if held in removed}
-    reached = _linked(named | holding, local)
+    reached = library.linked(named | holding, local)
     # A mark ties it to a removed account, and its own hash is another account's.
     odd = {key for key in reached - named if account.get(key) not in removed | {None}}
     disputed = set()  # removed accounts whose keys here are not all linked: one of them is not the account's
     for held in removed:  # its hash ties it to a removed account, and no mark links it to the account's other keys
         keys = {key for key in holding if account[key] == held}
-        if keys and not keys <= _linked({min(keys)}, local):
+        if keys and not keys <= library.linked({min(keys)}, local):
             odd |= keys - named
             disputed.add(held)
     barred = reached if follow else named
-    marks = library.artist_marks(local) if barred else {}  # a run that bars nobody reads none
-    hashes |= {store._hash(key) for key in barred if marks.get(key, ("",))[0] != library.RENAMED}
+    hashes |= {store._hash(key) for key in barred - left if not account.get(key)}  # by name: no account kept
     hashes |= {held for key in barred if (held := account.get(key)) and (follow or held not in disputed)}
     return hashes, barred, len(store.named_by(hashes, local)), odd
 
@@ -732,8 +722,9 @@ def run(dry_run: bool, allow_delete: int | None = None, local: pathlib.Path | st
     (artists sent without their own site, which is on the removal list); accounts_left_out_shared (artists sent
     without their account, whose hash another key kept here holds and no rename mark ties to them: a broken
     store, so only the owner can remove them, on a request without proof); neighbours_sent,
-    artists_sent_without_neighbours, and neighbours_skipped_by_database (what db.load said the database would not
-    take: a row that names an artist it does not have);
+    artists_sent_without_neighbours, artists_skipped_by_database and neighbours_skipped_by_database (what db.load
+    said the database would not take: an artist on its removal list, barred since this run read it, and a row that
+    names an artist it does not have);
     artists_deleted_from_database, works_deleted_from_database and neighbours_deleted_from_database (rows it had
     that are no longer sent; of neighbour rows, those an artist who stays loses and gets no other for);
     removed_artists_deleted_from_database and removals_added_to_database (artists the removal list bars, and key
@@ -761,7 +752,7 @@ def run(dry_run: bool, allow_delete: int | None = None, local: pathlib.Path | st
         raise Stop(NO_ARTISTS)  # a run would make the file and find nothing in it: a dry run makes no file
     with store.snapshot(local) as now:
         kept = set(library.artist_keys(now))
-        here = _removed_here(now)
+        here = store.removed_hashes(now)
         # Whom the database's list names, and whom the store's names by the handle they are kept under: removals
         # somebody made by name, there through the site or here (store.mark_removed). However many, each is the
         # wish of the person named or of the owner.
@@ -782,14 +773,14 @@ def run(dry_run: bool, allow_delete: int | None = None, local: pathlib.Path | st
     # The artists the list bars go with it, whatever happens further down: the database deletes them itself when
     # their hash arrives, and one it had to leave (a load held the row) is deleted here by id.
     unlisted = hashes - remote
-    barred = {int(row["artist_id"]) for row in there if hashes & {row["da_key"], row["site_key"]}}
+    barred = {int(row["artist_id"]) for row in there if hashes & {row["da_key"], row["site_key"], row["da_account"]}}
     removal = ([_removed_sql(unlisted)] if unlisted else []) + ([_delete_sql("artists", barred)] if barred else [])
     stuck = 0
     if not dry_run:
         store.import_removed(hashes, local)  # here first, then there, and only then is a file deleted
         if removal:
             db.sql("; ".join(removal))
-        for key in purge:
+        for key in purge:  # the store's row for each handle with it (library.purge): no handle needs barring for that
             try:
                 library.purge(key, local)
             except OSError:  # a file somebody holds open: the rows that name it stay, and the next run finds them
@@ -840,6 +831,7 @@ def run(dry_run: bool, allow_delete: int | None = None, local: pathlib.Path | st
             "accounts_left_out_shared": held["accounts_left_out_shared"],
             "neighbours_sent": len(neighbours) - empty,
             "artists_sent_without_neighbours": empty,
+            "artists_skipped_by_database": 0,
             "neighbours_skipped_by_database": 0,
             "artists_deleted_from_database": len(gone_artists),
             "works_deleted_from_database": len(gone_works),
@@ -877,8 +869,11 @@ def run(dry_run: bool, allow_delete: int | None = None, local: pathlib.Path | st
             stale.append(BLANK_SQL.format(", ".join(map(str, sorted(losing)))))
         if stale:
             db.sql("; ".join(stale))  # one call: all of it or none
+        # An artist the database skipped has a handle, site or account on its list now: one barred since this run
+        # read it (a proof meanwhile), which the next run reads and sends them without, or removes them for.
         # Each row that names no neighbour is one the database counts as skipped: those are not news.
-        counts["neighbours_skipped_by_database"] = max((db.load(artists, works, neighbours) or 0) - empty, 0)
+        counts["artists_skipped_by_database"], skipped = db.load(artists, works, neighbours)
+        counts["neighbours_skipped_by_database"] = max(skipped - empty, 0)
     return counts
 
 

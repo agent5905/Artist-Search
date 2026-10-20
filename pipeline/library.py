@@ -878,6 +878,15 @@ def same_account(artist_key: str, db: pathlib.Path | str | None = None) -> list[
         return sorted({other for (other,) in conn.execute(query, {"key": key})} - {key})
 
 
+def linked(keys: set[str], db: pathlib.Path | str | None = None) -> set[str]:
+    """These keys, and every key a RENAMED mark links to one of them (same_account), and to those in turn."""
+    found, more = set(), set(keys)
+    while more:
+        found |= more
+        more = {other for key in more for other in same_account(key, db)} - found
+    return found
+
+
 def holders(user_id: object, db: pathlib.Path | str | None = None) -> list[str]:
     """The keys under which the account with this API user id is kept, by its hash in either spelling."""
     with _open(db) as conn:

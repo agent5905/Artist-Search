@@ -59,18 +59,21 @@ handle either. Codes do not expire. One made before the owner replaced the secre
 under words of their own (removal_code: none was given out), is not the slug's code any more, and proves nothing.
 
 A code found where it must be goes to confirm_removal, which checks it again and removes the artist at once and
-for good, listed at that moment or not, and closes the request. What it bars is what the proof covered: the account
-the request is bound to, the handle the profile just read answers under now, and the request's site only while
-that profile still names it (and no other handle is listed with it: grant_request). Not the request's own handle
-when the account has left it for another: DeviantArt can give it to somebody else, and the account bars the artist
-under every handle anyway. Those key hashes, as the database answers them, go on the local store's list
-(store.import_removed), so no stage here collects the artist again. The next push or collect purges what is kept
-about them, under every handle of their account, as it does for every removal on the database's list. The owner's
---grant does the same for an open request without proof (with the request's own handle, and its site on the same
-condition). A request whose artist is removed another way (under another handle of their account, say) is closed
-by the database as that happens.
+for good, listed at that moment or not, and closes the request. What it bars is the account the request is bound
+to, which bars the artist under every handle the account holds or takes; and the request's site only while the
+profile just read still names it (and nobody else is listed with it: grant_request). No handle by name: DeviantArt
+gives a handle an account has left to somebody else. Only a request bound to no account bars a handle, its own, as
+the profile just read answers under it. Those key hashes, as the database answers them, go on the local store's
+list (store.import_removed), so no stage here collects the artist again. The next push or collect purges what is
+kept about them, under every handle of their account, as it does for every removal on the database's list. The
+owner's --grant does the same for an open request without proof: the account, or for a request bound to none its
+handle, once a fresh look finds the handle's profile answering under it with the account kept here for it (answer),
+and its site on the same condition. A request whose artist is removed another way (under another handle of their
+account, say) is closed by the database as that happens.
 
-Anything less leaves the request open, for the owner and for its next look.
+Anything less leaves the request open, for the owner and for its next look. So does the database failing for one
+request (confirm_removal rebuilds the word list within the Data API's 8 s): it is counted, the request stays due,
+and the next is looked at.
 
 Every request to DeviantArt waits its turn in discover.Pace, and holds the API's lock for that request alone: a
 collect run can start between two of them, and this run then stops at its next one. A collect run holds the API
@@ -96,6 +99,7 @@ import pathlib
 import re
 import sys
 import traceback
+from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -128,6 +132,7 @@ COUNTS = (
     "proofs_refused_by_database",
     "left_for_owner_no_code_found",
     "left_for_owner_not_checked",  # a place could not be read, or there is none we may read: looked at again later
+    "left_due_database_failed",  # due still: the next run looks at it first
 )
 
 
@@ -172,6 +177,18 @@ def _move_on(request: dict[str, Any], now: datetime, dry_run: bool) -> None:
         # Not one a proof just closed, nor one asked for again since it was read.
         where = {"id": f"eq.{request['id']}", "outcome": "is.null", "code_at": f"eq.{request['code_at']}"}
         db._checked(db.data_api("PATCH", "removal_requests", "secret", params=where, json={"due_at": due}))
+
+
+@contextlib.contextmanager
+def _client(client_id: str, client_secret: str, transport: httpx.BaseTransport | None) -> Iterator[discover._Api]:
+    """The API client the collect stage uses: the user agent, no redirect followed, no URL logged."""
+    with (
+        discover._http_logs_off(),
+        httpx.Client(
+            headers={"User-Agent": config.USER_AGENT}, transport=transport, timeout=30, follow_redirects=False
+        ) as http,
+    ):
+        yield discover._Api(http, client_id, client_secret)
 
 
 def _profile(api: discover._Api, handle: str) -> dict[str, Any] | None:
@@ -237,10 +254,11 @@ def run(
     api: discover._Api | None = None,
 ) -> None:
     """One pass over the requests that are due, counted into `counts` (COUNTS) as it goes, so that a run that stops
-    still says what it did. discover.Stop when another run holds the API, or the API refuses for too long;
-    RuntimeError when the database fails. Either ends the run there: what was removed stays removed, and the
-    request being looked at stays due. Given `api`, a collect or discovery run's, it asks through that (its pace,
-    which that run holds) and not a client of its own."""
+    still says what it did. discover.Stop when another run holds the API, or the API refuses for too long, ends the
+    run there: what was removed stays removed, and the request being looked at stays due. So does RuntimeError when
+    the database fails before any request is read. Once they are, it failing for one request (a slow rebuild of the
+    word list in confirm_removal, say) leaves that one due, counted, and the run goes on to the next. Given `api`, a
+    collect or discovery run's, it asks through that (its pace, which that run holds) and not a client of its own."""
     now = datetime.fromtimestamp(discover.now(), UTC)
     tally = db.rpc("removal_tally", {}, "secret")
     counts.update({name: int(tally[name]) for name in TALLY})
@@ -251,36 +269,30 @@ def run(
         return
     fetcher = fetcher or crawl.PoliteFetcher()
     with contextlib.ExitStack() as held:
-        if api is None:  # the API client the collect stage uses: the user agent, no redirect followed, no URL logged
-            held.enter_context(discover._http_logs_off())
-            http = held.enter_context(
-                httpx.Client(
-                    headers={"User-Agent": config.USER_AGENT}, transport=transport, timeout=30, follow_redirects=False
-                )
-            )
-            api = discover._Api(http, client_id, client_secret)
+        api = api or held.enter_context(_client(client_id, client_secret, transport))
         kept = held.enter_context(store.snapshot(local))
         for request in due:
-            code = db.rpc("removal_code", {"p_slug": request["artist_slug"]}, "secret")
-            found = (
-                _look(api, fetcher, request, code, kept) if CODE.fullmatch(str(code)) else ("not_checked", False, "")
-            )
-            where, site, under = found
-            if where not in ("deviantart", "own_site"):
-                counts[f"left_for_owner_{where}"] += 1
-            else:
-                counts[f"proven_on_{where}"] += 1
-                args = {"p_id": request["id"], "p_code": code, "p_site": site, "p_handle": under}
-                if dry_run:
-                    counts["artists_removed"] += 1
-                # The database first: it is the judge of the code. Here only once it has removed them, and only
-                # what it put on its own list, which every later push takes as the database's own removal.
-                elif barred := db.rpc("confirm_removal", args, "secret"):
-                    store.import_removed(barred, local)
-                    counts["artists_removed"] += 1
+            try:
+                code = db.rpc("removal_code", {"p_slug": request["artist_slug"]}, "secret")
+                checked = CODE.fullmatch(str(code))
+                where, site, under = _look(api, fetcher, request, code, kept) if checked else ("not_checked", False, "")
+                if where not in ("deviantart", "own_site"):
+                    counts[f"left_for_owner_{where}"] += 1
                 else:
-                    counts["proofs_refused_by_database"] += 1
-            _move_on(request, now, dry_run)
+                    counts[f"proven_on_{where}"] += 1
+                    args = {"p_id": request["id"], "p_code": code, "p_site": site, "p_handle": under}
+                    if dry_run:
+                        counts["artists_removed"] += 1
+                    # The database first: it is the judge of the code. Here only once it has removed them, and only
+                    # what it put on its own list, which every later push takes as the database's own removal.
+                    elif barred := db.rpc("confirm_removal", args, "secret"):
+                        store.import_removed(barred, local)
+                        counts["artists_removed"] += 1
+                    else:
+                        counts["proofs_refused_by_database"] += 1
+                _move_on(request, now, dry_run)
+            except RuntimeError:  # the database: this request stays due, and the queue does not wait on it
+                counts["left_due_database_failed"] += 1
 
 
 def pending() -> list[str]:
@@ -306,15 +318,66 @@ def pending() -> list[str]:
     ]
 
 
-def answer(grant: list[int], reject: list[int], local: pathlib.Path | str | None = None) -> dict[str, int]:
-    """The owner's answer to open requests, by id. A granted one is removed for good as a proven one is, its site
-    with it (grant_request), here at once too; a rejected one is closed and nothing else changes. An id with no
-    open request is left alone."""
-    counts = {"granted": 0, "rejected": 0}
-    for request in grant:
-        if barred := db.rpc("grant_request", {"p_id": request, "p_outcome": "granted", "p_site": True}, "secret"):
-            store.import_removed(barred, local)
-            counts["granted"] += 1
+def _answers_under(api: discover._Api, handle: object, local: pathlib.Path | str | None) -> str | None:
+    """The handle, when its profile, read now, still answers under it, with the account kept here for it if one
+    is. None when it answers under another handle or for another account, or not at all, or cannot be read: another
+    run holds the API, or the API does not answer."""
+    if not isinstance(handle, str) or not store.HANDLE.fullmatch(handle):
+        return None
+    try:
+        profile = _profile(api, handle)
+    except (discover.Stop, httpx.HTTPError):
+        return None
+    user = profile.get("user") if profile else None
+    user_id, name = (user.get("userid"), user.get("username")) if isinstance(user, dict) else (None, None)
+    kept = library.account_hash(store.artist_key(handle), local)
+    if not (isinstance(name, str) and name.lower() == handle.lower() and library.account(user_id)):
+        return None
+    return name if kept in (None, library.account(user_id), library.account(user_id, "da-user")) else None
+
+
+def answer(
+    grant: list[int],
+    reject: list[int],
+    local: pathlib.Path | str | None = None,
+    client_id: str = "",
+    client_secret: str = "",
+    *,
+    transport: httpx.BaseTransport | None = None,
+) -> dict[str, int]:
+    """The owner's answer to open requests, by id. A granted one is removed for good as a proven one is, here at
+    once too (grant_request): the account it is bound to, and its site. One bound to no account can only bar its
+    handle, which DeviantArt may have given to somebody else since: it is granted only once the handle's profile, read
+    now, still answers under it with the account kept here for the handle (if one is). When it does not, or cannot be
+    read, the request is left open, counted as not_granted, and the owner is told by its id on stderr. A rejected one
+    is closed and nothing else changes. An id with no open request is left alone."""
+    counts = {"granted": 0, "rejected": 0, "not_granted": 0}
+    bound = {}  # the open requests among those granted, by id
+    if grant:
+        asked = {"id": f"in.({','.join(map(str, grant))})", "outcome": "is.null", "order": "first_at.asc,id.asc"}
+        bound = {row["id"]: row for row in _rows("removal_requests", select="id,da_username,da_account", **asked)}
+    with _client(client_id, client_secret, transport) as api:
+        for request in grant:
+            row = bound.get(request)
+            if row is None:  # no open request: left alone
+                continue
+            handle = None
+            if not row["da_account"]:
+                handle = _answers_under(api, row["da_username"], local)
+                if handle is None:
+                    print(
+                        f"request {request}: not granted, and left open. It is bound to no account, so only its handle "
+                        "could be barred, and its profile does not answer under that handle now with the account kept "
+                        "for it, or could not be read: the handle may be somebody else's. Try again later.",
+                        file=sys.stderr,
+                    )
+                    counts["not_granted"] += 1
+                    continue
+                print(f"request {request}: bound to no account, so its handle alone is barred.", file=sys.stderr)
+            args = {"p_id": request, "p_outcome": "granted", "p_site": True, "p_handle": handle}
+            if barred := db.rpc("grant_request", args, "secret"):
+                store.import_removed(barred, local)
+                counts["granted"] += 1
     for request in reject:
         counts["rejected"] += db.rpc("reject_removal", {"p_id": request}, "secret") is True
     return counts
@@ -335,19 +398,21 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--reject", nargs="+", type=int, default=[], metavar="ID", help="close them, and no more")
     args = parser.parse_args(argv)
     try:
+        env = config.load_env()
+    except FileNotFoundError:
+        env = {}
+    try:
         if args.pending:
             print("\n".join(pending()) or "no open requests")
             return 0
         if args.grant or args.reject:
-            print(json.dumps(answer(args.grant, args.reject)))
-            return 0
+            # The API only for a request bound to no account: without it, such a request is not granted.
+            answered = answer(args.grant, args.reject, None, *(env.get(name, "") for name in discover.ENV_NAMES))
+            print(json.dumps(answered))
+            return 1 if answered["not_granted"] else 0
     except Exception as exc:  # deliberately broad: nothing gets out of here as a traceback
         print(f"stopped: {_where(exc)}", file=sys.stderr)
         return 1
-    try:
-        env = config.load_env()
-    except FileNotFoundError:
-        env = {}
     missing = [name for name in discover.ENV_NAMES if not env.get(name)]
     if missing:
         print(f"Missing in .env: {', '.join(missing)} (see .env.example)", file=sys.stderr)
@@ -361,6 +426,10 @@ def main(argv: list[str] | None = None) -> int:
         status = 1
     except Exception as exc:  # deliberately broad: nothing gets out of here as a traceback
         print(f"stopped: {_where(exc)}", file=sys.stderr)
+        status = 1
+    if counts["left_due_database_failed"]:
+        failed = counts["left_due_database_failed"]
+        print(f"the database failed for {failed} requests, which stay due for the next run", file=sys.stderr)
         status = 1
     print(json.dumps(counts))  # counts only, nothing about any artist
     return status

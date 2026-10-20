@@ -358,6 +358,7 @@ def look_between(api: _Api, counts: dict[str, int], db: pathlib.Path | str | Non
         print(f"a removal check failed: {removals._where(exc)}", file=sys.stderr)
     api.looked = now()
     counts[PROVEN] += found["artists_removed"]
+    counts[UNCHECKED] += found["left_due_database_failed"]  # the database failed for one request: due still
 
 
 @contextlib.contextmanager

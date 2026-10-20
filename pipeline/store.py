@@ -358,6 +358,12 @@ def covers(key_hashes: Collection[str], identifier: str) -> bool:
     return any(_hash(key) in key_hashes for key in ([f"da:{value}"] if kind == "da" else _host_keys(value)))
 
 
+def removed_hashes(db: pathlib.Path | str | None = None) -> set[str]:
+    """Every key hash on the removal list: artists, their sites, and the accounts the collect stage adds."""
+    with _open(db) as conn:
+        return {key_hash for (key_hash,) in conn.execute("SELECT key_hash FROM removed")}
+
+
 def named_by(key_hashes: Iterable[str], db: pathlib.Path | str | None = None) -> list[str]:
     """The keys of the stored artists import_removed() would delete for these key hashes. It changes nothing."""
     with _open(db) as conn:

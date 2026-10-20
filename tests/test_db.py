@@ -330,8 +330,9 @@ ALPHA_SIMILAR = ["zz-test-gamma", "zz-test-delta", "zz-test-beta"]  # what a vis
 
 
 def seed() -> dict[str, int]:
-    # The push stage's way in. It says how many neighbour rows it skipped: the one that names nobody.
-    assert db.load(ARTISTS, WORKS, NEIGHBORS) == 1
+    # The push stage's way in. It says how many artists it skipped (none is removed) and how many neighbour rows: the
+    # one that names nobody.
+    assert db.load(ARTISTS, WORKS, NEIGHBORS) == (0, 1)
     return db.rpc("artist_ids", {"p_slugs": list(BY_SLUG)}, "secret")
 
 
@@ -518,7 +519,7 @@ def test_load_goes_batch_by_batch(monkeypatch):
     ring = [neighbor(name, names[(n + 1) % len(names)], 1, 0.5) for n, name in enumerate(names)]
     rest = [neighbor(names[0], name, rank, 0.25) for rank, name in enumerate(reversed(names[2:]), start=2)]
     try:
-        assert db.load(CROWD, crowd_works, ring + rest) == 0
+        assert db.load(CROWD, crowd_works, ring + rest) == (0, 0)
         # Thirty artists in batches of seven: five batches, a plain vacuum after the second and the fourth.
         # The same again for their thirty lists of neighbours, and one vacuum with statistics to finish.
         assert vacuums == [False, False, False, False, True]
@@ -553,7 +554,7 @@ def test_a_column_a_load_does_not_send_is_left_as_it_was():
     }
     try:
         db.upsert("artists", [whole], "slug", "slug")
-        assert db.load([again, new], [work], []) == 0
+        assert db.load([again, new], [work], []) == (0, 0)
         rows = db.sql("""
             select a.name, a.tagline, a.hidden, a.top_tags,
                    (select jsonb_agg(jsonb_build_array(w.position, w.tags, w.title, w.width, w.height))
@@ -814,7 +815,7 @@ def test_a_load_that_changes_neighbours_leaves_no_stale_row(seeded):
     try:
         # Alpha is ranked anew: two neighbours where there were four, at other ranks, with other scores.
         changed = [neighbor("alpha", "delta", 1, 0.75), neighbor("alpha", "beta", 2, 0.25)]
-        assert db.load([BY_SLUG["zz-test-alpha"]], [], changed) == 0
+        assert db.load([BY_SLUG["zz-test-alpha"]], [], changed) == (0, 0)
         assert db.sql(ALPHA_ROWS) == [
             {"rank": 1, "slug": "zz-test-delta", "score": 0.75},
             {"rank": 2, "slug": "zz-test-beta", "score": 0.25},
@@ -824,7 +825,7 @@ def test_a_load_that_changes_neighbours_leaves_no_stale_row(seeded):
         # To leave an artist with no neighbours, the push stage sends one row for them that names none.
         # It is counted with the skipped rows, and among other artists' rows it clears only its own artist.
         none = {"artist_slug": "zz-test-beta", "neighbor_slug": None, "rank": None, "score": None}
-        assert db.load([], [], [none, *changed]) == 1
+        assert db.load([], [], [none, *changed]) == (0, 1)
         assert stored("beta") == 0 and similar("beta") == []
         assert similar("alpha") == ["zz-test-delta", "zz-test-beta"]
 
@@ -862,7 +863,7 @@ def test_a_similar_artist_shows_the_works_picked_for_the_seed_and_no_others(seed
     try:
         # Alpha's works at these positions are the closest to beta's, best first. The load stores them, and
         # beside beta alpha is shown with those, in that order. Still four works.
-        assert db.load([], [], [{**row, "picks": [7, 0, 10, 3]}]) == 0
+        assert db.load([], [], [{**row, "picks": [7, 0, 10, 3]}]) == (0, 0)
         [first] = db.sql(stored)
         assert first["picks"] == [7, 0, 10, 3]
         assert shown("beta") == {"zz-test-alpha": ["alpha 7", "alpha 0", "alpha 10", "alpha 3"]}
@@ -1102,13 +1103,19 @@ def request_id(row_or_slug: dict[str, Any] | str, handle: str | None = None) -> 
 
 
 def confirm(row: dict[str, Any], code: str, site: bool = True, handle: str | None = None) -> list[str] | None:
-    """confirm_removal for the row's open request: the keys it barred, or None."""
-    return db.rpc("confirm_removal", {"p_id": request_id(row, handle), "p_code": code, "p_site": site}, "secret")
+    """confirm_removal for the row's open request: the keys it barred, or None. With the handle the verifier found
+    the profile answering under, the row's own (which only a request bound to no account bars)."""
+    found = {"p_id": request_id(row, handle), "p_code": code, "p_site": site, "p_handle": row["da_username"]}
+    return db.rpc("confirm_removal", found, "secret")
 
 
-def grant(request: int) -> list[str] | None:
-    """The owner's yes to a request (removals.answer): the keys it barred, or None."""
-    return db.rpc("grant_request", {"p_id": request, "p_outcome": "granted", "p_site": True}, "secret")
+def grant(request: int, handle: str | None = None) -> list[str] | None:
+    """The owner's yes to a request (removals.answer): the keys it barred, or None. `handle` is what answer() sends
+    for a request bound to no account, once a fresh look finds the profile answering under it; without it, such a
+    request bars nothing."""
+    return db.rpc(
+        "grant_request", {"p_id": request, "p_outcome": "granted", "p_site": True, "p_handle": handle}, "secret"
+    )
 
 
 def test_an_artists_request_survives_whatever_is_asked_after_it(seeded):
@@ -1232,8 +1239,9 @@ def test_proof_of_control_removes_at_once_and_for_good(seeded):
     # The code opens nothing a second time, and the artist cannot be loaded again.
     assert confirm(GONE, code) is None
     assert db.upsert("artists", [GONE], "slug", "slug") == []
-    # Nor by a load, which skips their works and every neighbour row that names them.
-    assert db.load([GONE], works_of("gone", 1, artist_slug=GONE["slug"]), pair) == 2
+    # Nor by a load, which skips them (and says so: the push counts it), their works and every neighbour row that
+    # names them.
+    assert db.load([GONE], works_of("gone", 1, artist_slug=GONE["slug"]), pair) == (1, 2)
     assert db.sql(there) == nothing_left
 
 
@@ -1279,12 +1287,19 @@ def test_the_owner_answers_unproven_requests(seeded):
     assert slugs(db.sql(REQUESTS)) == [GONE["slug"]]
     assert visible(STAY)
 
+    # Bound to no account, the request can only bar its handle, and only on the word of a look just made that the
+    # profile answers under it: without that word (the ninth critic's probe 1, where the grant fell back to the
+    # request's own handle, which a stranger held by then), nothing is barred and the request stays open. Nor for
+    # another handle than the request's.
+    assert grant(gone) is None and grant(gone, "zz-test-stay") is None
+    assert visible(GONE) and slugs(db.sql(REQUESTS)) == [GONE["slug"]] and db.sql(remembered) == []
+
     # Granted: that artist is removed for good, and only that one.
-    assert sorted(grant(gone) or []) == GONE_HASHES
+    assert sorted(grant(gone, GONE["da_username"]) or []) == GONE_HASHES
     assert not visible(GONE) and visible(STAY)
     assert [row["key_hash"] for row in db.sql(remembered)] == GONE_HASHES
     assert db.sql(REQUESTS) == []
-    assert grant(gone) is None
+    assert grant(gone, GONE["da_username"]) is None
 
 
 OPEN = """
@@ -1326,8 +1341,9 @@ def test_a_request_outlives_its_artists_row_and_only_an_answer_closes_it(seeded)
     hashes = ", ".join(f"'{key_hash}'" for key_hash in GONE_HASHES)
     assert db.sql(f"select count(*)::int as n from public.removed where key_hash in ({hashes})") == [{"n": 2}]
     assert db.upsert("artists", [GONE], "slug", "slug") == []  # the next push cannot list them again
-    # The owner grants the other while it is not listed either: the same.
-    assert grant(request_id(STAY))
+    # The owner grants the other while it is not listed either: the same (bound to no account: its handle, as
+    # removals.answer sends it once the profile is seen to answer under it).
+    assert grant(request_id(STAY), STAY["da_username"])
     assert db.upsert("artists", [STAY], "slug", "slug") == []
     assert db.sql(OPEN) == [] and db.sql(NAMED_WHEN_CLOSED) == [{"n": 0}]
     after = tally()
@@ -1373,28 +1389,34 @@ def test_a_proof_removes_the_artist_it_was_bound_to_and_not_whoever_the_slug_lis
         {"da_username": "zz-test-twin", "da_account": account(first), "coded": True},
         {"da_username": "ZZ-Test_Twin", "da_account": account(second), "coded": False},
     ]
-    assert sorted(confirm(first, code, site=False, handle="zz-test-twin") or []) == sorted(
-        [digest("da:zz-test-twin"), account(first)]
-    )
+    # Each bound to an account: the proof bars that, and no handle by name.
+    assert confirm(first, code, site=False, handle="zz-test-twin") == [account(first)]
     assert visible(second) and [row["da_username"] for row in db.sql(made_for)] == ["ZZ-Test_Twin"]
     # The code is the slug's: put up by the second in her own place, it removes her, and her alone.
-    assert sorted(confirm(second, code, site=False) or []) == sorted([digest("da:zz-test_twin"), account(second)])
+    assert confirm(second, code, site=False) == [account(second)]
     assert not visible(second)
 
 
-def test_a_proof_under_the_accounts_new_handle_bars_that_handle_and_not_the_old_one(seeded):
-    """The eighth critic's: the account took a new handle and DeviantArt gave the old one to a stranger. The proof,
-    found under the new handle (p_handle, as the verifier sends it), bars that handle and the account, which deletes
-    the artist under any handle; not the request's own, which is the stranger's now."""
-    fresh({**GONE, "da_account": account(GONE)})
+def test_a_proof_or_a_grant_bars_the_account_and_no_handle_by_name(seeded):
+    """The eighth critic's: the account took a new handle and DeviantArt gave the old one to a stranger. The ninth's:
+    the owner's grant, which sends no handle, fell back to the request's own, the stranger's. A proof, found under
+    the new handle (p_handle, as the verifier sends it), and a grant both bar the account the request is bound to,
+    which deletes the artist under any handle, and neither handle by name."""
+    fresh({**GONE, "da_account": account(GONE)}, {**STAY, "da_account": account(STAY)})
     found = {"p_id": request_id(GONE), "p_code": proof_code(GONE), "p_site": False, "p_handle": RENAMED["da_username"]}
-    assert sorted(db.rpc("confirm_removal", found, "secret") or []) == sorted([key_hashes(RENAMED)[0], account(GONE)])
-    assert not visible(GONE)
-    stranger = artist("stranger", da_username=GONE["da_username"])  # whoever holds the old handle now
+    assert db.rpc("confirm_removal", found, "secret") == [account(GONE)]
+    ask(STAY, "it is me")
+    assert grant(request_id(STAY)) == [account(STAY), key_hashes(STAY)[1]]  # and its site, nobody else's
+    assert not visible(GONE) and not visible(STAY)
+    strangers = [  # whoever holds the old handles now
+        artist("stranger", da_username=GONE["da_username"]),
+        artist("other", da_username=STAY["da_username"]),
+    ]
     try:
-        assert db.upsert("artists", [stranger], "slug", "slug") == [{"slug": "zz-test-stranger"}] and visible(stranger)
+        assert sorted(slugs(db.upsert("artists", strangers, "slug", "slug"))) == ["zz-test-other", "zz-test-stranger"]
+        assert all(visible(row) for row in strangers)
     finally:
-        db.sql("delete from public.artists where slug = 'zz-test-stranger'")
+        db.sql("delete from public.artists where slug in ('zz-test-stranger', 'zz-test-other')")
 
 
 def test_a_ticket_binds_the_request_to_whom_the_page_showed_though_the_slug_lists_somebody_else_now(seeded):
@@ -1420,7 +1442,7 @@ def test_granting_an_artist_who_left_their_site_does_not_bar_whoever_lists_it_no
     db.upsert("artists", [{**STAY, **site("moved")}], "slug", "slug")
     db.upsert("artists", [{**KEEP, **site("stay")}], "slug", "slug")
     try:
-        assert grant(request_id(STAY)) == [digest("da:zz-test-stay")]
+        assert grant(request_id(STAY), STAY["da_username"]) == [digest("da:zz-test-stay")]
         assert visible(KEEP) and not visible(STAY)
     finally:
         db.upsert("artists", [KEEP], "slug", "slug")  # its own site again, which the next test's STAY needs free
@@ -1432,8 +1454,22 @@ def test_a_site_barred_with_its_artist_closes_no_other_artists_request(seeded):
     db.upsert("artists", [{**STAY, **site("moved")}], "slug", "slug")
     db.upsert("artists", [{**KEEP, **site("stay")}], "slug", "slug")
     ask(KEEP)
-    assert set(grant(request_id(KEEP)) or []) == {digest("da:zz-test-keep"), digest("site:zz-test-stay.invalid")}
+    granted = grant(request_id(KEEP), KEEP["da_username"])
+    assert set(granted or []) == {digest("da:zz-test-keep"), digest("site:zz-test-stay.invalid")}
     assert slugs(db.sql(OPEN)) == [STAY["slug"]] and visible(STAY)
+
+
+def test_a_site_its_own_account_is_listed_with_under_another_handle_is_barred_with_it(seeded):
+    """The ninth critic's: the grant's site guard compared handles, so the artist's own account, still listed with the
+    site under its old handle, counted as somebody else, and the site stayed. It compares accounts."""
+    fresh({**KEEP, "da_account": account(STAY)})  # STAY's account, under the handle it had before
+    db.sql(f"""
+        insert into public.removal_requests (artist_slug, da_username, site_url, site_domain, da_account)
+        values ('{STAY["slug"]}', '{STAY["da_username"]}', '{KEEP["site_url"]}', '{KEEP["site_domain"]}',
+                '{account(STAY)}')
+    """)  # bound to the account and the site, under the handle it has now (as a ticket binds it)
+    assert set(grant(request_id(STAY)) or []) == {account(STAY), key_hashes(KEEP)[1]}
+    assert not visible(KEEP) and db.sql(OPEN) == []
 
 
 def bar_gone() -> None:
@@ -1492,6 +1528,75 @@ def test_existing_row_cannot_move_onto_a_removed_key(seeded):
     assert not visible(STAY)
     moved = db.data_api("PATCH", "artists", "secret", json={"site_url": "https://zz-test-stay.invalid/new"}, **patch)
     assert moved.status_code == 200 and len(moved.json()) == 1
+
+
+def test_an_account_on_the_removal_list_bars_its_artist_under_every_handle(seeded):
+    """A proof or a grant bars the account its request is bound to, and no handle by name (grant_request). So the
+    account does what a handle does: its artist goes at once (delete_removed), a row that brings it back under
+    another handle is skipped, and one that moves onto it is refused (artists_before_write). The ninth critic's
+    uncaught breaks took the account out of each."""
+    fresh({**KEEP, "da_account": account(KEEP)}, {**STAY, "da_account": None})
+    try:
+        db.sql(f"insert into public.removed (key_hash) values ('{account(KEEP)}')")  # as a proof bound to it puts it
+        assert db.sql(f"select count(*)::int as n from public.artists where slug = '{KEEP['slug']}'") == [{"n": 0}]
+        renamed = {**RENAMED, "da_account": account(KEEP)}  # the same account, under a handle it takes later
+        assert db.upsert("artists", [renamed], "slug", "slug") == [] and not visible(renamed)
+        patch = {"params": {"slug": f"eq.{STAY['slug']}"}, "headers": {"Prefer": "return=representation"}}
+        moved = db.data_api("PATCH", "artists", "secret", json={"da_account": account(KEEP)}, **patch)
+        assert moved.status_code == 400 and "removed artist" in moved.text and visible(STAY)
+    finally:
+        db.sql(FORGET)
+
+
+def test_the_commit_time_check_refuses_a_write_a_removal_got_ahead_of(seeded):
+    """artists_not_removed, the check made when a write commits: what holds if a write ever does not wait for a
+    removal (removals_lock). In one transaction, undone at its end whatever happens: the artist is written, then
+    barred, the row left as a removal that had to skip it leaves it, and the check made at once. It refuses the
+    write. The ninth critic's uncaught break switched it off; then the statement after it says so."""
+    db.sql(f"delete from public.artists where slug = '{RACE['slug']}'; {FORGET};")
+    race = f"('{RACE['slug']}', '{RACE['name']}', '{RACE['da_username']}')"
+    with pytest.raises(RuntimeError) as refused:
+        db.sql(f"""
+            alter table public.removed disable trigger removed_after_insert;
+            insert into public.artists (slug, name, da_username) values {race};
+            insert into public.removed (key_hash) values ('{key_hashes(RACE)[0]}');
+            set constraints all immediate;
+            do $$ begin raise exception 'zz-test: the commit-time check let a removed artist through'; end $$;
+        """)
+    assert "belongs to a removed artist" in str(refused.value)
+    assert db.sql(f"select count(*)::int as n from public.artists where slug = '{RACE['slug']}'") == [{"n": 0}]
+    assert db.sql(f"select count(*)::int as n from public.removed where key_hash = '{key_hashes(RACE)[0]}'") == [
+        {"n": 0}
+    ]
+
+
+def test_an_artist_a_removal_had_to_leave_is_shown_by_no_public_function(seeded):
+    """A removal skips a row something else holds (delete_removed: for update skip locked), and the sweep after a
+    load takes it. Meanwhile every function the public reaches leaves the artist out, by the list. In one transaction,
+    undone at its end: the row is left as such a removal leaves it, and what each function shows of the artist is
+    said by the error that ends it. The ninth critic's uncaught breaks: get_artist and site_claim showing them."""
+    fresh(KEEP, STAY)
+    assert db.rpc("replace_neighbors", {"p_rows": [neighbor("stay", "keep", 1, 0.5)]}, "secret") == 0
+    try:
+        assert visible(KEEP) and similar("stay") == [KEEP["slug"]] and KEEP["slug"] in search(q="zzqxkeepword")
+        assert slugs(as_the_site("site_claim", p_slug=KEEP["slug"])) == [KEEP["slug"]]
+        shown = f"""(select jsonb_build_array(
+            (select count(*) from public.get_artist('{KEEP["slug"]}')),
+            (select count(*) from public.site_claim('zz-test-token', '{KEEP["slug"]}')),
+            (select count(*) from public.search_artists('zzqxkeepword') c where c ->> 'slug' = '{KEEP["slug"]}'),
+            (select count(*) from public.similar_artists('{STAY["slug"]}')),
+            (select count(*) from public.artists where slug = '{KEEP["slug"]}')))"""
+        with pytest.raises(RuntimeError, match=r"zz-test shown: \[0, 0, 0, 0, 1\]"):  # gone from all four; still there
+            db.sql(f"""
+                update public.site_secret set token_hash = public.key_hash('zz-test-token');
+                alter table public.removed disable trigger removed_after_insert;
+                insert into public.removed (key_hash) values ('{key_hashes(KEEP)[0]}');
+                do $$ begin raise exception 'zz-test shown: %', {shown}; end $$;
+            """)
+        assert visible(KEEP)  # all of it undone
+    finally:
+        none = {"artist_slug": STAY["slug"], "neighbor_slug": None, "rank": None, "score": None}
+        db.rpc("replace_neighbors", {"p_rows": [none]}, "secret")
 
 
 def test_removal_does_not_bar_lookalikes(seeded):
@@ -2201,13 +2306,14 @@ def test_the_verifier_removes_through_the_real_queue_and_the_real_confirm_remova
     assert {name: count for name, count in counts.items() if name not in removals.TALLY} == {
         name: 0 for name in removals.COUNTS if name not in removals.TALLY
     } | {"requests_due": 2, "proven_on_deviantart": 1, "artists_removed": 1, "left_for_owner_no_code_found": 1}
-    # Their handle and account. Not their site, which the profile it read does not name.
+    # Their account, which bars them under any handle. Not their handle by name, nor their site, which the profile it
+    # read does not name.
     hashes = ", ".join(f"'{key_hash}'" for key_hash in [*GONE_HASHES, account(GONE)])
     barred = db.sql(f"select key_hash from public.removed where key_hash in ({hashes}) order by 1")
-    assert [row["key_hash"] for row in barred] == sorted([digest("da:zz-test-gone"), account(GONE)])
-    assert db.upsert("artists", [GONE], "slug", "slug") == []  # and not listed again
+    assert [row["key_hash"] for row in barred] == [account(GONE)]
+    assert db.upsert("artists", [{**GONE, "da_account": account(GONE)}], "slug", "slug") == []  # not listed again
     assert visible(STAY) and visible(KEEP)
-    assert store.is_removed(GONE["da_username"])  # here too, at once
+    assert library.account_removed(f"FAKE-USER-{GONE['da_username']}")  # here too, at once
     # STAY is looked at again in an hour; KEEP's request, without a code, was never touched.
     queue = {row["slug"]: row for row in db.sql(QUEUE)}
     assert sorted(queue) == [KEEP["slug"], STAY["slug"]]
@@ -2435,7 +2541,7 @@ def test_full_scale_fits_the_budget_and_the_public_timeout():
         watcher = threading.Thread(target=visitor)
         watcher.start()
         try:
-            assert db.load(artists, works, neighbors) == 0
+            assert db.load(artists, works, neighbors) == (0, 0)
         finally:
             loading.set()
             watcher.join()
