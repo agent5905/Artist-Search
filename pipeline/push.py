@@ -38,8 +38,8 @@ Four things stop a run, each with a message and a status that is not zero:
     broken local store shows, and nobody's wish: a corrupt table of rename links once turned one removal through
     the site into twelve, and five profiles given a removed account's hash made it six. Whom the two lists name
     is removed all the same, here and there. Nothing else is done, and `--allow-delete N` lets N of them through.
-    (An account hash kept for two keys no link ties together is not sent for either, so no proof there can bar
-    it before this guard has looked: build, accounts_left_out_shared);
+    (An artist whose account hash another key no link ties to holds is not sent, so no proof there can bar it
+    before this guard has looked: build, no_account);
   - the local library has no artists. An empty or a new file is no reason to empty the database;
   - more would be deleted than a run is believed about: more than DELETE_PERCENT of the artists the database
     holds, of their works or of their neighbour rows, and more than DELETE_FLOOR. A changed prompt version, a
@@ -132,7 +132,7 @@ TRIES = 2
 # Besides these, one reason for each mark the collect stage has left: "marked_<its reason>" (see _marked).
 ARTIST_REASONS = (
     *("not_profiled", "profile_excluded", "profile_out_of_date", "declares_ai", "adult_account"),
-    *("account_not_read", "adult_portfolio", "not_all_rated", "too_few_works", "slug_unusable"),
+    *("account_not_read", "adult_portfolio", "not_all_rated", "too_few_works", "slug_unusable", "no_account"),
 )
 WORK_REASONS = (
     *("not_seen_lately", "not_tagged", "not_artwork", "checked_not_artwork", "explicit", "unfit_image"),
@@ -507,15 +507,17 @@ def _build(local: store.Snapshot, removed: Collection[str]) -> tuple[Rows, Rows,
         # No slug at all, the slug of a test row (see TEST_SLUG), or one that another handle has already made.
         elif not slug or slug.startswith(TEST_SLUG) or slug in slugs.values():
             why = "slug_unusable"
+        # No account kept for them, or one that another key no rename mark ties to holds (a broken store). A removal
+        # of theirs could bar only a handle, and DeviantArt gives a freed handle to somebody else: not sent at all.
+        # On 2026-10-20 every one of the 3,969 artists kept here had an account of their own.
+        elif account_of.get(key) is None or account_of[key] in disputed:
+            why = "no_account"
         if why:
             counts[f"artists_held_{why}"] += 1
             counts["works_held_artist_held_back"] += len(ready)
             continue
         counts["site_links_left_out_removed"] += left_out
-        account = account_of.get(key)
-        if account in disputed:
-            account = None
-            counts["accounts_left_out_shared"] += 1
+        account = account_of[key]
         # The owner's (2026-10-19): an adoptable or for-sale sheet is the artist's work, but never leads. Sheets go
         # after every other work that may go, so one fills a slot only when there are fewer than MAX_WORKS others.
         filler = {work_id for *_, result, _, work_id in ready if SHEET in (result.get("formats") or [])}
@@ -719,9 +721,7 @@ def run(dry_run: bool, allow_delete: int | None = None, local: pathlib.Path | st
     rule); taglines_left_out_profane and taglines_left_out_social (of artists who are sent, the taglines left out
     for swearing or for naming a social handle: tagging.accounts); sheets_sent_as_filler (adoptable or for-sale
     sheets sent after an artist's other works, to fill their MAX_WORKS: SHEET); site_links_left_out_removed
-    (artists sent without their own site, which is on the removal list); accounts_left_out_shared (artists sent
-    without their account, whose hash another key kept here holds and no rename mark ties to them: a broken
-    store, so only the owner can remove them, on a request without proof); neighbours_sent,
+    (artists sent without their own site, which is on the removal list); neighbours_sent,
     artists_sent_without_neighbours, artists_skipped_by_database and neighbours_skipped_by_database (what db.load
     said the database would not take: an artist on its removal list, barred since this run read it, and a row that
     names an artist it does not have);
@@ -828,7 +828,6 @@ def run(dry_run: bool, allow_delete: int | None = None, local: pathlib.Path | st
             "taglines_left_out_social": held["taglines_left_out_social"],
             "sheets_sent_as_filler": held["sheets_sent_as_filler"],
             "site_links_left_out_removed": held["site_links_left_out_removed"],
-            "accounts_left_out_shared": held["accounts_left_out_shared"],
             "neighbours_sent": len(neighbours) - empty,
             "artists_sent_without_neighbours": empty,
             "artists_skipped_by_database": 0,

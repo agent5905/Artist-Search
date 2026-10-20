@@ -1597,33 +1597,36 @@ def test_a_code_asked_for_from_another_network_takes_nothing_from_the_artist(wor
     assert kept in function_body("start_removal_proof")
 
 
-def test_an_account_hash_two_unlinked_keys_hold_is_sent_for_neither_and_a_proof_takes_nobody_else(world):
+def test_an_account_hash_two_unlinked_keys_hold_sends_neither_artist_so_no_removal_can_reach_the_other(world):
     """The sixth critic's: a broken store gives BRAVO's profile ALPHA's account hash, and no rename mark links the two.
-    Push sent both rows with it; ALPHA's own proof barred it, and the database deleted BRAVO too, for good, before
-    the next push could refuse the store. That account is sent for neither now (the rule _removal holds the store
-    to), and counted. An account kept under two handles a rename mark links is one artist's, and is sent. ALPHA's
-    code in the bio is then not read (a request bound to no account), and the owner's grant bars ALPHA's handle
-    alone, once ALPHA's profile is seen to answer under it still."""
+    Push sent both rows with it; ALPHA's own proof barred it, and the database deleted BRAVO too, for good. Then
+    both were sent without an account, and a removal of theirs could bar only a handle, which DeviantArt may give
+    to somebody else (the tenth critic's). Neither is sent now, so no request can be filed for either. An account
+    kept under two handles a rename mark links is one artist's, and is sent with it."""
     artist(ALPHA, angle=0.0)
     artist(BRAVO, user=ALPHA, angle=0.4)
     artist(CHARLIE, angle=0.8)
     library.mark_artist(f"da:{CHARLIE}", "account gone")
     artist(DELTA, angle=0.9, user=CHARLIE, old_keys=[f"da:{CHARLIE}"])  # the collect stage links the two handles
     assert library.account_hash(f"da:{BRAVO}") == library.account_hash(f"da:{ALPHA}")
-    assert push.run(False)["accounts_left_out_shared"] == 2
+    assert push.run(False)["artists_held_no_account"] == 2
     sent = sent_artists(world.db)
-    assert [sent[handle]["da_account"] for handle in (ALPHA, BRAVO)] == [None, None]
+    assert ALPHA not in sent and BRAVO not in sent
     assert sent[DELTA]["da_account"] == library.account(f"FAKE-USER-{CHARLIE}")
-    world.db.file(ALPHA, with_code=True)
-    world.da.profiles[ALPHA] = profile(ALPHA, bio=f"Leaving. {code(ALPHA)}")
+    assert all(row["da_account"] for row in sent.values())  # nobody is sent without an account
 
-    assert world.check() == expected(requests_due=1, left_for_owner_not_checked=1)
-    granted = removals.answer([world.db.queue[ALPHA]["id"]], [], transport=world.da.transport)
-    assert granted == {"granted": 1, "rejected": 0, "not_granted": 0}
-    assert world.db.removed == [digest(f"da:{ALPHA}")] and not gone(world, BRAVO)
-    with pytest.raises(push.Stop, match="broken local store"):  # what is kept here still ties BRAVO to ALPHA
-        push.run(False)
-    assert not gone(world, BRAVO) and world.db.removed == [digest(f"da:{ALPHA}")]
+
+def test_an_artist_with_no_account_kept_is_not_sent(world):
+    """The tenth critic's: an artist listed with no account kept could only ever be removed by handle, and a removal
+    by handle lands on whoever DeviantArt gives it to next. Such an artist is held back, and counted."""
+    artist(ALPHA, angle=0.0)
+    artist(BRAVO, angle=0.4)
+    with sqlite3.connect(config.LOCAL_DB) as conn:
+        conn.execute("UPDATE profiles SET user_hash = NULL WHERE artist_key = ?", (f"da:{BRAVO}",))
+    conn.close()
+    assert library.account_hash(f"da:{BRAVO}") is None
+    assert push.run(False)["artists_held_no_account"] == 1
+    assert set(sent_artists(world.db)) == {ALPHA}
 
 
 def test_a_request_filed_while_its_artist_is_removed_is_never_left_open():

@@ -55,7 +55,7 @@ COUNTS = [
     "works_sent",
     *(f"works_held_{reason}" for reason in push.WORK_REASONS),
     *("texts_left_out_for_contact", "taglines_left_out_profane", "taglines_left_out_social", "sheets_sent_as_filler"),
-    *("site_links_left_out_removed", "accounts_left_out_shared"),
+    "site_links_left_out_removed",
     *("neighbours_sent", "artists_sent_without_neighbours", "artists_skipped_by_database"),
     "neighbours_skipped_by_database",
     *("artists_deleted_from_database", "works_deleted_from_database", "neighbours_deleted_from_database"),
@@ -1279,7 +1279,7 @@ def test_a_marked_artist_is_not_sent_not_even_as_a_neighbour_and_is_counted_unde
     assert library.artist_keys() == [f"da:{ALPHA}", f"da:{BRAVO}", f"da:{CHARLIE}"]
     assert counts[ARTIST_MARKS[reason]] == 1 and counts["artists_sent"] == 2
     assert [name for name in counts if "marked" in name] == [ARTIST_MARKS[reason]]
-    assert list(counts).index(ARTIST_MARKS[reason]) == list(counts).index("artists_held_slug_unusable") + 1
+    assert list(counts).index(ARTIST_MARKS[reason]) == list(counts).index(f"artists_held_{push.ARTIST_REASONS[-1]}") + 1
     assert counts["works_held_artist_held_back"] == 5 and counts["artists_deleted_from_database"] == 1
     assert not any(word in json.dumps(fake.loads[-1]).lower() for word in of_artist(BRAVO))
     assert not any(

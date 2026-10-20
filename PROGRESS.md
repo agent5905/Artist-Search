@@ -1327,6 +1327,14 @@ Deadlocks are gone as written, and nothing else stands beyond the accepted limit
 - **Tests:** all 11 of the ninth critic's SQL breaks are now caught offline, and the live suite gains tests for the account bar, the commit-time check and the removed-artist filters. 5,002 tests pass.
 - **Rare cases left:** a profile stored with the old spelling of the account hash can count against push's limit of 5. Discovery may store a proven artist's handle again, costing one lookup before it is dropped.
 
+**Claim-or-remove's tenth critic: yes, once push refuses artists with no account.**
+- **Holds for artists whose account is kept:** removals do what the bar asks, and the ninth critic's findings no longer stand.
+- **What remained:** an artist listed with no account kept could only be removed by handle, and a handle can pass to somebody else. Every one of the 3,969 artists kept here has an account of their own, so this never happens on the real data.
+- **The fix, made by the lead the same night:** push now holds such an artist back (`no_account`), along with the broken-store case where two unlinked keys share one account. So no request can ever be bound to no account.
+- **Left, and covered:** an artist who renames before collect links the new handle may not have their code found; the owner's grant covers it. Discovery may store a removed artist's handle again until collect's next turn drops it.
+
+**The claim-or-remove critic loop ends here,** under decision 15: the last critic found nothing beyond the accepted limits that this fix does not close. Its one remaining gate is `tests/test_db.py` passing against the migrated database at setup.
+
 **The disk filled up.** Drive F: reached 0 bytes free at about 19:45 on 10-19, and two image-check turns failed to open the store and were retried. The cause was this project: 20 finished builder worktrees, each with its own Python environment (73 GB), and critics' temporary test folders (9.5 GB).
 - **Every branch was merged,** so the worktrees were removed, with the branches kept, and the temporary folders deleted. F: has 83 GB free.
 - **The store's integrity check passes.** No reading was lost.
