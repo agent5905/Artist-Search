@@ -1319,6 +1319,14 @@ Deadlocks are gone as written, and nothing else stands beyond the accepted limit
 - A database failure on one request no longer stalls the queue.
 - More SQL-text tests, and live tests for what nothing tests on its own.
 
+**Removals round 10: merged.**
+- **The rule now:** when an artist proves a removal, or the owner grants one, the site bars that artist's DeviantArt account, which covers every handle they hold now or take later. It never bars a handle because the artist once used it, since DeviantArt can give a freed handle to someone else. It bars a handle by name only when no account is known, and only after checking that the profile still answers under it. A handle on a removal list applies to whoever holds it now, never to an artist who has moved on from it.
+- **The owner's `--grant`** uses the request's bound account. Without one, it bars the handle only after a fresh lookup confirms it; otherwise it leaves the request open and says so.
+- **One request's database failure** is counted and left due, and the queue moves on.
+- **The flood guard** no longer stops a push after a batch of proofs: six proofs between two pushes stop nothing.
+- **Tests:** all 11 of the ninth critic's SQL breaks are now caught offline, and the live suite gains tests for the account bar, the commit-time check and the removed-artist filters. 5,002 tests pass.
+- **Rare cases left:** a profile stored with the old spelling of the account hash can count against push's limit of 5. Discovery may store a proven artist's handle again, costing one lookup before it is dropped.
+
 **The disk filled up.** Drive F: reached 0 bytes free at about 19:45 on 10-19, and two image-check turns failed to open the store and were retried. The cause was this project: 20 finished builder worktrees, each with its own Python environment (73 GB), and critics' temporary test folders (9.5 GB).
 - **Every branch was merged,** so the worktrees were removed, with the branches kept, and the temporary folders deleted. F: has 83 GB free.
 - **The store's integrity check passes.** No reading was lost.
