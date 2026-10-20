@@ -33,7 +33,7 @@ Made 2026-10-11, after the DeviantArt terms were read.
 15. **Claim-or-remove's accepted limits (2026-10-19).** This is a portfolio project, so these are accepted:
     - Anyone who controls a domain an artist names (their employer, studio or host, as well as a buyer of a lapsed one) can prove a removal.
     - A flood of fake codes from 75 to 150 networks can push real looks 12 to 25 hours back.
-    - An office or campus behind one IPv4 address shares one network's 100 daily reads.
+    - An office or campus behind one IPv4 address shares one visitor's 100 daily reads. Since removals round 8, a network (an IPv4 /24 or an IPv6 /48) shares 1,000.
 
     The critic loop for claim-or-remove ends when a critic, given this list and decisions 12 and 13, finds nothing beyond them.
 16. **Hate symbols in fiction (2026-10-19).** Nazi-themed game and film art (Call of Duty zombies, Wolfenstein, Jojo Rabbit) stays held back as hate symbols, about 190 works. It is the safest choice for a studio-facing site.
@@ -1271,6 +1271,17 @@ What fails is the content. Nothing checks fitness beyond sex and gore, so the fi
 - Read limits of 100 per visitor, 1,000 per network and 3,000 overall. Decision 12 already accepts that one actor can take the API down, so a tight per-network cap mostly hurt real visitors.
 - One lock for removals and loads, and `db.migrate` catches older live definitions.
 - Tests for every uncaught break.
+
+**Removals round 8: merged.** All five findings are fixed:
+- **Notes:** each network keeps its latest note, from the ten networks heard from last, so writing first gains a stranger nothing.
+- **The race:** `_move_on` is a compare-and-set on `code_at`, so a "Get my code" pressed during a look leaves the request due at once.
+- **Read limits:**
+  - 100 a day per visitor (an IPv4 address, or an IPv6 /64), 1,000 per network and 3,000 overall. Egress is unchanged, at 86% of the free 5 GB at most.
+  - It now takes 30 visitors over three or more networks to use up a day.
+- **One lock for removals and loads:** the lock is inside `refresh_search_words` itself, so removals and loads no longer deadlock.
+- **`db.migrate` catches older live definitions:** it replaces any live index or named constraint that differs from the files, and stops, naming it, on any function the files do not create.
+- **Tests:** all 11 test-gap breaks are now caught.
+- **Not yet run against Postgres:** none of the new SQL; `tests/test_db.py` exercises it at setup. The first live migration may stop on older functions left from round 8, which will need dropping.
 
 **The disk filled up.** Drive F: reached 0 bytes free at about 19:45 on 10-19, and two image-check turns failed to open the store and were retried. The cause was this project: 20 finished builder worktrees, each with its own Python environment (73 GB), and critics' temporary test folders (9.5 GB).
 - **Every branch was merged,** so the worktrees were removed, with the branches kept, and the temporary folders deleted. F: has 83 GB free.
