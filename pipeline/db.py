@@ -182,6 +182,8 @@ def load(artists: list[dict[str, Any]], works: list[dict[str, Any]], neighbors: 
 
     After each batch it rests for as long as the batch took (LOAD_REST at most), so the load uses
     half of what the database can do and visitors get the rest; a slow database is given more room.
+    Each batch is one transaction, under the removals' lock (removals_lock in sql/002_functions.sql): a
+    removal waits for the batch, and the batch for a removal, and neither can deadlock the other.
     Dead row versions are vacuumed every VACUUM_EVERY batches, without the statistics pass: that one
     samples whole tables, which is the heaviest reading a load would do. Safe to repeat: rows that
     have not changed are not rewritten.
@@ -212,8 +214,10 @@ def _paced(batches: Iterable[Any], write: Callable[[Any], int]) -> int:
                 total += write(batch)
                 break
             except RuntimeError as error:
-                # One more try for a batch the database was too busy to finish in time (it is safe to repeat).
-                if attempt == 2 or "57014" not in str(error):
+                # One more try for a batch the database was too busy to finish in time (57014), or that named an
+                # artist whom a removal deleted while the batch waited for it (23503: the batch read its artists
+                # before removals_lock let it in). Written again, it reads them anew. It is safe to repeat.
+                if attempt == 2 or not any(code in str(error) for code in ("57014", "23503")):
                     raise
                 time.sleep(LOAD_REST)
         time.sleep(min(time.perf_counter() - began, LOAD_REST))
@@ -235,8 +239,8 @@ def after_load() -> None:
     """Finish a load: sweep, rebuild what the public functions read, vacuum. load() calls it.
 
     Call it yourself after writing rows with upsert(). The sweep deletes any artist on the removal
-    list that a removal had to leave because a load held the row. Both go through the Management
-    API, which has no 8 s limit.
+    list that a removal had to leave because something held the row. Both go through the Management
+    API, which has no 8 s limit, and each takes the removals' lock, so a removal waits for it.
     """
     sql("select public.delete_removed()")
     sql("select public.refresh_search_words()")

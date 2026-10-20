@@ -7,14 +7,15 @@
 In this order, and the order is the point:
   1. Removal (hard rule 7), in both directions. It is worked out first, with nothing changed (see _removal),
      from the two removal lists and from nothing else: the database's `removed` table and the store's. Whoever
-     they bar is barred under every handle their account is kept under here, and the account goes on the list
-     too. Then it is written down, here first (store.import_removed) and then in the database: the hashes its
-     list lacks are added, so a removal made here outlives this machine, and the artists the list bars are
-     deleted there. Only after that is what is kept here about them purged. A file that cannot be deleted is
-     counted, and the next run tries again: the removal stands meanwhile, here and there, and the run goes on
-     (it ends with a status that is not zero, and says why). When writing it down fails the run stops: nothing
-     is purged and nothing is built. A removed site bars nobody, whoever asked for its removal (store._named_by),
-     and holds nobody back: whoever names it is sent without it (site_links_left_out_removed).
+     they bar is purged under every handle their account is kept under here and barred under each but one the
+     account has left (which may be somebody else's now), and the account goes on the list too. Then it is
+     written down, here first (store.import_removed) and then in the database: the hashes its list lacks are
+     added, so a removal made here outlives this machine, and the artists the list bars are deleted there. Only
+     after that is what is kept here about them purged. A file that cannot be deleted is counted, and the next
+     run tries again: the removal stands meanwhile, here and there, and the run goes on (it ends with a status
+     that is not zero, and says why). When writing it down fails the run stops: nothing is purged and nothing is
+     built. A removed site bars nobody, whoever asked for its removal (store._named_by), and holds nobody back:
+     whoever names it is sent without it (site_links_left_out_removed).
   2. The rows are built (see build) from what is left, and only from artists the store still lists, from one
      copy of the store made at one moment.
   3. The database is brought to exactly those rows: an artist or a work it has that is not among them is
@@ -685,7 +686,9 @@ def _removal(
     profile that names it. An account's hash bars whoever is kept here under it (their profile's hash). A site's
     bars nobody: it is kept out of every row (store._named_by, build), and anybody can name it. A removal
     covers the account under every handle it is kept under here, linked to one of those by the collect stage's
-    marks (library.same_account), and theirs in turn: each goes on the list too. With `follow` False only whom a
+    marks (library.same_account), and theirs in turn: each goes on the list too, but a handle the account has left
+    for another (marked RENAMED). DeviantArt can give that one to somebody else, and the account's hash bars the
+    artist under it anyway, so it is purged here and barred nowhere by name. With `follow` False only whom a
     hash names by handle is barred, and their account goes on the list only where what is kept here agrees on it.
 
     What is kept here can be wrong: a corrupt table of rename links once turned one removal into twelve, and five
@@ -711,7 +714,8 @@ def _removal(
             odd |= keys - named
             disputed.add(held)
     barred = reached if follow else named
-    hashes |= {store._hash(key) for key in barred}
+    marks = library.artist_marks(local) if barred else {}  # a run that bars nobody reads none
+    hashes |= {store._hash(key) for key in barred if marks.get(key, ("",))[0] != library.RENAMED}
     hashes |= {held for key in barred if (held := account.get(key)) and (follow or held not in disputed)}
     return hashes, barred, len(store.named_by(hashes, local)), odd
 

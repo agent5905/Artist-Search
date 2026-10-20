@@ -1763,7 +1763,10 @@ def test_a_removal_covers_the_account_under_every_handle_it_is_kept_under(fake, 
         fake.sql(push._removed_sql({digest(f"da:{CHARLIE}")}))
     else:
         store.mark_removed(CHARLIE if asked == "the_new_handle_here" else BRAVO)
-    wanted = {digest(f"da:{BRAVO}"), digest(f"da:{CHARLIE}"), library.account(f"FAKE-USER-{BRAVO}")}
+    # The handle the account has left is barred only where it is the one named: it may be somebody else's now, and
+    # the account bars the artist under it anyway (the eighth critic's).
+    wanted = {digest(f"da:{CHARLIE}"), library.account(f"FAKE-USER-{BRAVO}")}
+    wanted |= {digest(f"da:{BRAVO}")} if asked == "the_old_handle_here" else set()
 
     for run in range(3):  # purging one handle frees no other: it stays so, run after run
         counts = push.run(False)
@@ -1772,9 +1775,10 @@ def test_a_removal_covers_the_account_under_every_handle_it_is_kept_under(fake, 
         assert not any(word in fake.held() for word in of_artist(BRAVO) + of_artist(CHARLIE))
         assert set(fake.removed) == wanted == push._removed_here(None)
         assert library.artist_keys() == [f"da:{ALPHA}"] and library.artist_marks() == {}
-    # Neither handle is taken in again, the account is known under a handle it takes later, and nobody else is touched.
-    for handle in (BRAVO, CHARLIE):
-        assert not store.upsert_artist(handle, f"https://www.deviantart.com/{handle}", [], 1)
+    # The new handle is not taken in again, nor the old one where it was named; the account is known under a handle
+    # it takes later, and nobody else is touched.
+    assert not store.upsert_artist(CHARLIE, f"https://www.deviantart.com/{CHARLIE}", [], 1)
+    assert store.upsert_artist(BRAVO, f"https://www.deviantart.com/{BRAVO}", [], 1) == (asked != "the_old_handle_here")
     assert library.account_removed(f"FAKE-USER-{BRAVO}") and not library.account_removed(f"FAKE-USER-{ALPHA}")
     assert not store.is_removed(ALPHA) and len(library.work_ids(f"da:{ALPHA}")) == 5
 
@@ -2751,7 +2755,8 @@ def test_profiles_given_a_removed_accounts_hash_stop_the_run_and_nothing_bars_or
 def test_granted_removals_of_accounts_kept_under_an_older_handle_too_go_through_and_purge_both(fake):
     """The push critic's: six granted removals, each a handle and its account, each account kept here under an older
     handle too, stopped every run, and the older handles' works and images stayed here until --allow-delete. What is
-    kept here agrees on whose they are, the rename links and the account hashes alike: they go, and nobody says so."""
+    kept here agrees on whose they are, the rename links and the account hashes alike: they go, and nobody says so.
+    The older handles are purged and barred nowhere: DeviantArt may have given them to somebody else."""
     olds, news = [f"yy-fake-o{n}" for n in range(6)], [f"yy-fake-n{n}" for n in range(6)]
     for n, (old, new) in enumerate(zip(olds, news, strict=True)):
         artist(old, 4, angle=0.1 * n)
@@ -2765,12 +2770,13 @@ def test_granted_removals_of_accounts_kept_under_an_older_handle_too_go_through_
     counts = push.run(False)
 
     assert counts["artists_purged_here"] == 12 and library.artist_keys() == [f"da:{ALPHA}"]
-    assert set(fake.removed) >= {digest(f"da:{old}") for old in olds} and list(sent_artists(fake)) == [ALPHA]
-    assert all(store.is_removed(old) for old in olds)
+    assert not set(fake.removed) & {digest(f"da:{old}") for old in olds} and list(sent_artists(fake)) == [ALPHA]
+    assert not any(store.is_removed(old) for old in olds)
 
 
 def test_one_person_under_three_handles_is_removed_at_once_however_far_apart_the_links_are(fake):
-    """A genuine removal reaches every handle of the account, each linked only to the next, and goes through."""
+    """A genuine removal reaches every handle of the account, each linked only to the next, and goes through. The
+    two the account has left are purged here and barred nowhere by name."""
     artist(ALPHA, angle=0.0)
     artist(BRAVO, angle=0.2)  # the account's first handle
     push.run(False)
@@ -2785,9 +2791,7 @@ def test_one_person_under_three_handles_is_removed_at_once_however_far_apart_the
     counts = push.run(False)
 
     assert counts["artists_purged_here"] == 3 and library.artist_keys() == [f"da:{ALPHA}"]
-    assert set(fake.removed) == {digest(f"da:{h}") for h in (BRAVO, CHARLIE, DELTA)} | {
-        library.account(f"FAKE-USER-{BRAVO}")
-    }
+    assert set(fake.removed) == {digest(f"da:{DELTA}"), library.account(f"FAKE-USER-{BRAVO}")}
     assert list(sent_artists(fake)) == [ALPHA]
 
 

@@ -318,14 +318,17 @@ def _remove(key: str, counts: dict[str, int], db: pathlib.Path | str | None, use
 
     A handle a rename link reaches goes too only where what is kept here agrees: one that holds another
     account's hash is somebody else, whatever a corrupt table of links says (push._removal holds to the same).
+    One the account has left (marked RENAMED) is purged and not barred: DeviantArt can give it to somebody else.
     """
     accounts = {account for account in (library.account_hash(key, db), library.account(user_id)) if account}
     others = [other for other in library.same_account(key, db) if library.account_hash(other, db) in accounts | {None}]
+    left = {other for other, mark in library.artist_marks(db).items() if mark[0] == library.RENAMED}
     if accounts:
         store.import_removed(accounts, db)
     done = True
-    for other in others:  # the handle the account had before, or took after: barred as well, and purged
-        store.mark_removed(other.removeprefix("da:"), db)
+    for other in others:  # the handle the account had before, or took after: purged, and barred unless it was left
+        if other not in left:
+            store.mark_removed(other.removeprefix("da:"), db)
         done = _purge(other, counts, db) and done
     return _purge(key, counts, db) and done
 
