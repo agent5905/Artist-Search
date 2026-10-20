@@ -708,7 +708,10 @@ as $$
 $$;
 
 -- Service role only. Removes artists outright: their keys go on the removal list, which deletes
--- them (works cascade) and bars their handle, site and account for good. It takes the removals' lock first, so
+-- them (works cascade) and bars them and their site for good. As grant_request does: the account when it is known,
+-- which bars the artist under every handle the account takes, and the handle only when it is not. A handle the
+-- account has since left would be another artist's on the list: DeviantArt gives it to somebody else, and every
+-- stage takes a handle on the list for whoever holds it now. It takes the removals' lock first, so
 -- that no load's batch lands between its two counts, and reads the artists without locking them. Returns how many
 -- artists were deleted; one that something else held at that moment is not counted, is hidden from the public at
 -- once all the same, and goes with the next sweep.
@@ -722,7 +725,7 @@ begin
   before := (select count(*) from public.artists);
   insert into public.removed (key_hash)
   select distinct k
-  from public.artists a, unnest(array_remove(public.artist_keys(a.da_username, a.site_domain) || a.da_account, null)) k
+  from public.artists a, unnest(array_remove(array[coalesce(a.da_account, a.da_key), a.site_key], null)) k
   where a.slug = any (p_slugs)
   on conflict (key_hash) do nothing;
   return before - (select count(*) from public.artists);

@@ -9,7 +9,8 @@ In this order, and the order is the point:
      from the two removal lists and from nothing else: the database's `removed` table and the store's. Whoever
      they bar is purged under every handle their account is kept under here, and the account goes on the list,
      which bars them under any handle; a handle goes on it by name only for somebody with no account kept, since
-     DeviantArt gives a handle an account has left to somebody else. Then it is
+     DeviantArt gives a handle an account has left to somebody else. (A handle only the database's list holds bars
+     whoever holds it now and no account of theirs: it may be an earlier holder's.) Then it is
      written down, here first (store.import_removed) and then in the database: the hashes its list lacks are
      added, so a removal made here outlives this machine, and the artists the list bars are deleted there. Only
      after that is what is kept here about them purged. A file that cannot be deleted is counted, and the next
@@ -27,18 +28,19 @@ In this order, and the order is the point:
 Four things stop a run, each with a message and a status that is not zero:
   - the database holds a slug that begins "zz-". Those are another builder's test rows, and this stage would
     delete them. It is the first thing looked at, before anything is done here or there;
-  - the removals would bar people beyond those the two removal lists name (whom the database's list names, and
-    whom the store's names by the handle or the account they are kept under here; an account named, under every
-    key kept here that holds it, while those keys agree) that what is kept here does not agree on:
-    an artist a rename link ties to a removed account while their profile's hash is another account's, or one
-    whose profile has a removed account's hash while no rename link ties them to the account's other handles.
-    Or the store's list would add more than DELETE_FLOOR hashes that are no handle or account of anybody barred
-    here (a site, a handle nobody here has). A handle of somebody kept here is on the store's list because
-    somebody named it (store.mark_removed), so the owner's removals here go through however many there are, and
-    so does a removed account under every key the links and the hashes agree on. A disagreement is how a
-    broken local store shows, and nobody's wish: a corrupt table of rename links once turned one removal through
-    the site into twelve, and five profiles given a removed account's hash made it six. Whom the two lists name
-    is removed all the same, here and there. Nothing else is done, and `--allow-delete N` lets N of them through.
+  - the removals would bar people beyond those the database's removal list names (by the handle or the account
+    they are kept under here; an account named, under every key kept here that holds it, while those keys agree),
+    more than DELETE_FLOOR of them: artists only the store's list bars, and hashes it would add that are no handle
+    or account of anybody barred here, nor a site somebody kept here names (a handle nobody here has). The
+    database's list is filled by proofs and the owner's grants, and goes through however long it is; the owner's
+    removals here are a few at a time, and a store's removal table filled from a bad copy once held every artist's
+    hash, which would have deleted them all there and barred them for good. Or any person, however few, that what
+    is kept here does not agree on: an artist a rename link ties to a removed account while their profile's hash is
+    another account's, or one whose profile has a removed account's hash while no rename link ties them to the
+    account's other handles. A disagreement is how a broken local store shows, and nobody's wish: a corrupt table
+    of rename links once turned one removal through the site into twelve, and five profiles given a removed
+    account's hash made it six. Whom the database's list names is removed all the same, here and there. Nothing
+    else is done, and `--allow-delete N` lets N of them through. A removed site counts for nothing: it bars nobody.
     (An artist whose account hash another key no link ties to holds is not sent, so no proof there can bar it
     before this guard has looked: build, no_account);
   - the local library has no artists. An empty or a new file is no reason to empty the database;
@@ -99,8 +101,10 @@ from pipeline import config, crawl, db, library, profiles, store, style, tagging
 MIN_WORKS = 4  # publishable works: an artist with fewer is not sent
 MAX_WORKS = 10  # works sent for an artist: the most recently published of those that may go
 # Of an artist's works that are rated or have an image to rate, the share rated suggestive or explicit, or not
-# rated yet; and of the pictures on the sheet the profile stage looked at, the share it counted as sexualised or
-# gory. At this share of either, the artist is left out. DeviantArt's mature works are not in it (see build).
+# rated yet: at this share the artist is left out. DeviantArt's mature works are not in it (see build). Not the
+# profile stage's count over their sheet, which counts gore with sex: on 2026-10-20 it alone held 75 artists, most
+# of them of ordinary game art, and the rating, the suggestive reason and the content check now read each work for
+# the rest. (Of the 75, one whose own tags name a fetish is held by hand: HELD_BY_HAND.)
 ADULT_PERCENT = 30
 SAFE_RATING = "safe"  # the only rating a work is sent with
 ADULT_RATINGS = ("suggestive", "explicit")
@@ -120,8 +124,8 @@ STYLE_FLOOR = 0.575
 # Of the artists the database holds, of their works or of their neighbour rows: more than this going at once is
 # not believed.
 DELETE_PERCENT = 10
-# Deletions of each kind that a run may always make, however little the database holds. And the hashes the
-# store's removal list may always add that bar nobody kept here (see run).
+# Deletions of each kind that a run may always make, however little the database holds. And the artists the
+# store's removal list may always bar beyond the database's, with the hashes it adds that bar nobody kept here (run).
 DELETE_FLOOR = 5
 TEST_SLUG = "zz-"  # how the other builders' test rows begin. Never sent, and a database that has one is left alone
 STYLE_MODEL, STYLE_RULE = "csd", "local"  # round 7's blind test chose them; "few" did no better on the tags
@@ -133,12 +137,13 @@ TRIES = 2
 # Besides these, one reason for each mark the collect stage has left: "marked_<its reason>" (see _marked).
 ARTIST_REASONS = (
     *("not_profiled", "profile_excluded", "profile_out_of_date", "declares_ai", "adult_account"),
-    *("account_not_read", "profane_handle", "ai_declared_work", "adult_portfolio", "not_all_rated"),
-    *("too_few_works", "slug_unusable", "no_account"),
+    *("account_not_read", "profane_handle", "ai_declared_work", "ai_not_read", "adult_portfolio", "not_all_rated"),
+    *("too_few_works", "slug_unusable", "no_account", "held_by_hand"),
 )
 WORK_REASONS = (
     *("not_seen_lately", "not_tagged", "not_artwork", "checked_not_artwork", "explicit", "unfit_image"),
-    *("political", "unfit_title", "profane_title", "declared_ai", "contact_in_words", "words_not_read"),
+    *("held_by_hand", "political", "unfit_title", "profane_title", "service_in_title", "declared_ai"),
+    *("contact_in_words", "words_not_read"),
     *("not_rated", "suggestive", "suggestive_not_checked", "artwork_not_checked", "political_not_checked"),
     *("fit_not_checked", "contact_by_rule", "bad_address", "artist_held_back", "sheet_over_limit", "over_limit"),
 )
@@ -149,8 +154,16 @@ SHEET = "adoptable or design-for-sale sheet"  # of tagging.FORMATS: sent after a
 # not as a word of the title ("Open World", "Commissions are open").
 # ponytail: of those 871, one "OTA" was a character's name and about 23 were finished "YCH" commissions, which go
 # as filler too. Drop "ych" from the rule if a finished commission should lead.
+# And a sale's own words (2026-10-20, seventh critic): "sold", "sale", "FFA" (free for all), "flat sale", "set price",
+# "closed", and "SB" (starting bid) only with an amount or an "AB" after it ("SB $10", "SB-45 AB-100"): before a
+# name or a model number it was neither. Of the 39,744 titles they take 188 more, 100 of them sent works not read as
+# sheets, 23 their artist's first. Wrongly, as far as was read: 2 of the 716 with "closed" (a door, a tomb; neither
+# sent) and one sent "sale" (a picture about a shop's sale). "Open" anywhere would take some 35 finished works
+# titled "Commissions open", and a few where it is a verb.
 SHEET_TITLE = re.compile(
-    r"\b(?:adopt\w*|auction\w*|for\s+sale|ota|ych)\b|(?:^|[^\w\s])\s*open\b(?:\s*\d+\s*[/\\]\s*\d+)?\s*(?:$|[^\w\s])",
+    r"\b(?:adopt\w*|auction\w*|for\s+sale|ota|ych|sold|sale|ffa|flat\s*sale|set\s*price|closed)\b"
+    r"|\bsb\s*[-:=]?\s*(?:[$€£]\s*\d|\d+\s*(?:[$€£]|usd|eur|pts|points)|\d+\b.*\bab\s*[-:=]?\s*\d)"
+    r"|(?:^|[^\w\s])\s*open\b(?:\s*\d+\s*[/\\]\s*\d+)?\s*(?:$|[^\w\s])",
     re.IGNORECASE,
 )
 # What an artist's username and tagline say (tagging.accounts) that holds them back; None is not read yet. Of the
@@ -186,6 +199,32 @@ _SWEARS = (
 )
 PROFANE_TITLE = re.compile(rf"fuck|\bf[*#@]?ck(?:s|d|ed|er|ing|in)?\b|\b(?:bull|dip|horse)?(?:{_SWEARS})\b", re.I)
 PROFANE_HANDLE = re.compile(rf"fuck|(?:^|[^a-z])(?:{_SWEARS})|(?:{_SWEARS})(?:$|[^a-z])", re.I)
+# Words that declare a work AI-made, read in its own title and tags and in the description that is sent, case-folded:
+# the owner's decision 18 by rule, beside the model's reading (tagging.declared_ai), which missed a title saying "AI
+# realistic" and a picture captioned "AI-assisted". "ai" only where a word begins with it, glued or not to the word
+# after ("aiart", "ai_generated", "AI-assisted", "aicreature"), never inside one ("raijin", "samurai"); an image
+# generator by name; "made with AI"; "(AI)". On 2026-10-20 it takes 1,780 of the 39,744 works kept, 1,773 of them
+# read "yes" by the model too, and holds back 3 more artists who would be sent: two rightly, and one whose
+# screenshot of a search engine's AI summary is no artwork of theirs (the description names it).
+# ponytail: a tag that is "ai" and nothing else is left to the model: it is also what a robot is tagged.
+_AI_MADE = (
+    r"art|generat|genereat|gen\b|assist|aided|enhance|made\b|creat|realis|adopt|image|illustr|render|photo|portrait|"
+    r"character|girl|anime|furry|fantasy|design|desing|digital|video|animation|communit|comunit|collab|tool|model"
+)
+AI_WORDS = re.compile(
+    rf"(?<![^\W_])ai[\s_-]*(?:{_AI_MADE})|[(\[]\s*ai\s*[)\]]|midjourney|nijijourney|novel[\s_-]*ai\b|"
+    r"(?:stable|pony|disco)[\s_-]*diffusion|\bdall[\s_-]?e(?:\d|\b)|synthograph|\bcomfy[\s_-]*ui\b|\bsdxl\b|"
+    r"\b(?:made|created|generated|done|drawn|edited|enhanced|assisted|rendered|painted)\s+(?:with|by|using|in|via)\s+"
+    r"(?:an?\s+)?ai\b"
+)
+# Words that refuse it: then the rule says nothing of the work, whatever else its words say ("No AI art").
+AI_REFUSED = re.compile(
+    r"(?<![^\W_])(?:no|not|non|anti|zero|without|never)[\s_-]*ai|(?<![^\W_])ai[\s_-]*(?:free|sucks)|"
+    r"\b0\s*%\s*ai\b|\bhuman[\s_-]*(?:made|drawn|created)\b|\b(?:no|not|without)\s+(?:\w+\s+){1,3}ai\b"
+)
+# The owner's own list of what no rule catches, in the git-ignored cache: a deviation id or an artist key
+# ("da:<handle>") a line, and "#" for a comment. Whatever it names is held back as held_by_hand. No file holds nothing.
+HELD_BY_HAND = "held_by_hand.txt"
 # The local library has nothing to push. Said for a dry run that finds no file too, without making one.
 NO_ARTISTS = (
     "the local library has no artists, so there is nothing to push, and a push would delete every artist the "
@@ -303,6 +342,22 @@ def _held(result: dict[str, Any] | None) -> str | None:
     return None if result.get("fit") else "fit_not_checked"
 
 
+def _ai_words(title: str | None, tags: str, description: str | None) -> bool:
+    """True when a work's own title or tags (as the library keeps them, a JSON list), or its description, say it is
+    AI-made (AI_WORDS) and none of them refuses it (AI_REFUSED). Each is read on its own: two tags make no phrase."""
+    texts = [text.casefold() for text in (title, *json.loads(tags), description) if isinstance(text, str)]
+    return any(map(AI_WORDS.search, texts)) and not any(map(AI_REFUSED.search, texts))
+
+
+def held_by_hand() -> set[str]:
+    """What HELD_BY_HAND names, case-folded: deviation ids and artist keys. Read from config.CACHE_DIR each time."""
+    try:
+        lines = (config.CACHE_DIR / HELD_BY_HAND).read_text(encoding="utf-8").splitlines()
+    except FileNotFoundError:
+        return set()
+    return {line.split("#", 1)[0].strip().casefold() for line in lines} - {""}
+
+
 def _marked(reason: str) -> str:
     """The reason a marked work or artist is held back: "marked_" and the collect stage's own words for it, as
     one word. Whatever it marks, and whatever it comes to call it, is held back and counted under that name."""
@@ -410,10 +465,11 @@ def build(
     An artist goes when the store lists them, the collect stage has left no mark on them, pipeline/profiles.py
     gave them a profile, their own username and tagline were read and declare neither AI art nor adult content
     (HELD_ACCOUNTS), their handle does not swear (PROFANE_HANDLE), no work of theirs kept here is declared AI-made
-    by its own title or tags (the owner's, 2026-10-20: tagging.declared_ai), their portfolio is not an adult one
-    (ADULT_PERCENT, by their works' ratings or by the pictures on their sheet, whichever says so), and MIN_WORKS
-    of their works may be sent. `removed` is key hashes the store's removal list does not hold yet and will (see
-    _removal): whoever they bar is not built.
+    by its own title or tags or the description sent (the owner's, 2026-10-20: tagging.declared_ai and AI_WORDS),
+    nor has words nobody has read so, their portfolio is not an adult one (ADULT_PERCENT, by their works'
+    ratings), the owner has not held them back by hand (HELD_BY_HAND), and MIN_WORKS of their works may be sent.
+    `removed` is key hashes the store's removal list does not hold yet and will (see _removal): whoever they bar
+    is not built.
 
     Every rating an artist's works have counts towards that share, whether the work has verified tags or not:
     the tagging stage rates every image. A work rated suggestive for blood and wounds alone counts as safe
@@ -425,9 +481,10 @@ def build(
     not to fill it (decision 19). So the share counts only the works kept here, not DeviantArt's mature ones, and
     an artist whose portfolio is mostly mature, with a few safe works, can be sent.
 
-    A work may be sent when the collect stage has left no mark on it, it was in the artist's latest answer from
-    DeviantArt, it passes _held, its title has no word of UNFIT_TITLE, PROFANE_TITLE or GLUED_HATE, and the plain
-    rule finds no contact in its title or its description. Every other text is held to that rule too, and one that
+    A work may be sent when the collect stage has left no mark on it, the owner has not held it back by hand, it
+    was in the artist's latest answer from DeviantArt, it passes _held, its title has no word of UNFIT_TITLE,
+    PROFANE_TITLE or GLUED_HATE and names no service (library.names_service), and the plain rule finds no contact
+    in its title or its description. Every other text is held to that rule too, and one that
     fails is left out and counted (see the module's docstring). The collect stage deletes nothing any more: a work
     it finds mature, somebody else's, no longer public or titled with contact details stays here with a mark, and
     a work the artist has taken down stays with the time it was last seen, which is before their profile was last
@@ -458,7 +515,13 @@ def build(
 
 def _build(local: store.Snapshot, removed: Collection[str]) -> tuple[Rows, Rows, Rows, Counter[str]]:
     """build(), from one copy of the store."""
-    listed = {key: username for key, username, _ in store.all_artists(local) if not store.covers(removed, key)}
+    account_of = {other: held for other in library.artist_keys(local) if (held := library.account_hash(other, local))}
+    # Not whom `removed` bars by handle or by account: a dry run has purged nobody, and a proof bars the account.
+    listed = {
+        key: username
+        for key, username, _ in store.all_artists(local)
+        if not store.covers(removed, key) and account_of.get(key) not in removed
+    }
     # A removed site holds nobody back now: a mark an earlier collect stage left for one goes at their next turn.
     marked_artists = {key: mark for key, mark in library.artist_marks(local).items() if mark[0] != library.LISTED}
     marked_works = library.work_marks(local)
@@ -473,10 +536,10 @@ def _build(local: store.Snapshot, removed: Collection[str]) -> tuple[Rows, Rows,
     declared = tagging.declared_ai(profiles.TAGGER, local)  # of every work kept, with tags or not
     works_of, fields = _collected(local)
     answers = library.answers(local)  # what each artist's latest answer emptied, and how many works it flags mature
+    by_hand = held_by_hand()
     counts: Counter[str] = Counter()
     # An account hash kept here for two keys that no rename mark links is a broken store (_removal's rule), and is
     # sent for neither: a proof bound to it would bar it there, and the database would delete the other at once.
-    account_of = {other: held for other in library.artist_keys(local) if (held := library.account_hash(other, local))}
     holders: dict[str, set[str]] = {}
     for other, held in account_of.items():
         holders.setdefault(held, set()).add(other)
@@ -510,12 +573,21 @@ def _build(local: store.Snapshot, removed: Collection[str]) -> tuple[Rows, Rows,
             reason, address = _held(result), _addresses(page, thumb, listed[key])
             if work_id in marked_works:
                 reason = _marked(marked_works[work_id][0])
+            elif work_id.casefold() in by_hand:
+                reason = "held_by_hand"
             elif seen < stored:  # not in the answer their profile was last stored with: taken down, as far as is known
                 reason = "not_seen_lately"
             elif UNFIT_TITLE.search(title or "") or GLUED_HATE.search((title or "").casefold()):
                 reason = "unfit_title"
             elif PROFANE_TITLE.search(title or ""):
                 reason = "profane_title"
+            # An announcement ("now on" a social network, a server's banner) or a work sold through a service. On
+            # 2026-10-20: 148 titles, 79 of them sent, of which some 8 are announcements and the rest ordinary art
+            # naming where it was made for or sold ("Patreon" practice series, a commission through VGen, game props
+            # for a streaming service's drops), and 4 artists fall under MIN_WORKS for it. ponytail: held all the
+            # same, the safe way; sending those as filler (SHEET's way) is the upgrade if the owner wants the art.
+            elif library.names_service(title):
+                reason = "service_in_title"
             elif result and not reason and any(map(library.holds_contact, (title, result["description"]))):
                 reason = "contact_by_rule"
             # A page is one work in the database: a second work with the same page is not sent.
@@ -537,6 +609,8 @@ def _build(local: store.Snapshot, removed: Collection[str]) -> tuple[Rows, Rows,
         why = None
         if key in marked_artists:
             why = _marked(marked_artists[key][0])
+        elif key in by_hand:
+            why = "held_by_hand"
         # A sentence the plain contact rule refuses is no profile to show: the artist waits for another.
         elif key not in written or library.holds_contact(written[key]["written"]):
             why = "profile_excluded" if key in excluded else "not_profiled"
@@ -551,14 +625,17 @@ def _build(local: store.Snapshot, removed: Collection[str]) -> tuple[Rows, Rows,
         elif PROFANE_HANDLE.search(listed[key]):
             why = "profane_handle"
         # One work whose own words declare it AI-made is enough (the owner's, 2026-10-20): every work kept here,
-        # held back or not. ponytail: a work the collect stage marked as another author's counts too; none was.
-        elif any(declared.get(work_id) == "yes" for work_id, *_ in works_of.get(key, [])):
-            why = "ai_declared_work"
-        # By either measure: the rating each work was given, or the profile stage's count over the artist's sheet
-        # (a profile made before it counted has neither number, and is judged on the ratings alone).
-        elif _too_many(adult, rated) or _too_many(
-            written[key].get("unsuitable_pictures") or 0, written[key].get("pictures") or 0
+        # held back or not, as the model read its title and tags or by the rule's words (_ai_words). ponytail: a
+        # work the collect stage marked as another author's counts too; none was.
+        elif any(
+            declared.get(work_id) == "yes" or _ai_words(title, tags, (results.get(work_id) or {}).get("description"))
+            for work_id, _, title, tags, *_ in works_of.get(key, [])
         ):
+            why = "ai_declared_work"
+        # And one whose words nobody has read as they are, of those the tagging stage reads: a work with an image.
+        elif any(cached and work_id not in declared for work_id, *_, cached, _ in works_of.get(key, [])):
+            why = "ai_not_read"
+        elif _too_many(adult, rated):  # by the rating each work was given (ADULT_PERCENT)
             why = "adult_portfolio"
         elif _too_many(adult + ratings.count(None), rated):  # an image nobody has rated is not safe yet
             why = "not_all_rated"
@@ -723,25 +800,29 @@ def _removed_sql(key_hashes: set[str]) -> str:
 
 
 def _removal(
-    listed: set[str], kept: set[str], local: pathlib.Path | str | None, follow: bool = True
+    listed: set[str], kept: set[str], local: pathlib.Path | str | None, follow: bool = True, mine: Collection[str] = ()
 ) -> tuple[set[str], set[str], int, set[str]]:
     """What hard rule 7 asks of this run for these key hashes, worked out with nothing changed: every key hash
     the two removal lists must hold for them, the keys of the artists those bar that are stored or kept here,
     how many of them the store will stop listing, and the keys a removal reaches only through a disagreement in
-    what is kept here.
+    what is kept here. `mine` is which of the hashes are the store's own (see below).
 
     Only a removal list says who is removed: `listed` is the database's, with or without the store's own. An
     artist the store's `artists` table merely lacks is nobody's removal. That table was emptied once, and the
     run that followed purged the whole library and barred every account.
 
     A removal bars what it is bound to and nothing else. A handle's hash bars whoever holds that handle now: the
-    artist stored or kept here (`kept`, the library's keys) under it (store.named_by), and their account goes on the
-    list with it, so that the account is known for what it is under a handle it takes later, when the purge has
-    deleted the profile that names it. Never a key the account has left for another (marked RENAMED): DeviantArt
-    can give that handle to somebody else, whose removal it then is, so that key's account is not taken from it. An
-    account's hash bars every key kept here under it (their profile's hash). A site's bars nobody: it is kept out of
-    every row (store._named_by, build), and anybody can name it. A removal covers the account under every handle it
-    is kept under here, linked to one of those by the collect stage's marks (library.same_account), and theirs in
+    artist stored or kept here (`kept`, the library's keys) under it (store.named_by). Their account goes on the
+    list with it only for a handle somebody named here (`mine`: the store's own hashes, which the database's list
+    lacks, as store.mark_removed leaves them), so that the account is known for what it is under a handle it takes
+    later, when the purge has deleted the profile that names it. A handle on the database's list may be one an
+    earlier holder was barred under (sql/002_functions.sql's remove_artists put the handle with the account, until
+    2026-10-20): it takes nobody's account but one a list holds too, and is followed to no other handle. Never a key
+    the account has left for another (marked RENAMED): DeviantArt can give that handle to somebody else, whose
+    removal it then is, so that key's account is not taken from it. An account's hash bars every key kept here
+    under it (their profile's hash). A site's bars nobody: it is kept out of every row (store._named_by, build),
+    and anybody can name it. A removal of an account covers it under every handle it is kept under here, linked to
+    one of those by the collect stage's marks (library.same_account), and theirs in
     turn: all are purged here, and the account's hash is what goes on the lists, which bars the artist under any
     handle, there (artists.da_account) and here (library.account_removed). A handle goes on them by name only for
     a key with no account kept: the account may have left it, unseen here, and DeviantArt given it to somebody
@@ -762,9 +843,9 @@ def _removal(
     named = {*store.named_by(hashes, local), *(key for key in kept if store.covers(hashes, key))} - left
     account = {key: library.account_hash(key, local) for key in kept}
     removed = {held for held in account.values() if held in hashes}  # the accounts barred: on a list,
-    removed |= {held for key in named if (held := account.get(key))}  # or a barred handle's
+    removed |= {held for key in named if store._hash(key) in mine and (held := account.get(key))}  # or named here
     holding = {key for key, held in account.items() if held in removed}
-    reached = library.linked(named | holding, local)
+    reached = named | library.linked(holding, local)
     # A mark ties it to a removed account, and its own hash is another account's.
     odd = {key for key in reached - named if account.get(key) not in removed | {None}}
     disputed = set()  # removed accounts whose keys here are not all linked: one of them is not the account's
@@ -777,7 +858,7 @@ def _removal(
     by_account = {key for key in holding if account[key] in listed and account[key] not in disputed}
     barred = reached if follow else named | by_account
     hashes |= {store._hash(key) for key in barred - left if not account.get(key)}  # by name: no account kept
-    hashes |= {held for key in barred if (held := account.get(key)) and (follow or held not in disputed)}
+    hashes |= {held for key in barred if (held := account.get(key)) in removed and (follow or held not in disputed)}
     return hashes, barred, len(store.named_by(hashes, local)), odd
 
 
@@ -803,10 +884,10 @@ def run(dry_run: bool, allow_delete: int | None = None, local: pathlib.Path | st
 
     Stop, and nothing more is done, in the four cases the module's docstring names; when too much would be
     deleted it carries the counts. `allow_delete` is how many artists, how many works and how many neighbour
-    rows this one run may delete instead, and how many people the removals may bar beyond those the two removal
-    lists name (see the module's docstring): any whom what is kept here does not agree on, and hashes that bar
-    nobody here when that is more than DELETE_FLOOR. RuntimeError when the database
-    fails, ValueError when a removal list cannot be read: whichever comes, nothing after it is done.
+    rows this one run may delete instead, and how many people the removals may bar beyond those the database's
+    removal list names (see the module's docstring): any whom what is kept here does not agree on, and artists only
+    the store's list bars with hashes that bar nobody here when that is more than DELETE_FLOOR. RuntimeError when
+    the database fails, ValueError when a removal list cannot be read: whichever comes, nothing after it is done.
     """
     there = db.sql(LISTING_SQL)
     if any(str(row["slug"]).startswith(TEST_SLUG) for row in there):
@@ -822,22 +903,23 @@ def run(dry_run: bool, allow_delete: int | None = None, local: pathlib.Path | st
     with store.snapshot(local) as now:
         kept = set(library.artist_keys(now))
         here = store.removed_hashes(now)
-        # Whom the database's list names, and whom the store's names by the handle or the account they are kept
-        # under: removals somebody made by name, there through the site or here (store.mark_removed). However many,
-        # each is the wish of the person named or of the owner.
-        theirs = {store._hash(key) for key in kept} | {
-            hash_ for key in kept if (hash_ := library.account_hash(key, now))
-        }
-        named = _removal(remote | (theirs & here), kept, now, False)
-        whole = _removal(remote | here, kept, now)  # and all that the two lists come to here
-        # Beyond them: each artist a removal reaches only through a disagreement in what is kept here (whole[3]),
-        # and each hash the store's list adds that is no handle or account of an artist barred here (a site, a
-        # handle nobody here has). An account's other handles that what is kept here agrees on are neither.
-        new = whole[1] - named[1]
-        own = {store._hash(key) for key in new} | {hash_ for key in new if (hash_ := library.account_hash(key, now))}
-        odd, people = len(whole[3]), len(whole[3]) + len(whole[0] - named[0] - own)
+        # Whom the database's list names: proofs and the owner's grants, made there. However many, each is the wish
+        # of the person named or of the owner, and the list's own record.
+        named = _removal(remote, kept, now, False)
+        whole = _removal(remote | here, kept, now, mine=here - remote)  # and all that the two lists come to here
+        # Beyond it: each artist a removal reaches only through a disagreement in what is kept here (whole[3]), each
+        # one only the store's list bars (the owner's removals here are a few; a table filled from a bad copy once
+        # held every artist's), and each hash the store's list adds that is no handle or account of an artist barred
+        # here, nor a site somebody kept here names (a handle nobody here has). A site bars nobody (store._named_by):
+        # it keeps the site out of rows. An account's other handles that what is kept here agrees on are none of it.
+        own = {store._hash(key) for key in whole[1]}
+        own |= {hash_ for key in whole[1] if (hash_ := library.account_hash(key, now))}
+        sites = {store._hash(site) for key in kept for site in store._link_keys([library.website(key, now) or ""])}
+        odd = len(whole[3])
+        people = odd + len(whole[1] - named[1] - whole[3]) + len(whole[0] - named[0] - own - sites)
     may_add = max(DELETE_FLOOR, allow_delete or 0)  # a handful of hashes always goes through, whatever a run is told
-    # Then only whom the two lists name is removed, and the run stops after it. A disagreement never goes unasked.
+    # Then only whom the database's list names is removed, and the run stops after it. A disagreement never goes
+    # unasked.
     flood = people > may_add or odd > (allow_delete or 0)
     hashes, removed, applied, _ = named if flood else whole
     purge = sorted(removed & kept)
@@ -860,12 +942,13 @@ def run(dry_run: bool, allow_delete: int | None = None, local: pathlib.Path | st
     if flood:
         done = "would be" if dry_run else "was"
         raise Stop(
-            f"the removals would bar {people} people beyond those the two removal lists name (it may bar {may_add}, "
-            f"and none of the {odd} whom only a rename link or only an account hash kept here ties to a removed "
-            f"account): add {len(whole[0] - named[0])} key hashes to the database's removal list, where they stay "
-            f"for good, and purge {len(whole[1] & kept) - len(purge)} artists here. That looks like a broken local "
-            f"store. Whom the two lists name {done} removed, here and there, and nothing else. If they are real "
-            f"removals, run it again with --allow-delete {people}."
+            f"the removals would bar {people} people beyond those the database's removal list names (it may bar "
+            f"{may_add}, and none of the {odd} whom only a rename link or only an account hash kept here ties to a "
+            f"removed account): add {len(whole[0] - named[0])} key hashes to the database's removal list, where they "
+            f"stay for good, and purge {len(whole[1] & kept) - len(purge)} artists here. That looks like a broken "
+            f"local store, or more removals made here at once than a run believes. Whom the database's list names "
+            f"{done} removed, here and there, and nothing else. If they are real removals, run it again with "
+            f"--allow-delete {people}."
         )
     if not kept - removed:
         raise Stop(NO_ARTISTS)
@@ -957,8 +1040,9 @@ def main(argv: list[str] | None = None) -> None:
         metavar="N",
         help="let this one run delete up to N artists who no longer qualify, and up to N works and N neighbour rows "
         f"of artists who stay (without it: {DELETE_PERCENT} percent of what the database has, and never fewer than "
-        f"{DELETE_FLOOR}); and let the removals bar up to N people beyond those the two removal lists name, whom "
-        f"what is kept here does not agree on (without it: none, and {DELETE_FLOOR} hashes that bar nobody here)",
+        f"{DELETE_FLOOR}); and let the removals bar up to N people beyond those the database's removal list names: "
+        f"whom what is kept here does not agree on (without it: none), and artists only the local list bars with "
+        f"hashes that bar nobody here (without it: {DELETE_FLOOR})",
     )
     args = parser.parse_args(argv)
     try:
