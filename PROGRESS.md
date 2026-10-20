@@ -1355,7 +1355,19 @@ Deadlocks are gone as written, and nothing else stands beyond the accepted limit
 - **Held back:** 123 (0.31%): 94 fetish, 26 hate symbol and 3 as a possible sexualised minor.
 - **The 3 possible minors** stay held back and are kept out of every review sample: no critic is shown them.
 
-**Running:** a blind check of the content check (50 held, 35 kept whose own tags or descriptions hint at fetish or hate, and 35 kept at random), and push's sixth critic, judging a build on the real, fully analysed data.
+**The content check, judged blind** by two fresh critics against the product's definition. The sample was 50 held, 35 kept whose own tags or descriptions hint at fetish or hate, and 35 kept at random.
+
+| | Critic: hold | Critic: show |
+|---|---|---|
+| Check held (50) | 30 | 20 (the critic was sure of 9) |
+| Check kept (70) | 1 (unsure: a manga close-up of a foot) | 69 |
+
+- **Few misses:** one unsure case in 70, which matters most, since a miss is what a studio would see.
+- **It over-holds:** about two in five of its holds are ordinary art (a pregnant mage, a werewolf barbarian, bikini monster girls, a pun croissant). Across the pool that is about 50 works, or 0.12%; an artist shows up to 10, so one rarely changes whether they appear. Accepted as it is, in the safe direction.
+- **Outside the bar:** an anti-Muslim image (a pig with the shahada) was held as a hate symbol. The critic noted the bar as written does not cover it; holding it is right.
+- **Ceiling, if it matters:** a second, stricter question asked only of the 120 held works would take about 2 minutes of GPU.
+
+**Running:** push's sixth critic, judging a build on the real, fully analysed data.
 
 **The disk filled up.** Drive F: reached 0 bytes free at about 19:45 on 10-19, and two image-check turns failed to open the store and were retried. The cause was this project: 20 finished builder worktrees, each with its own Python environment (73 GB), and critics' temporary test folders (9.5 GB).
 - **Every branch was merged,** so the worktrees were removed, with the branches kept, and the temporary folders deleted. F: has 83 GB free.
