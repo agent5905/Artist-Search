@@ -216,21 +216,25 @@ describe('the limits, which the database keeps', () => {
     }
   })
 
-  it('counts an IPv6 visitor by their /56 and network by its /48, however the address is written', () => {
+  it('counts an IPv6 visitor by their /64 and network by its /48, however the address is written', () => {
     const visitor = (address: string) => client(from(address))
-    expect(visitor('2001:db8:aa:bb::1')).toBe('2001:db8:aa:0::/56')
-    expect(visitor('2001:db8:aa:bbcc:ffff:1:2:3')).toBe('2001:db8:aa:bb00::/56')
-    expect(visitor('2001:0db8:00aa:bbff::9')).toBe('2001:db8:aa:bb00::/56')
-    expect(visitor('2001:db8::1')).toBe('2001:db8:0:0::/56')
-    expect(visitor('1::2:3:4:5:6:7')).toBe('1:0:2:0::/56')
-    expect(visitor('1:2:3:4567::')).toBe('1:2:3:4500::/56')
-    // A home's /56 is 256 /64s: one visitor. The next /56 is another.
-    expect(new Set(Array.from({ length: 256 }, (_, n) => visitor(`2001:db8:aa:${(0x1200 + n).toString(16)}::1`))).size).toBe(1)
-    expect(visitor('2001:db8:aa:1300::1')).not.toBe(visitor('2001:db8:aa:12ff::1'))
-    // A /48 is 256 /56s, 256 visitors: one network.
-    const in48 = Array.from({ length: 256 }, (_, n) => from(`2001:db8:77:${(n << 8).toString(16)}::1`))
-    expect(new Set(in48.map(client)).size).toBe(256)
-    expect(new Set(in48.map(network))).toEqual(new Set(['2001:db8:77::/48']))
+    expect(visitor('2001:db8:aa:bb::1')).toBe('2001:db8:aa:bb::/64')
+    expect(visitor('2001:db8:aa:bbcc:ffff:1:2:3')).toBe('2001:db8:aa:bbcc::/64')
+    expect(visitor('2001:0db8:00aa:bbff::9')).toBe('2001:db8:aa:bbff::/64')
+    expect(visitor('2001:DB8:AA:BBFF:0:0:0:9')).toBe('2001:db8:aa:bbff::/64')
+    expect(visitor('2001:db8::1')).toBe('2001:db8:0:0::/64')
+    expect(visitor('1::2:3:4:5:6:7')).toBe('1:0:2:3::/64')
+    expect(visitor('1:2:3:4567::')).toBe('1:2:3:4567::/64')
+    // An IPv4 tail is two groups, so the same address written with one is the same visitor.
+    expect(visitor('2001:db8::5:6:7:1.2.3.4')).toBe('2001:db8:0:5::/64')
+    expect(visitor('2001:db8::5:6:7:1.2.3.4')).toBe(visitor('2001:db8:0:5:6:7:102:304'))
+    // One subscriber's /64: whatever address a device takes in it (a new private one every day or so) is one visitor.
+    const in64 = Array.from({ length: 256 }, (_, n) => visitor(`2001:db8:aa:1200:${((n * 0x9e37) & 0xffff).toString(16)}:${n}:${n * 7}:1`))
+    expect(new Set(in64)).toEqual(new Set(['2001:db8:aa:1200::/64']))
+    // Phones on one carrier: each its own /64, each its own visitor, and the 4,096 of a /48 one network.
+    const phones = Array.from({ length: 4096 }, (_, n) => from(`2001:db8:77:${n.toString(16)}::1`))
+    expect(new Set(phones.map(client)).size).toBe(4096)
+    expect(new Set(phones.map(network))).toEqual(new Set(['2001:db8:77::/48']))
     expect(network(from('2001:db8:78::1'))).toBe('2001:db8:78::/48')
   })
 
@@ -253,7 +257,7 @@ describe('the limits, which the database keeps', () => {
     await claimPage(from('2001:db8:77:1200::5', '/api/removal?slug=someone'), site, db.fetcher)
     for (const body of [{ slug: 'someone', proof: true }, { slug: 'someone' }]) await removal(post(body, '2001:db8:77:1200::5'), site, db.fetcher)
 
-    const asked = { p_token: TOKEN, p_client: '2001:db8:77:1200::/56', p_network: '2001:db8:77::/48' }
+    const asked = { p_token: TOKEN, p_client: '2001:db8:77:1200::/64', p_network: '2001:db8:77::/48' }
     expect(db.called('client_wait').map((call) => call.args)).toEqual(
       ['search', 'profile', 'similar', 'claim', 'removal', 'removal'].map((kind) => ({ ...asked, p_kind: kind })),
     )
@@ -414,12 +418,19 @@ describe('POST /api/removal', () => {
     expect(db.calls.every((call) => (call.init.headers as Record<string, string>).apikey === KEY)).toBe(true)
   })
 
-  it('files a request without proof, with its note trimmed and cut to 300 characters', async () => {
+  it('files a request without proof, with its note trimmed and cut to 300 characters, and the network it came from', async () => {
+    // The note is kept in its network's place (request_removal): a stranger elsewhere cannot put the artist's out.
     const db = database(Response.json(true))
     const response = await removal(post({ slug: 'someone', ticket: 'FAKE-TICKET', note: `  ${'n'.repeat(400)} ` }), env(), db.fetcher)
 
     expect(await response.json()).toEqual({ ok: true })
-    expect(db.called('site_request_removal')[0].args).toEqual({ p_token: TOKEN, p_slug: 'someone', p_note: 'n'.repeat(300), p_ticket: 'FAKE-TICKET' })
+    expect(db.called('site_request_removal')[0].args).toEqual({
+      p_token: TOKEN,
+      p_slug: 'someone',
+      p_note: 'n'.repeat(300),
+      p_ticket: 'FAKE-TICKET',
+      p_network: '203.0.113.0/24',
+    })
   })
 
   it('sends a ticket only as the page had it: a text no longer than a ticket can be, or none', async () => {

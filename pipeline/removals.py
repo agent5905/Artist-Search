@@ -19,8 +19,9 @@ The queue (removal_requests.code_at, due_at and networks). A run reads, with the
 of the open requests with a code that are due, in turns between the networks the codes were asked from, the one
 due longest first in each turn (due_removals), and moves each one it looks at on: an hour while its code was asked
 for under a day ago, six hours while under two weeks ago, a week after that (_next_look). Asking for the code again
-starts that over, and makes the request due at once unless it already was; it never puts a request ahead of one
-due before it in its network's turn. So one network that asks for hundreds of codes holds back only its own. A
+starts that over, and makes the request due at once unless it already was, even while a run is looking at it
+(_move_on); it never puts a request ahead of one due before it in its network's turn. So one network that asks for
+hundreds of codes holds back only its own. A
 request is in the turns of every network that asked for its code (the first MAX_REQUESTS of them) and is taken in
 the first it comes to, so a stranger who asks for an artist's code, before or after the artist, takes nothing from
 them: asking only ever brings a request forward.
@@ -161,10 +162,13 @@ def _next_look(code_at: str, now: datetime) -> datetime:
 
 
 def _move_on(request: dict[str, Any], now: datetime, dry_run: bool) -> None:
-    """Set when the request is looked at next. Not in a dry run, which changes nothing."""
+    """Set when the request is looked at next. Not in a dry run, which changes nothing. Only while its code_at is
+    still the one read: the code asked for again during the look (the page tells an artist to, after two weeks)
+    made it due at once, and that stands, where "a week on" from the old code_at would have buried it."""
     if not dry_run:
         due = _next_look(request["code_at"], now).isoformat()
-        where = {"id": f"eq.{request['id']}", "outcome": "is.null"}  # not one a proof just closed
+        # Not one a proof just closed, nor one asked for again since it was read.
+        where = {"id": f"eq.{request['id']}", "outcome": "is.null", "code_at": f"eq.{request['code_at']}"}
         db._checked(db.data_api("PATCH", "removal_requests", "secret", params=where, json={"due_at": due}))
 
 
@@ -277,10 +281,11 @@ def run(
 def pending() -> list[str]:
     """One entry for each open request, the oldest first, every one of them: a line with the slug, the request's
     id, the public handle it was made for, when it was first and last asked for and how often, and whether a code
-    was given out; then a line for each note left with it, with when it came (the first and the latest four:
-    request_removal). For the owner, who reads them and answers by id with --grant or --reject. A note is a
-    visitor's words, printed as a quoted string with anything that does not print escaped, so it cannot act on the
-    terminal. A slug can have more than one request: the artist listed under it changed, or their site did."""
+    was given out; then a line for each note kept with it, with when it came (the latest from each network, of the
+    ten heard from last: request_removal). For the owner, who reads them and answers by id with --grant or --reject.
+    A note is a visitor's words, printed as a quoted string with anything that does not print escaped, so it cannot
+    act on the terminal. A slug can have more than one request: the artist listed under it changed, or their site
+    did."""
     rows = _rows(
         "removal_requests",
         select="id,artist_slug,da_username,first_at,last_at,requests,code_at,notes",

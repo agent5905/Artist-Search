@@ -24,19 +24,23 @@ export const NO_STORE = { 'cache-control': 'no-store' } // a removed artist must
 /** The address Cloudflare saw, and nothing a client can set. An IPv4 address written as IPv6 is read as IPv4. */
 const address = (request: Request) => (request.headers.get('cf-connecting-ip') ?? '').replace(/^::ffff:(?=[\d.]+$)/i, '')
 
-/** The first four groups of an IPv6 address, however it is written. */
+/** The first four groups of an IPv6 address, however it is written (an IPv4 tail, 64:ff9b::192.0.2.1, is two). */
 function groups(ipv6: string): number[] {
   const [head, tail] = ipv6.split('::').map((part) => (part ? part.split(':') : []))
-  const written = tail ? [...head, ...Array(Math.max(8 - head.length - tail.length, 0)).fill('0'), ...tail] : head
+  const zeros = 8 - head.length - (tail?.length ?? 0) - (ipv6.includes('.') ? 1 : 0)
+  const written = tail ? [...head, ...Array(Math.max(zeros, 0)).fill('0'), ...tail] : head
   return [0, 1, 2, 3].map((n) => parseInt(written[n], 16) || 0)
 }
 
-/** Who is asking, for the limits: their address, and an IPv6 one by its /56, which one subscriber usually has whole. */
+/**
+ * Who is asking, for the limits: their address, and an IPv6 one by its /64, one subscriber's network. The addresses a
+ * device takes in it (a new private one every day or so) are one visitor, and the next /64 another: a carrier gives
+ * each phone its own.
+ */
 export function client(request: Request): string {
   const ip = address(request)
   if (!ip.includes(':')) return ip
-  const [a, b, c, d] = groups(ip)
-  return `${[a, b, c, d & 0xff00].map((group) => group.toString(16)).join(':')}::/56`
+  return `${groups(ip).map((group) => group.toString(16)).join(':')}::/64`
 }
 
 /** The network they ask from, which holds whatever other addresses one person can easily have: an IPv4 /24, an IPv6 /48. */
