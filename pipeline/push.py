@@ -28,7 +28,8 @@ Four things stop a run, each with a message and a status that is not zero:
   - the database holds a slug that begins "zz-". Those are another builder's test rows, and this stage would
     delete them. It is the first thing looked at, before anything is done here or there;
   - the removals would bar people beyond those the two removal lists name (whom the database's list names, and
-    whom the store's names by the handle they are kept under here) that what is kept here does not agree on:
+    whom the store's names by the handle or the account they are kept under here; an account named, under every
+    key kept here that holds it, while those keys agree) that what is kept here does not agree on:
     an artist a rename link ties to a removed account while their profile's hash is another account's, or one
     whose profile has a removed account's hash while no rename link ties them to the account's other handles.
     Or the store's list would add more than DELETE_FLOOR hashes that are no handle or account of anybody barred
@@ -99,7 +100,7 @@ MIN_WORKS = 4  # publishable works: an artist with fewer is not sent
 MAX_WORKS = 10  # works sent for an artist: the most recently published of those that may go
 # Of an artist's works that are rated or have an image to rate, the share rated suggestive or explicit, or not
 # rated yet; and of the pictures on the sheet the profile stage looked at, the share it counted as sexualised or
-# gory. At this share of either, the artist is left out.
+# gory. At this share of either, the artist is left out. DeviantArt's mature works are not in it (see build).
 ADULT_PERCENT = 30
 SAFE_RATING = "safe"  # the only rating a work is sent with
 ADULT_RATINGS = ("suggestive", "explicit")
@@ -132,15 +133,26 @@ TRIES = 2
 # Besides these, one reason for each mark the collect stage has left: "marked_<its reason>" (see _marked).
 ARTIST_REASONS = (
     *("not_profiled", "profile_excluded", "profile_out_of_date", "declares_ai", "adult_account"),
-    *("account_not_read", "adult_portfolio", "not_all_rated", "too_few_works", "slug_unusable", "no_account"),
+    *("account_not_read", "profane_handle", "ai_declared_work", "adult_portfolio", "not_all_rated"),
+    *("too_few_works", "slug_unusable", "no_account"),
 )
 WORK_REASONS = (
     *("not_seen_lately", "not_tagged", "not_artwork", "checked_not_artwork", "explicit", "unfit_image"),
-    *("unfit_title", "declared_ai", "contact_in_words", "words_not_read", "not_rated", "suggestive"),
-    *("artwork_not_checked", "fit_not_checked", "contact_by_rule", "bad_address", "artist_held_back"),
-    *("sheet_over_limit", "over_limit"),
+    *("political", "unfit_title", "profane_title", "declared_ai", "contact_in_words", "words_not_read"),
+    *("not_rated", "suggestive", "suggestive_not_checked", "artwork_not_checked", "political_not_checked"),
+    *("fit_not_checked", "contact_by_rule", "bad_address", "artist_held_back", "sheet_over_limit", "over_limit"),
 )
 SHEET = "adoptable or design-for-sale sheet"  # of tagging.FORMATS: sent after an artist's other works, never picked
+# A work titled as one is a sheet too, whatever the format reading says (owner decision 14): on 2026-10-20, 871 sent
+# works were titled so and not read as sheets, 135 of them their artist's first, picked 8,610 times beside other
+# artists. Whole words, and "open" only as a status between marks ("Adopt - Open", "[OPEN] Design 12", "{open}"),
+# not as a word of the title ("Open World", "Commissions are open").
+# ponytail: of those 871, one "OTA" was a character's name and about 23 were finished "YCH" commissions, which go
+# as filler too. Drop "ych" from the rule if a finished commission should lead.
+SHEET_TITLE = re.compile(
+    r"\b(?:adopt\w*|auction\w*|for\s+sale|ota|ych)\b|(?:^|[^\w\s])\s*open\b(?:\s*\d+\s*[/\\]\s*\d+)?\s*(?:$|[^\w\s])",
+    re.IGNORECASE,
+)
 # What an artist's username and tagline say (tagging.accounts) that holds them back; None is not read yet. Of the
 # rest, "profane" and "social" leave the tagline out and send the artist.
 HELD_ACCOUNTS = {"ai": "declares_ai", "adult": "adult_account", None: "account_not_read"}
@@ -148,8 +160,8 @@ HELD_ACCOUNTS = {"ai": "declares_ai", "adult": "adult_account", None: "account_n
 # words: "carnivore", "inflatable", "Lolita" and "breastplate" go. A list, where the image check (tagging.run_content)
 # is a model, because a work held wrongly costs little: on the 39,744 titles of 2026-10-19 it holds 58, two of them
 # wrongly, where "sex" was not sexual. Not "giantess" or "xxx": in titles they were a female giant and a placeholder.
-# ponytail: what a title only hints at ("Feeding time") passes, and so does a word glued to others; the image
-# check and the rating are behind it.
+# ponytail: what a title only hints at ("Feeding time") passes, and so does a word glued to others but for the
+# hate words of GLUED_HATE; the image check and the rating are behind it.
 UNFIT_TITLE = re.compile(
     r"\b(?:nsfw|porn\w*|hentai|ecchi|lewd|nudes?|nudity|topless|sexy|sex|sextober|kinktober|kinky?|"
     r"fetish\w*|bdsm|bondage|erotic\w*|lingerie|boob(?:s|ies)|tits|titties|breasts?|butts?|booty|ass|thicc|milf|"
@@ -157,6 +169,23 @@ UNFIT_TITLE = re.compile(
     r"loli(?:con)?|shota(?:con)?|nazis?|reich|swastikas?|hitler|kkk)\b",
     re.IGNORECASE,
 )
+# These inside any word of the case-folded title too: "spaceNaziMechs". Of the 39,744 titles of 2026-10-20 it holds
+# three more, two of them wrongly: a character's name that begins "Nazi", and a made-up word with "kkk" in it.
+# "kkk" within a longer run of k ("sharkkkk") is not one.
+GLUED_HATE = re.compile(r"nazi|hitler|swastika|(?<!k)kkk(?!k)")
+# Swearing and slurs. A title with one holds back its work, and a handle with one its artist: the handle is their
+# name and their slug on the site. "fuck" wherever it is; the rest as a whole word of a title ("shitpost", "piss
+# off"), or at either end of a run of letters in a handle ("shitbird", "grimbastard"), since a handle is words
+# glued together. Mild words ("damn", "sucks", "crap") are not, and nor are words inside others ("Scunthorpe",
+# "assassin", "cocktail", "Ashitaka", "goshitsme"). On 2026-10-20 it holds 14 titles and 3 handles, none wrongly.
+# ponytail: a name that begins or ends with one ("Shitara", "Wankhede") would hold its artist; none of the 3,969
+# handles of 2026-10-20 does. The model's reading of the handle is the upgrade, at a new account prompt version.
+_SWEARS = (
+    r"shit(?:s|ty|post\w*|head)?|cunts?|bitch(?:es|y)?|whores?|sluts?|twats?|wank(?:er|ers|ing)?|bastards?|"
+    r"piss(?:ed|ing)?|assholes?|retard(?:s|ed)?|nigg(?:a|as|er|ers)|fag(?:s|got|gots)?|trann(?:y|ies)"
+)
+PROFANE_TITLE = re.compile(rf"fuck|\bf[*#@]?ck(?:s|d|ed|er|ing|in)?\b|\b(?:bull|dip|horse)?(?:{_SWEARS})\b", re.I)
+PROFANE_HANDLE = re.compile(rf"fuck|(?:^|[^a-z])(?:{_SWEARS})|(?:{_SWEARS})(?:$|[^a-z])", re.I)
 # The local library has nothing to push. Said for a dry run that finds no file too, without making one.
 NO_ARTISTS = (
     "the local library has no artists, so there is nothing to push, and a push would delete every artist the "
@@ -240,7 +269,9 @@ def _held(result: dict[str, Any] | None) -> str | None:
     """Why a work is held back, as one of WORK_REASONS, or None when it may be sent.
 
     `result` is the work's entry in tagging.results() for the verified set: None when it has none. A reading
-    or a rating that has not been made yet holds the work back, the same as one that came out wrong.
+    or a rating that has not been made yet holds the work back, the same as one that came out wrong. A work
+    rated suggestive for blood and wounds alone is as one rated safe (the owner's, 2026-10-20: see
+    tagging.run_suggestive); one rated so that has not been asked why is held back as suggestive_not_checked.
     """
     if result is None:
         return "not_tagged"
@@ -253,16 +284,22 @@ def _held(result: dict[str, Any] | None) -> str | None:
         return "explicit"
     if result.get("fit") is False:  # fetish, a hate symbol or a sexualised minor (tagging.run_content)
         return "unfit_image"
+    if result.get("political") is True:  # political content about a real person (tagging.run_political)
+        return "political"
     if declared == "yes":
         return "declared_ai"
     if contact == "yes":
         return "contact_in_words"
     if declared is None or contact != "no":
         return "words_not_read"
-    if rating != SAFE_RATING:
-        return "suggestive" if rating in ADULT_RATINGS else "not_rated"
+    if rating == "suggestive" and result.get("blood_only") is not True:
+        return "suggestive" if result.get("blood_only") is False else "suggestive_not_checked"
+    if rating not in (SAFE_RATING, "suggestive"):
+        return "not_rated"
     if not result.get("artwork"):
         return "artwork_not_checked"
+    if result.get("political") is None:  # a candidate that has not been asked about
+        return "political_not_checked"
     return None if result.get("fit") else "fit_not_checked"
 
 
@@ -341,21 +378,25 @@ def _collected(
     Each artist's works, the most recently published first, as (deviation id, page, title, the artist's tags as
     JSON, thumbnail, when it was last seen and still qualified, whether it has a cached image, its rating from
     tagging.RATINGS or None); and each artist's (tagline, website, when their profile was last stored). A rating
-    is of one image: given to an image the work no longer shows (library.IMAGE), it is no rating.
+    is of one image: given to an image the work no longer shows (library.IMAGE), it is no rating. A work rated
+    suggestive for blood and wounds alone (tagging.run_suggestive, of the same image) is here rated safe.
     ponytail: the library has no reader for these columns, and the tagging stage has none for the rating of a
     work that has no tags, so they are selected here. Move it there when they have.
     """
     works: dict[str, list[tuple[Any, ...]]] = {}
     with tagging._open(local) as conn:  # the library's tables and the tagging stage's, with own_file() for IMAGE
-        for key, *work, sorted_as in conn.execute(
+        for key, *work, sorted_as, why in conn.execute(
             "SELECT w.artist_key, w.deviation_id, w.page_url, w.title, w.tags, w.thumb_url, w.fetched_at, "
-            "w.image_file IS NOT NULL, f.result FROM works w LEFT JOIN work_format f "
+            "w.image_file IS NOT NULL, f.result, s.result FROM works w LEFT JOIN work_format f "
             "ON f.deviation_id = w.deviation_id AND f.model = ? AND f.prompt_version = ? "
-            f"AND f.fingerprint = {library.IMAGE} "
+            f"AND f.fingerprint = {library.IMAGE} LEFT JOIN work_suggestive s ON s.deviation_id = w.deviation_id "
+            "AND s.model = ? AND s.prompt_version = ? AND s.fingerprint = f.fingerprint "
             "ORDER BY w.artist_key, w.published_at IS NULL, w.published_at DESC, w.deviation_id",
-            (profiles.TAGGER, tagging.FORMAT_VERSION),
+            (profiles.TAGGER, tagging.FORMAT_VERSION, profiles.TAGGER, tagging.SUGGESTIVE_VERSION),
         ):
             rating = json.loads(sorted_as).get("rating") if sorted_as else None
+            if rating == "suggestive" and why and json.loads(why)["blood_only"]:
+                rating = SAFE_RATING
             works.setdefault(key, []).append((*work, rating if rating in tagging.RATINGS else None))
         rows = conn.execute("SELECT artist_key, tagline, website, fetched_at FROM profiles").fetchall()
     return works, {key: (tagline, website, stored) for key, tagline, website, stored in rows}
@@ -368,23 +409,31 @@ def build(
 
     An artist goes when the store lists them, the collect stage has left no mark on them, pipeline/profiles.py
     gave them a profile, their own username and tagline were read and declare neither AI art nor adult content
-    (HELD_ACCOUNTS), their portfolio is not an adult one (ADULT_PERCENT, by their works' ratings or by the
-    pictures on their sheet, whichever says so), and MIN_WORKS of their works may be sent. `removed` is key
-    hashes the store's removal list does not hold yet and will (see _removal): whoever they bar is not built.
+    (HELD_ACCOUNTS), their handle does not swear (PROFANE_HANDLE), no work of theirs kept here is declared AI-made
+    by its own title or tags (the owner's, 2026-10-20: tagging.declared_ai), their portfolio is not an adult one
+    (ADULT_PERCENT, by their works' ratings or by the pictures on their sheet, whichever says so), and MIN_WORKS
+    of their works may be sent. `removed` is key hashes the store's removal list does not hold yet and will (see
+    _removal): whoever they bar is not built.
 
     Every rating an artist's works have counts towards that share, whether the work has verified tags or not:
-    the tagging stage rates every image. A work with an image and no rating counts as one that is not safe until
-    it is rated. An artist those tip over the share, and the ratings alone would not, is held back as
-    not_all_rated.
+    the tagging stage rates every image. A work rated suggestive for blood and wounds alone counts as safe
+    (tagging.run_suggestive), and one rated suggestive that has not been asked why counts as suggestive. A work
+    with an image and no rating counts as one that is not safe until it is rated. An artist those tip over the
+    share, and the ratings alone would not, is held back as not_all_rated. The works DeviantArt flags mature are
+    never kept, and would count as adult by the number an artist's latest answer gave (library.answers). That
+    number is not filled in: no artist kept on 2026-10-20 was stored since it was written down, and the owner chose
+    not to fill it (decision 19). So the share counts only the works kept here, not DeviantArt's mature ones, and
+    an artist whose portfolio is mostly mature, with a few safe works, can be sent.
 
     A work may be sent when the collect stage has left no mark on it, it was in the artist's latest answer from
-    DeviantArt, it passes _held, its title has no word of UNFIT_TITLE, and the plain rule finds no contact in its
-    title or its description. Every other text is held to that rule too, and one that fails is left out and
-    counted (see the module's docstring). The collect stage deletes nothing any more: a work it finds mature,
-    somebody else's, no longer public or titled with contact details stays here with a mark, and a work the
-    artist has taken down stays with the time it was last seen, which is before their profile was last stored.
-    Of the works that may be sent, the MAX_WORKS most recently published are, each with its thumbnail's size
-    when the collect stage has it; an adoptable or for-sale sheet (SHEET) only after all the others, as filler.
+    DeviantArt, it passes _held, its title has no word of UNFIT_TITLE, PROFANE_TITLE or GLUED_HATE, and the plain
+    rule finds no contact in its title or its description. Every other text is held to that rule too, and one that
+    fails is left out and counted (see the module's docstring). The collect stage deletes nothing any more: a work
+    it finds mature, somebody else's, no longer public or titled with contact details stays here with a mark, and
+    a work the artist has taken down stays with the time it was last seen, which is before their profile was last
+    stored. Of the works that may be sent, the MAX_WORKS most recently published are, each with its thumbnail's
+    size when the collect stage has it; an adoptable or for-sale sheet (SHEET, or a title of SHEET_TITLE) only
+    after all the others, as filler.
 
     Everything in an artist's row that comes from their works comes from the works that are sent, and a
     neighbour is always an artist who is sent too. A neighbour's row says which of their works to show beside
@@ -421,6 +470,7 @@ def _build(local: store.Snapshot, removed: Collection[str]) -> tuple[Rows, Rows,
     results = tagging.results(profiles.TAGGER, db=local, verifier=profiles.TAGGER)
     contacts = tagging.contacts(profiles.TAGGER, local)
     accounts = tagging.accounts(profiles.TAGGER, local)
+    declared = tagging.declared_ai(profiles.TAGGER, local)  # of every work kept, with tags or not
     works_of, fields = _collected(local)
     answers = library.answers(local)  # what each artist's latest answer emptied, and how many works it flags mature
     counts: Counter[str] = Counter()
@@ -462,8 +512,10 @@ def _build(local: store.Snapshot, removed: Collection[str]) -> tuple[Rows, Rows,
                 reason = _marked(marked_works[work_id][0])
             elif seen < stored:  # not in the answer their profile was last stored with: taken down, as far as is known
                 reason = "not_seen_lately"
-            elif UNFIT_TITLE.search(title or ""):
+            elif UNFIT_TITLE.search(title or "") or GLUED_HATE.search((title or "").casefold()):
                 reason = "unfit_title"
+            elif PROFANE_TITLE.search(title or ""):
+                reason = "profane_title"
             elif result and not reason and any(map(library.holds_contact, (title, result["description"]))):
                 reason = "contact_by_rule"
             # A page is one work in the database: a second work with the same page is not sent.
@@ -479,7 +531,8 @@ def _build(local: store.Snapshot, removed: Collection[str]) -> tuple[Rows, Rows,
         if left_out or website_emptied:
             site_url = site_domain = None
         slug = _slug(listed[key])
-        # The works DeviantArt flags mature are never kept, and count as adult works all the same (library.answers).
+        # The works DeviantArt flags mature are never kept, and count as adult works all the same (library.answers),
+        # once the number is filled in: it is not, for anybody kept on 2026-10-20 (decision 19, see build).
         adult, rated = sum(rating in ADULT_RATINGS for rating in ratings) + mature, len(ratings) + mature
         why = None
         if key in marked_artists:
@@ -494,6 +547,13 @@ def _build(local: store.Snapshot, removed: Collection[str]) -> tuple[Rows, Rows,
         # An account whose own words declare AI art or adult content, or whose words nobody has read as they are.
         elif accounts.get(key) in HELD_ACCOUNTS:
             why = HELD_ACCOUNTS[accounts.get(key)]
+        # The handle is the artist's name on the site, and their slug.
+        elif PROFANE_HANDLE.search(listed[key]):
+            why = "profane_handle"
+        # One work whose own words declare it AI-made is enough (the owner's, 2026-10-20): every work kept here,
+        # held back or not. ponytail: a work the collect stage marked as another author's counts too; none was.
+        elif any(declared.get(work_id) == "yes" for work_id, *_ in works_of.get(key, [])):
+            why = "ai_declared_work"
         # By either measure: the rating each work was given, or the profile stage's count over the artist's sheet
         # (a profile made before it counted has neither number, and is judged on the ratings alone).
         elif _too_many(adult, rated) or _too_many(
@@ -520,7 +580,12 @@ def _build(local: store.Snapshot, removed: Collection[str]) -> tuple[Rows, Rows,
         account = account_of[key]
         # The owner's (2026-10-19): an adoptable or for-sale sheet is the artist's work, but never leads. Sheets go
         # after every other work that may go, so one fills a slot only when there are fewer than MAX_WORKS others.
-        filler = {work_id for *_, result, _, work_id in ready if SHEET in (result.get("formats") or [])}
+        # A sheet is one the format reading or the title says is one.
+        filler = {
+            work_id
+            for _, _, title, _, result, _, work_id in ready
+            if SHEET in (result.get("formats") or []) or SHEET_TITLE.search(title or "")
+        }
         ready.sort(key=lambda work: work[-1] in filler)  # stable: the most recent first within each, as read
         counts["works_held_over_limit"] += sum(work[-1] not in filler for work in ready[MAX_WORKS:])
         counts["works_held_sheet_over_limit"] += sum(work[-1] in filler for work in ready[MAX_WORKS:])
@@ -680,8 +745,10 @@ def _removal(
     turn: all are purged here, and the account's hash is what goes on the lists, which bars the artist under any
     handle, there (artists.da_account) and here (library.account_removed). A handle goes on them by name only for
     a key with no account kept: the account may have left it, unseen here, and DeviantArt given it to somebody
-    else. With `follow` False only whom a hash names by handle is barred, and their account goes on the list only
-    where what is kept here agrees on it.
+    else. With `follow` False only whom a hash names is barred: by handle, or by the account their profile holds
+    when that account's hash is one of `listed` and what is kept here agrees on whose it is; and their account goes
+    on the list only where what is kept here agrees on it. The database's list holds only the account for a proof,
+    so a removal it made is applied here even when the run stops for something else.
 
     What is kept here can be wrong: a corrupt table of rename links once turned one removal into twelve, and five
     profiles given a removed account's hash made it six. So the two must agree: every key kept under a removed
@@ -706,7 +773,9 @@ def _removal(
         if keys and not keys <= library.linked({min(keys)}, local):
             odd |= keys - named
             disputed.add(held)
-    barred = reached if follow else named
+    # Whom the lists name by their account: every key kept under a listed account's hash, where those keys agree.
+    by_account = {key for key in holding if account[key] in listed and account[key] not in disputed}
+    barred = reached if follow else named | by_account
     hashes |= {store._hash(key) for key in barred - left if not account.get(key)}  # by name: no account kept
     hashes |= {held for key in barred if (held := account.get(key)) and (follow or held not in disputed)}
     return hashes, barred, len(store.named_by(hashes, local)), odd
@@ -753,10 +822,13 @@ def run(dry_run: bool, allow_delete: int | None = None, local: pathlib.Path | st
     with store.snapshot(local) as now:
         kept = set(library.artist_keys(now))
         here = store.removed_hashes(now)
-        # Whom the database's list names, and whom the store's names by the handle they are kept under: removals
-        # somebody made by name, there through the site or here (store.mark_removed). However many, each is the
-        # wish of the person named or of the owner.
-        named = _removal(remote | ({store._hash(key) for key in kept} & here), kept, now, False)
+        # Whom the database's list names, and whom the store's names by the handle or the account they are kept
+        # under: removals somebody made by name, there through the site or here (store.mark_removed). However many,
+        # each is the wish of the person named or of the owner.
+        theirs = {store._hash(key) for key in kept} | {
+            hash_ for key in kept if (hash_ := library.account_hash(key, now))
+        }
+        named = _removal(remote | (theirs & here), kept, now, False)
         whole = _removal(remote | here, kept, now)  # and all that the two lists come to here
         # Beyond them: each artist a removal reaches only through a disagreement in what is kept here (whole[3]),
         # and each hash the store's list adds that is no handle or account of an artist barred here (a site, a
