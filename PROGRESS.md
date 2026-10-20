@@ -1403,7 +1403,14 @@ Deadlocks are gone as written, and nothing else stands beyond the accepted limit
 - **Removal by account:** a removal the lists name only by account is now applied here even when the guard stops.
 - **Tests:** the critic's three uncaught breaks are now caught; 5,024 tests pass.
 
-**Running:** the two new GPU stages, suggestive and political (started 10:40, about 1 h 40 min). Then push's seventh critic on the real data.
+**The two new GPU stages finished** (by 13:05 on 10-20), with no failures.
+- **Suggestive, all 4,997 works asked why:**
+  - 510 are suggestive only for blood and wounds, so they are now shown and count as safe.
+  - 4,220 are sexualised, 250 both and 17 unclear; all of those stay held.
+- **Political:** all 131 candidates checked.
+- **A flaky collect test was fixed:** it depended on whether a second ticked over between two handles' turns. It now has a still clock and passes 10 of 10.
+
+**Running:** push's seventh critic, judging a build on the real data against the owner's content rules.
 
 **The disk filled up.** Drive F: reached 0 bytes free at about 19:45 on 10-19, and two image-check turns failed to open the store and were retried. The cause was this project: 20 finished builder worktrees, each with its own Python environment (73 GB), and critics' temporary test folders (9.5 GB).
 - **Every branch was merged,** so the worktrees were removed, with the branches kept, and the temporary folders deleted. F: has 83 GB free.
