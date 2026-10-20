@@ -107,7 +107,7 @@ The removal check reads the removal requests that a proof code was given out for
 ```bash
 uv run python -m pipeline.removals --dry-run
 uv run python -m pipeline.removals
-uv run python -m pipeline.removals --pending              # the open requests: slug, id, public handle
+uv run python -m pipeline.removals --pending              # the open requests: slug, id, public handle, notes
 uv run python -m pipeline.removals --grant ID --reject ID
 ```
 

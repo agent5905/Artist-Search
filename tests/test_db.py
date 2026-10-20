@@ -1025,7 +1025,10 @@ def test_a_function_made_later_is_not_the_publics_to_call():
 #    site's server function, which calls them with a secret key: so do these tests.
 
 REQUESTS = """
-select r.artist_slug as slug, r.note, r.requests::int as requests, r.first_at <= r.last_at as in_order
+select r.artist_slug as slug,
+       array(select n.e ->> 'note' from jsonb_array_elements(r.notes) with ordinality as n (e, i) order by n.i)
+         as notes,
+       r.requests::int as requests, r.first_at <= r.last_at as in_order
 from public.removal_requests r
 where r.artist_slug like 'zz-test-%' order by r.artist_slug
 """
@@ -1083,23 +1086,25 @@ def test_an_artists_request_survives_whatever_is_asked_after_it(seeded):
     ask("zz-test-nobody", "x")  # the same answer for a slug that does not exist, and nothing logged
     assert db.sql(REQUESTS) == []
 
-    # The artist asks, with a note. Then a script asks six more times, with notes of its own and without.
+    # The artist asks, with a note. Then a script asks twelve more times, with notes of its own and without.
     ask(GONE, "It is me. Please take my work down.")
-    for n in range(6):
+    for n in range(12):
         ask(GONE, f"junk {n}" if n % 2 else None)
     ask(STAY, "y" * 5000)  # a long note cannot fill the table
     ask("zz-test-hidden")  # a hidden artist's request is logged too
-    # One row per artist: the first note is still there, and what came after only counted.
+    # One row per artist: the artist's note is still there, first, then the latest four (the sixth critic's: the
+    # latest note took the place of the artist's), and the rest only counted.
+    kept = ["It is me. Please take my work down.", "junk 5", "junk 7", "junk 9", "junk 11"]
     assert db.sql(REQUESTS) == [
-        {"slug": GONE["slug"], "note": "It is me. Please take my work down.", "requests": 7, "in_order": True},
-        {"slug": "zz-test-hidden", "note": None, "requests": 1, "in_order": True},
-        {"slug": STAY["slug"], "note": "y" * 300, "requests": 1, "in_order": True},
+        {"slug": GONE["slug"], "notes": kept, "requests": 13, "in_order": True},
+        {"slug": "zz-test-hidden", "notes": [], "requests": 1, "in_order": True},
+        {"slug": STAY["slug"], "notes": ["y" * 300], "requests": 1, "in_order": True},
     ]
-    # The service role can read it.
-    mine = {"artist_slug": f"eq.{GONE['slug']}", "select": "note,requests"}
-    assert db.data_api("GET", "removal_requests", "secret", params=mine).json() == [
-        {"note": "It is me. Please take my work down.", "requests": 7}
-    ]
+    # The service role can read it, each note with when it came.
+    mine = {"artist_slug": f"eq.{GONE['slug']}", "select": "notes,requests"}
+    [row] = db.data_api("GET", "removal_requests", "secret", params=mine).json()
+    assert [note["note"] for note in row["notes"]] == kept and row["requests"] == 13
+    assert [set(note) for note in row["notes"]] == [{"at", "note"}] * 5
     # And nobody's visibility changed.
     assert db.sql(SHOWN) == shown
     assert visible(GONE) and visible(STAY)
@@ -1136,7 +1141,7 @@ def test_no_public_call_changes_what_is_shown_or_spoils_a_code(seeded):
     # The log holds one row for each artist asked about, with how often (the first code asked for filed it), and
     # none for the unknown slug.
     assert db.sql(REQUESTS) == [
-        {"slug": slug, "note": None, "requests": 1 + asked.count(slug), "in_order": True}
+        {"slug": slug, "notes": [], "requests": 1 + asked.count(slug), "in_order": True}
         for slug in sorted(targets[:-1])
     ]
 
@@ -1248,9 +1253,9 @@ from public.removal_requests where artist_slug like 'zz-test-%' and outcome is n
 # Closed requests that still hold anything of an artist: there must be none.
 NAMED_WHEN_CLOSED = """
 select count(*)::int as n from public.removal_requests
-where outcome is not null and (artist_slug not like 'closed:%' or note is not null or da_username is not null
-                               or site_url is not null or site_domain is not null or da_account is not null
-                               or due_at is not null)
+where outcome is not null and (artist_slug not like 'closed:%' or note is not null or notes <> '[]'
+                               or da_username is not null or site_url is not null or site_domain is not null
+                               or da_account is not null or due_at is not null or networks <> '{}')
 """
 
 
@@ -1307,7 +1312,7 @@ def test_a_rejected_artist_can_ask_again(seeded):
     ask(STAY, "first")
     assert db.rpc("reject_removal", {"p_id": request_id(STAY)}, "secret") is True
     ask(STAY, "second")
-    assert db.sql(REQUESTS) == [{"slug": STAY["slug"], "note": "second", "requests": 1, "in_order": True}]
+    assert db.sql(REQUESTS) == [{"slug": STAY["slug"], "notes": ["second"], "requests": 1, "in_order": True}]
 
 
 def test_a_proof_removes_the_artist_it_was_bound_to_and_not_whoever_the_slug_lists_now(seeded):
@@ -1766,6 +1771,8 @@ def test_removal_tables_hold_no_long_text():
         post("removal_requests", {"artist_slug": "zz-test-alpha", "note": "n" * 301}), "removal_requests_short"
     )
     assert refused(post("removal_requests", {"artist_slug": "zz-test-".ljust(81, "a")}), "removal_requests_short")
+    for notes in ([{"at": "2026-10-19T00:00:00+00:00", "note": IMAGE}], {"note": "not a list"}):
+        assert refused(post("removal_requests", {"artist_slug": "zz-test-alpha", "notes": notes}), "few_notes")
     assert refused(post("removed", {"key_hash": IMAGE}), "removed_key_is_a_hash")
     assert refused(post("removed", {"key_hash": "da:zz-test-alpha"}), "removed_key_is_a_hash")  # a name, not a hash
     assert db.sql("""
@@ -1991,7 +1998,8 @@ def test_a_request_from_the_page_is_bound_to_whom_it_showed_while_a_push_holds_t
     assert as_the_site("site_request_removal", p_slug=GONE["slug"], p_note="it is me", p_ticket=shown["ticket"])
     as_the_site("site_removal_code", p_slug=GONE["slug"], p_ticket=shown["ticket"], p_network="zz-test-net")
     made = db.sql(
-        "select da_username, site_domain, da_account, code_at is not null as coded, note, network is not null as net "
+        "select da_username, site_domain, da_account, code_at is not null as coded, notes -> 0 ->> 'note' as note, "
+        "cardinality(networks) = 1 as net "
         f"from public.removal_requests where artist_slug = '{GONE['slug']}' and outcome is null"
     )
     assert made == [
@@ -2008,13 +2016,16 @@ def test_a_request_from_the_page_is_bound_to_whom_it_showed_while_a_push_holds_t
 
 def test_the_verifier_takes_turns_between_the_networks_codes_were_asked_from(seeded):
     """The final critic's flood: codes asked for from one network ahead of a real one held it back by their number.
-    due_removals takes each network's request due longest in turn, so a flood holds back only its own."""
+    due_removals takes each network's request due longest in turn, so a flood holds back only its own. The sixth
+    critic's: a code asked for again moved the request into the asker's turn, behind the flood. A request is in the
+    turns of every network that asked for it, and taken in the first it comes to."""
     flood = CROWD[:3]
     fresh(*flood, STAY)
     for row in flood:
         as_the_site("site_removal_code", p_slug=row["slug"], p_network="zz-test-flood")
     time.sleep(1)
     as_the_site("site_removal_code", p_slug=STAY["slug"], p_network="zz-test-artist")
+    as_the_site("site_removal_code", p_slug=STAY["slug"], p_network="zz-test-flood")  # the flood asks for it too
     due = db.rpc("due_removals", {"p_now": "2999-01-01T00:00:00+00:00", "p_limit": None}, "secret")
     mine = [row["artist_slug"] for row in due if row["artist_slug"].startswith("zz-test-")]
     assert mine == [flood[0]["slug"], STAY["slug"], flood[1]["slug"], flood[2]["slug"]]

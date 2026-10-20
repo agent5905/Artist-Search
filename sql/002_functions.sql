@@ -562,21 +562,28 @@ as $$
 $$;
 
 -- Logs a request for the artist its page showed (request_binding), bound to their handle, site and account,
--- with its note. Asking again for the same only counts, and moves nothing in the verifier's queue; a note that
--- says something takes the place of the one kept, so a stranger's empty first request hides nothing the artist
--- writes after it. Always returns true, whatever the slug, so it gives nothing away.
+-- with its note and when it came. Asking again for the same only counts, and moves nothing in the verifier's
+-- queue; a note that says something is kept beside those before it. Five at most: the first and the latest four,
+-- so the owner reads what the artist wrote whoever asks before or after them, and nobody can fill the row.
+-- Always returns true, whatever the slug, so it gives nothing away.
 create or replace function public.request_removal(p_slug text, p_note text default null, p_ticket text default null)
 returns boolean
 language plpgsql security definer set search_path = ''
 as $$
+declare
+  said constant text := left(nullif(btrim(p_note), ''), 300);
 begin
   perform pg_advisory_xact_lock(4207); -- the removals' lock: see request_binding
-  insert into public.removal_requests as r (artist_slug, note, da_username, site_url, site_domain, da_account)
-  select b.slug, left(nullif(btrim(p_note), ''), 300), b.da_username, b.site_url, b.site_domain, b.da_account
+  insert into public.removal_requests as r (artist_slug, notes, da_username, site_url, site_domain, da_account)
+  select b.slug,
+         case when said is null then '[]' else jsonb_build_array(jsonb_build_object('at', now(), 'note', said)) end,
+         b.da_username, b.site_url, b.site_domain, b.da_account
   from public.request_binding(p_slug, p_ticket) b
   on conflict (artist_slug, da_key, site_key) where outcome is null do update set
     last_at = now(), requests = r.requests + 1, da_account = coalesce(r.da_account, excluded.da_account),
-    note = coalesce(excluded.note, r.note);
+    -- A sixth note takes the place of the second: one comes at a time.
+    notes = case when jsonb_array_length(r.notes || excluded.notes) > 5 then (r.notes || excluded.notes) - 1
+                 else r.notes || excluded.notes end;
   return true;
 end
 $$;
@@ -584,19 +591,23 @@ $$;
 -- The proof code for a slug: derived from the slug and a secret, so it is the same every time, it is
 -- stored nowhere, and nobody without the secret can work it out. Service role only: the verifier asks
 -- it for the code to look for. Null when the secret is missing.
+-- What the secret signs begins with words of its own for each use: 'removal code ' here, 'claim ticket ' for a
+-- ticket, '<budget> visitor ' and '<budget> network ' for client_wait and the verifier's turns. So a code, which
+-- anybody gets for any slug they like, is never a part of a ticket's signature or of a network's key.
 create or replace function public.removal_code(p_slug text) returns text
 language sql stable security definer set search_path = ''
 as $$
   select 'artist-search-removal-'
-      || left(encode(extensions.hmac(coalesce(p_slug, ''), secret, 'sha256'), 'hex'), 32)
+      || left(encode(extensions.hmac('removal code ' || coalesce(p_slug, ''), secret, 'sha256'), 'hex'), 32)
   from public.removal_secret
 $$;
 
 -- Tells the artist their code, and from then on the verifier looks for it: the request for the artist its
 -- page showed (request_binding) is filed if it was not, and its checks start over (hourly for a day, then
 -- every six hours for two weeks, then weekly: pipeline/removals.py), due at once unless it already was, in the
--- turn of the network asking (p_network: due_removals). The code never changes. The answer has the same shape
--- whether the slug is unknown, hidden or visible; only an artist's slug is filed.
+-- turns of the network asking (p_network: due_removals) as well as those of every network that asked before,
+-- up to 30 (as many as a run looks at). The code never changes. The answer has the same shape whether the slug
+-- is unknown, hidden or visible; only an artist's slug is filed.
 create or replace function public.start_removal_proof(p_slug text, p_ticket text default null, p_network text default null)
 returns text
 language plpgsql security definer set search_path = ''
@@ -604,34 +615,42 @@ as $$
 begin
   perform pg_advisory_xact_lock(4207); -- the removals' lock: see request_binding
   insert into public.removal_requests as r
-    (artist_slug, da_username, site_url, site_domain, da_account, code_at, due_at, network)
+    (artist_slug, da_username, site_url, site_domain, da_account, code_at, due_at, networks)
   select b.slug, b.da_username, b.site_url, b.site_domain, b.da_account, now(), now(),
-         encode(extensions.hmac('removal network ' || coalesce(p_network, ''), s.secret, 'sha256'), 'hex')
+         array[encode(extensions.hmac('removal network ' || coalesce(p_network, ''), s.secret, 'sha256'), 'hex')]
   from public.request_binding(p_slug, p_ticket) b, public.removal_secret s
   on conflict (artist_slug, da_key, site_key) where outcome is null do update set
     code_at = now(), due_at = least(r.due_at, now()), da_account = coalesce(r.da_account, excluded.da_account),
-    network = excluded.network;
+    networks = case when cardinality(r.networks) >= 30 or excluded.networks <@ r.networks then r.networks
+                    else r.networks || excluded.networks end;
   return public.removal_code(p_slug);
 end
 $$;
 
 -- Service role only: the open requests a code was given out for that are due by p_now, p_limit at most, for
 -- the verifier (pipeline/removals.py). In turns between the networks the codes were asked from: each one's
--- request due longest, then each one's next, and so on, the one due longest first within a turn. So a network
--- that asks for many codes holds back only its own, and a flood from many is as slow as their number, not as
--- the number of codes they asked for.
+-- request due longest, then each one's next, and so on, the one due longest first within a turn. A request asked
+-- for from several networks is in the turns of each, and is taken in the first it comes to. So a network that
+-- asks for many codes holds back only its own, one that asks for somebody else's code too takes nothing from them
+-- (asking only ever brings a request forward), and a flood from many is as slow as their number, not as the
+-- number of codes they asked for.
 create or replace function public.due_removals(p_now timestamptz, p_limit int)
 returns table (id bigint, artist_slug text, code_at timestamptz, da_username text, site_url text, site_domain text,
                da_account text)
 language sql stable set search_path = ''
 as $$
-  select q.id, q.artist_slug, q.code_at, q.da_username, q.site_url, q.site_domain, q.da_account
+  select r.id, r.artist_slug, r.code_at, r.da_username, r.site_url, r.site_domain, r.da_account
   from (
-    select r.*, row_number() over (partition by r.network order by r.due_at, r.code_at, r.id) as turn
-    from public.removal_requests r
-    where r.outcome is null and r.code_at is not null and r.due_at <= p_now
-  ) q
-  order by q.turn, q.due_at, q.code_at, q.id
+    select q.id, min(q.turn) as turn
+    from (
+      select r.id, row_number() over (partition by n.network order by r.due_at, r.code_at, r.id) as turn
+      from public.removal_requests r left join lateral unnest(r.networks) as n (network) on true
+      where r.outcome is null and r.code_at is not null and r.due_at <= p_now
+    ) q
+    group by q.id
+  ) t
+  join public.removal_requests r on r.id = t.id
+  order by t.turn, r.due_at, r.code_at, r.id
   limit p_limit
 $$;
 
@@ -656,15 +675,15 @@ end
 $$;
 
 -- Service role only. Closes an open request with the verifier's or the owner's answer, and keeps nothing
--- of the artist in it: its slug gives way to a random key and the handle, site, account and note go.
+-- of the artist in it: its slug gives way to a random key and the handle, site, account and notes go.
 -- Returns whether there was one open.
 create or replace function public.close_request(p_id bigint, p_outcome text) returns boolean
 language sql set search_path = ''
 as $$
   with closed as (
     update public.removal_requests
-    set artist_slug = 'closed:' || gen_random_uuid(), outcome = p_outcome, note = null, da_username = null,
-        site_url = null, site_domain = null, da_account = null, due_at = null, network = null
+    set artist_slug = 'closed:' || gen_random_uuid(), outcome = p_outcome, note = null, notes = '[]',
+        da_username = null, site_url = null, site_domain = null, da_account = null, due_at = null, networks = '{}'
     where id = p_id and outcome is null
     returning 1
   )
