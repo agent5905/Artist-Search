@@ -1301,6 +1301,11 @@ What fails is the content. Nothing checks fitness beyond sex and gore, so the fi
 - Every path that writes artists, works or neighbours takes the removal lock first.
 - Static SQL tests where they can catch a break offline, and a live test for each of the rest.
 
+**Removals round 9: merged.** Both findings are fixed:
+- **Reissued handles:** a proof bars the account and the handle the profile answers under now, never an older handle by name. Local data under the account's old handles is still purged, but an old handle goes on neither removal list, since DeviantArt may have given it to someone else.
+- **Deadlocks:** every write to artists, works, neighbours and the removal list takes the removal lock first, through statement-level triggers, so loads and removals take turns. A batch that read its data before waiting is retried once.
+- **Tests:** all 19 SQL breaks the critic tried, and all 3 page breaks, are now caught offline. `tests/test_db.py` gains live tests for the deadlock, the handle rule, the ticket's precedence and the 30-network cap. The live suite at setup is the last gate the eighth critic named.
+
 **The disk filled up.** Drive F: reached 0 bytes free at about 19:45 on 10-19, and two image-check turns failed to open the store and were retried. The cause was this project: 20 finished builder worktrees, each with its own Python environment (73 GB), and critics' temporary test folders (9.5 GB).
 - **Every branch was merged,** so the worktrees were removed, with the branches kept, and the temporary folders deleted. F: has 83 GB free.
 - **The store's integrity check passes.** No reading was lost.
