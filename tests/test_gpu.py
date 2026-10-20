@@ -65,24 +65,47 @@ def test_the_artwork_check_waits_while_paused_before_every_request(tmp_path, mon
     assert waits == [(15, []), (15, ["/api/show"])] and sent == ["/api/show", "/api/chat"]
 
 
-def test_the_content_check_waits_while_paused_before_every_request(tmp_path, monkeypatch, capsys):
+ANSWERS = {  # each question's answer, by its prompt, and the count it shows up in
+    tagging.CONTENT_PROMPT: ({"shows": "fetish", "unfit": "yes"}, "unfit"),
+    tagging.SUGGESTIVE_PROMPT: ({"shows": tagging.BLOOD, "blood_only": "yes"}, "blood_only"),
+    tagging.POLITICAL_PROMPT: ({"shows": tagging.REAL_PERSON, "real_person": "yes"}, "political"),
+    tagging.NAMED_PROMPT: ({"says": "FAKE-WORDS", "names": "no"}, None),
+}
+
+
+def one_work(tmp_path, monkeypatch, tags=()):
+    """A store with one invented work and its cached image. Returns its id and the image's fingerprint."""
     monkeypatch.setattr(config, "CACHE_DIR", tmp_path)
     monkeypatch.setattr(config, "LOCAL_DB", tmp_path / "pipeline.sqlite")
-    work_id = "00000000-0000-4000-A000-000000000001"
-    library.save_image(work_id, "image/jpeg", b"\xff\xd8\xff" + b"FAKE-IMAGE-BYTES")
+    work_id, jpeg = "00000000-0000-4000-A000-000000000001", b"\xff\xd8\xff" + b"FAKE-IMAGE-BYTES"
+    library.save_image(work_id, "image/jpeg", jpeg)
     work = {"work_id": work_id, "page_url": "https://www.deviantart.com/zz-fake-alpha/art/FAKE-TITLE-1"}
-    work |= {"title": "FAKE-TITLE", "tags": [], "thumb_url": "https://images-wixmp-zzfake.wixmp.com/f/FAKE.jpg"}
+    work |= {"title": "FAKE-TITLE", "tags": list(tags), "thumb_url": "https://images-wixmp-zzfake.wixmp.com/f/FAKE.jpg"}
     work |= {"published": "1"}
     library.store_artist(
         "da:zz-fake-alpha", user_id=None, tagline=None, specialty=None, level=None, website=None, works=[work]
     )
+    return work_id, library.fingerprint(jpeg)
+
+
+@pytest.mark.parametrize("stage", ["content", "suggestive", "political"])
+def test_an_image_check_waits_while_paused_before_every_request(tmp_path, monkeypatch, capsys, stage):
+    work_id, read = one_work(tmp_path, monkeypatch, ["propaganda"] if stage == "political" else [])
+    if stage == "suggestive":  # asked only of a work rated suggestive
+        tagging.results()  # so that the tables exist
+        row = (work_id, profiles.TAGGER, tagging.FORMAT_VERSION, '{"formats": [], "rating": "suggestive"}', "1", read)
+        with sqlite3.connect(config.LOCAL_DB) as conn:
+            conn.execute("INSERT INTO work_format VALUES (?, ?, ?, ?, ?, ?)", row)
+        conn.close()
     (tmp_path / config.PAUSE_FILE).touch()
-    sent, waits = [], []
+    sent, waits, counted = [], [], []
 
     def ollama(request):
         sent.append(request.url.path)
         (tmp_path / config.PAUSE_FILE).touch()  # the owner pauses again after every request
-        answer = {"shows": "fetish", "unfit": "yes"}
+        prompt = json.loads(request.content).get("messages", [{}])[0].get("content")  # none for /api/show
+        answer, count = ANSWERS.get(prompt, ({}, None))
+        counted.append(count)
         return httpx.Response(200, json={"capabilities": ["vision"], "message": {"content": json.dumps(answer)}})
 
     def sleep(seconds):  # and resumes after one wait
@@ -90,9 +113,31 @@ def test_the_content_check_waits_while_paused_before_every_request(tmp_path, mon
         (tmp_path / config.PAUSE_FILE).unlink()
 
     monkeypatch.setattr(time, "sleep", sleep)
-    tagging.main([*gpu.STAGES["content"][1:]], transport=httpx.MockTransport(ollama))  # as the worker runs it
-    assert json.loads(capsys.readouterr().out)["unfit"] == 1
-    assert waits == [(15, []), (15, ["/api/show"])] and sent == ["/api/show", "/api/chat"]
+    tagging.main([*gpu.STAGES[stage][1:]], transport=httpx.MockTransport(ollama))  # as the worker runs it
+    assert json.loads(capsys.readouterr().out)[counted[1]] == 1
+    asked = ["/api/show", "/api/chat", *(["/api/chat"] if stage == "political" else [])]  # the image, then its words
+    assert sent == asked and waits == [(15, asked[:n]) for n in range(len(asked))]
+
+
+def test_status_counts_why_and_the_political_check_of_the_works_they_ask_of(tmp_path, monkeypatch):
+    work_id, read = one_work(tmp_path, monkeypatch, ["propaganda"])
+    tagging.results()  # so that the tables exist
+    words = tagging.political_print(read, "FAKE-TITLE", json.dumps(["propaganda"]))
+    rows = {
+        "work_format": (work_id, profiles.TAGGER, tagging.FORMAT_VERSION, '{"rating": "suggestive"}', "1", read),
+        "work_suggestive": (work_id, profiles.TAGGER, tagging.SUGGESTIVE_VERSION, '{"blood_only": true}', "1", read),
+        "work_political": (work_id, profiles.TAGGER, tagging.POLITICAL_VERSION, '{"political": true}', "1", words),
+    }
+    with sqlite3.connect(config.LOCAL_DB) as conn:
+        for table, row in rows.items():
+            conn.execute(f"INSERT INTO {table} VALUES (?, ?, ?, ?, ?, ?)", row)
+    conn.close()
+    assert "  suggestive works asked why: 1 done, 0 to go; 0 in the last hour" in gpu.status()
+    assert "  political candidates checked: 1 done, 0 to go; 0 in the last hour" in gpu.status()
+    with sqlite3.connect(config.LOCAL_DB) as conn:  # its words changed since the political check read them
+        conn.execute("UPDATE works SET tags = ?", (json.dumps(["propaganda", "zzmore"]),))
+    conn.close()
+    assert "  political candidates checked: 0 done, 1 to go; 0 in the last hour" in gpu.status()
 
 
 def test_status_reads_a_cache_with_no_store_and_a_store_no_stage_has_filled(tmp_path, monkeypatch):

@@ -250,7 +250,9 @@ def artist(
     verified tags), "explicit" or "not_artwork": True, "declared" (AI: "yes", "unclear", None for not read),
     "contact" ("yes", None for not read), "rating" ("suggestive", "explicit", None for not rated), "artwork"
     (False when the artwork check found it is not, None for not checked), "fit" (False when the content check
-    found it unfit, None for not checked), "formats" (from tagging.FORMATS), "title", "thumb".
+    found it unfit, None for not checked), "formats" (from tagging.FORMATS), "title", "thumb", "blood_only" (True or
+    False: why a work rated suggestive is so was asked; not asked without it) and "political" (True or False: the
+    political check was asked; not asked without it, which for a title of no political word is as False).
     And "size": its thumbnail's (width, height), as the API gave it: without one, none is kept for the work.
     profile: "written", "excluded" (the profile stage ruled them out) or None (no row there yet).
     account: what their username and tagline were read to say (tagging.ACCOUNT_ANSWERS), or None for not read.
@@ -307,6 +309,13 @@ def artist(
         if (fit := edit.get("fit", True)) is not None:
             checked = json.dumps({"shows": tagging.FIT if fit else "fetish", "fit": fit})
             rows.append(("work_content", (work["id"], profiles.TAGGER, tagging.CONTENT_VERSION, checked, AT, image)))
+        if "blood_only" in edit:
+            why = json.dumps({"shows": tagging.BLOOD, "blood_only": edit["blood_only"]})
+            rows.append(("work_suggestive", (work["id"], profiles.TAGGER, tagging.SUGGESTIVE_VERSION, why, AT, image)))
+        if "political" in edit:
+            checked = json.dumps({"shows": "none", "named": "no", "political": edit["political"]})
+            both = tagging.political_print(image, work["title"], json.dumps(work["tags"]))
+            rows.append(("work_political", (work["id"], profiles.TAGGER, tagging.POLITICAL_VERSION, checked, AT, both)))
         rows.append(("style_vectors", (work["id"], "csd", style_vector(angle, n), image)))
     if tagline_contact:
         read = tagging.tagline_print(f"FAKE-TAGLINE {handle}")
@@ -619,16 +628,21 @@ HELD = {
     "unfit_image": {"fit": False},
     "fit_not_checked": {"fit": None},
     "unfit_title": {"title": "FAKE-TITLE Vore-verse: zz"},
+    "unfit_title glued to other words": {"title": "FAKE-TITLE spaceNaziMechs zz"},
+    "profane_title": {"title": "FAKE-TITLE Piss off zz"},
+    "profane_title glued": {"title": "FAKE-TITLE zzfuckery zz"},
     "explicit": {"explicit": True},
     "explicit by rating": {"rating": "explicit"},
-    "declared_ai": {"declared": "yes"},
     "words_not_read for AI": {"declared": None},
     "contact_in_words": {"contact": "yes"},
     "words_not_read": {"contact": None},
     "not_rated": {"rating": None},
-    "suggestive": {"rating": "suggestive"},
+    "suggestive": {"rating": "suggestive", "blood_only": False},
+    "suggestive_not_checked": {"rating": "suggestive"},
+    "political": {"political": True},
+    "political_not_checked": {"title": "FAKE-TITLE Election poster zz"},  # a candidate nobody has asked about
     "bad_address": {"thumb": "https://yy-fake.deviantart.net/f/FAKE-THUMB-NOT-ON-WIXMP.jpg"},
-}
+}  # and declared_ai: one such work holds back its artist (ai_declared_work, below)
 
 
 @pytest.mark.parametrize("why", HELD)
@@ -655,6 +669,17 @@ def test_a_work_declared_unclear_about_ai_is_sent_and_only_a_safe_rating_is(fake
     assert counts["works_sent"] == 5 and counts["works_held_not_rated"] == 1
 
 
+def test_a_work_rated_suggestive_for_blood_alone_is_sent_and_counts_as_safe_in_the_artists_share(fake):
+    """The owner's (2026-10-20): blood shows, pin-ups do not. Three works of ten rated suggestive is 30 percent."""
+    artist(ALPHA, 10, edits={n: {"rating": "suggestive", "blood_only": True} for n in (1, 4, 7)}, angle=0.0)
+    artist(BRAVO, 10, edits={n: {"rating": "suggestive", "blood_only": False} for n in (1, 4, 7)}, angle=0.5)
+    artist(CHARLIE, 10, edits={n: {"rating": "suggestive"} for n in (1, 4, 7)}, angle=1.0)  # not asked why yet
+    counts = push.run(False)
+    assert list(sent_artists(fake)) == [ALPHA] and counts["works_sent"] == 10
+    assert counts["artists_held_adult_portfolio"] == 2
+    assert counts["works_held_suggestive"] == counts["works_held_suggestive_not_checked"] == 3
+
+
 # Which artists go.
 
 LEFT_OUT = {
@@ -664,7 +689,8 @@ LEFT_OUT = {
     "adult_account": {"account": "adult"},
     "account_not_read": {"account": None},
     "adult_portfolio": {"count": 10, "edits": {n: {"rating": "suggestive"} for n in (1, 4, 7)}},  # 3 of 10 rated
-    "too_few_works": {"count": 5, "edits": {0: {"rating": None}, 3: {"declared": "yes"}}},  # 3 left
+    "too_few_works": {"count": 5, "edits": {0: {"rating": None}, 3: {"contact": "yes"}}},  # 3 left
+    "ai_declared_work": {"count": 10, "edits": {6: {"declared": "yes", "result": None}}},  # one of ten, untagged
 }
 
 
@@ -692,7 +718,7 @@ def test_the_thresholds_are_the_named_ones(fake):
     # Exactly 4 works that may go, with 2 of 7 suggestive or not rated yet (28.6 percent): sent.
     artist(ALPHA, 7, edits={0: {"rating": "suggestive"}, 1: {"rating": None}, 2: {"not_artwork": True}})
     # Fewer than 30 percent, and one work short.
-    artist(BRAVO, 10, edits={0: {"rating": None}, 1: {"rating": None}} | {n: {"declared": "yes"} for n in range(2, 7)})
+    artist(BRAVO, 10, edits={0: {"rating": None}, 1: {"rating": None}} | {n: {"contact": "yes"} for n in range(2, 7)})
     # 3 of 10 is 30 percent: out, though 7 works could go.
     artist(CHARLIE, 10, edits={n: {"rating": "explicit"} for n in (0, 1, 2)})
     # 30 percent of the rated works, whatever else holds them back: 3 of 10 again, two of them not artwork.
@@ -728,6 +754,22 @@ def test_a_handle_that_would_make_a_test_rows_slug_is_never_sent(fake):
     assert [row["slug"] for row in fake.loads[-1][0]] == [ALPHA] and first["artists_held_slug_unusable"] == 1
     assert "zz-fake-own" not in fake.sent()
     assert push.run(False)["artists_sent"] == 1  # and so the next run is not stopped by a row of its own
+
+
+def test_a_handle_that_swears_holds_back_its_artist_and_mild_words_or_words_inside_others_hold_back_nothing(fake):
+    """The sixth critic's: two real handles with "fuck" and "shit" were sent. The handle is the artist's name and
+    slug on the site; it is words glued together, so a swear word counts at either end of a run of letters."""
+    swearing = ["yy-fake-fuckit", "yy-fake-shitbird", "yy-fake-grimbastard"]
+    fine = ["yy-fake-goshitsme", "yy-fake-damnit", "yy-fake-scunthorpe", "yy-fake-assassin"]
+    for n, handle in enumerate(swearing + fine):
+        artist(handle, 4, angle=0.2 * n)
+    titles = ["Damn, that sucks", "Scunthorpe cocktail", "Ashitaka the assassin", "Shitake grove", "Crap weather"]
+    artist(ALPHA, 5, edits={n: {"title": f"FAKE-TITLE {title} zz"} for n, title in enumerate(titles)}, angle=2.0)
+    counts = push.run(False)
+    assert sorted(sent_artists(fake)) == sorted([ALPHA, *fine]) and counts["artists_held_profane_handle"] == 3
+    assert counts["works_sent"] == 5 + 4 * len(fine)  # each of ALPHA's titles too
+    assert counts["works_held_profane_title"] == 4  # the invented titles that carry "yy-fake-fuckit"
+    assert not any(word in fake.sent() for handle in swearing for word in of_artist(handle))
 
 
 # An artist's own words, and private contacts (hard rule 6).
@@ -1143,7 +1185,7 @@ def test_running_twice_sends_the_same_rows_and_an_artist_who_stops_qualifying_is
 
     assert fake.calls[-4:] == ["listing", "removed", "delete", "load"]
     assert third["artists_deleted_from_database"] == 1 and third["works_deleted_from_database"] == 1
-    assert third["artists_held_adult_portfolio"] == 1 and third["works_held_suggestive"] == 1
+    assert third["artists_held_adult_portfolio"] == 1 and third["works_held_suggestive_not_checked"] == 1
     assert sorted(row["slug"] for row in fake.artists.values()) == [ALPHA, CHARLIE]
     assert not any(word in fake.held() for word in of_artist(BRAVO))  # their works, and their place as a neighbour
     assert not any(text in fake.held() for text in of_work(works[3]))
@@ -1446,6 +1488,21 @@ def test_a_sheet_is_never_picked_to_show_beside_another_artist(fake):
     push.run(False)
     picks = {(row["artist_slug"], row["neighbor_slug"]): row.get("picks") for row in fake.loads[-1][2]}
     assert len(picks[ALPHA, BRAVO]) >= push.MIN_PICKS and all(pick < 3 for pick in picks[ALPHA, BRAVO])
+
+
+def test_a_work_titled_as_an_adoption_or_a_sale_is_a_sheet_though_the_format_reading_did_not_say_so(fake):
+    """The sixth critic's: 679 sent works titled adopt, auction, for sale or OTA were read as portraits and the
+    like, and led their artist or were picked beside others. The title says it as well as the format reading."""
+    made = artist(ALPHA, 6, edits={0: {"title": "FAKE-TITLE Adopt auction [OPEN] zz"}}, angle=0.0)
+    artist(BRAVO, 6, angle=0.001)
+    counts = push.run(False)
+    mine = [row["page_url"] for row in fake.loads[-1][1] if row["artist_slug"] == ALPHA]
+    assert mine == [made[n]["page"] for n in (1, 2, 3, 4, 5, 0)] and counts["sheets_sent_as_filler"] == 1
+    picks = {(row["artist_slug"], row["neighbor_slug"]): row.get("picks") for row in fake.loads[-1][2]}
+    assert len(picks[BRAVO, ALPHA]) >= push.MIN_PICKS and 5 not in picks[BRAVO, ALPHA]
+    sheets = ["Adoptable #12", "OTA | Soda Fox", "zz YCH [open] 3 slots", "Dragon for sale", "Adopt - Open", "{open}"]
+    others = ["Open World", "Our commissions are open", "The open sea", "Opening night", "Rota", "Psyche"]
+    assert all(map(push.SHEET_TITLE.search, sheets)) and not any(map(push.SHEET_TITLE.search, others))
 
 
 # An adult portfolio, by the profile stage's count over the artist's sheet (round 3).
@@ -1985,6 +2042,34 @@ def test_many_hashes_of_nobody_here_are_as_many_people(fake):
     with pytest.raises(push.Stop, match="bar 6 people"):
         push.run(False)
     assert fake.removed == [] and library.artist_keys() == [f"da:{ALPHA}"]
+
+
+@pytest.mark.parametrize("where", ["there", "here"])
+def test_a_removal_by_account_alone_is_applied_here_too_when_the_guard_stops_for_something_else(fake, where):
+    """The sixth critic's: a proof bars the account, so the database's list holds its hash and no handle. Six sites
+    the owner removed here, which bar nobody, trip the guard, and then only whom the two lists name is removed:
+    matched by handle alone, that was nobody here, and the artist's rows and images stayed run after run."""
+    artist(ALPHA, angle=0.0)
+    removed = artist(BRAVO, angle=0.3)
+    artist(CHARLIE, angle=0.6)
+    push.run(False)
+    account = library.account(f"FAKE-USER-{BRAVO}")
+    if where == "there":
+        fake.sql(push._removed_sql({account}))
+    else:  # a run that put it on the store's list and could not reach the database's
+        store.import_removed([account])
+    for n in range(6):
+        store.mark_removed(f"yy-fake-site{n}.art")
+
+    with pytest.raises(push.Stop, match="bar 6 people beyond"):
+        push.run(False)
+
+    assert library.artist_keys() == [f"da:{ALPHA}", f"da:{CHARLIE}"] and library.account_removed(f"FAKE-USER-{BRAVO}")
+    assert not any(path.stem in {work["id"] for work in removed} for path in library.image_dir().iterdir())
+    assert BRAVO not in fake.held() and set(fake.removed) == {account}  # the six sites wait for --allow-delete
+    with pytest.raises(push.Stop, match="bar 6 people beyond"):
+        push.run(False)
+    assert push.run(False, allow_delete=6)["artists_sent"] == 2
 
 
 @pytest.mark.parametrize("linked", ["in_the_stores_row", "in_the_profile_only"])
@@ -2867,6 +2952,22 @@ def test_an_account_on_the_databases_list_is_not_sent_under_the_handle_it_took_w
     assert "yy-fake-newname" not in json.dumps(local_state()[0])  # purged here
 
 
+def test_an_account_hash_two_keys_hold_with_no_rename_link_between_them_is_sent_for_neither(fake):
+    """The sixth critic's untested break: a broken store gave BRAVO's profile ALPHA's account hash, and no rename
+    mark links the two. A proof bound to that account would bar both there, so neither is sent."""
+    artist(ALPHA, angle=0.0)
+    artist(BRAVO, angle=0.3)
+    artist(CHARLIE, angle=0.6)
+    account = library.account(f"FAKE-USER-{ALPHA}")
+    with closing(sqlite3.connect(config.LOCAL_DB)) as conn, conn:
+        conn.execute("UPDATE profiles SET user_hash = ? WHERE artist_key = ?", (account, f"da:{BRAVO}"))
+
+    counts = push.run(False)
+
+    assert list(sent_artists(fake)) == [CHARLIE] and counts["artists_held_no_account"] == 2
+    assert account not in fake.sent() and not any(word in fake.sent() for word in of_artist(ALPHA) + of_artist(BRAVO))
+
+
 @pytest.mark.parametrize("how", ["not_read_at_the_new_prompt_version_yet", "read_again_and_otherwise"])
 def test_a_card_counted_from_tag_readings_that_no_longer_stand_waits_for_one_counted_from_those_that_do(fake, how):
     """The critic's: a card made from the verified tags of an older prompt version went as current."""
@@ -2988,6 +3089,35 @@ def test_a_rating_of_the_picture_a_work_showed_before_is_no_rating_of_the_one_it
 
     assert counts["works_held_not_rated"] == 1 and ANOTHER.lower() not in fake.sent()
     assert tagging.results(profiles.TAGGER, verifier=profiles.TAGGER)[made[0]["id"]]["rating"] is None
+
+
+@pytest.mark.parametrize(
+    ("table", "reason"),
+    [
+        ("work_content", "fit_not_checked"),
+        ("work_suggestive", "suggestive_not_checked"),
+        ("work_political", "political_not_checked"),
+    ],
+)
+def test_a_check_of_the_picture_a_work_showed_before_is_no_check_of_the_one_it_shows_now(fake, table, reason):
+    """The sixth critic's untested break: the content check of the old picture, which said it was fit, taken for a
+    check of the new one. Every other reading of the work is of the new picture; this one is not."""
+    checked = {"rating": "suggestive", "blood_only": True, "title": "FAKE-TITLE Election poster zz", "political": False}
+    made = artist(ALPHA, 6, edits={0: checked})
+    artist(BRAVO, angle=0.3)
+    assert push.run(False)["works_sent"] == 11  # each check made of this picture, and passed
+    collected_again(ALPHA, made, thumbs={0: ANOTHER}, images={0: NEW_PICTURE})
+    new = library.fingerprint(NEW_PICTURE)
+    both = tagging.political_print(new, made[0]["title"], json.dumps(made[0]["tags"]))
+    with closing(sqlite3.connect(config.LOCAL_DB)) as conn, conn:
+        for other in ("work_tags", "work_format", "work_artwork", "work_content", "work_suggestive", "work_political"):
+            if other != table:  # read again from the new picture, answering as before: every check but one
+                read = both if other == "work_political" else new
+                conn.execute(f"UPDATE {other} SET fingerprint = ? WHERE deviation_id = ?", (read, made[0]["id"]))
+
+    counts = push.run(False)
+
+    assert counts[f"works_held_{reason}"] == 1 and counts["works_sent"] == 10 and ANOTHER.lower() not in fake.sent()
 
 
 def test_a_replaced_pictures_size_is_not_sent_with_the_new_picture(fake):
@@ -3151,6 +3281,22 @@ def test_a_work_whose_style_vector_is_unusable_is_left_out_of_the_ranking_and_ho
     rows = [row for row in fake.loads[-1][2] if row["neighbor_slug"]]
     assert counts["neighbours_sent"] == len(rows) == 12 and all(math.isfinite(row["score"]) for row in rows)
     assert all(0 not in (row["picks"] or []) for row in rows if row["neighbor_slug"] == BRAVO)
+
+
+def test_style_vectors_stored_at_another_length_are_ranked_and_picked_as_at_unit_length(fake):
+    """The sixth critic's untested break: vectors not made unit length before they are compared. A cosine is a dot
+    product only between unit vectors, so at three times the length two artists 69 degrees apart (cosine 0.36,
+    under STYLE_FLOOR) would pass the floor nine times over."""
+    for handle, angle in ((ALPHA, 0.0), (BRAVO, 1.2)):
+        artist(handle, 5, angle=angle)
+    with closing(sqlite3.connect(config.LOCAL_DB)) as conn, conn:
+        for work_id, vector in conn.execute("SELECT deviation_id, vector FROM style_vectors").fetchall():
+            longer = (np.frombuffer(vector, dtype=np.float16) * 3).astype(np.float16).tobytes()
+            conn.execute("UPDATE style_vectors SET vector = ? WHERE deviation_id = ?", (longer, work_id))
+
+    push.run(False)
+
+    assert fake.loads[-1][2] == [{"artist_slug": ALPHA} | NO_NEIGHBOUR, {"artist_slug": BRAVO} | NO_NEIGHBOUR]
 
 
 def test_search_text_read_whole_names_no_service_and_loses_only_what_made_it_name_one(fake):

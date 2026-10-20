@@ -1,4 +1,5 @@
-"""Run, pause and watch the local GPU work: style vectors, tags, formats, the artwork and content checks, profiles.
+"""Run, pause and watch the local GPU work: style vectors, tags, formats, the artwork and content checks, why a
+suggestive work is so, the political check, profiles.
 
     uv run python scripts/gpu.py status              what is done, what is left, and whether it is running
     uv run python scripts/gpu.py pause               free the GPU: every stage holds where it is, models are unloaded
@@ -36,14 +37,29 @@ STAGES = {
     "formats": ["pipeline.tagging", "--max-works", str(TURN), "--formats"],
     "artwork": ["pipeline.tagging", "--max-works", str(TURN), "--artwork"],
     "content": ["pipeline.tagging", "--max-works", str(TURN), "--content"],
+    "suggestive": ["pipeline.tagging", "--max-works", str(TURN), "--suggestive"],
+    "political": ["pipeline.tagging", "--max-works", str(TURN), "--political"],
     "profiles": ["pipeline.profiles", "--max-artists", str(TURN // 4)],
 }
 _ALL = "SELECT count(*) FROM works w WHERE w.image_file IS NOT NULL"
 _ARTISTS = "SELECT count(DISTINCT artist_key) FROM works"
-# What each stage has done, of the works with an image or of the artists. Where its rows are timed, the query
-# takes :since, and counts what was done after it. A reading of an image the work no longer shows is not done:
-# library.IMAGE is the rule, as in the stages themselves.
+# The two stages that ask of some works only, and which: those rated suggestive, and the political candidates.
+_SUGGESTIVE = (
+    "SELECT count(*) FROM works w JOIN work_format f USING (deviation_id) WHERE w.image_file IS NOT NULL AND "
+    f"f.model = :model AND f.prompt_version = :formats AND f.fingerprint = {library.IMAGE} "
+    "AND json_extract(f.result, '$.rating') = 'suggestive'"
+)
+_CANDIDATES = (
+    f"SELECT count(*) FROM works w WHERE w.image_file IS NOT NULL AND {library.IMAGE} IS NOT NULL AND "
+    "political_hint(w.title, w.tags, (SELECT group_concat(json_extract(t.result, '$.description'), ' ') FROM "
+    f"work_tags t WHERE t.deviation_id = w.deviation_id AND t.result IS NOT NULL AND t.fingerprint = {library.IMAGE}))"
+)
+# What each stage has done, of the works with an image, of the artists, or of the works it asks of (_OF). Where its
+# rows are timed, the query takes :since, and counts what was done after it. A reading of an image the work no
+# longer shows is not done: library.IMAGE is the rule, as in the stages themselves.
 _PROFILED = "artists profiled, or left out for a reason"
+_WHY, _POLITICAL = "suggestive works asked why", "political candidates checked"
+_OF = {_PROFILED: "artists", _WHY: "works rated suggestive", _POLITICAL: "political candidates"}
 _DONE = {
     "style vectors": "SELECT count(*) FROM works w JOIN style_vectors v USING (deviation_id) "
     f"WHERE w.image_file IS NOT NULL AND v.model = 'csd' AND v.vector IS NOT NULL AND v.fingerprint = {library.IMAGE}",
@@ -59,6 +75,11 @@ _DONE = {
     "checked for unfit content": "SELECT count(*) FROM works w JOIN work_content c USING (deviation_id) WHERE "
     "w.image_file IS NOT NULL AND c.model = :model AND c.prompt_version = :content AND c.asked_at > :since "
     f"AND c.fingerprint = {library.IMAGE}",
+    _WHY: f"{_SUGGESTIVE} AND EXISTS (SELECT 1 FROM work_suggestive s WHERE s.deviation_id = w.deviation_id AND "
+    "s.model = :model AND s.prompt_version = :suggestive AND s.asked_at > :since AND s.fingerprint = f.fingerprint)",
+    _POLITICAL: f"{_CANDIDATES} AND EXISTS (SELECT 1 FROM work_political p WHERE p.deviation_id = w.deviation_id "
+    "AND p.model = :model AND p.prompt_version = :political AND p.asked_at > :since "
+    f"AND p.fingerprint = political_print({library.IMAGE}, w.title, w.tags))",
     _PROFILED: "SELECT count(*) FROM artist_profiles WHERE made_at > :since",
 }
 
@@ -78,15 +99,20 @@ def counts(since: str = "") -> dict[str, int]:
         "formats": tagging.FORMAT_VERSION,
         "artwork": tagging.ARTWORK_VERSION,
         "content": tagging.CONTENT_VERSION,
+        "suggestive": tagging.SUGGESTIVE_VERSION,
+        "political": tagging.POLITICAL_VERSION,
         "since": since,
     }
     found = {}
+    totals = {"works": _ALL, "artists": _ARTISTS, _OF[_WHY]: _SUGGESTIVE, _OF[_POLITICAL]: _CANDIDATES}
     if not config.LOCAL_DB.exists():
-        return dict.fromkeys(("works", "artists", *_DONE), 0)
+        return dict.fromkeys((*totals, *_DONE), 0)
     conn = sqlite3.connect(f"file:{config.LOCAL_DB.as_posix()}?mode=ro", uri=True, timeout=60)
     try:
         conn.create_function("own_file", 1, library.own_file, deterministic=True)
-        for label, query in {"works": _ALL, "artists": _ARTISTS, **_DONE}.items():
+        conn.create_function("political_hint", 3, tagging.political_hint, deterministic=True)
+        conn.create_function("political_print", 3, tagging.political_print, deterministic=True)
+        for label, query in {**totals, **_DONE}.items():
             try:
                 found[label] = int(conn.execute(query, names).fetchone()[0])
             except sqlite3.OperationalError:
@@ -120,7 +146,7 @@ def status() -> list[str]:
     now, hour = counts(), counts((datetime.now(UTC) - timedelta(hours=1)).isoformat(timespec="seconds"))
     lines.append(f"Collected: {now['artists']} artists, {now['works']} works with an image.")
     for label, query in _DONE.items():
-        left = max(now["artists" if label.startswith("artists") else "works"] - now[label], 0)
+        left = max(now[_OF.get(label, "works")] - now[label], 0)
         line = f"  {label}: {now[label]} done, {left} to go"
         if ":since" in query:
             line += f"; {hour[label]} in the last hour"

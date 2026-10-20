@@ -38,6 +38,8 @@ READ = {
     "rating": None,
     "artwork": None,
     "fit": None,
+    "blood_only": None,
+    "political": False,  # no work here has a political word: none is a candidate
 }  # results() adds
 COUNTS = re.compile(
     r'\{"analyzed": \d+, "failed": \d+, "flagged": \d+, "skipped": \d+, "removed": \d+, '
@@ -110,6 +112,9 @@ class FakeOllama:
     artwork:  the artwork check's answer, or a function (work number, request) -> that.
     account:  the reader of a username and tagline: one of tagging.ACCOUNT_ANSWERS, or a function (request) -> one.
     content:  the content check's answer, or a function (work number, request) -> that.
+    why:      the answer to why a suggestive work is so, or a function (work number, request) -> that.
+    political: the political check of an image, or a function (work number, request) -> that.
+    named:    the political check of a title and tags: one of tagging.NAMED_ANSWERS, or a function (request) -> one.
     """
 
     def __init__(
@@ -127,7 +132,13 @@ class FakeOllama:
         artwork=None,
         account="fine",
         content=None,
+        why=None,
+        political=None,
+        named="no",
     ):
+        self.why, self.whys = why or {"shows": "sexualised", "blood_only": "no"}, []
+        self.political, self.politics = political or {"shows": "none", "real_person": "no"}, []
+        self.named, self.namings = named, []
         self.artwork, self.arts = artwork or {"kind": tagging.ARTWORK, "artwork": "yes"}, []
         self.account, self.account_readings = account, []
         self.content, self.contents = content or {"shows": tagging.FIT, "unfit": "no"}, []
@@ -162,6 +173,10 @@ class FakeOllama:
             self.account_readings.append(chat)
             answer = self.account(chat) if callable(self.account) else self.account
             return self.say({"says": "FAKE-WORDS", "answer": answer} if answer in tagging.ACCOUNT_ANSWERS else answer)
+        if prompt == tagging.NAMED_PROMPT:
+            self.namings.append(chat)
+            answer = self.named(chat) if callable(self.named) else self.named
+            return self.say({"says": "FAKE-WORDS", "names": answer} if answer in tagging.NAMED_ANSWERS else answer)
         if prompt == tagging.AGREE_PROMPT:
             self.merges.append(chat)
             self.order.append("merge")
@@ -179,6 +194,12 @@ class FakeOllama:
         if prompt == tagging.CONTENT_PROMPT:
             self.contents.append((n, chat["model"]))
             return self.say(self.content(n, chat) if callable(self.content) else self.content)
+        if prompt == tagging.SUGGESTIVE_PROMPT:
+            self.whys.append((n, chat["model"]))
+            return self.say(self.why(n, chat) if callable(self.why) else self.why)
+        if prompt == tagging.POLITICAL_PROMPT:
+            self.politics.append((n, chat["model"]))
+            return self.say(self.political(n, chat) if callable(self.political) else self.political)
         if prompt == tagging.SECOND_PROMPT:
             self.seconds.append((n, chat["model"]))
             self.order.append("second")
@@ -531,6 +552,8 @@ def test_a_rerun_asks_nothing_and_stores_nothing_new():
         6,
         3,
         3,
+        0,
+        0,
         0,
         0,
         0,
@@ -1257,6 +1280,100 @@ def test_the_content_check_is_kept_by_the_image_it_read_and_asked_again_when_the
     assert fetched.contents == [(102, tagging.DEFAULT_MODEL)]
     run(fetched)  # and its tags, read again from the new image
     assert tagging.results()[fetish]["fit"] is True and len(stored("work_content")) == 4
+
+
+# Why a work rated suggestive is so (the owner's, 2026-10-20: blood shows, pin-ups do not): asked of those alone.
+
+
+def suggestive_run(fake, max_works=500, **kwargs):
+    counts = tagging.run_suggestive(max_works, transport=httpx.MockTransport(fake), **kwargs)
+    assert isinstance(counts.pop("seconds_per_image"), float)
+    return counts
+
+
+def test_why_a_work_rated_suggestive_is_so_is_asked_of_those_alone_and_kept_by_the_image_it_read():
+    blood, unsure, pinup, safe, broken = works(1, 2, 3, 4, 5, tagline="FAKE-TAGLINE")
+    run(FakeOllama())
+    formats_run(FakeOllama(formatted=lambda n, chat: RATED | {"rating": "safe" if n == 4 else "suggestive"}))
+    answers = {
+        1: {"shows": tagging.BLOOD, "blood_only": "yes"},
+        2: {"shows": tagging.BLOOD, "blood_only": "no"},  # the model is not sure of it: the work stays held back
+        3: {"shows": "sexualised", "blood_only": "yes"},
+        5: {"shows": "FAKE-KIND", "blood_only": "yes"},  # not a kind: no answer at all
+    }
+    assert {result["blood_only"] for result in tagging.results().values()} == {None}  # not run by default
+    fake = FakeOllama(why=lambda n, chat: answers[n])
+    assert suggestive_run(fake) == {"blood_only": 1, "sexualised": 2, "failed": 1, "skipped": 0}
+    assert {n for n, _ in fake.whys} == {1, 2, 3, 5} and fake.whys.count((5, tagging.DEFAULT_MODEL)) == 3
+    read = {key: value["blood_only"] for key, value in tagging.results().items()}
+    assert read == {blood: True, unsure: False, pinup: False, safe: None, broken: None}
+    assert json.loads(stored("work_suggestive")[0][3]) == {"shows": tagging.BLOOD, "blood_only": True}
+    asked = json.loads(next(request.content for request in fake.requests if request.url.path == "/api/chat"))
+    assert asked["messages"][0] == {"role": "system", "content": tagging.SUGGESTIVE_PROMPT}
+    assert asked["messages"][1]["images"] == [base64.b64encode(JPEG + b"1").decode()]
+    for kept_back in (blood, "zz-fake-alpha", "fake-title", "faketag", "fake-tagline", "deviantart", ".jpg"):
+        assert kept_back.lower() not in json.dumps(asked).lower()
+    again = FakeOllama()
+    assert suggestive_run(again)["skipped"] == 4 and again.requests == []  # nothing is asked twice
+
+    collected_again(1, 2, 3, 4, 5, thumbs={1: ANOTHER}, images={1: JPEG + b"101"})  # the artist replaced an image
+    fetched = FakeOllama(formatted=RATED | {"rating": "suggestive"})
+    run(fetched)
+    formats_run(fetched)  # rated suggestive again: the old image's blood says nothing about the new one
+    assert tagging.results()[blood]["blood_only"] is None
+    assert suggestive_run(fetched) == {"blood_only": 0, "sexualised": 1, "failed": 0, "skipped": 3}
+    assert fetched.whys == [(101, tagging.DEFAULT_MODEL)] and tagging.results()[blood]["blood_only"] is False
+
+
+# Political content about a real person (the owner's, 2026-10-20): the candidates alone, by their image and words.
+
+
+def political_run(fake, max_works=500, **kwargs):
+    counts = tagging.run_political(max_works, transport=httpx.MockTransport(fake), **kwargs)
+    assert isinstance(counts.pop("seconds_per_work"), float)
+    return counts
+
+
+def test_a_political_candidate_is_asked_of_its_image_and_its_words_apart_and_kept_by_both():
+    tags = {1: ["political_cartoon"], 2: ["faketag2", "trump2028"], 3: ["trumpet"], 5: ["propaganda"]}
+    cartoon, named, trumpet, described, broken = works(1, 2, 3, 4, 5, tags=tags, tagline="FAKE-TAGLINE")
+    run(FakeOllama(answer=lambda n, attempt, chat: GOOD | ({"description": "A campaign poster."} if n == 4 else {})))
+    images = {
+        1: {"shows": tagging.REAL_PERSON, "real_person": "yes"},
+        2: {"shows": "none", "real_person": "no"},
+        4: {"shows": "a real-world cause", "real_person": "no"},
+        5: {"shows": "FAKE-KIND", "real_person": "yes"},  # not a kind: no answer at all
+    }
+    words = {"political_cartoon": "no", "trump2028": "yes", "FAKE-TITLE-4": "unclear", "propaganda": "yes"}
+
+    def said(chat):
+        return next(answer for word, answer in words.items() if word in chat["messages"][-1]["content"])
+
+    assert [tagging.results()[work]["political"] for work in (cartoon, trumpet, described)] == [None, False, None]
+    fake = FakeOllama(political=lambda n, chat: images[n], named=said)
+    assert political_run(fake) == {"political": 2, "not_political": 1, "failed": 1, "skipped": 0}
+    assert {n for n, _ in fake.politics} == {1, 2, 4, 5}  # "trumpet" is no candidate, and not asked
+    read = {key: value["political"] for key, value in tagging.results().items()}
+    assert read == {cartoon: True, named: True, trumpet: False, described: False, broken: None}
+    assert json.loads(stored("work_political")[1][3]) == {"shows": "none", "named": "yes", "political": True}
+    image = json.loads(next(request.content for request in fake.requests if request.url.path == "/api/chat"))
+    assert image["messages"] == [
+        {"role": "system", "content": tagging.POLITICAL_PROMPT},
+        {"role": "user", "content": "Look at this image.", "images": [base64.b64encode(JPEG + b"1").decode()]},
+    ]
+    assert [chat["messages"][-1] for chat in fake.namings[:1]] == [
+        {"role": "user", "content": "Title: FAKE-TITLE-1\nTags: political_cartoon"}  # the words, and no image
+    ]
+    again = FakeOllama()
+    assert political_run(again)["skipped"] == 4 and again.requests == []  # nothing is asked twice
+
+    collected_again(1, 2, 3, 4, 5, tags=tags | {2: ["faketag2", "trump2028", "zzmore"]})  # the artist tags it again
+    assert tagging.results()[named]["political"] is None  # a reading of other words: a candidate not yet asked
+    asked_again = FakeOllama(named=said)
+    assert political_run(asked_again) == {"political": 1, "not_political": 0, "failed": 0, "skipped": 3}
+    assert asked_again.politics == [(2, tagging.DEFAULT_MODEL)] and tagging.results()[named]["political"] is True
+    assert tagging.political_hint("FAKE-TITLE Kennedy", "[]", None)  # a candidate, for the model to tell apart
+    assert not tagging.political_hint("FAKE-TITLE trumpets", '["zztrumpet"]', None)
 
 
 # Round 4. A description two models agree on, stored beside the checked one.
