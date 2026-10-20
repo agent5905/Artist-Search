@@ -61,6 +61,17 @@ def when(text):
     return datetime.fromisoformat(text)
 
 
+def function_body(name):
+    """A function as sql/ makes it, on one line and without comments: for the tests that read the statements
+    RemovalsDb follows, so that a break in them fails here too, without the owner's database."""
+    sql = "\n".join(
+        (config.ROOT / "sql" / f).read_text(encoding="utf-8") for f in ("002_functions.sql", "003_limits.sql")
+    )
+    sql = re.sub(r"--[^\n]*", "", sql)
+    start = sql.index(f"create or replace function public.{name}(")
+    return " ".join(sql[start : sql.index("$$;", start)].split())
+
+
 class RemovalsDb(FakeDb):
     """FakeDb, with the removal requests and the functions this stage calls, as sql/002_functions.sql has them.
 
@@ -70,9 +81,11 @@ class RemovalsDb(FakeDb):
     already was, in the turns of the network that asked as well as of the first 30 that did), bound to whom the
     claim page showed (its ticket), or without one to the artist listed under the slug then: their handle, site and
     account, and never one already barred. The same handle and site asked about again is the same request, which
-    only counts (and takes an account it lacked, and keeps a note that says something: the first and the latest
-    four); anything else is a request of its own. due_removals takes the due ones in turns between networks, each
-    in the first turn it has in any of its networks. Nothing a push or a load does touches one. confirm_removal and
+    only counts (and takes an account it lacked, and keeps a note that says something in place of its network's
+    earlier one: the latest from each of the ten networks heard from last); anything else is a request of its own.
+    due_removals takes the due ones in turns between networks, each in the first turn it has in any of its networks.
+    Nothing a push or a load does touches one. A run moves one on only while its code_at is the one the run read.
+    confirm_removal and
     grant_request close an open one, and put on the list the handle and the account it is bound to, and its site
     when the caller says the proof covered it and no other handle is listed with it now: never whoever the slug
     lists now. That deletes whoever they bar, and an open request whose handle or account they bar is closed as
@@ -116,13 +129,13 @@ class RemovalsDb(FakeDb):
             return  # gone already: a request would only keep their handle
         same = [name for name in self.requests if self.queue[name]["artist_slug"] == slug]
         same = [name for name in same if self.made_for(self.queue[name]) == self.made_for(bound)]
-        said = [{"at": now, "note": note}] if note and not with_code else []
+        said = [{"at": now, "note": note, "network": network}] if note and not with_code else []
         if same:
             row = self.queue[same[0]]
             row["da_account"] = row["da_account"] or bound["da_account"]
             if not with_code:
-                notes = row["notes"] + said
-                row |= {"last_at": now, "requests": row["requests"] + 1, "notes": notes[:1] + notes[1:][-4:]}
+                notes = [kept for kept in row["notes"] if not said or kept["network"] != network] + said
+                row |= {"last_at": now, "requests": row["requests"] + 1, "notes": notes[-10:]}
         else:
             row = {"id": next(self._ids), "artist_slug": slug, "notes": said, "first_at": now, "last_at": now}
             row |= bound | {"requests": 1, "code_at": None, "due_at": None, "outcome": None, "networks": []}
@@ -157,8 +170,11 @@ class RemovalsDb(FakeDb):
     def data_api(self, method, path, key, params, json=None):
         assert key == "secret" and path == "removal_requests"  # the service key, and nothing else
         if method == "PATCH":
-            assert set(params) == {"id", "outcome"} and params["outcome"] == "is.null" and set(json) == {"due_at"}
+            assert set(params) == {"id", "outcome", "code_at"} and params["outcome"] == "is.null"
+            assert set(json) == {"due_at"}
             name = self._open(int(params["id"].removeprefix("eq.")))
+            if name and when(self.queue[name]["code_at"]) != when(params["code_at"].removeprefix("eq.")):
+                name = None  # its code was asked for again since it was read
             self.moved.append((self.queue[name]["artist_slug"] if name else None, json["due_at"]))
             if name:
                 self.queue[name]["due_at"] = json["due_at"]
@@ -491,6 +507,8 @@ def test_the_account_is_known_under_either_spelling_of_its_hash(world, spelling)
     world.da.profiles[ALPHA] = profile(ALPHA, bio=code(ALPHA))
 
     assert world.check() == expected(requests_due=1, proven_on_deviantart=1, artists_removed=1)
+    # And here, under that spelling: the collect stage does not take the account back under another handle.
+    assert library.account_removed(f"FAKE-USER-{ALPHA}")
 
 
 @pytest.mark.parametrize("holder", ["the_artist_still", "somebody_who_took_the_handle"])
@@ -926,7 +944,13 @@ def test_a_request_is_looked_at_less_often_as_it_ages(world):
 
 def test_asking_for_the_code_again_starts_the_checks_over(world):
     """The critic's case: a code put up after the daily checks have ended. The page tells the artist to ask for the
-    code again first, which makes the request due at once and hourly again."""
+    code again first, which makes the request due at once and hourly again. The seventh critic's uncaught breaks: the
+    page's advice taken out, and start_removal_proof keeping the due time a re-ask found (RemovalsDb follows the
+    statement read here)."""
+    page = " ".join((config.ROOT / "web" / "src" / "pages.tsx").read_text(encoding="utf-8").split())
+    advice = "Putting the code up more than two weeks after you got it? Come back to this page and press “Get my code”"
+    assert f"{advice} again first: the code is the same, and the checks start over." in page
+    assert "code_at = now(), due_at = least(r.due_at, now())," in function_body("start_removal_proof")
     world.list(ALPHA)
     world.da.profiles[ALPHA] = profile(ALPHA, bio="Concept artist.")
     for _ in range(20 * 24):  # twenty days of hourly runs: looked at weekly by now
@@ -934,6 +958,33 @@ def test_asking_for_the_code_again_starts_the_checks_over(world):
         world.later(hours=1)
     world.db.file(ALPHA, with_code=True)  # the artist asks again, on the site
     world.da.profiles[ALPHA]["bio"] = code(ALPHA)
+    assert world.check() == expected(requests_due=1, proven_on_deviantart=1, artists_removed=1)
+
+
+def test_asking_for_the_code_again_while_a_run_looks_at_it_makes_it_due_at_once(world):
+    """The seventh critic's race: "Get my code" pressed again, as the page asks after two weeks, while a run was
+    looking at the request. The run then set its next look from the code_at it had read, a week on, over the reset,
+    and the code, put up at once, was found 168 hours later. A run moves a request on only while its code_at is still
+    the one it read."""
+    world.list(ALPHA)
+    world.da.profiles[ALPHA] = profile(ALPHA, bio="Concept artist.")
+    world.later(days=15)
+    world.check()  # past two weeks: looked at weekly from here
+    world.later(days=7)
+    served = world.da._serve
+
+    def pressed_during_the_look(request):
+        if request.url.path.endswith(f"/user/profile/{ALPHA}"):
+            world.later(seconds=5)
+            world.db.file(ALPHA, with_code=True)
+        return served(request)
+
+    world.da.transport = httpx.MockTransport(pressed_during_the_look)
+    assert world.check() == expected(requests_due=1, left_for_owner_no_code_found=1)
+    world.da.transport = httpx.MockTransport(served)
+    assert when(world.db.queue[ALPHA]["due_at"]) <= when(world.db.queue[ALPHA]["code_at"])  # the reset stands
+    world.da.profiles[ALPHA]["bio"] = code(ALPHA)  # put up right after the press
+    world.later(seconds=removals.EVERY.total_seconds())
     assert world.check() == expected(requests_due=1, proven_on_deviantart=1, artists_removed=1)
 
 
@@ -1307,25 +1358,39 @@ def test_an_artist_who_names_a_site_barred_for_another_is_sent_without_it_and_wi
 def test_every_note_is_kept_with_its_time_and_a_stranger_cannot_take_the_artists_away(world):
     """The fifth critic's: the first request's note won, so a stranger's first try, with no note, hid the artist's
     own words from the owner. The sixth's: then the latest won, so a stranger's later note took the artist's place.
-    Every note that says something is kept, cut to 300 characters, with when it came: the first and the latest four
-    (request_removal in sql/002_functions.sql, which RemovalsDb follows: the statement itself is read below)."""
+    The seventh's: then the first and the latest four were kept, so a stranger who wrote first owned the one kept for
+    good, and four more notes of theirs pushed the artist's out. A note that says something takes the place of its
+    own network's earlier one, cut to 300 characters, with when it came: the latest from each network, of the ten
+    heard from last (request_removal in sql/002_functions.sql, which RemovalsDb follows: the statement is read
+    below). So a stranger needs ten networks to put the artist's note out, and the artist writing again brings it
+    back."""
     world.list(ALPHA, code=False)  # a stranger's, with no note
+    world.db.file(ALPHA, with_code=False, note="Please keep this profile up, I love it.", network="stranger")  # first
+    world.later(hours=3)
     words = f"This is my work and I would like it taken down. {'x' * 400}"
     for note in ("   ", words, None, ""):
-        world.db.file(ALPHA, with_code=False, note=note)
-    for n in range(6):  # a stranger, hour after hour
+        world.db.file(ALPHA, with_code=False, note=note, network="artist")
+    for n in range(6):  # the stranger again, hour after hour
         world.later(hours=1)
-        world.db.file(ALPHA, with_code=False, note=f"Keep my profile up! {n}")
+        world.db.file(ALPHA, with_code=False, note=f"Keep my profile up! {n}", network="stranger")
     kept = world.db.queue[ALPHA]["notes"]
-    assert [note["note"] for note in kept] == [words[:300], *(f"Keep my profile up! {n}" for n in range(2, 6))]
-    assert kept[0]["at"] == datetime.fromtimestamp(START, UTC).isoformat() and world.db.queue[ALPHA]["requests"] == 11
+    assert [note["note"] for note in kept] == [words[:300], "Keep my profile up! 5"]
+    assert kept[0]["at"] == datetime.fromtimestamp(START + 3 * 3600, UTC).isoformat()
+    assert world.db.queue[ALPHA]["requests"] == 12
+    for n in range(8):  # eight networks more: ten heard from, the artist's among them
+        world.db.file(ALPHA, with_code=False, note=f"From elsewhere {n}", network=f"elsewhere {n}")
     lines = removals.pending()[0].splitlines()
-    assert lines[0].endswith("notes: 5") and lines[1] == f"    2026-10-14T12:00  {words[:300]!r}" and len(lines) == 6
-    sql = (config.ROOT / "sql" / "002_functions.sql").read_text(encoding="utf-8")
-    body = sql[sql.index("function public.request_removal(") :]
-    body = " ".join(body[: body.index("$$;")].split())
-    assert "left(nullif(btrim(p_note), ''), 300)" in body and "jsonb_build_object('at', now(), 'note', said)" in body
-    assert "then (r.notes || excluded.notes) - 1 else r.notes || excluded.notes end" in body
+    assert lines[0].endswith("notes: 10") and lines[1] == f"    2026-10-14T15:00  {words[:300]!r}" and len(lines) == 11
+    world.db.file(ALPHA, with_code=False, note="From elsewhere 8", network="elsewhere 8")  # an eleventh
+    assert words[:300] not in [note["note"] for note in world.db.queue[ALPHA]["notes"]]
+    world.db.file(ALPHA, with_code=False, note=words, network="artist")  # the artist writes again
+    assert [note["note"] for note in world.db.queue[ALPHA]["notes"]][-1:] == [words[:300]]
+    assert len(world.db.queue[ALPHA]["notes"]) == 10
+    body = function_body("request_removal")
+    assert "left(nullif(btrim(p_note), ''), 300)" in body
+    assert "jsonb_build_object('at', now(), 'note', said, 'network', heard)" in body
+    assert "max(i) over (partition by coalesce(e -> 'network', to_jsonb(i))) as latest" in body
+    assert "where n.i = n.latest order by n.i desc limit 10" in body
 
 
 @pytest.mark.parametrize("asked", ["after_the_artist", "before_the_artist"])
@@ -1389,9 +1454,17 @@ def test_a_request_filed_while_its_artist_is_removed_is_never_left_open():
     on the list take the removals' lock first and hold it until they commit, so each sees what the other did: the
     request files nothing, or the removal closes it. Only Postgres can run the race; here the functions are read,
     so that taking the lock out of any of them, or putting it after a read, fails. They are plpgsql, whose every
-    statement reads the database afresh: the statements of an SQL function read it as the first one did."""
+    statement reads the database afresh: the statements of an SQL function read it as the first one did. The
+    seventh critic's: a load rebuilt the word list without the lock and a removal under it, each locking the words in
+    its own order, so Postgres aborted one. refresh_search_words takes it, whoever calls it."""
     sql = re.sub(r"--[^\n]*", "", (config.ROOT / "sql" / "002_functions.sql").read_text(encoding="utf-8"))
-    for name in ("request_removal", "start_removal_proof", "grant_request", "removed_after_insert"):
+    for name in (
+        "request_removal",
+        "start_removal_proof",
+        "grant_request",
+        "removed_after_insert",
+        "refresh_search_words",
+    ):
         body = sql[sql.index(f"function public.{name}(") :]
         body = body[: body.index("$$;")]
         assert "language plpgsql" in body, name
@@ -1449,6 +1522,13 @@ def test_a_request_from_the_page_is_filed_for_whom_it_showed_while_a_push_holds_
         assert barred(world, ALPHA)
     world.db.file(ALPHA, with_code=True, shown=shown)  # a ticket of an artist barred already files nothing
     assert world.db.requests == ([] if with_code else [ALPHA])
+    # The seventh critic's uncaught break: request_binding with its look at the removal list taken out (RemovalsDb
+    # follows the statement read here; tests/test_db.py runs it).
+    barred_already = "(public.key_hash('da:' || lower(b.da_username)), b.da_account))"
+    assert (
+        f"and not exists (select 1 from public.removed gone where gone.key_hash in {barred_already}"
+        in function_body("request_binding")
+    )
 
 
 @pytest.mark.parametrize("posted", ["both_codes", "the_new_handles_code"])
@@ -1660,6 +1740,51 @@ def test_the_sweep_never_waits_on_a_row_a_load_holds():
     clean_up = limits[limits.index("A row back to nothing says nothing") :]
     for body in (sweep[: sweep.index("$$;")], clean_up[: clean_up.index("$$;")]):
         assert re.search(r"for\s+update\s+skip\s+locked", body, re.IGNORECASE)
+
+
+def test_what_the_secret_signs_begins_with_words_of_its_own_for_each_use():
+    """The seventh critic's uncaught breaks: 'removal code ' or 'claim ticket ' taken off what the secret signs. A code
+    is anybody's for any slug they name, so a code for a slug spelled as a ticket's body would then be half of that
+    ticket's signature. Each use begins with words of its own (removal_code in sql/002_functions.sql), and every
+    signature in sql/ is one of these."""
+    begins = re.compile(r"hmac\(([^|,]*) \|\|")
+    for name, words in {
+        "removal_code": ["'removal code '"],
+        "claim_ticket": ["'claim ticket '"],
+        "ticket_binding": ["'claim ticket '"],
+        "start_removal_proof": ["'removal network '"],
+        "request_removal": ["'removal network '"],
+        "client_wait": ["budget", "budget"],  # '<budget> visitor ' and '<budget> network '
+    }.items():
+        assert begins.findall(function_body(name)) == words, name
+    sql = "\n".join(
+        (config.ROOT / "sql" / f).read_text(encoding="utf-8") for f in ("002_functions.sql", "003_limits.sql")
+    )
+    assert len(begins.findall(sql)) == sql.count("hmac(") == 7
+    assert "hmac(budget || ' visitor ' ||" in sql and "hmac(budget || ' network ' ||" in sql
+
+
+def test_migrate_brings_what_an_earlier_version_left_to_the_files_or_stops_naming_it(monkeypatch):
+    """The seventh critic's: "create index if not exists" and the named constraints left an earlier version's
+    definition as it was, and the database holds one. Only Postgres can show the swap (tests/test_db.py runs it);
+    here what migrate sends is read. Every index goes through pg_temp.index_as_written, which compares and replaces
+    it; the constraints' loop compares too; and the last check knows every function the files make, so it stops at
+    one they do not, and only at that."""
+    sent = []
+    monkeypatch.setattr(db, "load_env", lambda: {})
+    monkeypatch.setattr(db, "sql", lambda query: sent.append(query) or [])
+    monkeypatch.setattr(db, "data_api", lambda *args, **kwargs: httpx.Response(200, json={"paths": {}}))
+    db.migrate()
+    text = re.sub(r"--[^\n]*", "", sent[0])
+    indexes = re.findall(
+        r"select pg_temp\.index_as_written\(\s*'(\w+)', '(create (?:unique )?index %I on [^']*)'", text
+    )
+    assert len(indexes) == len(re.findall(r"create (?:unique )?index", text)) == len({name for name, _ in indexes}) == 9
+    assert "pg_get_constraintdef" in text and "add constraint constraint_as_written" in text
+    made = re.findall(r"create or replace function public\.(\w+)\(", text)
+    check = text[text.rindex("do $$") :]
+    assert re.findall(r"'(\w+)'", check[check.index("array[") : check.index("]::text[]")]) == made
+    assert "raise exception 'migrate stopped, nothing applied: sql/ does not make %" in check
 
 
 def test_migrate_gives_the_database_the_site_tokens_hash_and_never_the_token(monkeypatch):

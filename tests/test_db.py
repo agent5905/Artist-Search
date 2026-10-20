@@ -83,7 +83,7 @@ SERVICE_FUNCTIONS = [
     "remove_artists",
     "replace_neighbors",
 ]
-READS_PER_VISITOR, READS_PER_NETWORK, READS_A_DAY = 100, 100, 3000  # client_wait in sql/003_limits.sql, a day
+READS_PER_VISITOR, READS_PER_NETWORK, READS_A_DAY = 100, 1000, 3000  # client_wait in sql/003_limits.sql, a day
 REMOVALS_PER_VISITOR, REMOVALS_PER_NETWORK = 10, 20  # a day
 HELPER_FUNCTIONS = [
     "artist_card",
@@ -434,6 +434,35 @@ def test_migrate_twice_changes_nothing():
     assert db.sql(SNAPSHOT) == before
     # And the same secret: a code an artist was told before a migration is still their code after it.
     assert db.rpc("start_removal_proof", {"p_slug": "zz-test-nobody"}, "secret") == code
+
+
+def test_migrate_brings_what_an_earlier_version_left_to_the_files_and_stops_at_a_function_they_do_not_make():
+    """The seventh critic's: "create index if not exists" and the named constraints left an earlier version's
+    definition as it was. One of each is put back here as an earlier version could have left it, and migrate brings
+    both to the files'. A function the files neither make nor drop stops it, named, and nothing is applied."""
+    made = """
+        select (select indexdef from pg_indexes
+                where schemaname = 'public' and indexname = 'works_artist_position_idx') as index_made,
+               (select pg_get_constraintdef(oid) from pg_constraint
+                where conname = 'removal_requests_few_notes') as constraint_made
+    """
+    wanted = db.sql(made)
+    db.sql("""
+        drop index public.works_artist_position_idx;
+        create index works_artist_position_idx on public.works (artist_id);
+        alter table public.removal_requests drop constraint removal_requests_few_notes,
+          add constraint removal_requests_few_notes check (length(notes::text) <= 10000);
+    """)
+    try:
+        assert db.sql(made) != wanted
+        db.migrate()
+        assert db.sql(made) == wanted
+        db.sql("create function public.zz_test_stale(int) returns int language sql set search_path = '' as 'select 1'")
+        with pytest.raises(RuntimeError, match=r"sql/ does not make .*zz_test_stale\(integer\)"):
+            db.migrate()
+    finally:
+        db.sql("drop function if exists public.zz_test_stale(int)")
+        db.migrate()  # whatever happened above, the schema as the files make it
 
 
 # 2. Load the same artists and works twice: no duplicates.
@@ -1048,9 +1077,9 @@ def fresh(*rows: dict[str, Any]) -> None:
     assert there == [{"n": len(rows)}]
 
 
-def ask(row_or_slug: dict[str, Any] | str, note: str | None = None) -> None:
+def ask(row_or_slug: dict[str, Any] | str, note: str | None = None, network: str | None = None) -> None:
     slug = row_or_slug if isinstance(row_or_slug, str) else row_or_slug["slug"]
-    assert db.rpc("request_removal", {"p_slug": slug, "p_note": note}, "secret") is True
+    assert db.rpc("request_removal", {"p_slug": slug, "p_note": note, "p_network": network}, "secret") is True
 
 
 def proof_code(row_or_slug: dict[str, Any] | str) -> str:
@@ -1086,25 +1115,35 @@ def test_an_artists_request_survives_whatever_is_asked_after_it(seeded):
     ask("zz-test-nobody", "x")  # the same answer for a slug that does not exist, and nothing logged
     assert db.sql(REQUESTS) == []
 
-    # The artist asks, with a note. Then a script asks twelve more times, with notes of its own and without.
-    ask(GONE, "It is me. Please take my work down.")
+    # A stranger asks first, with a note, then the artist from their own network. Then the stranger asks twelve more
+    # times, with notes and without, and from eight networks more (the seventh critic's: the first note was kept for
+    # good, the stranger's, and four more of theirs put the artist's out).
+    ask(GONE, "Keep it up!", network="zz-test-stranger")
+    ask(GONE, "It is me. Please take my work down.", network="zz-test-artist")
     for n in range(12):
-        ask(GONE, f"junk {n}" if n % 2 else None)
+        ask(GONE, f"junk {n}" if n % 2 else None, network="zz-test-stranger")
+    for n in range(8):
+        ask(GONE, f"elsewhere {n}", network=f"zz-test-elsewhere-{n}")
     ask(STAY, "y" * 5000)  # a long note cannot fill the table
     ask("zz-test-hidden")  # a hidden artist's request is logged too
-    # One row per artist: the artist's note is still there, first, then the latest four (the sixth critic's: the
-    # latest note took the place of the artist's), and the rest only counted.
-    kept = ["It is me. Please take my work down.", "junk 5", "junk 7", "junk 9", "junk 11"]
+    # One row per artist: the latest note from each of the ten networks heard from, the artist's among them, and the
+    # rest only counted.
+    kept = ["It is me. Please take my work down.", "junk 11", *(f"elsewhere {n}" for n in range(8))]
     assert db.sql(REQUESTS) == [
-        {"slug": GONE["slug"], "notes": kept, "requests": 13, "in_order": True},
+        {"slug": GONE["slug"], "notes": kept, "requests": 22, "in_order": True},
         {"slug": "zz-test-hidden", "notes": [], "requests": 1, "in_order": True},
         {"slug": STAY["slug"], "notes": ["y" * 300], "requests": 1, "in_order": True},
     ]
-    # The service role can read it, each note with when it came.
+    # An eleventh network puts out the note heard from longest ago; the artist's, sent again, is back, the latest.
+    ask(GONE, "elsewhere 8", network="zz-test-elsewhere-8")
+    ask(GONE, "It is me. Please take my work down.", network="zz-test-artist")
+    kept = [*kept[2:], "elsewhere 8", kept[0]]
+    # The service role can read it, each note with when it came and its network's key, which names no address.
     mine = {"artist_slug": f"eq.{GONE['slug']}", "select": "notes,requests"}
     [row] = db.data_api("GET", "removal_requests", "secret", params=mine).json()
-    assert [note["note"] for note in row["notes"]] == kept and row["requests"] == 13
-    assert [set(note) for note in row["notes"]] == [{"at", "note"}] * 5
+    assert [note["note"] for note in row["notes"]] == kept and row["requests"] == 24
+    assert [set(note) for note in row["notes"]] == [{"at", "note", "network"}] * 10
+    assert all(re.fullmatch(r"[0-9a-f]{64}", note["network"]) for note in row["notes"])
     # And nobody's visibility changed.
     assert db.sql(SHOWN) == shown
     assert visible(GONE) and visible(STAY)
@@ -1856,14 +1895,27 @@ def test_a_profile_counts_a_tenth_of_a_page(seeded):
         forget(client, pages_let_through=1)
 
 
+def nearly_full(network: str, room: int) -> None:
+    """A network's count of reads, full but for `room` pages, as a busy day of its neighbours' leaves it: a test
+    meets the network's share without a thousand calls (in under 86 seconds, before the next page comes free)."""
+    db.sql(f"""
+        insert into public.client_counts (client_key, busy_until)
+        values ({counted_as("read", "network", network)},
+                extract(epoch from clock_timestamp()) + 86400 - {room} * 86400.0 / {READS_PER_NETWORK})
+        on conflict (client_key) do update set busy_until = excluded.busy_until
+    """)
+
+
 def test_one_network_shares_its_share_whatever_addresses_it_asks_from(seeded):
     network, clients = visitor(), [visitor() for _ in range(4)]
     try:
+        nearly_full(network, room=10)
         with ThreadPoolExecutor(30) as pool:
             waits = list(pool.map(lambda n: wait("search", clients[n % 4], network), range(4 * READS_PER_VISITOR)))
-        assert waits.count(0) == READS_PER_NETWORK  # four visitors' worth asked, one let in
+        assert waits.count(0) == 10  # four visitors' worth asked, the network's last ten let in
+        assert all(0 < seconds <= 86400 / READS_PER_NETWORK + 1 for seconds in waits if seconds)
     finally:
-        forget(network, *clients, pages_let_through=READS_PER_NETWORK)
+        forget(network, *clients, pages_let_through=10)
 
 
 def test_removal_requests_are_counted_by_the_day_and_apart_from_reads(seeded):
@@ -1933,14 +1985,16 @@ def test_the_count_fails_closed_without_what_it_needs(seeded):
 
 def test_many_calls_at_once_in_any_order_neither_wait_on_each_other_for_ever_nor_undo_a_count(seeded):
     """40 visitors in 5 networks, 160 reads from each network at once, 30 at a time: none fails (a deadlock would
-    be a failure), and each network lets exactly its share through."""
+    be a failure), and each network lets exactly what it had left through (nearly_full leaves it 20)."""
     networks, clients = [visitor() for _ in range(5)], [visitor() for _ in range(40)]
     try:
+        for network in networks:
+            nearly_full(network, room=20)
         with ThreadPoolExecutor(30) as pool:
             waits = list(pool.map(lambda n: (n % 5, wait("search", clients[n % 40], networks[n % 5])), range(800)))
-        assert [sum(seconds == 0 for at, seconds in waits if at == n) for n in range(5)] == [READS_PER_NETWORK] * 5
+        assert [sum(seconds == 0 for at, seconds in waits if at == n) for n in range(5)] == [20] * 5
     finally:
-        forget(*networks, *clients, pages_let_through=5 * READS_PER_NETWORK)
+        forget(*networks, *clients, pages_let_through=5 * 20)
 
 
 QUEUE = """
@@ -1995,11 +2049,13 @@ def test_a_request_from_the_page_is_bound_to_whom_it_showed_while_a_push_holds_t
         assert CODE.fullmatch(code)
         assert as_the_site("site_request_removal", p_slug=GONE["slug"], p_note=None, p_ticket=ticket) is True
     assert db.sql(QUEUE) == []
-    assert as_the_site("site_request_removal", p_slug=GONE["slug"], p_note="it is me", p_ticket=shown["ticket"])
-    as_the_site("site_removal_code", p_slug=GONE["slug"], p_ticket=shown["ticket"], p_network="zz-test-net")
+    asked = {"p_slug": GONE["slug"], "p_ticket": shown["ticket"], "p_network": "zz-test-net"}
+    assert as_the_site("site_request_removal", p_note="it is me", **asked)
+    as_the_site("site_removal_code", **asked)
+    net = counted_as("removal", "network", "zz-test-net")
     made = db.sql(
         "select da_username, site_domain, da_account, code_at is not null as coded, notes -> 0 ->> 'note' as note, "
-        "cardinality(networks) = 1 as net "
+        f"networks = array[notes -> 0 ->> 'network'] and networks[1] = {net} as net "
         f"from public.removal_requests where artist_slug = '{GONE['slug']}' and outcome is null"
     )
     assert made == [
@@ -2009,9 +2065,22 @@ def test_a_request_from_the_page_is_bound_to_whom_it_showed_while_a_push_holds_t
             "da_account": account(GONE),
             "coded": True,
             "note": "it is me",
-            "net": True,
+            "net": True,  # the note and the code, both in the turn of the network they came from
         }
     ]
+
+
+def test_a_ticket_from_before_a_removal_files_nothing(seeded):
+    """The seventh critic's uncaught break: request_binding with its look at the removal list taken out. A page opened
+    before the artist was removed still holds their ticket, and a request it sent after would be open for good,
+    keeping their handle."""
+    fresh({**GONE, "da_account": account(GONE)})
+    [shown] = as_the_site("site_claim", p_slug=GONE["slug"])
+    bar_gone()  # removed meanwhile, under their handle and site
+    asked = {"p_slug": GONE["slug"], "p_ticket": shown["ticket"], "p_network": "zz-test-net"}
+    assert CODE.fullmatch(as_the_site("site_removal_code", **asked))  # the same answer as ever
+    assert as_the_site("site_request_removal", p_note="it is me", **asked) is True
+    assert db.sql(QUEUE) == []
 
 
 def test_the_verifier_takes_turns_between_the_networks_codes_were_asked_from(seeded):

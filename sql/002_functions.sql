@@ -17,6 +17,8 @@ drop function if exists public.purge_removed(text[]);
 -- asked from.
 drop function if exists public.request_removal(text, text);
 drop function if exists public.start_removal_proof(text);
+-- And a note to the network it came from.
+drop function if exists public.request_removal(text, text, text);
 
 -- What a removal remembers of an artist without keeping their name (hard rule 7): the hashes of
 -- 'da:<lowercased handle>' and 'site:<registrable domain>'. The same keys as pipeline/store.py, so
@@ -420,9 +422,15 @@ $$;
 -- keyword search reads of an artist the public can see, with how many artists use it. A hidden or
 -- removed artist's words are not in it. db.after_load() and every removal call it; until then a
 -- misspelling can only be put right to words that were already known. Returns how many rows changed.
+-- Under the removals' lock (see request_binding), which a removal holds when it gets here: two rebuilds at once,
+-- a load's and a removal's, would lock the words in opposite orders, and Postgres would abort one.
 create or replace function public.refresh_search_words() returns int
-language sql set search_path = ''
+language plpgsql set search_path = ''
 as $$
+declare
+  changed int;
+begin
+  perform pg_advisory_xact_lock(4207); -- the removals' lock
   with fresh as (
     select word, ndoc as artists
     from ts_stat($words$
@@ -445,7 +453,9 @@ as $$
     on conflict (word) do update set artists = excluded.artists where w.artists is distinct from excluded.artists
     returning 1
   )
-  select (select count(*) from gone)::int + (select count(*) from written)::int
+  select (select count(*) from gone)::int + (select count(*) from written)::int into changed;
+  return changed;
+end
 $$;
 
 -- Other artists nearest in style: the artist's stored neighbours, best first, read by key. Nothing is
@@ -562,28 +572,39 @@ as $$
 $$;
 
 -- Logs a request for the artist its page showed (request_binding), bound to their handle, site and account,
--- with its note and when it came. Asking again for the same only counts, and moves nothing in the verifier's
--- queue; a note that says something is kept beside those before it. Five at most: the first and the latest four,
--- so the owner reads what the artist wrote whoever asks before or after them, and nobody can fill the row.
+-- with its note, when it came and the network it came from (p_network, as client_wait is given it, keyed as
+-- start_removal_proof keys it). Asking again for the same only counts, and moves nothing in the verifier's queue;
+-- a note that says something takes the place of its network's earlier one. The latest from each network, of the
+-- ten networks heard from last: so whoever asks first owns nothing, the owner reads what the artist wrote unless
+-- ten networks have written since (and the artist writing again brings it back), and nobody can fill the row.
 -- Always returns true, whatever the slug, so it gives nothing away.
-create or replace function public.request_removal(p_slug text, p_note text default null, p_ticket text default null)
-returns boolean
+create or replace function public.request_removal(
+  p_slug text, p_note text default null, p_ticket text default null, p_network text default null
+) returns boolean
 language plpgsql security definer set search_path = ''
 as $$
 declare
   said constant text := left(nullif(btrim(p_note), ''), 300);
+  heard constant text := (select encode(extensions.hmac('removal network ' || coalesce(p_network, ''), s.secret,
+                                                        'sha256'), 'hex') from public.removal_secret s);
 begin
   perform pg_advisory_xact_lock(4207); -- the removals' lock: see request_binding
   insert into public.removal_requests as r (artist_slug, notes, da_username, site_url, site_domain, da_account)
   select b.slug,
-         case when said is null then '[]' else jsonb_build_array(jsonb_build_object('at', now(), 'note', said)) end,
+         case when said is null then '[]'
+              else jsonb_build_array(jsonb_build_object('at', now(), 'note', said, 'network', heard)) end,
          b.da_username, b.site_url, b.site_domain, b.da_account
   from public.request_binding(p_slug, p_ticket) b
   on conflict (artist_slug, da_key, site_key) where outcome is null do update set
     last_at = now(), requests = r.requests + 1, da_account = coalesce(r.da_account, excluded.da_account),
-    -- A sixth note takes the place of the second: one comes at a time.
-    notes = case when jsonb_array_length(r.notes || excluded.notes) > 5 then (r.notes || excluded.notes) - 1
-                 else r.notes || excluded.notes end;
+    -- In the order they came. A note an earlier version kept names no network, and stands alone.
+    notes = (select coalesce(jsonb_agg(kept.e order by kept.i), '[]')
+             from (select n.e, n.i
+                   from (select e, i, max(i) over (partition by coalesce(e -> 'network', to_jsonb(i))) as latest
+                         from jsonb_array_elements(r.notes || excluded.notes) with ordinality as n (e, i)) n
+                   where n.i = n.latest
+                   order by n.i desc
+                   limit 10) kept);
   return true;
 end
 $$;
@@ -784,7 +805,7 @@ revoke all on function
   public.claim_ticket(jsonb),
   public.ticket_binding(text),
   public.request_binding(text, text),
-  public.request_removal(text, text, text),
+  public.request_removal(text, text, text, text),
   public.removal_code(text),
   public.start_removal_proof(text, text, text),
   public.due_removals(timestamptz, int),
@@ -816,7 +837,7 @@ grant execute on function
   public.refresh_search_words(),
   public.similar_artists(text, int),
   public.get_artist(text),
-  public.request_removal(text, text, text),
+  public.request_removal(text, text, text, text),
   public.removal_code(text),
   public.start_removal_proof(text, text, text),
   public.due_removals(timestamptz, int),

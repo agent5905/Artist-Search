@@ -17,6 +17,30 @@ create extension if not exists pgcrypto with schema extensions; -- for the remov
 alter default privileges for role postgres revoke execute on functions from public;
 alter default privileges for role postgres in schema public revoke execute on functions from anon, authenticated;
 
+-- Makes an index (p_definition names it %I), or brings one an earlier version made under the name to this
+-- definition: "create index if not exists" would leave it as it was. The index is made again under a scratch name
+-- and the two are compared as Postgres prints them: the same, the scratch one goes; not, it takes the old one's
+-- place. In pg_temp, so it is nobody's to call and goes with the migration's session; sql/003_limits.sql uses it too.
+-- ponytail: every migration builds each index a second time, seconds at full scale. Compare stored definitions if
+-- that ever matters.
+create or replace function pg_temp.index_as_written(p_name text, p_definition text) returns void
+language plpgsql as $$
+begin
+  if to_regclass(format('public.%I', p_name)) is null then
+    execute format(p_definition, p_name);
+    return;
+  end if;
+  execute format(p_definition, 'index_as_written');
+  if pg_get_indexdef(to_regclass(format('public.%I', p_name)))
+     = replace(pg_get_indexdef(to_regclass('public.index_as_written')), 'index_as_written', p_name) then
+    drop index public.index_as_written;
+  else
+    execute format('drop index public.%I', p_name);
+    execute format('alter index public.index_as_written rename to %I', p_name);
+  end if;
+end
+$$;
+
 -- A strict http(s) URL, at most 2,048 characters:
 --   * the host is a public DNS name in its one canonical spelling: lowercase ASCII (punycode for
 --     other scripts), no user, no trailing dot, no IP address. The same rule as pipeline/store.py.
@@ -139,7 +163,7 @@ create table if not exists public.artist_neighbors (
   constraint artist_neighbors_not_itself check (neighbor_id <> artist_id)
 );
 -- Deleting an artist finds the rows that name them as a neighbour by this.
-create index if not exists artist_neighbors_neighbor_idx on public.artist_neighbors (neighbor_id);
+select pg_temp.index_as_written('artist_neighbors_neighbor_idx', 'create index %I on public.artist_neighbors (neighbor_id)');
 
 -- The words visible artists use, for putting a misspelled search word right. Derived:
 -- refresh_search_words() rebuilds it; db.load() and every removal call that.
@@ -147,7 +171,8 @@ create table if not exists public.search_words (
   word text primary key check (length(word) between 4 and 40),
   artists int not null -- how many artists use it
 );
-create index if not exists search_words_trgm_idx on public.search_words using gin (word extensions.gin_trgm_ops);
+select pg_temp.index_as_written(
+  'search_words_trgm_idx', 'create index %I on public.search_words using gin (word extensions.gin_trgm_ops)');
 
 -- ponytail: no vector index. search_artists orders every artist by 128 bytes of sign bits and
 -- compares exactly only the best 100. Measured numbers are printed by the RUN_SCALE=1 test in
@@ -161,8 +186,8 @@ create index if not exists search_words_trgm_idx on public.search_words using gi
 -- for them (artists.da_account). Nothing afterwards changes what it is bound to, so the verifier finds that
 -- artist while they are not listed, and only that artist: a slug can pass to another handle, and a site to
 -- another artist. A later request for the same handle and site is the same request and
--- only counts (and fills in an account that was not known yet, and keeps its note if it has one, beside the
--- others: the owner reads them all); one for anything else is a request of its own
+-- only counts (and fills in an account that was not known yet, and keeps its note if it has one, in place of the
+-- note its network left before: the owner reads them all); one for anything else is a request of its own
 -- (removal_requests_open_idx below). A request with no note erases no note, and neither does one with a note.
 create table if not exists public.removal_requests (
   id bigint generated always as identity primary key, -- how the verifier and the owner name a request
@@ -189,8 +214,10 @@ alter table public.removal_requests
   -- the verifier takes turns between networks (due_removals), so that one asking for many codes holds back only
   -- its own, and one asking for somebody else's code takes nothing from them.
   add column if not exists networks text[] not null default '{}',
-  -- Every note left with the request that says something (request_removal), with its time: {"at", "note"}, the
-  -- first and the latest four, so a stranger can neither hide what the artist wrote nor fill the row.
+  -- The notes left with the request that say something (request_removal), each with its time and the network it
+  -- came from, keyed as networks are: {"at", "note", "network"}. The latest from each network, of the ten networks
+  -- heard from last, so a stranger can hide what the artist wrote only from ten networks of their own, and cannot
+  -- fill the row.
   add column if not exists notes jsonb not null default '[]',
   -- Null while open. 'proven' (the verifier saw the code), 'granted' or 'rejected' (the owner's answer), or
   -- 'removed' (the artist was removed another way). A closed row keeps nothing of the artist: its slug gives
@@ -220,8 +247,8 @@ begin
 end
 $$;
 alter table public.removal_requests alter column artist_slug set not null;
-create unique index if not exists removal_requests_open_idx
-on public.removal_requests (artist_slug, da_key, site_key) nulls not distinct where outcome is null;
+select pg_temp.index_as_written('removal_requests_open_idx', 'create unique index %I on public.removal_requests '
+                                '(artist_slug, da_key, site_key) nulls not distinct where outcome is null');
 
 -- The one secret a removal proof code is derived from. Readable by the table owner only, which the
 -- two functions that need it run as. Made once, with a random value.
@@ -261,11 +288,15 @@ alter table public.artists
   alter column mediums set storage main;
 
 -- Every constraint that is not part of a "create table" above, added once ("add constraint" has no
--- "if not exists"). The sizes: a name, tagline or title is a line, a profile or description a
--- paragraph, a list entry a few words.
+-- "if not exists"). One an earlier version made under the name is compared, as Postgres prints them, with this
+-- definition made under a scratch name (not valid, so no row is read), and replaced when they differ: the rows
+-- are then checked against the new one, and a row it refuses stops the migration, naming it. The sizes: a name,
+-- tagline or title is a line, a profile or description a paragraph, a list entry a few words.
 do $do$
 declare
   wanted record;
+  live text;
+  scratch text;
 begin
   for wanted in
     select * from (values
@@ -305,34 +336,41 @@ begin
       ('artist_neighbors', 'artist_neighbors_few_picks', 'check (cardinality(picks) <= 4)'),
       ('artist_neighbors', 'artist_neighbors_some_picks', 'check (cardinality(picks) >= 1)'),
       ('removal_requests', 'removal_requests_short', 'check (length(artist_slug) <= 80 and length(note) <= 300)'),
-      -- Five notes of 300 characters, each of them escaped at its longest (\u0001 for one character).
+      -- Ten notes of 300 characters, each of them escaped at its longest (\u0001 for one character), with their
+      -- time and network: 1,933 characters a note, 19,350 for ten.
       ('removal_requests', 'removal_requests_few_notes',
-       $$check (jsonb_typeof(notes) = 'array' and length(notes::text) <= 10000)$$),
+       $$check (jsonb_typeof(notes) = 'array' and length(notes::text) <= 20000)$$),
       ('removal_requests', 'removal_requests_outcome',
        $$check (outcome in ('proven', 'granted', 'rejected', 'removed'))$$),
       ('removed', 'removed_key_is_a_hash', $$check (key_hash ~ '^[0-9a-f]{64}$')$$)
     ) as listed (table_name, name, definition)
   loop
-    if not exists (
-      select 1 from pg_constraint
-      where conrelid = format('public.%I', wanted.table_name)::regclass and conname = wanted.name
-    ) then
-      execute format('alter table public.%I add constraint %I %s', wanted.table_name, wanted.name, wanted.definition);
+    live := (select pg_get_constraintdef(oid) from pg_constraint
+             where conrelid = format('public.%I', wanted.table_name)::regclass and conname = wanted.name);
+    if live is not null then
+      -- A unique constraint cannot be "not valid": it is built, an index on the table, and then dropped.
+      execute format('alter table public.%I add constraint constraint_as_written %s', wanted.table_name,
+                     wanted.definition || case when wanted.definition like 'check%' then ' not valid' else '' end);
+      scratch := (select pg_get_constraintdef(oid) from pg_constraint
+                  where conrelid = format('public.%I', wanted.table_name)::regclass and conname = 'constraint_as_written');
+      execute format('alter table public.%I drop constraint constraint_as_written', wanted.table_name);
+      continue when scratch in (live, live || ' NOT VALID');
+      execute format('alter table public.%I drop constraint %I', wanted.table_name, wanted.name);
     end if;
+    execute format('alter table public.%I add constraint %I %s', wanted.table_name, wanted.name, wanted.definition);
   end loop;
 end
 $do$;
 
-create index if not exists artists_fts_idx on public.artists using gin (fts);
--- Every search would otherwise read the whole list of entries a load left pending.
-alter index public.artists_fts_idx set (fastupdate = off);
+-- fastupdate off: every search would otherwise read the whole list of entries a load left pending.
+select pg_temp.index_as_written('artists_fts_idx', 'create index %I on public.artists using gin (fts) with (fastupdate = off)');
 -- One row per DeviantArt account and one per site. No two rows can share a removal key, so removing
 -- an artist leaves no second copy behind, and removing one artist never blocks another.
-create unique index if not exists artists_da_key_idx on public.artists (da_key);
-create unique index if not exists artists_site_key_idx on public.artists (site_key);
-create index if not exists artists_da_account_idx on public.artists (da_account); -- for a removal, too
+select pg_temp.index_as_written('artists_da_key_idx', 'create unique index %I on public.artists (da_key)');
+select pg_temp.index_as_written('artists_site_key_idx', 'create unique index %I on public.artists (site_key)');
+select pg_temp.index_as_written('artists_da_account_idx', 'create index %I on public.artists (da_account)'); -- for a removal
 -- A card shows an artist's first four works: with this, it reads four rows instead of all of them.
-create index if not exists works_artist_position_idx on public.works (artist_id, position, id);
+select pg_temp.index_as_written('works_artist_position_idx', 'create index %I on public.works (artist_id, position, id)');
 
 alter table public.artists enable row level security;
 alter table public.works enable row level security;

@@ -8,6 +8,7 @@ never the request URL (it holds the project ref).
 
 import hashlib
 import itertools
+import re
 import sys
 import time
 from collections.abc import Callable, Iterable
@@ -96,14 +97,42 @@ def rpc(name: str, args: dict[str, Any], key: Key = "publishable") -> Any:
     return _checked(data_api("POST", f"rpc/{name}", key, json=args))
 
 
+# Last in a migration: a function an earlier version made that sql/ neither makes nor drops (an old overload, a
+# renamed one) would linger, callable as it was. The migration stops at it, naming it, and nothing is applied. MADE
+# is every name sql/ makes, once for each time. (An index or a named constraint an earlier version made is brought
+# to the files' definition by sql/001_schema.sql itself.)
+_UNMADE = """
+do $$
+declare
+  stale text := (
+    select string_agg(p.oid::regprocedure::text, ', ' order by p.oid::regprocedure::text) from pg_proc p
+    where p.pronamespace = 'public'::regnamespace
+      and not exists (select 1 from pg_depend d  -- an extension's own
+                      where d.classid = 'pg_proc'::regclass and d.objid = p.oid and d.deptype = 'e')
+      and (select count(*) from pg_proc q where q.pronamespace = p.pronamespace and q.proname = p.proname)
+          > cardinality(array_positions(array[MADE]::text[], p.proname::text)));
+begin
+  if stale is not null then
+    raise exception 'migrate stopped, nothing applied: sql/ does not make %; drop it, or make it there', stale;
+  end if;
+end
+$$;"""
+
+
 def migrate() -> None:
     """Apply sql/*.sql in name order, all or nothing. Every statement is idempotent, so rerunning changes nothing.
+
+    What an earlier version left is not kept unnoticed: an index or a named constraint whose definition differs
+    from the files' is replaced (sql/001_schema.sql), and a function the files neither make nor drop stops the
+    migration, named in the error, with nothing applied.
 
     Then the site's token (SITE_TOKEN in .env), by its sha256 only, in the same call: the database lets the site's
     server functions in with it (sql/003_limits.sql). Without one in .env the database keeps the one it has, or has
     none and refuses the site everything.
     """
     files = [path.read_text(encoding="utf-8") for path in sorted((ROOT / "sql").glob("*.sql"))]
+    made = re.findall(r"create or replace function public\.(\w+)\(", "\n".join(files))
+    files.append(_UNMADE.replace("MADE", ", ".join(f"'{name}'" for name in made)))
     token = load_env().get("SITE_TOKEN")
     if token:
         files.append(

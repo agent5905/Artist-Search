@@ -5,10 +5,11 @@
 //   {"slug", "ticket", "note"}         -> {"ok": true}  site_request_removal: a request without proof, for the site owner
 // The ticket is what site_claim gave the page: it binds the request to the artist the page showed, even if a push holds
 // them back while the page is open (sql/002_functions.sql: request_binding). A code is asked for in the turn of the
-// visitor's network (due_removals). The database counts the visitor first (client_wait: 10 removals a day, 20 a network,
-// the page a tenth of one), apart from the reads and with no total for everyone, so a day's reads used up cannot keep
-// an artist from this page; past that, a 429 that says how long to wait. Called as search.ts calls it, and like it
-// refused to another site's page (crossSite). Only a JSON body is read, too.
+// visitor's network (due_removals), and a note in that network's place (request_removal): a stranger then needs ten
+// networks to put the artist's note out of the owner's sight. The database counts the visitor first (client_wait: 10
+// removals a day, 20 a network, the page a tenth of one), apart from the reads and with no total for everyone, so a
+// day's reads used up cannot keep an artist from this page; past that, a 429 that says how long to wait. Called as
+// search.ts calls it, and like it refused to another site's page (crossSite). Only a JSON body is read, too.
 import { crossSite, network, NO_STORE, notHere, refused, site, wait, type Env } from './search'
 
 export const TOO_MANY = 'Too many removal requests from your connection today.'
@@ -44,7 +45,8 @@ export async function handle(request: Request, env: Env, fetcher: typeof fetch =
       return Response.json({ code: await site<string>(env, 'site_removal_code', args, fetcher) }, { headers })
     }
     const note = typeof body.note === 'string' ? body.note.trim().slice(0, 300) || null : null
-    await site<boolean>(env, 'site_request_removal', { p_slug: slug, p_note: note, p_ticket: ticket }, fetcher)
+    const args = { p_slug: slug, p_note: note, p_ticket: ticket, p_network: network(request) }
+    await site<boolean>(env, 'site_request_removal', args, fetcher)
     return Response.json({ ok: true }, { headers })
   } catch {
     return Response.json({ error: 'That did not go through.' }, { status: 502, headers })

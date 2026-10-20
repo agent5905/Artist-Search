@@ -45,16 +45,16 @@ alter table public.client_counts
   drop column if exists hits_before,
   drop column if exists seen_at,
   add column if not exists busy_until float8 not null default 0;
-create index if not exists client_counts_busy_until_idx on public.client_counts (busy_until);
+select pg_temp.index_as_written('client_counts_busy_until_idx', 'create index %I on public.client_counts (busy_until)');
 alter table public.client_counts enable row level security;
 revoke all on table public.client_counts from public, anon, authenticated, service_role;
 
--- The site's server calls it first, with the visitor as Cloudflare saw them (an IPv4 address, or the /56
+-- The site's server calls it first, with the visitor as Cloudflare saw them (an IPv4 address, or the /64
 -- of an IPv6 one) and their network (its /24, or the /48). It answers how many seconds to wait: 0 means
 -- go ahead, and the request is counted. A request told to wait is not counted, so asking again while
 -- told to wait costs nothing.
 --   read: a page of search results or of similar artists counts 1, a profile 0.1 (its size). 100 a day
---         per visitor, 100 per network, 3,000 for everyone.
+--         per visitor, 1,000 per network, 3,000 for everyone.
 --   removal: asking for a code, or asking without one, counts 1; the claim-or-remove page itself (site_claim)
 --         0.1. 10 a day per visitor, 20 per network. No total, and apart from the reads: many networks
 --         together must not be able to keep an artist from asking, and a day's reads used up must not either.
@@ -67,9 +67,13 @@ revoke all on table public.client_counts from public, anon, authenticated, servi
 -- stored shape, every thumbnail's signed token at 640 characters, the longest seen). At most 96,000 pages a
 -- month (the first day's burst, then 31 days of 3,000) is 4.3 GB gzipped, 86% of the allowance; the rest is
 -- for the push stage's reads (about 10 MB a run). Change the numbers here if a real page measures larger.
--- A visitor is one address, an office's or a carrier's shared one too, so a visitor may use what a network
--- may. One network is 3.3% of the day: it takes 30 networks a day to use it up, and one person on 20 of them
--- leaves a third. Past that, many networks at once are the edge rule's to stop (docs/edge-rate-limit.md).
+-- A visitor is one IPv4 address, an office's or a carrier's shared one too, or one IPv6 /64, a subscriber's own.
+-- A network is ten visitors' worth, a third of the day, for the neighbours who share it: the 254 customers of an
+-- ISP's IPv4 /24, or a carrier's phones on 4,096 /64s of one /48. One visitor alone never meets it. So it takes
+-- 30 visitors, in three networks or more, to use the day up; one visitor takes a 30th of it, one network a third.
+-- Owner decision 12 accepts that one address can take the site down for a day anyway (Cloudflare's function
+-- requests, below), so a network's share is set for its neighbours, not against a flood: a tight one cost real
+-- visitors more than it kept out. Many networks at once are the edge rule's to stop (docs/edge-rate-limit.md).
 -- The rows are locked in one order (visitor, network, everyone), so two calls never wait on each other
 -- in a circle. The clock is read once they are all held, and a row only ever moves forward, so the order
 -- in which calls arrive cannot undo a count. Anything missing (the token, the removal secret, a known
@@ -84,7 +88,7 @@ declare
   budget constant text := case when p_kind in ('search', 'similar', 'profile') then 'read'
                                when p_kind in ('removal', 'claim') then 'removal' end;
   cost constant float8 := case when p_kind in ('profile', 'claim') then 0.1 else 1 end;
-  per_day constant float8[] := case budget when 'read' then '{100, 100, 3000}'::float8[] else '{10, 20, null}'::float8[] end;
+  per_day constant float8[] := case budget when 'read' then '{100, 1000, 3000}'::float8[] else '{10, 20, null}'::float8[] end;
   secret text;
   keys text[];
   held float8[];
@@ -179,9 +183,10 @@ as $$
 $$;
 
 -- The two a request is filed by: bound to what the page showed (p_ticket), and a code in the turn of the network
--- that asks for it (p_network, as client_wait is given it).
+-- that asks for it, a note in that network's place (p_network, as client_wait is given it).
 drop function if exists public.site_removal_code(text, text);
 drop function if exists public.site_request_removal(text, text, text);
+drop function if exists public.site_request_removal(text, text, text, text);
 
 create or replace function public.site_removal_code(
   p_token text, p_slug text, p_ticket text default null, p_network text default null
@@ -192,12 +197,13 @@ as $$
   select public.start_removal_proof(p_slug, p_ticket, p_network);
 $$;
 
-create or replace function public.site_request_removal(p_token text, p_slug text, p_note text, p_ticket text default null)
-returns boolean
+create or replace function public.site_request_removal(
+  p_token text, p_slug text, p_note text, p_ticket text default null, p_network text default null
+) returns boolean
 language sql security definer set search_path = ''
 as $$
   select public.site_check(p_token);
-  select public.request_removal(p_slug, p_note, p_ticket);
+  select public.request_removal(p_slug, p_note, p_ticket, p_network);
 $$;
 
 revoke all on function
@@ -208,7 +214,7 @@ revoke all on function
   public.site_similar(text, text),
   public.site_claim(text, text),
   public.site_removal_code(text, text, text, text),
-  public.site_request_removal(text, text, text, text)
+  public.site_request_removal(text, text, text, text, text)
 from public, anon, authenticated, service_role;
 
 grant execute on function
@@ -218,5 +224,5 @@ grant execute on function
   public.site_similar(text, text),
   public.site_claim(text, text),
   public.site_removal_code(text, text, text, text),
-  public.site_request_removal(text, text, text, text)
+  public.site_request_removal(text, text, text, text, text)
 to anon;
