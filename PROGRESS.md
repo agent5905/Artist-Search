@@ -1521,6 +1521,20 @@ Deadlocks are gone as written, and nothing else stands beyond the accepted limit
 - **What the guard asks for:** `--allow-delete 248`.
 - **The real load waits for the owner's go-ahead:** the auto-mode classifier treats it as a production deploy. Nothing is public until the site is deployed, since the database answers only the site's token.
 
+**The first real load (2026-10-21, with the owner's go-ahead).** `push --allow-delete 248` finished cleanly.
+- **The live database holds:** 2,978 artists, 27,443 works, 63,230 neighbour rows and 20,691 search words. It has no test rows, and the removal list is empty.
+- **Size:** 84.6 MB of the 400 MB the spec allows.
+- **Locked down, as designed:**
+  - A search with the site's token answers 24 results for "dark fantasy creature design".
+  - A wrong token gets 401.
+  - Reading a table directly with the public key gets 401.
+- **Still not public:** nothing is deployed.
+
+**Next:**
+1. The text-search A/B against DeviantArt's search, with the site run locally against this database and the 36 captured reference pages.
+2. The site's settings on the `artist-search` Pages project.
+3. The first public deployment, which is the owner's call.
+
 **The disk filled up.** Drive F: reached 0 bytes free at about 19:45 on 10-19, and two image-check turns failed to open the store and were retried. The cause was this project: 20 finished builder worktrees, each with its own Python environment (73 GB), and critics' temporary test folders (9.5 GB).
 - **Every branch was merged,** so the worktrees were removed, with the branches kept, and the temporary folders deleted. F: has 83 GB free.
 - **The store's integrity check passes.** No reading was lost.
