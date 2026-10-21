@@ -1930,9 +1930,16 @@ def test_holds_contact_is_the_plain_rule_a_title_is_held_to_for_any_text_a_later
         ("Write by e-mail or by email.", True),
         ("A tip jar: PayPal, Venmo, Cash App.", True),
         ("FAKE word " * 1001, True),  # too long to read, so not passed
+        # the eighth critic's, as titles say them: these only as they are written
+        ("FAKE Now on Bluesky!", True),
+        ("FAKE sketch for a friend (insta)", True),
+        ("FAKE moved to bsky", True),
+        ("FAKE commission from Toyhouse", True),
+        ("FAKE from IG", True),
         # words a picture is described in, which only look like one
         ("Discordant colours, a knight in plate mail and a female figure.", False),
         ("A clear blue sky over an X-wing; a line of soldiers; a signal fire.", False),
+        ("A toy house; an instant later, golden threads and a mastodon.", False),
         ("A twitching tail, a kick, and a youthful face.", False),
         (None, False),
     ],

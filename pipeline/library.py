@@ -201,14 +201,23 @@ _ENCODED = re.compile(r"[A-Za-z0-9+/=_-]{100,}")  # no word is this long; a base
 _CALLING = re.compile(r"call|tel|phone|whatsapp|\+", re.IGNORECASE)
 # Messaging, social and payment services: a model's words that name one say how to reach somebody, where the plain
 # rule sees nothing ("Discord fakepainter#1234"). See names_service.
-# ponytail: a hand list, matched as whole words. "X", "Line", "Signal", "Threads", "Bluesky" and "Mastodon" are
-# left out, being words a picture is described in; x.com and bsky.app are domains, which the plain rule refuses.
+# ponytail: a hand list, matched as whole words. "X", "Line", "Signal", "Threads" and "Mastodon" are left out, being
+# words a picture is described in, and "Cara", a name; x.com and bsky.app are domains, which the plain rule refuses.
+# Of the 39,744 titles of 2026-10-20, "Threads" named the service in one and was another word in one sent (and in 5
+# sent descriptions); "Cara" was a sent work's character and the service in six works held for other reasons; no
+# title said "Mastodon".
 SERVICES = (
     *("discord", "telegram", "snapchat", "whatsapp", "wechat", "skype", "kik", "viber", "email", "gmail", "hotmail"),
     *("instagram", "twitter", "tiktok", "facebook", "tumblr", "reddit", "youtube", "twitch", "pixiv", "vgen"),
     *("patreon", "kofi", "paypal", "venmo", "cashapp", "onlyfans", "fansly", "gumroad", "fanbox", "boosty"),
 )
-_SERVICE = re.compile(r"\b(?:" + "|".join(r"[\W_]*".join(name) for name in SERVICES) + r")\b", re.IGNORECASE)
+# And these only as they are written: with their letters set apart they are other words ("blue sky", "toy house").
+# On 2026-10-20 they are in 9 titles, all sent and each rightly held: announcements, raffles, and art credited to
+# where it was made or asked for. No sent description or profile names one.
+WHOLE_SERVICES = ("bluesky", "bsky", "insta", "ig", "toyhouse")
+_SERVICE = re.compile(
+    r"\b(?:" + "|".join([*(r"[\W_]*".join(name) for name in SERVICES), *WHOLE_SERVICES]) + r")\b", re.IGNORECASE
+)
 # A link, whatever it links to and whether or not a host with a dot is in it: "skype:name", "tg://name",
 # "sms:5550199", "http://10.0.0.7/x". A word, a colon, and something right after it. "Title: subtitle" is none.
 _LINK = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*:(?=\S)|://")
