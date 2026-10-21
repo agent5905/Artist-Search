@@ -1565,6 +1565,23 @@ Deadlocks are gone as written, and nothing else stands beyond the accepted limit
 
 **Next:** the first public deployment, which is the owner's call. It means building `web/` and running `wrangler pages deploy dist --project-name artist-search`. The verifier's 15-minute schedule (Windows Task Scheduler, on the owner's machine) goes with it.
 
+### Round 34: the site is public (2026-10-21)
+
+**Deployed at the owner's word:** `web/` was built and deployed with `wrangler pages deploy` to the `artist-search` project. It is live at **https://artist-search.pages.dev**.
+
+**Checked live:**
+- The home page loads.
+- Neither of its two assets holds a key, a token or the database's address.
+- A search through the site's own API answers.
+- A call without the site's header is refused (403), so another site's visitors cannot spend the reads.
+- The database's tables refuse direct reads with the public key (401).
+- In the browser, a search, an artist's profile, its "More artists like" link and the claim-or-remove page all work. Nothing on the claim page was pressed.
+
+**The removal checker** (`uv run python -m pipeline.removals`):
+- A dry run against the live database ran cleanly; no requests are open yet.
+- Its schedule waits for the owner: the auto-mode classifier refused to register a Windows scheduled task as unrequested persistence.
+- Until it is scheduled, the page's "at most a day" holds only while someone runs the checker by hand, or while a collect or discovery run is going.
+
 **The disk filled up.** Drive F: reached 0 bytes free at about 19:45 on 10-19, and two image-check turns failed to open the store and were retried. The cause was this project: 20 finished builder worktrees, each with its own Python environment (73 GB), and critics' temporary test folders (9.5 GB).
 - **Every branch was merged,** so the worktrees were removed, with the branches kept, and the temporary folders deleted. F: has 83 GB free.
 - **The store's integrity check passes.** No reading was lost.
