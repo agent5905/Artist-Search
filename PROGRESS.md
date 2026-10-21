@@ -1496,6 +1496,25 @@ Deadlocks are gone as written, and nothing else stands beyond the accepted limit
 
 **Push round 12, being built, the last:** all of these. The lead will then rerun the ninth critic's own probes and its 78 breaks against it, instead of a fresh critic, since it has said yes.
 
+**Push round 12: merged, and the ninth critic's conditions are met.** On a copy of the store, push would send 2,978 artists and 27,443 works.
+- **The last tag words:**
+  - `adultcontent`, glued "expansion", `quicksand`, `shibari`, `guro`, `dominatrix`, `feminization`, `dollification`, and hate words (`siegheil`, `1488`, ...).
+  - "rape" and "sex" only where they cannot be "grape" or "essex".
+  - 13 more sent works are held. 5 tagged guro may be horror that decision 17 would show; they are held as the brief named guro a fetish.
+- **Titles:** pin-up, busty, sieg heil and R18 added. 3 sent works are held, one of them arguably a comic "pin-up".
+- **Priced sheets:**
+  - A price in a title, or "P2U" (pay-to-use), makes a work a sheet: 125 titles, all sales.
+  - "WARRIOR FUSION [$15]" and two P2U bases no longer lead, and no sheet is picked.
+- **Taglines:** a tagline naming a service is left out, and the artist stays. It drops exactly the 11 found.
+- **Flood guard:** site hashes the local list adds now count against it, so a corrupt local list of sites stops the run with nothing deleted.
+- **Removals made here:** an old handle the owner removes takes the account, so the person goes under every handle.
+- **Tests:** the three breaks the critic found uncaught are now caught.
+- **Verified:**
+  - The ninth critic's 24 targeted probes pass on main.
+  - Its mutation runner catches 82 of 83 breaks. The one miss is a check that cannot be reached, since the library refuses those addresses first.
+
+**The push critic loop ends here.** The ninth critic said it would run the load after these fixes, and they are verified against its own probes.
+
 **The disk filled up.** Drive F: reached 0 bytes free at about 19:45 on 10-19, and two image-check turns failed to open the store and were retried. The cause was this project: 20 finished builder worktrees, each with its own Python environment (73 GB), and critics' temporary test folders (9.5 GB).
 - **Every branch was merged,** so the worktrees were removed, with the branches kept, and the temporary folders deleted. F: has 83 GB free.
 - **The store's integrity check passes.** No reading was lost.
