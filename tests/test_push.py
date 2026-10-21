@@ -633,7 +633,9 @@ HELD = {
     "fit_not_checked": {"fit": None},
     "unfit_title": {"title": "FAKE-TITLE Vore-verse: zz"},
     "unfit_title glued to other words": {"title": "FAKE-TITLE spaceNaziMechs zz"},
-    "unfit_tag": {"tags": ["NSFW"]},  # the artist's own whole tag, in any case
+    "unfit_title with a glued kkk": {"title": "FAKE-TITLE zztheKKKriders zz"},  # the eighth critic's uncaught break
+    "unfit_tag": {"tags": ["NSFW"]},  # the artist's own tag, in any case
+    "unfit_tag glued to other words": {"tags": ["zzHugeBoobs"]},
     "profane_title": {"title": "FAKE-TITLE Piss off zz"},
     "profane_title glued": {"title": "FAKE-TITLE zzfuckery zz"},
     "explicit": {"explicit": True},
@@ -648,6 +650,7 @@ HELD = {
     "bad_address": {"thumb": "https://yy-fake.deviantart.net/f/FAKE-THUMB-NOT-ON-WIXMP.jpg"},
     "service_in_title": {"title": "FAKE-TITLE zz now on Instagram"},
     "service_in_title spelled out": {"title": "FAKE-TITLE zz our Dis-cord server is back"},
+    "service_in_title bluesky": {"title": "FAKE-TITLE zz now on Bluesky"},  # the eighth critic's
     "held_by_hand": {},  # its id in the owner's list (held_by_hand, below)
 }  # and declared_ai, or no reading of it: one such work holds back its artist (ai_declared_work, ai_not_read, below)
 
@@ -657,9 +660,25 @@ def held_by_hand(*lines):
     (config.CACHE_DIR / push.HELD_BY_HAND).write_text("\n".join(lines), encoding="utf-8")
 
 
-def test_a_tag_that_only_contains_an_unfit_word_holds_nothing(fake):
-    """UNFIT_TAG takes whole tags: "carnivore" is no "vore", and "nsfwfree" says the opposite of "nsfw"."""
-    artist(ALPHA, 8, edits={2: {"tags": ["carnivore", "nsfwfree", "inflatable"]}})
+def test_a_tag_built_from_an_unfit_word_holds_its_work_and_a_word_inside_another_holds_nothing(fake):
+    """The eighth critic's: 162 sent works carried a sexual or fetish tag the list of whole tags missed ("nude",
+    "bigboobs", "hypnosismindcontrol"). Tags glue words together; a word that is inside other words too counts only
+    at either end of a run of letters, or as the whole of one."""
+    unfit = [
+        *("nude", "Sexy", "boobs", "bigboobs", "hugeboobs", "boobsandbutts", "milf", "pinup", "pin_up", "bimbo"),
+        *("bondagefetish", "stockstickling", "hypnosismindcontrol", "zzpornart", "nsfwzz", "zzfutanari", "futa"),
+        *("ecchigirl", "nudity", "softvore", "vore_zz", "zzinflation", "bdsm", "lingerie", "bigbreasts", "bigbutt"),
+        *("thiccthighs", "feet", "zzfeet", "footfetish", "ass", "zz_ass", "R-18", "zznazizombies", "zzKKKriders"),
+    ]
+    fine = [
+        *("carnivore", "omnivore", "herbivore", "glass", "class", "bass", "assassin", "badass", "therapist"),
+        *("arlecchino", "futaba", "button", "headbutt", "butterfly", "menudesign", "snakedragon", "treeskink"),
+        *("boobytrap", "breastplate", "lolita", "hypnos", "gothiccomic", "emilfanart", "foodporn", "inflatable"),
+        *("photoshoppainting", "skyscraper", "sharkkkk", "inktober18"),
+    ]
+    assert [tag for tag in unfit if not push.UNFIT_TAG.search(tag.casefold())] == []
+    assert [tag for tag in fine if push.UNFIT_TAG.search(tag.casefold())] == []
+    artist(ALPHA, 8, edits={2: {"tags": fine}})
     artist(BRAVO, angle=0.3)
     counts = push.run(False)
     assert counts["works_held_unfit_tag"] == 0 and counts["works_sent"] == 8 + 5
@@ -796,6 +815,24 @@ def test_an_artist_left_out_appears_nowhere_in_what_is_sent_not_even_as_a_neighb
         (ALPHA, CHARLIE, 1),
         (CHARLIE, ALPHA, 1),
     ]
+
+
+def test_an_artist_held_by_hand_stays_held_under_a_handle_their_account_takes(fake):
+    """The eighth critic's: the owner's list named BRAVO's key, the account took the handle CHARLIE, and the list
+    matched by key, so CHARLIE was sent."""
+    artist(ALPHA, angle=0.0)
+    artist(BRAVO, angle=0.3)
+    held_by_hand(f"da:{BRAVO}  # the owner's")
+    push.run(False)
+    assert list(sent_artists(fake)) == [ALPHA]
+    library.mark_artist(f"da:{BRAVO}", "account gone")  # as the collect stage finds the account under a new handle
+    artist(CHARLIE, angle=0.31, user=BRAVO, old_keys=[f"da:{BRAVO}"])
+    artist(DELTA, angle=0.6)  # and somebody else
+
+    counts = push.run(False)
+
+    assert sorted(sent_artists(fake)) == [ALPHA, DELTA] and counts["artists_held_held_by_hand"] == 1
+    assert not any(word in fake.sent() for word in of_artist(CHARLIE))
 
 
 def test_the_thresholds_are_the_named_ones(fake):
@@ -2925,7 +2962,8 @@ def test_only_a_tag_on_the_reviewed_list_is_shown_as_the_artists(fake):
     ]
     assert list(profiles._own_tags(works, ALPHA, {*UNSHOWN, "knight", "dragon"})) == ["knight", "dragon"]
     made = artist(ALPHA, 6)
-    tags = {n: [*UNSHOWN, "Knight", "character_design", work["tags"][1]] for n, work in enumerate(made)}
+    sendable = [tag for tag in UNSHOWN if not push.UNFIT_TAG.search(tag)]  # the others hold their work back
+    tags = {n: [*sendable, "Knight", "character_design", work["tags"][1]] for n, work in enumerate(made)}
     collected_again(ALPHA, made, tags=tags)
     read_again(*made)
     # A row made before the list, or before a tag was taken off it, or with the artist's spacing: its vector was
@@ -3028,6 +3066,26 @@ def test_profiles_given_a_removed_accounts_hash_stop_the_run_and_nothing_bars_or
         push.run(False)
     assert push.run(False, allow_delete=6)["artists_purged_here"] == 6
     assert library.artist_keys() == [f"da:{ALPHA}"]
+
+
+def test_one_profile_given_a_removed_accounts_hash_stops_the_run_though_it_is_fewer_than_the_floor(fake):
+    """The eighth critic's uncaught break: two people only a disagreement reaches are fewer than DELETE_FLOOR, and
+    only that they are a disagreement stops the run. Nobody here is purged for it, and the stop says what to run."""
+    artist(ALPHA, angle=0.0)
+    artist(BRAVO, angle=0.3)
+    other = artist(CHARLIE, angle=0.6)
+    push.run(False)
+    account = library.account(f"FAKE-USER-{BRAVO}")
+    with closing(sqlite3.connect(config.LOCAL_DB)) as conn, conn:
+        conn.execute("UPDATE profiles SET user_hash = ? WHERE artist_key = ?", (account, f"da:{CHARLIE}"))
+    fake.sql(push._removed_sql({account}))
+
+    with pytest.raises(push.Stop, match="bar 2 people") as stopped:
+        push.run(False)
+
+    assert "`uv run python -m pipeline.push --allow-delete 2`" in str(stopped.value)
+    assert library.artist_keys() == [f"da:{handle}" for handle in (ALPHA, BRAVO, CHARLIE)]
+    assert {work["id"] for work in other} <= {path.stem for path in library.image_dir().iterdir()}
 
 
 def test_granted_removals_of_accounts_kept_under_an_older_handle_too_go_through_and_purge_both(fake):

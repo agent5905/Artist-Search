@@ -182,18 +182,34 @@ UNFIT_TITLE = re.compile(
     r"loli(?:con)?|shota(?:con)?|nazis?|reich|swastikas?|hitler|kkk)\b",
     re.IGNORECASE,
 )
-# The artist's own tag says what the work is: one of these as a whole tag, case-folded, holds it back. A whole tag
-# only ("nsfw", "vore", "nazi"), never one that merely contains one ("carnivore", "nsfwfree"). On 2026-10-20, 168 of
-# the 39,744 works carried one, of 53 artists (nsfw 91, vore 40, fetish 10, inflation 8, softvore 8, lewd 6, ...);
-# the seventh critic found sent works tagged "futa", "nsfw" and "nazi" that the rating and the image check passed.
-UNFIT_TAG = re.compile(
-    r"nsfw|futa(?:nari)?|hentai|porn\w*|lewd|ecchi|r-?18|(?:soft)?vore|(?:body)?inflation|fetish\w*|"
-    r"nazis?|swastikas?|hitler|kkk"
-)
 # These inside any word of the case-folded title too: "spaceNaziMechs". Of the 39,744 titles of 2026-10-20 it holds
 # three more, two of them wrongly: a character's name that begins "Nazi", and a made-up word with "kkk" in it.
 # "kkk" within a longer run of k ("sharkkkk") is not one.
 GLUED_HATE = re.compile(r"nazi|hitler|swastika|(?<!k)kkk(?!k)")
+# The artist's own tag says what the work is: a case-folded tag that is, or is built from, a sexual or fetish word, or
+# that has a hate word of GLUED_HATE in it, holds the work back. Tags glue words together ("bigboobs", "boobsandbutts",
+# "hypnosismindcontrol", "bondagefetish"), so most of these count anywhere in a tag. Those that are inside other
+# words too count only at the start of a run of letters, at its end, or as the whole run, as the handle's swear words
+# do: "ecchi" and "futa" are no "arlecchino" or "futaba", "milf" no "emilfanart", "nude" no "menudesign", "thicc" no
+# "gothiccomic", "naked" and "kink" no "snakedragon" or "treeskink", "vore" no "carnivore", "butt" no "button" or
+# "headbutt", "ass" no "glass", "badass" or "assassin", "breast" no "breastplate", "boob" no "boobytrap", "loli" no
+# "lolita", "hypno" no "hypnos" (the god); and "porn" is no "foodporn".
+# On 2026-10-20 it takes 538 more of the store's distinct tags, and holds 244 more of the works push would send, of
+# 131 artists, every example of the eighth critic's among them; 10 more artists fall under MIN_WORKS. By their
+# descriptions about 60 of the 244 are plainly ordinary art: a word in another sense ("feet" on concept art, a book's
+# title, a creature named "hypno"), or a sexual word an artist puts on every work, creature sketches included. About
+# 100 more show nothing the tag says; the image checks had passed them all.
+# ponytail: a hand list, as the titles' is, held the safe way as the owner leans. "feet" alone holds 12 of the 244,
+# about 10 wrongly, and "sexy" alone 96: drop either if that art should go. Not "bikini", "succubus", "tf" or
+# "genderbend": ordinary art carries them too, and the image checks read it.
+UNFIT_TAG = re.compile(
+    r"fetish|nsfw|hentai|(?<!food)porn|lewd|futanari|lolicon|shotacon|sexy|bimbo|pin[\W_]?up|lingerie|bondage|bdsm|"
+    r"femdom|busty|booty|boob(?!y)|breasts|tits|titties|nipple|topless|erotic|yiff|ahegao|upskirt|panties|"
+    r"hypno(?!s(?![a-z]))|mind[\W_]?control|tickl|inflation|weight[\W_]?gain|giantess|(?:soft|belly)vore|buttcheek|"
+    r"buttock|(?<![a-z])(?:ecchi|nud(?:es?|ity)|feet|oppai|shota|thicc|milf|naked|kink|vore|r-?18(?!\d)|"
+    r"(?:breast|ass)(?![a-z]))|(?:ecchi|futa|nud(?:es?|ity)|feet|oppai|shota|thicc|milf|loli|(?<!head)butts?)(?![a-z])|"
+    + GLUED_HATE.pattern
+)
 # Swearing and slurs. A title with one holds back its work, and a handle with one its artist: the handle is their
 # name and their slug on the site. "fuck" wherever it is; the rest as a whole word of a title ("shitpost", "piss
 # off"), or at either end of a run of letters in a handle ("shitbird", "grimbastard"), since a handle is words
@@ -231,7 +247,8 @@ AI_REFUSED = re.compile(
     r"\b0\s*%\s*ai\b|\bhuman[\s_-]*(?:made|drawn|created)\b|\b(?:no|not|without)\s+(?:\w+\s+){1,3}ai\b"
 )
 # The owner's own list of what no rule catches, in the git-ignored cache: a deviation id or an artist key
-# ("da:<handle>") a line, and "#" for a comment. Whatever it names is held back as held_by_hand. No file holds nothing.
+# ("da:<handle>") a line, and "#" for a comment. Whatever it names is held back as held_by_hand, and an artist under
+# every key kept here with the account kept for the key named: a new handle is the same account. No file holds nothing.
 HELD_BY_HAND = "held_by_hand.txt"
 # The local library has nothing to push. Said for a dry run that finds no file too, without making one.
 NO_ARTISTS = (
@@ -475,7 +492,8 @@ def build(
     (HELD_ACCOUNTS), their handle does not swear (PROFANE_HANDLE), no work of theirs kept here is declared AI-made
     by its own title or tags or the description sent (the owner's, 2026-10-20: tagging.declared_ai and AI_WORDS),
     nor has words nobody has read so, their portfolio is not an adult one (ADULT_PERCENT, by their works'
-    ratings), the owner has not held them back by hand (HELD_BY_HAND), and MIN_WORKS of their works may be sent.
+    ratings), the owner has not held them back by hand (HELD_BY_HAND), under this handle or any other of their
+    account's, and MIN_WORKS of their works may be sent.
     `removed` is key hashes the store's removal list does not hold yet and will (see _removal): whoever they bar
     is not built.
 
@@ -491,14 +509,14 @@ def build(
 
     A work may be sent when the collect stage has left no mark on it, the owner has not held it back by hand, it
     was in the artist's latest answer from DeviantArt, it passes _held, its title has no word of UNFIT_TITLE,
-    PROFANE_TITLE or GLUED_HATE and names no service (library.names_service), and the plain rule finds no contact
-    in its title or its description. Every other text is held to that rule too, and one that
-    fails is left out and counted (see the module's docstring). The collect stage deletes nothing any more: a work
-    it finds mature, somebody else's, no longer public or titled with contact details stays here with a mark, and
-    a work the artist has taken down stays with the time it was last seen, which is before their profile was last
-    stored. Of the works that may be sent, the MAX_WORKS most recently published are, each with its thumbnail's
-    size when the collect stage has it; an adoptable or for-sale sheet (SHEET, or a title of SHEET_TITLE) only
-    after all the others, as filler.
+    PROFANE_TITLE or GLUED_HATE and names no service (library.names_service), no own tag of it is UNFIT_TAG's, and
+    the plain rule finds no contact in its title or its description. Every other text is held to that rule too, and
+    one that fails is left out and counted (see the module's docstring). The collect stage deletes nothing any
+    more: a work it finds mature, somebody else's, no longer public or titled with contact details stays here with
+    a mark, and a work the artist has taken down stays with the time it was last seen, which is before their profile
+    was last stored. Of the works that may be sent, the MAX_WORKS most recently published are, each with its
+    thumbnail's size when the collect stage has it; an adoptable or for-sale sheet (SHEET, or a title of
+    SHEET_TITLE) only after all the others, as filler.
 
     Everything in an artist's row that comes from their works comes from the works that are sent, and a
     neighbour is always an artist who is sent too. A neighbour's row says which of their works to show beside
@@ -545,6 +563,8 @@ def _build(local: store.Snapshot, removed: Collection[str]) -> tuple[Rows, Rows,
     works_of, fields = _collected(local)
     answers = library.answers(local)  # what each artist's latest answer emptied, and how many works it flags mature
     by_hand = held_by_hand()
+    # An artist held by hand stays held under any handle their account takes: the account kept for the key named.
+    by_hand_accounts = {held for entry in by_hand if (held := account_of.get(entry))}
     counts: Counter[str] = Counter()
     # An account hash kept here for two keys that no rename mark links is a broken store (_removal's rule), and is
     # sent for neither: a proof bound to it would bar it there, and the database would delete the other at once.
@@ -587,9 +607,7 @@ def _build(local: store.Snapshot, removed: Collection[str]) -> tuple[Rows, Rows,
                 reason = "not_seen_lately"
             elif UNFIT_TITLE.search(title or "") or GLUED_HATE.search((title or "").casefold()):
                 reason = "unfit_title"
-            elif any(
-                isinstance(tag, str) and UNFIT_TAG.fullmatch(tag.strip().casefold()) for tag in json.loads(own_tags)
-            ):
+            elif any(isinstance(tag, str) and UNFIT_TAG.search(tag.casefold()) for tag in json.loads(own_tags)):
                 reason = "unfit_tag"
             elif PROFANE_TITLE.search(title or ""):
                 reason = "profane_title"
@@ -621,7 +639,7 @@ def _build(local: store.Snapshot, removed: Collection[str]) -> tuple[Rows, Rows,
         why = None
         if key in marked_artists:
             why = _marked(marked_artists[key][0])
-        elif key in by_hand:
+        elif key in by_hand or account_of.get(key) in by_hand_accounts:
             why = "held_by_hand"
         # A sentence the plain contact rule refuses is no profile to show: the artist waits for another.
         elif key not in written or library.holds_contact(written[key]["written"]):
@@ -959,8 +977,8 @@ def run(dry_run: bool, allow_delete: int | None = None, local: pathlib.Path | st
             f"removed account): add {len(whole[0] - named[0])} key hashes to the database's removal list, where they "
             f"stay for good, and purge {len(whole[1] & kept) - len(purge)} artists here. That looks like a broken "
             f"local store, or more removals made here at once than a run believes. Whom the database's list names "
-            f"{done} removed, here and there, and nothing else. If they are real removals, run it again with "
-            f"--allow-delete {people}."
+            f"{done} removed, here and there, and nothing else. If they are real removals, run "
+            f"`uv run python -m pipeline.push --allow-delete {people}`."
         )
     if not kept - removed:
         raise Stop(NO_ARTISTS)
@@ -1021,7 +1039,7 @@ def run(dry_run: bool, allow_delete: int | None = None, local: pathlib.Path | st
             f"this run would delete {going[0]} of the {there_are[0]} artists the database has (it may delete "
             f"{may[0]}), {going[1]} of the {there_are[1]} works of the artists who stay (it may delete {may[1]}) and "
             f"{going[2]} of their {there_are[2]} neighbour rows (it may delete {may[2]}). Nothing was deleted or "
-            f"loaded. If that is what should happen, run it again with --allow-delete {max(going)}.",
+            f"loaded. If that is what should happen, run `uv run python -m pipeline.push --allow-delete {max(going)}`.",
             counts,
         )
     if not dry_run:
