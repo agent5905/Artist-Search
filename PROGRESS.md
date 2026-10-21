@@ -1557,9 +1557,13 @@ Deadlocks are gone as written, and nothing else stands beyond the accepted limit
 
 **What it shows to improve later:** negations in a brief, and leaning less on a portfolio's tags when its works do not fit.
 
-**Next:**
-1. The site's settings on the `artist-search` Pages project.
-2. The first public deployment, which is the owner's call.
+**The Pages project's settings are set (2026-10-21, at the owner's word).** `artist-search` now holds the three values the site's server functions read, for production and for preview alike: the database's address, its publishable key, and the site's token.
+- **All three are stored as secrets,** since the project's settings come from `web/wrangler.toml` and only secrets stand beside it.
+- **No value was printed.**
+- **The Workers AI binding** comes from `wrangler.toml` at deploy time.
+- **Still undeployed:** `artist-search.pages.dev` has no deployment yet.
+
+**Next:** the first public deployment, which is the owner's call. It means building `web/` and running `wrangler pages deploy dist --project-name artist-search`. The verifier's 15-minute schedule (Windows Task Scheduler, on the owner's machine) goes with it.
 
 **The disk filled up.** Drive F: reached 0 bytes free at about 19:45 on 10-19, and two image-check turns failed to open the store and were retried. The cause was this project: 20 finished builder worktrees, each with its own Python environment (73 GB), and critics' temporary test folders (9.5 GB).
 - **Every branch was merged,** so the worktrees were removed, with the branches kept, and the temporary folders deleted. F: has 83 GB free.
