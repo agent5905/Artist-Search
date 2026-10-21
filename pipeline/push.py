@@ -199,15 +199,16 @@ GLUED_HATE = re.compile(r"nazi|hitler|swastika|(?<!k)kkk(?!k)")
 # descriptions about 60 of the 244 are plainly ordinary art: a word in another sense ("feet" on concept art, a book's
 # title, a creature named "hypno"), or a sexual word an artist puts on every work, creature sketches included. About
 # 100 more show nothing the tag says; the image checks had passed them all.
-# ponytail: a hand list, as the titles' is, held the safe way as the owner leans. "feet" alone holds 12 of the 244,
-# about 10 wrongly, and "sexy" alone 96: drop either if that art should go. Not "bikini", "succubus", "tf" or
-# "genderbend": ordinary art carries them too, and the image checks read it.
+# ponytail: a hand list, as the titles' is, held the safe way as the owner leans. Not "feet" alone: it held 12 of the
+# 244, about 10 wrongly (robot feet, concept sheets), so the lead took it out; a foot fetish says "fetish". "sexy"
+# alone holds 96, some wrongly (an artist who puts it on every portrait): drop it if that art should go. Not
+# "bikini", "succubus", "tf" or "genderbend": ordinary art carries them too, and the image checks read it.
 UNFIT_TAG = re.compile(
     r"fetish|nsfw|hentai|(?<!food)porn|lewd|futanari|lolicon|shotacon|sexy|bimbo|pin[\W_]?up|lingerie|bondage|bdsm|"
     r"femdom|busty|booty|boob(?!y)|breasts|tits|titties|nipple|topless|erotic|yiff|ahegao|upskirt|panties|"
     r"hypno(?!s(?![a-z]))|mind[\W_]?control|tickl|inflation|weight[\W_]?gain|giantess|(?:soft|belly)vore|buttcheek|"
-    r"buttock|(?<![a-z])(?:ecchi|nud(?:es?|ity)|feet|oppai|shota|thicc|milf|naked|kink|vore|r-?18(?!\d)|"
-    r"(?:breast|ass)(?![a-z]))|(?:ecchi|futa|nud(?:es?|ity)|feet|oppai|shota|thicc|milf|loli|(?<!head)butts?)(?![a-z])|"
+    r"buttock|(?<![a-z])(?:ecchi|nud(?:es?|ity)|oppai|shota|thicc|milf|naked|kink|vore|r-?18(?!\d)|"
+    r"(?:breast|ass)(?![a-z]))|(?:ecchi|futa|nud(?:es?|ity)|oppai|shota|thicc|milf|loli|(?<!head)butts?)(?![a-z])|"
     + GLUED_HATE.pattern
 )
 # Swearing and slurs. A title with one holds back its work, and a handle with one its artist: the handle is their

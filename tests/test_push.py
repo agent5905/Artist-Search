@@ -668,13 +668,13 @@ def test_a_tag_built_from_an_unfit_word_holds_its_work_and_a_word_inside_another
         *("nude", "Sexy", "boobs", "bigboobs", "hugeboobs", "boobsandbutts", "milf", "pinup", "pin_up", "bimbo"),
         *("bondagefetish", "stockstickling", "hypnosismindcontrol", "zzpornart", "nsfwzz", "zzfutanari", "futa"),
         *("ecchigirl", "nudity", "softvore", "vore_zz", "zzinflation", "bdsm", "lingerie", "bigbreasts", "bigbutt"),
-        *("thiccthighs", "feet", "zzfeet", "footfetish", "ass", "zz_ass", "R-18", "zznazizombies", "zzKKKriders"),
-    ]
+        *("thiccthighs", "footfetish", "ass", "zz_ass", "R-18", "zznazizombies", "zzKKKriders"),
+    ]  # and not "feet" alone, which held concept art of robot feet: a foot fetish says "fetish"
     fine = [
         *("carnivore", "omnivore", "herbivore", "glass", "class", "bass", "assassin", "badass", "therapist"),
         *("arlecchino", "futaba", "button", "headbutt", "butterfly", "menudesign", "snakedragon", "treeskink"),
         *("boobytrap", "breastplate", "lolita", "hypnos", "gothiccomic", "emilfanart", "foodporn", "inflatable"),
-        *("photoshoppainting", "skyscraper", "sharkkkk", "inktober18"),
+        *("photoshoppainting", "skyscraper", "sharkkkk", "inktober18", "feet", "robotfeet"),
     ]
     assert [tag for tag in unfit if not push.UNFIT_TAG.search(tag.casefold())] == []
     assert [tag for tag in fine if push.UNFIT_TAG.search(tag.casefold())] == []

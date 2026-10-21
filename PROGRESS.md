@@ -1465,11 +1465,17 @@ Deadlocks are gone as written, and nothing else stands beyond the accepted limit
   - A legacy handle-only entry on the database's list would take its current holder. None can arise any more, since push refuses artists with no account and grants bar accounts, and the live list is empty.
 - **Outside the owner's rules, noted for later:** AI-made work that never says so (a "NEURAL" watermark, Gemini's mark) leads some cards.
 
-**Push round 11, being built:**
-- Sexual and fetish tags matched as glued words.
-- More services in the service list.
-- The hand-held list follows the account.
-- The two missing tests.
+**Push round 11: merged.** On a copy of the store, push would now send 2,980 artists and 27,460 works.
+- **Sexual and fetish tags, matched as glued words:**
+  - 244 more sent works of 131 artists are held, every one of the critic's examples among them.
+  - Words that also sit inside ordinary words count only at the start or end of a run of letters: "carnivore", "assassin", "button", "breastplate", "boobytrap" and "foodporn" stay clear.
+  - About 60 of the 244 are ordinary art under spammy or other-sense tags, held the safe way the owner leans.
+  - The lead then took out bare "feet" (it held 12, about 10 wrongly); a foot fetish still matches "fetish".
+- **Services in titles:** Bluesky, bsky, insta, IG and Toyhouse added, holding 9 more announcements.
+- **The hand-held list follows the account,** so a held artist who takes a new handle stays held.
+- **Tests:** the two uncaught breaks are now caught.
+- **The hand-held list** (local) gains three fetish-genre portfolios: hypnosis comics, transformation comics with children's cartoon characters, and a transformation-fetish portfolio.
+- **Kept as designed:** removing more than 5 handles here at once stops push until `--allow-delete N`, and the stop message now says exactly what to run.
 
 **The disk filled up.** Drive F: reached 0 bytes free at about 19:45 on 10-19, and two image-check turns failed to open the store and were retried. The cause was this project: 20 finished builder worktrees, each with its own Python environment (73 GB), and critics' temporary test folders (9.5 GB).
 - **Every branch was merged,** so the worktrees were removed, with the branches kept, and the temporary folders deleted. F: has 83 GB free.
