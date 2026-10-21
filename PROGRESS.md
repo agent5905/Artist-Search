@@ -1530,10 +1530,36 @@ Deadlocks are gone as written, and nothing else stands beyond the accepted limit
   - Reading a table directly with the public key gets 401.
 - **Still not public:** nothing is deployed.
 
+### Round 33: the text-search test against DeviantArt's search, won 28 to 8 (2026-10-21)
+
+**Piece 5, the spec's own bar, run for the first time: won.**
+
+**How it was run:**
+- **Our side:** the site was run locally (built, served by wrangler with the real Workers AI) against the database just loaded. Chrome's own headless mode captured the first screen of results for each of the 36 frozen queries (`eval/queries.jsonl`), each in a fresh profile, at 1280×800.
+- **DeviantArt's side:** its own search, captured on 10-13 the same way, through Chrome. Both sites are dark.
+- **The judging:** each pair was labelled A and B at random, with the key kept apart. Two fresh critics judged 18 briefs each, by which first screen gives a studio's art lead more artists who truly fit the brief, and counted the fitting results. Both sides show their logos, as in the earlier site comparisons.
+
+| | Ours | DeviantArt |
+|---|---|---|
+| Queries won (of 36) | **28** | 8 |
+| First half (q01–q18) | 13 | 5 |
+| Second half (q19–q36) | 15 | 3 |
+
+**Why ours won:**
+- **Named artist cards:** name, tagline and four works show who does what at a glance.
+- **Clean first screens:** DeviantArt's are often padded with text posts, locked or blurred tiles, AI-badged images and sale banners.
+- **Always an answer:** DeviantArt returns nothing for long briefs and for the misspelling "concpet artist charcter desing", where ours finds character artists.
+
+**Why DeviantArt won its 8:**
+- **Exact single pieces** where the brief named one: icon sheets, pixel sprites, art nouveau, dieselpunk aviators. Its cyberpunk-city hits look AI-made.
+- **Our tag-matched artists** whose portfolios do not fit the brief (mechs, turnarounds).
+- **"no anime"** (q29): our search does not honour a negation.
+
+**What it shows to improve later:** negations in a brief, and leaning less on a portfolio's tags when its works do not fit.
+
 **Next:**
-1. The text-search A/B against DeviantArt's search, with the site run locally against this database and the 36 captured reference pages.
-2. The site's settings on the `artist-search` Pages project.
-3. The first public deployment, which is the owner's call.
+1. The site's settings on the `artist-search` Pages project.
+2. The first public deployment, which is the owner's call.
 
 **The disk filled up.** Drive F: reached 0 bytes free at about 19:45 on 10-19, and two image-check turns failed to open the store and were retried. The cause was this project: 20 finished builder worktrees, each with its own Python environment (73 GB), and critics' temporary test folders (9.5 GB).
 - **Every branch was merged,** so the worktrees were removed, with the branches kept, and the temporary folders deleted. F: has 83 GB free.
