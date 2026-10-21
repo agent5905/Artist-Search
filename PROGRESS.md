@@ -1,16 +1,24 @@
 # Artist Search: Progress
 
-**Status, 2026-10-18:** The GPU analysis is finished: all 39,744 works by 3,948 artists are tagged, checked and rated, and 3,656 artists have a profile card. Next come the last blind comparisons (style and text search against DeviantArt) and the final critics of push and claim-or-remove. After that comes the first public deployment, which waits for the owner's approval. 119 artists are public; nothing is deployed.
+**Status, 2026-10-21: live at https://artist-search.pages.dev.**
+- **The database:** 2,978 game concept and character artists and 27,443 of their works, 84.6 MB of 400 MB.
+- **The spec's two head-to-head bars:** both beat DeviantArt in blind tests: style, 14 to 12 (confirmed by a second pair of critics), and text search, 28 to 8.
+- **The critic loops:** push and claim-or-remove each ended under the owner's accepted limits (decisions 12 to 20).
+- **The removal checker** runs every 15 minutes on the owner's machine.
 
 ## Waiting on the owner
 
-Nothing is blocking. Three things to weigh when convenient, each with a default in place:
+Nothing is blocking.
 
-1. **When is collect good enough?** Default: it runs now on the rebuilt pacing, whose second critic said it would run it (Round 18).
-2. **How strict should the content filter be?** Default in place: works rated suggestive or explicit are held back, and an artist is held back at 30% or more. On today's data that holds back 70 of 470 artists.
-3. **Brief slow-downs during a data load.** Default: the site retries a failed call once.
+**Day to day:**
+- `uv run python -m pipeline.removals --pending` lists the removal requests that need the owner's answer, and `--grant ID` or `--reject ID` answers them.
+- `cache/held_by_hand.txt` holds back any work or artist by hand.
+- The GPU worker is stopped because its work is done. `uv run python scripts/gpu.py start` runs it again when new works arrive.
 
-The GPU worker is stopped because its work is done; `uv run python scripts/gpu.py start` runs it again when new works arrive. The first public deployment will be asked for separately when the site reaches its preview stage.
+**Left for later, not blocking:**
+- Negations in a search brief ("no anime").
+- AI-made work that never says so.
+- A domain for the edge rate-limiting rule (decision 12).
 
 ## Owner decisions (these amend the spec)
 
@@ -1581,6 +1589,12 @@ Deadlocks are gone as written, and nothing else stands beyond the accepted limit
 - A dry run against the live database ran cleanly; no requests are open yet.
 - Its schedule waits for the owner: the auto-mode classifier refused to register a Windows scheduled task as unrequested persistence.
 - Until it is scheduled, the page's "at most a day" holds only while someone runs the checker by hand, or while a collect or discovery run is going.
+
+**The removal checker is scheduled (the same morning, at the owner's word).**
+- **The task:** the Windows scheduled task "Artist Search removal checker" runs `cache/run_removals.cmd` (git-ignored) every 15 minutes.
+- **How it runs:** headless, with no window. A second copy never starts while one runs, and a run is stopped after 6 hours. Output goes to `cache/removals.log`.
+- **First run:** 08:39, result 0, with no open requests.
+- **The page's promise:** "at most within a day" now holds while the PC is on.
 
 **The disk filled up.** Drive F: reached 0 bytes free at about 19:45 on 10-19, and two image-check turns failed to open the store and were retried. The cause was this project: 20 finished builder worktrees, each with its own Python environment (73 GB), and critics' temporary test folders (9.5 GB).
 - **Every branch was merged,** so the worktrees were removed, with the branches kept, and the temporary folders deleted. F: has 83 GB free.
