@@ -152,3 +152,7 @@ python scripts/secret_scan.py --all
 | `docs/` | Operational notes (for example the edge rate-limit rule) |
 | `ARTIST_SEARCH_SPEC.md` | The original brief |
 | `PROGRESS.md` | Design decisions, test results and the build log |
+
+## License
+
+The code is released under the [MIT License](LICENSE). It does not cover the artworks the site links to, which belong to their artists.
