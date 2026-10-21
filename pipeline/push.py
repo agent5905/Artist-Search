@@ -31,7 +31,7 @@ Four things stop a run, each with a message and a status that is not zero:
   - the removals would bar people beyond those the database's removal list names (by the handle or the account
     they are kept under here; an account named, under every key kept here that holds it, while those keys agree),
     more than DELETE_FLOOR of them: artists only the store's list bars, and hashes it would add that are no handle
-    or account of anybody barred here, nor a site somebody kept here names (a handle nobody here has). The
+    or account of anybody barred here (a handle nobody here has, or a site, whose holder the database deletes). The
     database's list is filled by proofs and the owner's grants, and goes through however long it is; the owner's
     removals here are a few at a time, and a store's removal table filled from a bad copy once held every artist's
     hash, which would have deleted them all there and barred them for good. Or any person, however few, that what
@@ -40,9 +40,8 @@ Four things stop a run, each with a message and a status that is not zero:
     account's other handles. A disagreement is how a broken local store shows, and nobody's wish: a corrupt table
     of rename links once turned one removal through the site into twelve, and five profiles given a removed
     account's hash made it six. Whom the database's list names is removed all the same, here and there. Nothing
-    else is done, and `--allow-delete N` lets N of them through. A removed site counts for nothing: it bars nobody.
-    (An artist whose account hash another key no link ties to holds is not sent, so no proof there can bar it
-    before this guard has looked: build, no_account);
+    else is done, and `--allow-delete N` lets N of them through. (An artist whose account hash another key no link
+    ties to holds is not sent, so no proof there can bar it before this guard has looked: build, no_account);
   - the local library has no artists. An empty or a new file is no reason to empty the database;
   - more would be deleted than a run is believed about: more than DELETE_PERCENT of the artists the database
     holds, of their works or of their neighbour rows, and more than DELETE_FLOOR. A changed prompt version, a
@@ -160,10 +159,16 @@ SHEET = "adoptable or design-for-sale sheet"  # of tagging.FORMATS: sent after a
 # sheets, 23 their artist's first. Wrongly, as far as was read: 2 of the 716 with "closed" (a door, a tomb; neither
 # sent) and one sent "sale" (a picture about a shop's sale). "Open" anywhere would take some 35 finished works
 # titled "Commissions open", and a few where it is a verb.
+# And a price (the ninth critic's): a currency sign beside a number ("[$15]", "15$", "€10") or a number in US
+# dollars, euros or pounds ("10 USD"); and a pay-to-use base ("P2U"), which is sold. On 2026-10-20 a sheet of six
+# designs with only a price in its title led its artist and was picked beside 16 others, and P2U bases 2 to 18 times.
+# Of the 39,744 titles, the 125 with a price are all adoptables, commissions, bases or products for sale, none a
+# title about money. With P2U they make 15 more sent works filler, 3 of them their artist's first, and none is picked.
 SHEET_TITLE = re.compile(
     r"\b(?:adopt\w*|auction\w*|for\s+sale|ota|ych|sold|sale|ffa|flat\s*sale|set\s*price|closed)\b"
     r"|\bsb\s*[-:=]?\s*(?:[$€£]\s*\d|\d+\s*(?:[$€£]|usd|eur|pts|points)|\d+\b.*\bab\s*[-:=]?\s*\d)"
-    r"|(?:^|[^\w\s])\s*open\b(?:\s*\d+\s*[/\\]\s*\d+)?\s*(?:$|[^\w\s])",
+    r"|(?:^|[^\w\s])\s*open\b(?:\s*\d+\s*[/\\]\s*\d+)?\s*(?:$|[^\w\s])"
+    r"|[$€£]\s*\d|\d\s*(?:[$€£]|(?:usd|eur|gbp)\b)|\b(?:p2u|pay[\s-]*to[\s-]*use)\b",
     re.IGNORECASE,
 )
 # What an artist's username and tagline say (tagging.accounts) that holds them back; None is not read yet. Of the
@@ -173,12 +178,16 @@ HELD_ACCOUNTS = {"ai": "declares_ai", "adult": "adult_account", None: "account_n
 # words: "carnivore", "inflatable", "Lolita" and "breastplate" go. A list, where the image check (tagging.run_content)
 # is a model, because a work held wrongly costs little: on the 39,744 titles of 2026-10-19 it holds 58, two of them
 # wrongly, where "sex" was not sexual. Not "giantess" or "xxx": in titles they were a female giant and a placeholder.
+# Pin-ups (owner decision 17), "busty", "R18", rape, incest, guro, shibari and "sieg heil" were added on 2026-10-20
+# (the ninth critic's): of the 39,744 titles they take 34 more, 3 of them sent works, among them a 3D pin-up outfit and
+# a shibari commission. One of the 3 is arguable: "pin-up" is also a comic's word for a lone character's splash page.
 # ponytail: what a title only hints at ("Feeding time") passes, and so does a word glued to others but for the
 # hate words of GLUED_HATE; the image check and the rating are behind it.
 UNFIT_TITLE = re.compile(
     r"\b(?:nsfw|porn\w*|hentai|ecchi|lewd|nudes?|nudity|topless|sexy|sex|sextober|kinktober|kinky?|"
     r"fetish\w*|bdsm|bondage|erotic\w*|lingerie|boob(?:s|ies)|tits|titties|breasts?|butts?|booty|ass|thicc|milf|"
     r"oppai|ahegao|futa(?:nari)?|yiff|vore|inflation|inflat(?:ed|ing)|diapers?|abdl|"
+    r"pin[\s-]?ups?|busty|r-?18|rape|incest|guro|shibari|sieg[\s-]?heil|"
     r"loli(?:con)?|shota(?:con)?|nazis?|reich|swastikas?|hitler|kkk)\b",
     re.IGNORECASE,
 )
@@ -203,10 +212,22 @@ GLUED_HATE = re.compile(r"nazi|hitler|swastika|(?<!k)kkk(?!k)")
 # 244, about 10 wrongly (robot feet, concept sheets), so the lead took it out; a foot fetish says "fetish". "sexy"
 # alone holds 96, some wrongly (an artist who puts it on every portrait): drop it if that art should go. Not
 # "bikini", "succubus", "tf" or "genderbend": ordinary art carries them too, and the image checks read it.
+# The ninth critic's (2026-10-20): a body's "expansion", quicksand peril, shibari, guro, a dominatrix, feminization,
+# dollification and adult content were on 14 sent works of 9 artists, and sex, rape, incest, diapers, ABDL and hate
+# slogans and numbers are added beside them. "expansion" counts glued after a word, never alone or first
+# ("expansionpack"); "sex" at the start of a run, but for "sextant", "sextet" and "sexton" ("essex", "bisexual" are
+# clear); "guro" at the start ("ganguro" is a fashion); "rape" at the start but for "rapeseed", or at the end but
+# after c, d or g ("grape", "drape", "scrape"). They take 26 more of the store's distinct tags, on 80 works, and hold
+# 13 more sent works (the 14th goes by its title); none sent is plainly ordinary art, though 5 tagged guro may be
+# horror the blood rule (decision 17) would show. What "sex" takes alone (sex work, sex education) is none of it sent.
+# ponytail: "rape" glued in the middle of a tag passes, and a game's expansion glued to its name would be held; none is.
 UNFIT_TAG = re.compile(
     r"fetish|nsfw|hentai|(?<!food)porn|lewd|futanari|lolicon|shotacon|sexy|bimbo|pin[\W_]?up|lingerie|bondage|bdsm|"
     r"femdom|busty|booty|boob(?!y)|breasts|tits|titties|nipple|topless|erotic|yiff|ahegao|upskirt|panties|"
     r"hypno(?!s(?![a-z]))|mind[\W_]?control|tickl|inflation|weight[\W_]?gain|giantess|(?:soft|belly)vore|buttcheek|"
+    r"adult[\W_]?content|shibari|dominatrix|femini[sz]ation|dollification|quicksand|incest|diaper|abdl|"
+    r"(?<=[a-z])expansion|(?<![a-z])(?:sex(?!t(?:ant|et|on))|guro|rape(?!seed))|(?<![cdg])rape(?![a-z])|"
+    r"sieg[\W_]?heil|white[\W_]?power|(?<!\d)1488(?!\d)|"
     r"buttock|(?<![a-z])(?:ecchi|nud(?:es?|ity)|oppai|shota|thicc|milf|naked|kink|vore|r-?18(?!\d)|"
     r"(?:breast|ass)(?![a-z]))|(?:ecchi|futa|nud(?:es?|ity)|oppai|shota|thicc|milf|loli|(?<!head)butts?)(?![a-z])|"
     + GLUED_HATE.pattern
@@ -727,6 +748,10 @@ def _build(local: store.Snapshot, removed: Collection[str]) -> tuple[Rows, Rows,
         words = [*facts, *(title for _, _, title, *_ in ready if title), *listed_tags]
         search_text = _search_text(words)  # read whole, as every text that goes, by both rules
         said = accounts[key]  # "fine", or "profane" or "social": then the tagline is left out and the artist goes
+        # One that names a service is social whatever the reading says (library.names_service, the rule a model's
+        # words are held to): on 2026-10-20 the reading let 11 such taglines through, a handle and two sites among them.
+        if said == "fine" and library.names_service(tagline):
+            said = "social"
         if tagline and said != "fine":
             counts[f"taglines_left_out_{said}"] += 1
         artists.append(
@@ -848,19 +873,21 @@ def _removal(
     lacks, as store.mark_removed leaves them), so that the account is known for what it is under a handle it takes
     later, when the purge has deleted the profile that names it. A handle on the database's list may be one an
     earlier holder was barred under (sql/002_functions.sql's remove_artists put the handle with the account, until
-    2026-10-20): it takes nobody's account but one a list holds too, and is followed to no other handle. Never a key
-    the account has left for another (marked RENAMED): DeviantArt can give that handle to somebody else, whose
-    removal it then is, so that key's account is not taken from it. An account's hash bars every key kept here
-    under it (their profile's hash). A site's bars nobody: it is kept out of every row (store._named_by, build),
-    and anybody can name it. A removal of an account covers it under every handle it is kept under here, linked to
-    one of those by the collect stage's marks (library.same_account), and theirs in
-    turn: all are purged here, and the account's hash is what goes on the lists, which bars the artist under any
-    handle, there (artists.da_account) and here (library.account_removed). A handle goes on them by name only for
-    a key with no account kept: the account may have left it, unseen here, and DeviantArt given it to somebody
-    else. With `follow` False only whom a hash names is barred: by handle, or by the account their profile holds
-    when that account's hash is one of `listed` and what is kept here agrees on whose it is; and their account goes
-    on the list only where what is kept here agrees on it. The database's list holds only the account for a proof,
-    so a removal it made is applied here even when the run stops for something else.
+    2026-10-20): it takes nobody's account but one a list holds too, and is followed to no other handle; nor does it
+    name a key the account has left for another (marked RENAMED): DeviantArt can give that handle to somebody else,
+    whose removal it then is. A handle named here takes the account kept under its key all the same, RENAMED or not:
+    the owner removes the person a request names by the handle it names, and the person goes under every handle
+    (the ninth critic's: an artist removed here by the handle they had left stayed public under the new one). An
+    account's hash bars every key kept here under it (their profile's hash). A site's bars nobody: it is kept out
+    of every row (store._named_by, build), and anybody can name it. A removal of an account covers it under every
+    handle it is kept under here, linked to one of those by the collect stage's marks (library.same_account), and
+    theirs in turn: all are purged here, and the account's hash is what goes on the lists, which bars the artist
+    under any handle, there (artists.da_account) and here (library.account_removed). A handle goes on them by name
+    only for a key with no account kept: the account may have left it, unseen here, and DeviantArt given it to
+    somebody else. With `follow` False only whom a hash names is barred: by handle, or by the account their profile
+    holds when that account's hash is one of `listed` and what is kept here agrees on whose it is; and their account
+    goes on the list only where what is kept here agrees on it. The database's list holds only the account for a
+    proof, so a removal it made is applied here even when the run stops for something else.
 
     What is kept here can be wrong: a corrupt table of rename links once turned one removal into twelve, and five
     profiles given a removed account's hash made it six. So the two must agree: every key kept under a removed
@@ -874,7 +901,7 @@ def _removal(
     named = {*store.named_by(hashes, local), *(key for key in kept if store.covers(hashes, key))} - left
     account = {key: library.account_hash(key, local) for key in kept}
     removed = {held for held in account.values() if held in hashes}  # the accounts barred: on a list,
-    removed |= {held for key in named if store._hash(key) in mine and (held := account.get(key))}  # or named here
+    removed |= {held for key in kept if store._hash(key) in mine and (held := account.get(key))}  # or named here
     holding = {key for key, held in account.items() if held in removed}
     reached = named | library.linked(holding, local)
     # A mark ties it to a removed account, and its own hash is another account's.
@@ -941,13 +968,14 @@ def run(dry_run: bool, allow_delete: int | None = None, local: pathlib.Path | st
         # Beyond it: each artist a removal reaches only through a disagreement in what is kept here (whole[3]), each
         # one only the store's list bars (the owner's removals here are a few; a table filled from a bad copy once
         # held every artist's), and each hash the store's list adds that is no handle or account of an artist barred
-        # here, nor a site somebody kept here names (a handle nobody here has). A site bars nobody (store._named_by):
-        # it keeps the site out of rows. An account's other handles that what is kept here agrees on are none of it.
+        # here: a handle nobody here has, or a site. A site bars nobody here (store._named_by), but the database
+        # deletes whoever has it on their row and holds it for good, and a table filled with every artist's site
+        # (the ninth critic's) would have deleted them all there before the load. A site on the database's list goes
+        # through however many. An account's other handles that what is kept here agrees on are none of it.
         own = {store._hash(key) for key in whole[1]}
         own |= {hash_ for key in whole[1] if (hash_ := library.account_hash(key, now))}
-        sites = {store._hash(site) for key in kept for site in store._link_keys([library.website(key, now) or ""])}
         odd = len(whole[3])
-        people = odd + len(whole[1] - named[1] - whole[3]) + len(whole[0] - named[0] - own - sites)
+        people = odd + len(whole[1] - named[1] - whole[3]) + len(whole[0] - named[0] - own)
     may_add = max(DELETE_FLOOR, allow_delete or 0)  # a handful of hashes always goes through, whatever a run is told
     # Then only whom the database's list names is removed, and the run stops after it. A disagreement never goes
     # unasked.
