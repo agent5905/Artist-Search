@@ -1477,6 +1477,25 @@ Deadlocks are gone as written, and nothing else stands beyond the accepted limit
 - **The hand-held list** (local) gains three fetish-genre portfolios: hypnosis comics, transformation comics with children's cartoon characters, and a transformation-fetish portfolio.
 - **Kept as designed:** removing more than 5 handles here at once stops push until `--allow-delete N`, and the stop message now says exactly what to run.
 
+**Push's ninth critic: yes, after a few fixes.**
+- **What holds:**
+  - Dry runs and reruns are clean on the real copy.
+  - All 208,473 picks, recomputed from the vectors, pass the floor and the constraints.
+  - The 25 images it opened, the most-picked among them, are fit to show a studio, with no bulk wrong holds.
+  - Nothing of the earlier critics stands beyond the accepted list.
+- **What a build sends:** 2,978 artists and 27,459 works.
+- **Its conditions:**
+  - About 14 sent works with tags the list still misses (`adultcontent`, `bellyexpansion`, `shibari`, ...).
+  - A guard against a corrupt local list of site removals. The list is empty today, so it cannot fire yet.
+  - A test for a break that a corrupt rename link would otherwise pass.
+- **Small items:**
+  - a priced sheet titled "[$15]" not read as one;
+  - "pinup" missing from the title rule;
+  - 11 taglines naming a service;
+  - an old handle the owner removes by hand not barring the account.
+
+**Push round 12, being built, the last:** all of these. The lead will then rerun the ninth critic's own probes and its 78 breaks against it, instead of a fresh critic, since it has said yes.
+
 **The disk filled up.** Drive F: reached 0 bytes free at about 19:45 on 10-19, and two image-check turns failed to open the store and were retried. The cause was this project: 20 finished builder worktrees, each with its own Python environment (73 GB), and critics' temporary test folders (9.5 GB).
 - **Every branch was merged,** so the worktrees were removed, with the branches kept, and the temporary folders deleted. F: has 83 GB free.
 - **The store's integrity check passes.** No reading was lost.
