@@ -1515,6 +1515,12 @@ Deadlocks are gone as written, and nothing else stands beyond the accepted limit
 
 **The push critic loop ends here.** The ninth critic said it would run the load after these fixes, and they are verified against its own probes.
 
+**The dry run against the live database** (2026-10-20, about 19:15). It changed nothing.
+- **What it would send:** 2,978 artists, 27,443 works and 63,230 neighbour rows.
+- **It stopped on the deletion guard, as expected.** The database still holds the 119 artists of Round 8. Under today's rules, 8 of them are held back, 113 of the staying artists' works no longer go, and 248 neighbour rows go.
+- **What the guard asks for:** `--allow-delete 248`.
+- **The real load waits for the owner's go-ahead:** the auto-mode classifier treats it as a production deploy. Nothing is public until the site is deployed, since the database answers only the site's token.
+
 **The disk filled up.** Drive F: reached 0 bytes free at about 19:45 on 10-19, and two image-check turns failed to open the store and were retried. The cause was this project: 20 finished builder worktrees, each with its own Python environment (73 GB), and critics' temporary test folders (9.5 GB).
 - **Every branch was merged,** so the worktrees were removed, with the branches kept, and the temporary folders deleted. F: has 83 GB free.
 - **The store's integrity check passes.** No reading was lost.
